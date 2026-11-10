@@ -134,7 +134,8 @@ impl Gathered {
         self.asking.as_deref()
     }
 
-    #[cfg(test)]
+    /// The same agent, judged as of `now`: a round that found a deadline
+    /// passed at `now` steps it at that same moment.
     pub(crate) fn at(mut self, now: Ms) -> Self {
         self.now = now;
         self
@@ -274,9 +275,6 @@ pub(crate) struct Carried {
     session: SessionId,
     delivered: super::presentation::Carried,
     prepared: super::wake_receipt::Prepared,
-    /// The identity of every item it presents, which a delivery discharges
-    /// from whatever the monitor holds for it in memory alone.
-    presented: Vec<String>,
 }
 
 /// What a `Delivered` commits: carried out by the monitor off its loop.
@@ -289,7 +287,7 @@ impl Commit {
     /// The items the delivery discharged: a transient one, kept by the
     /// monitor until now, is owed no longer.
     pub(crate) fn presented(&self) -> &[String] {
-        &self.carried.presented
+        &self.carried.delivered.identities
     }
 
     /// Record the presentation and run its receipt callbacks, while the
@@ -307,7 +305,14 @@ impl Commit {
         if !current() {
             return;
         }
-        super::presentation::record_delivered(repo, &author, &carried.delivered, current);
+        super::presentation::record_delivered(
+            repo,
+            &author,
+            carried.tool,
+            carried.session.as_str(),
+            &carried.delivered,
+            current,
+        );
         super::wake_receipt::dispatch(repo, &author, carried.prepared, carried.tool, current).await;
     }
 }
@@ -582,7 +587,7 @@ impl Turns {
                 // reaches the model: Claude's.
                 let commits =
                     !matches!(report, Report::SessionStart { .. }) || tool == Tool::Claude;
-                let (delivered, prepared, presented) = if commits {
+                let (delivered, prepared) = if commits {
                     (
                         super::wake_render::carried(items.iter().copied()),
                         super::wake_receipt::prepare(
@@ -590,7 +595,6 @@ impl Turns {
                             author,
                             super::wake_render::receipt_candidates(items.iter().copied()),
                         ),
-                        items.iter().map(|item| item.identity()).collect(),
                     )
                 } else {
                     Default::default()
@@ -603,7 +607,6 @@ impl Turns {
                         session: report.session().clone(),
                         delivered,
                         prepared,
-                        presented,
                     });
                 }
                 Frame::text(WireVerdict::Deliver { presentation }, text)
@@ -856,12 +859,46 @@ impl Turns {
         }
     }
 
-    /// The soonest moment a check-in is due, across every agent.
+    /// The soonest moment a check-in is due or a presentation in flight
+    /// runs out of time, across every agent.
     pub(crate) fn next_deadline(&self) -> Option<Ms> {
         self.agents
             .values()
-            .filter_map(|c| c.state.next_deadline())
+            .flat_map(|c| [c.state.next_deadline(), c.state.delivery_deadline()])
+            .flatten()
             .min()
+    }
+
+    /// The agents whose presentation in flight has had its time by `now`.
+    pub(crate) fn overdue_authors(&self, now: Ms) -> Vec<AgentLabel> {
+        self.agents
+            .iter()
+            .filter(|(_, c)| c.state.delivery_deadline().is_some_and(|at| at <= now))
+            .map(|(author, _)| author.clone())
+            .collect()
+    }
+
+    /// Fail `author`'s presentation in flight if its carrier has had
+    /// [`clank_core::turn_policy::DELIVERY_RESULT_WITHIN`] and not answered.
+    /// Whether one was failed: what it carried stays owed and undelivered,
+    /// and a result its carrier sends later is refused, as any result for
+    /// nothing in flight is.
+    pub(crate) fn expire(&mut self, author: &AgentLabel, g: &Gathered) -> bool {
+        let expired = matches!(
+            self.step(author, g, None, Event::ResultOverdue),
+            Some(Output::Result(ResultOutcome::Resolved(_)))
+        );
+        if expired && let Some(custody) = self.agents.get_mut(author) {
+            custody.carried = None;
+        }
+        expired
+    }
+
+    /// What `author`'s presentation in flight carries, and when it stops
+    /// counting as a delivery (unix seconds).
+    pub(crate) fn in_flight(&self, author: &AgentLabel) -> Option<(Vec<String>, u64)> {
+        let p = self.agents.get(author)?.state.outstanding.as_ref()?;
+        Some((p.identities.clone(), p.expires().div_ceil(1000)))
     }
 
     /// The agents with a check-in due by `now`.

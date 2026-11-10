@@ -1,0 +1,2 @@
+{"t":"inbox","v":1,"seq":1,"at":1790648000,"transport":"message","action_key":"message#claude/00000000000000000000bb01","item":{"kind":"message","handle":"00000000000000000000bb01","from":"claude","repo":"/home/user/src/example-other","subject":"shown to a session that is gone","body":"shown to a session that is gone"}}
+{"t":"presentation","v":1,"seq":1,"ident":"k:message#claude/00000000000000000000bb01","at":1790648060}

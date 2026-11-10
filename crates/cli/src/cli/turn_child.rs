@@ -435,27 +435,39 @@ async fn shared(
     }
 }
 
+/// How long the hook has to say what became of a presentation: the
+/// monitor's own bound, less the margin that lets this child's word reach
+/// the monitor before the monitor gives the presentation up by itself.
+pub(crate) const RESULT_WITHIN: std::time::Duration = std::time::Duration::from_millis(
+    clank_core::turn_policy::DELIVERY_RESULT_WITHIN - DEADLINE_MARGIN.as_millis() as u64,
+);
+
+/// The hook's one result for presentation `id`. A pipe that closes before
+/// a result, a result for anything else, and a hook that says nothing
+/// within [`RESULT_WITHIN`] are each a failed emit.
+async fn result_of(id: &PresentationId, owner: &mut Owner) -> TurnResult {
+    let failed = |why: &str| TurnResult::EmitFailed {
+        presentation: id.clone(),
+        why: why.into(),
+    };
+    match tokio::time::timeout(RESULT_WITHIN, owner.next()).await {
+        Ok(Said::Line(line)) => match serde_json::from_str::<TurnResult>(&line) {
+            Ok(result) if result.presentation() == id => result,
+            _ => failed("the hook answered for something else"),
+        },
+        Ok(Said::Gone) => failed("the hook closed its pipe before it answered"),
+        Err(_) => failed("the hook gave no result in time"),
+    }
+}
+
 /// Forward the hook's one result for presentation `id` on the socket that
-/// carried it. A pipe that closes before a result, or a result for
-/// anything else, is a failed emit.
+/// carried it.
 async fn forward_result(
     socket: &std::os::unix::net::UnixStream,
     id: &PresentationId,
     owner: &mut Owner,
 ) {
-    let result = match owner.next().await {
-        Said::Line(line) => match serde_json::from_str::<TurnResult>(&line) {
-            Ok(result) if result.presentation() == id => result,
-            _ => TurnResult::EmitFailed {
-                presentation: id.clone(),
-                why: "the hook answered for something else".into(),
-            },
-        },
-        Said::Gone => TurnResult::EmitFailed {
-            presentation: id.clone(),
-            why: "the hook closed its pipe before it answered".into(),
-        },
-    };
+    let result = result_of(id, owner).await;
     let Ok(line) = serde_json::to_string(&result) else {
         return;
     };

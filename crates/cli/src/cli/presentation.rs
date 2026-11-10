@@ -4,23 +4,144 @@ use clank_core::{
     AgentLabel,
     wait::{AnswerRef, EventPresentation},
 };
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 /// What one presentation carried to the model.
 #[derive(Debug, Default)]
 pub(crate) struct Carried {
     pub(crate) events: Vec<EventPresentation>,
     pub(crate) answers: Vec<AnswerRef>,
+    /// The stable identity of every item it presented, event or not.
+    pub(crate) identities: Vec<String>,
 }
 
-/// The one record of a wake that reached the model: its events are
-/// presented and its answers received, each only while `current` holds.
+/// What reached the model in one session, by item identity: the only proof
+/// that an item was delivered to the binding that holds the label now.
+///
+/// An event log's `presentation` record names no session, and review work
+/// has no log at all, so neither can say which binding saw an item.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Receipts {
+    pub(crate) session: String,
+    /// Unix seconds of each item's first delivery to `session`.
+    pub(crate) delivered: BTreeMap<String, u64>,
+}
+
+/// Receipts kept for one session. Past this the oldest are dropped, whose
+/// items read as not delivered and are presented again.
+const RECEIPTS_KEPT: usize = 2048;
+
+pub(crate) fn receipts_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("delivered.json")
+}
+
+/// When each item reached `session`. Empty when the receipts on disk are
+/// another session's, missing, or unreadable: none of those is a delivery.
+pub(crate) fn delivered_to(agent_dir: &Path, session: &str) -> BTreeMap<String, u64> {
+    std::fs::read(receipts_path(agent_dir))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Receipts>(&bytes).ok())
+        .filter(|r| r.session == session)
+        .map(|r| r.delivered)
+        .unwrap_or_default()
+}
+
+/// Record that `identities` reached `session` of `tool` at `at`, if that
+/// session holds the label. `false` when it does not, and nothing is
+/// written.
+///
+/// One transaction under the label's binding lock, which `guard` is: the
+/// binding is compared and the receipts read, merged and replaced with no
+/// bind, rebind or other receipt able to land between. A delivery whose
+/// session has since lost the label can therefore never replace its
+/// successor's receipts, and two deliveries never lose each other's.
+pub(crate) fn receive(
+    guard: &crate::agent_store::BindingGuard,
+    tool: clank_core::Tool,
+    session: &str,
+    identities: &[String],
+    at: u64,
+) -> std::io::Result<bool> {
+    receive_with(guard, tool, session, identities, at, |_| {})
+}
+
+/// [`receive`], calling `before_write` with the label's directory once the
+/// receipts are merged and before they replace the file.
+fn receive_with(
+    guard: &crate::agent_store::BindingGuard,
+    tool: clank_core::Tool,
+    session: &str,
+    identities: &[String],
+    at: u64,
+    before_write: impl FnOnce(&Path),
+) -> std::io::Result<bool> {
+    if !guard.bound_to(tool, session) {
+        return Ok(false);
+    }
+    if identities.is_empty() {
+        return Ok(true);
+    }
+    let agent_dir = guard.agent_dir();
+    let mut delivered = delivered_to(&agent_dir, session);
+    for identity in identities {
+        delivered.entry(identity.clone()).or_insert(at);
+    }
+    while delivered.len() > RECEIPTS_KEPT {
+        let oldest = delivered
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(identity, _)| identity.clone());
+        match oldest {
+            Some(identity) => delivered.remove(&identity),
+            None => break,
+        };
+    }
+    before_write(&agent_dir);
+    let receipts = Receipts {
+        session: session.to_string(),
+        delivered,
+    };
+    let path = receipts_path(&agent_dir);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&receipts)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(true)
+}
+
+/// The one record of a wake that reached the model in `session` of
+/// `tool`: its items are delivered to that session if it still holds the
+/// label, its events presented and its answers received, each only while
+/// `current` holds.
 pub(crate) fn record_delivered(
     repo: &Path,
     author: &AgentLabel,
+    tool: clank_core::Tool,
+    session: &str,
     carried: &Carried,
     current: impl Fn() -> bool,
 ) {
+    let received = match carried.identities.is_empty() {
+        true => Ok(true),
+        false => crate::agent_store::hold_binding(repo, author)
+            .map_err(std::io::Error::other)
+            .and_then(|guard| {
+                receive(
+                    &guard,
+                    tool,
+                    session,
+                    &carried.identities,
+                    super::github::log::now_epoch(),
+                )
+            }),
+    };
+    if let Err(e) = received {
+        eprintln!(
+            "clank: wake delivered; could not record its receipt, so it reads as undelivered: {e}"
+        );
+    }
     record(repo, author, &carried.events, &current);
     for answer in &carried.answers {
         // A presentation speaks for its own agent's blocks only.
@@ -81,3 +202,7 @@ pub(crate) fn record(
         );
     }
 }
+
+#[cfg(test)]
+#[path = "presentation_tests.rs"]
+mod tests;

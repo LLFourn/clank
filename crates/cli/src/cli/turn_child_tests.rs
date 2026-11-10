@@ -872,3 +872,60 @@ fn the_child_names_no_fold_and_no_watcher() {
         );
     }
 }
+
+fn presentation() -> clank_core::turn_policy::PresentationId {
+    clank_core::turn_policy::PresentationId {
+        session: clank_core::SessionId::parse("session-one").unwrap(),
+        seq: 4,
+    }
+}
+
+/// A hook that takes a presentation and then says nothing, with its pipe
+/// still open, is not waited on for ever: the child answers for it as a
+/// failed emit just inside the monitor's own bound, so the monitor hears
+/// it from the carrier before it gives the presentation up by itself.
+#[tokio::test(start_paused = true)]
+async fn a_hook_that_never_answers_for_its_presentation_is_a_failed_emit() {
+    let (owner_read, stdin) = std::io::pipe().unwrap();
+    let mut owner = Owner::reading(owner_read);
+    let id = presentation();
+    let started = tokio::time::Instant::now();
+    let result = super::result_of(&id, &mut owner).await;
+    assert_eq!(started.elapsed(), super::RESULT_WITHIN);
+    assert!(
+        super::RESULT_WITHIN
+            < std::time::Duration::from_millis(clank_core::turn_policy::DELIVERY_RESULT_WITHIN),
+        "the carrier speaks first"
+    );
+    let TurnResult::EmitFailed { presentation, why } = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(presentation, id);
+    assert_eq!(why, "the hook gave no result in time");
+    drop(stdin);
+}
+
+/// A result the hook does give is forwarded as given, and a pipe that
+/// closes first is a failed emit, at once.
+#[tokio::test]
+async fn a_hooks_own_result_is_what_is_forwarded() {
+    use std::io::Write as _;
+    let id = presentation();
+    let (owner_read, mut stdin) = std::io::pipe().unwrap();
+    let mut owner = Owner::reading(owner_read);
+    let delivered = TurnResult::Delivered {
+        presentation: id.clone(),
+    };
+    writeln!(stdin, "{}", serde_json::to_string(&delivered).unwrap()).unwrap();
+    assert_eq!(super::result_of(&id, &mut owner).await, delivered);
+
+    let (owner_read, stdin) = std::io::pipe().unwrap();
+    let mut owner = Owner::reading(owner_read);
+    drop(stdin);
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        super::result_of(&id, &mut owner).await,
+        TurnResult::EmitFailed { .. }
+    ));
+    assert!(started.elapsed() < super::RESULT_WITHIN);
+}

@@ -284,8 +284,6 @@ impl Owes {
 /// kind. Baseline copies are born acknowledged, so pre-watch history is
 /// never owed.
 pub(super) fn owes(snap: &StatusSnapshot, label: &str) -> Owes {
-    use clank_core::wait::WaitItem;
-    let short = |sha: &str| crate::cli::status::short_sha(sha).to_string();
     let role = snap
         .agents
         .iter()
@@ -298,21 +296,10 @@ pub(super) fn owes(snap: &StatusSnapshot, label: &str) -> Owes {
             .into_iter()
             .next()
     });
+    // The ledger's words: an undelivered row and an interrupted one name
+    // the same work the same way.
     let work = match routed {
-        Some(item @ (WaitItem::Reviewer { .. } | WaitItem::AdHocReview { .. })) => {
-            Some(format!("review of {}", super::object_of(&item)))
-        }
-        Some(item @ WaitItem::AdHocRevise { .. }) => {
-            Some(format!("revision of {}", super::object_of(&item)))
-        }
-        Some(item @ WaitItem::Master { .. }) => {
-            Some(format!("work on {}", super::object_of(&item)))
-        }
-        Some(WaitItem::FixCommitTag { sha, .. }) => {
-            Some(format!("tag fix on {}", short(sha.as_str())))
-        }
-        Some(WaitItem::PromoteFromQueue { name, .. }) => Some(format!("promotion of {name}")),
-        Some(_) => None,
+        Some(item) => crate::cli::ledger::what(&item),
         None if role == Some(clank_core::vocab::Role::Master) => {
             promotable(snap).map(|q| format!("promotion of {}", q.name))
         }

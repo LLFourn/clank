@@ -20,7 +20,11 @@ pub(crate) struct AgentState {
     pub(crate) activity: Activity,
     /// Unix seconds: when `activity` last changed, as the monitor saw it.
     pub(crate) since: u64,
-    pub(crate) suppressors: Vec<Suppressor>,
+    /// What clank owes the agent and which of the four cases that puts it
+    /// in. Absent when nothing is owed, and from a state published before
+    /// owed work was accounted for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owed: Option<Owing>,
     pub(crate) nudge: Nudge,
     /// Why clank cannot nudge this agent itself, when it cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,17 +84,110 @@ pub(crate) enum Activity {
     Unobserved,
 }
 
-/// What keeps clank from nudging, whatever the activity.
+/// The work clank owes an agent, and what stands between the agent and it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Owing {
+    /// The item owed longest.
+    pub(crate) oldest: OwedItem,
+    /// The item owed longest among those the bound session has not been
+    /// delivered. `None` when every owed item reached it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) undelivered: Option<OwedItem>,
+    /// How long an item may go undelivered before a row says so, in
+    /// seconds: `recovery.stall_warn`, or its default while that is off.
+    pub(crate) warn: u64,
+    pub(crate) case: Case,
+}
+
+/// One owed item, as status shows it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OwedItem {
+    pub(crate) kind: String,
+    pub(crate) what: String,
+    pub(crate) since: crate::cli::ledger::Since,
+    pub(crate) delivery: crate::cli::ledger::Delivery,
+}
+
+/// Where an agent that is owed work stands. There is no fifth case: owed
+/// work is never just waiting.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "is", content = "detail", rename_all = "snake_case")]
+pub(crate) enum Case {
+    /// Clank must not nudge, and why.
+    HandsOff(HandsOff),
+    /// A presentation is with its carrier, until this unix second.
+    BeingDelivered(u64),
+    /// The harness's record proves the agent is going.
+    Active(Active),
+    /// A recovery episode is live: [`AgentState::nudge`] says what it
+    /// means to do.
+    Recovering,
+}
+
+/// Why clank keeps its hands off an agent it owes work.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "why", content = "detail", rename_all = "snake_case")]
+pub(crate) enum HandsOff {
+    AutoOff,
+    /// The agent's own question to a person is pending in its session.
+    Asking,
+    /// The agent's own block is pending, by name.
+    Blocked(String),
+    /// Work it attends quiets everything it has received.
+    Attending,
+    /// A person stopped its latest turn.
+    Interrupted,
+    /// Clank has no way to resume its harness.
+    CannotResume(String),
+    /// A budget is spent or an attempt's fate unknown: latched for a
+    /// person.
+    WaitingForYou(String),
+    /// Its turn is open and `recovery.stall_warn` is off.
+    StallWarnOff,
+    /// Its open turn went silent and `recovery.stall_nudge` is off.
+    StallNudgeOff,
+    /// Its record cannot be read and `recovery.blind_nudge` is off.
+    BlindNudgeOff,
+}
+
+impl HandsOff {
+    /// The reason in a few words, and in full.
+    fn clause(&self, long: bool) -> String {
+        match self {
+            HandsOff::AutoOff => "auto off".into(),
+            HandsOff::Asking => "asking".into(),
+            HandsOff::Blocked(name) => format!("waiting on its block {name}"),
+            HandsOff::Attending => "attended".into(),
+            HandsOff::Interrupted => "interrupted".into(),
+            HandsOff::WaitingForYou(why) if long => format!("waiting for you · {why}"),
+            HandsOff::WaitingForYou(_) => "waiting for you".into(),
+            HandsOff::CannotResume(why) if long => format!("not nudged: {why}"),
+            HandsOff::StallWarnOff if long => {
+                "not nudged: its turn is open and `recovery.stall_warn` is off".into()
+            }
+            HandsOff::StallNudgeOff if long => {
+                "not nudged: its turn went silent and `recovery.stall_nudge` is off".into()
+            }
+            HandsOff::BlindNudgeOff if long => {
+                "not nudged: its record cannot be read and `recovery.blind_nudge` is off".into()
+            }
+            HandsOff::CannotResume(_)
+            | HandsOff::StallWarnOff
+            | HandsOff::StallNudgeOff
+            | HandsOff::BlindNudgeOff => "not nudged".into(),
+        }
+    }
+}
+
+/// What proves an agent is going without clank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Suppressor {
-    /// A question or block is pending, or a person is attending.
-    Attending,
-    /// It is parked in a wait that can take its work.
-    Delivering,
+pub(crate) enum Active {
+    /// Its latest turn has not ended, and its record moved inside the
+    /// stall window.
+    Turn,
     /// The harness is retrying the latest turn itself.
     NativeRetry,
-    AutoOff,
 }
 
 /// What clank means to do about the agent.
@@ -384,6 +481,10 @@ pub(crate) struct View {
     pub(crate) state: AgentState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stale: Option<&'static str>,
+    /// The oldest item a current state says is owed, aged when the view
+    /// was taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) owed: Option<OwedView>,
 }
 
 impl View {
@@ -397,6 +498,38 @@ impl View {
     /// interrupted. A stale state says nothing about now, so it is never.
     pub(crate) fn interrupted(&self) -> bool {
         self.activity() == Some(&Activity::Interrupted)
+    }
+
+    /// The owed item the bound session has gone without for longer than
+    /// the warn threshold, as a row shouts it. A stale state shouts
+    /// nothing.
+    pub(crate) fn undelivered(&self, now: u64) -> Option<String> {
+        self.stale
+            .is_none()
+            .then(|| undelivered(&self.state, now))
+            .flatten()
+    }
+
+    /// Whether a row may say the agent is working: its record shows a
+    /// turn going, and nothing owed to it says otherwise.
+    pub(crate) fn working(&self) -> bool {
+        self.activity() == Some(&Activity::Working) && proven_working(&self.state)
+    }
+
+    /// `state` as a reader at `now` sees it. A stale state says nothing
+    /// is owed: what it knew is not known now.
+    pub(crate) fn at(state: AgentState, stale: Option<&'static str>, now: u64) -> Self {
+        let owed = state
+            .owed
+            .as_ref()
+            .filter(|_| stale.is_none())
+            .map(|owing| OwedView {
+                age: owing.oldest.since.known().map(|at| now.saturating_sub(at)),
+                kind: owing.oldest.kind.clone(),
+                what: owing.oldest.what.clone(),
+                delivery: owing.oldest.delivery,
+            });
+        View { state, stale, owed }
     }
 
     /// The whole state in one line, with every reason it gives.
@@ -420,7 +553,7 @@ impl View {
     pub(crate) fn row(&self, now: u64) -> Option<String> {
         match self.activity() {
             Some(Activity::Unobserved) => {
-                let clauses = nudge_clauses(&self.state, now);
+                let clauses = clauses(&self.state, now, false, false);
                 (!clauses.is_empty()).then(|| clauses.join(" · "))
             }
             _ => Some(self.brief(now)),
@@ -445,7 +578,54 @@ pub(crate) fn view(
     };
     let living = |o: &Observer| o.birth.as_ref().is_some_and(|b| b.still_holds(o.pid));
     let stale = stale(&state, session, &role, monitor, living);
-    Some(View { state, stale })
+    Some(View::at(state, stale, crate::cli::recovery::unix_now()))
+}
+
+/// The oldest owed item as `clank status -j` carries it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct OwedView {
+    /// Seconds since it became owed; `null` when no record dates it.
+    pub(crate) age: Option<u64>,
+    pub(crate) kind: String,
+    pub(crate) what: String,
+    pub(crate) delivery: crate::cli::ledger::Delivery,
+}
+
+/// How owed work the bound session never received is named wherever a
+/// person reads an agent's state.
+pub(crate) const UNDELIVERED: &str = "UNDELIVERED";
+
+/// The SGR undelivered work is drawn in: bold bright red.
+pub(crate) const UNDELIVERED_SGR: &str = "1;91";
+
+/// `UNDELIVERED <age> · <what>` once the oldest item the bound session has
+/// not received has gone without for the warn threshold. One in flight
+/// inside its bound is being delivered, not missing. An undated item is
+/// timed from when the ledger first held it, and its age is said to be
+/// unknown.
+fn undelivered(state: &AgentState, now: u64) -> Option<String> {
+    use crate::cli::ledger::{Delivery, Since};
+    let owing = state.owed.as_ref()?;
+    let item = owing.undelivered.as_ref()?;
+    if matches!(item.delivery, Delivery::InFlight(until) if now < until)
+        || now < item.since.no_later_than().saturating_add(owing.warn)
+    {
+        return None;
+    }
+    let age = match item.since {
+        Since::At(at) => crate::age::duration(now.saturating_sub(at)),
+        Since::Unknown { .. } => "age unknown".to_string(),
+    };
+    Some(format!("{UNDELIVERED} {age} · {}", item.what))
+}
+
+/// Whether `working` is something the state proves: nothing is owed, or
+/// the owed work's case is the record's own evidence of a turn going.
+fn proven_working(state: &AgentState) -> bool {
+    state
+        .owed
+        .as_ref()
+        .is_none_or(|o| matches!(o.case, Case::Active(_)))
 }
 
 /// How an interrupted agent is named wherever a person reads its state.
@@ -458,9 +638,23 @@ pub(crate) const INTERRUPTED_SGR: &str = "1;38;5;166";
 
 /// The activity and its age, and what clank means to do.
 fn brief(state: &AgentState, now: u64) -> String {
+    said(state, now, false)
+}
+
+fn said(state: &AgentState, now: u64, long: bool) -> String {
+    let shouted = undelivered(state, now);
+    let mut parts = vec![shouted.clone().unwrap_or_else(|| doing(state, now))];
+    parts.extend(clauses(state, now, long, shouted.is_some()));
+    parts.join(" · ")
+}
+
+/// What the agent is doing, by its record, and for how long.
+fn doing(state: &AgentState, now: u64) -> String {
     let age = crate::age::duration(now.saturating_sub(state.since));
-    let mut out = match &state.activity {
-        Activity::Working => format!("working {age}"),
+    match &state.activity {
+        Activity::Working if proven_working(state) => format!("working {age}"),
+        // Its turn has not ended, and nothing shows it moving.
+        Activity::Working => format!("turn open {age}"),
         Activity::Unwatched => format!("unwatched {age}"),
         Activity::Idle => format!("idle {age}"),
         Activity::Failed(class) => format!("failed ({class}) {age}"),
@@ -472,10 +666,43 @@ fn brief(state: &AgentState, now: u64) -> String {
         // Clank has nothing for it, whether a parked wait or a nudge
         // would deliver the next thing.
         Activity::Unobserved => "waiting for work".to_string(),
-    };
-    for clause in nudge_clauses(state, now) {
-        out.push_str(" · ");
-        out.push_str(&clause);
+    }
+}
+
+/// What stands between the agent and its owed work, then what clank
+/// means to do. `shouted` when the row leads with the undelivered item
+/// rather than the activity, which then no longer says the reason itself.
+fn clauses(state: &AgentState, now: u64, long: bool, shouted: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    match state.owed.as_ref().map(|o| &o.case) {
+        Some(Case::HandsOff(why)) => {
+            let headline_says = match why {
+                HandsOff::Interrupted => state.activity == Activity::Interrupted,
+                HandsOff::Asking => state.activity == Activity::Asking,
+                _ => false,
+            };
+            // The nudge's own clause says it, and why.
+            let nudge_says = matches!(why, HandsOff::WaitingForYou(_))
+                && matches!(state.nudge, Nudge::WaitingForYou(_));
+            if (shouted || !headline_says) && !nudge_says {
+                out.push(why.clause(long));
+            }
+        }
+        Some(Case::BeingDelivered(_)) => out.push("being delivered".to_string()),
+        Some(Case::Active(Active::NativeRetry)) => out.push("retrying itself".to_string()),
+        Some(Case::Active(Active::Turn) | Case::Recovering) | None => {}
+    }
+    // A nudge clank will not send is not promised beside the reason it
+    // will not.
+    let held = matches!(
+        state.owed.as_ref().map(|o| &o.case),
+        Some(Case::HandsOff(_))
+    );
+    if !held || matches!(state.nudge, Nudge::WaitingForYou(_)) {
+        out.extend(nudge_clauses(state, now));
+    }
+    if long && let Nudge::WaitingForYou(why) = &state.nudge {
+        out.push(why.clone());
     }
     out
 }
@@ -498,32 +725,22 @@ fn nudge_clauses(state: &AgentState, now: u64) -> Vec<String> {
     }
 }
 
-/// `state` in one line: [`brief`], then what holds a nudge back, why the
-/// record cannot be read, why clank is waiting for a person, and why it
-/// cannot resume the agent itself.
+/// `state` in one line: [`brief`] with every reason in full, then why the
+/// record cannot be read and why clank cannot resume the agent itself.
 pub(crate) fn line(state: &AgentState, now: u64) -> String {
-    let mut out = brief(state, now);
+    let mut out = said(state, now, true);
     if let Activity::Unknown(why) = &state.activity {
         out.push_str(&format!(": {why}"));
     }
-    let unobserved = state.activity == Activity::Unobserved;
-    for s in &state.suppressors {
-        out.push_str(match s {
-            Suppressor::Attending => " · attended",
-            Suppressor::Delivering if unobserved => "",
-            Suppressor::Delivering => " · waiting for work",
-            Suppressor::NativeRetry => " · retrying itself",
-            Suppressor::AutoOff => " · auto off",
-        });
-    }
-    if let Nudge::WaitingForYou(why) = &state.nudge {
-        out.push_str(&format!(" · {why}"));
-    }
     // Nothing is owed to nudge or resume for.
-    if unobserved {
+    if state.activity == Activity::Unobserved {
         return out;
     }
-    if let Some(why) = &state.cannot_resume {
+    let said_already = matches!(
+        state.owed.as_ref().map(|o| &o.case),
+        Some(Case::HandsOff(HandsOff::CannotResume(_)))
+    );
+    if let Some(why) = state.cannot_resume.as_ref().filter(|_| !said_already) {
         out.push_str(&format!(" · not nudged: {why}"));
     }
     out
@@ -532,6 +749,7 @@ pub(crate) fn line(state: &AgentState, now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ledger::{Delivery, Since};
 
     fn state() -> AgentState {
         AgentState {
@@ -544,7 +762,7 @@ mod tests {
             },
             activity: Activity::Idle,
             since: 100,
-            suppressors: Vec::new(),
+            owed: None,
             nudge: Nudge::Nothing,
             cannot_resume: None,
             attending: Vec::new(),
@@ -568,21 +786,20 @@ mod tests {
         assert!(stale(&s, Some("s1"), "master", Some(42), |_| false).is_some());
     }
 
-    fn unobserved(suppressors: Vec<Suppressor>) -> AgentState {
+    fn unobserved() -> AgentState {
         AgentState {
             activity: Activity::Unobserved,
-            suppressors,
             cannot_resume: Some("no pane named `claude` in /r's tab".into()),
             ..state()
         }
     }
 
-    /// A parked waiter took the place of a fold, so whether work is
-    /// pending is not known: it is waiting for work, said once.
+    /// An agent owed nothing is waiting for work, said once, with no
+    /// caveat about a nudge nothing calls for.
     #[test]
-    fn an_unobserved_agent_with_a_waiter_is_waiting_for_work() {
-        let shown = line(&unobserved(vec![Suppressor::Delivering]), 1000);
-        assert_eq!(shown, "waiting for work");
+    fn an_agent_owed_nothing_is_waiting_for_work() {
+        assert_eq!(line(&unobserved(), 1000), "waiting for work");
+        assert_eq!(brief(&unobserved(), 1000), "waiting for work");
     }
 
     /// An age is read by a person, so 20 hours reads `20h`, not the second
@@ -617,21 +834,24 @@ mod tests {
     #[test]
     fn an_idle_roster_row_says_nothing_but_status_still_does() {
         let waiting = View {
-            state: unobserved(Vec::new()),
+            owed: None,
+            state: unobserved(),
             stale: None,
         };
         assert_eq!(waiting.row(1000), None);
         assert_eq!(waiting.line(1000), "waiting for work");
         let nudging = View {
+            owed: None,
             state: AgentState {
                 nudge: Nudge::InFlight,
-                ..unobserved(Vec::new())
+                ..unobserved()
             },
             stale: None,
         };
         assert_eq!(nudging.row(1000).as_deref(), Some("nudged"));
         for activity in [Activity::Working, Activity::Idle, Activity::Interrupted] {
             let v = View {
+                owed: None,
                 state: AgentState {
                     activity,
                     ..state()
@@ -642,40 +862,242 @@ mod tests {
         }
     }
 
-    /// `brief` keeps the words for `clank status` and the agent page.
-    #[test]
-    fn brief_says_waiting_for_work_either_way() {
-        for suppressors in [vec![Suppressor::Delivering], Vec::new()] {
-            assert_eq!(brief(&unobserved(suppressors), 1000), "waiting for work");
+    fn owing(item: OwedItem, case: Case) -> Owing {
+        Owing {
+            undelivered: (item.delivery != Delivery::Delivered).then(|| item.clone()),
+            oldest: item,
+            warn: 2400,
+            case,
         }
     }
 
-    /// No parked waiter: still waiting for work, as far as the user is
-    /// concerned.
+    fn message(since: Since, delivery: Delivery) -> OwedItem {
+        OwedItem {
+            kind: "message".into(),
+            what: "message from claude".into(),
+            since,
+            delivery,
+        }
+    }
+
+    fn view(state: AgentState) -> View {
+        View::at(state, None, 0)
+    }
+
+    /// An item the bound session has not received reads `UNDELIVERED` once
+    /// it has gone without for the warn threshold, and not before; one in
+    /// flight inside its bound is being delivered; one delivered and still
+    /// owed reads as its recovery state.
     #[test]
-    fn an_unobserved_agent_without_a_waiter_is_waiting_for_work_too() {
-        assert_eq!(line(&unobserved(Vec::new()), 1000), "waiting for work");
+    fn undelivered_work_is_shouted_only_past_the_threshold() {
+        let owed = |delivery, case| AgentState {
+            owed: Some(owing(message(Since::At(1000), delivery), case)),
+            nudge: Nudge::At(1000 + 7200 + 60),
+            ..state()
+        };
+        let missing = owed(Delivery::NotDelivered, Case::Recovering);
+        assert_eq!(view(missing.clone()).undelivered(1000 + 2399), None);
         assert_eq!(
-            line(&unobserved(vec![Suppressor::AutoOff]), 1000),
-            "waiting for work · auto off"
+            brief(&missing, 1000 + 7200),
+            "UNDELIVERED 2h · message from claude · nudge in 1m"
+        );
+        let flying = owed(Delivery::InFlight(1000 + 7260), Case::BeingDelivered(8260));
+        assert_eq!(view(flying.clone()).undelivered(1000 + 7200), None);
+        assert!(
+            view(flying).undelivered(1000 + 7260).is_some(),
+            "past its bound it is not on its way"
+        );
+        let delivered = owed(Delivery::Delivered, Case::Recovering);
+        assert_eq!(view(delivered.clone()).undelivered(1000 + 7200), None);
+        assert_eq!(brief(&delivered, 1000 + 7200), "idle 2h · nudge in 1m");
+    }
+
+    /// An item no record dates is timed from when the ledger first held
+    /// it, and its age is said to be unknown, never counted from there.
+    #[test]
+    fn an_undated_item_says_its_age_is_unknown() {
+        let s = AgentState {
+            owed: Some(owing(
+                message(Since::Unknown { held: 5000 }, Delivery::NotDelivered),
+                Case::Recovering,
+            )),
+            ..state()
+        };
+        assert_eq!(view(s.clone()).undelivered(5000 + 2399), None);
+        assert_eq!(
+            view(s.clone()).undelivered(5000 + 2400).as_deref(),
+            Some("UNDELIVERED age unknown · message from claude")
+        );
+        assert_eq!(View::at(s, None, 9000).owed.unwrap().age, None);
+    }
+
+    /// Every reason clank keeps its hands off is said in the row, and in
+    /// full in the line; an undelivered row says it after what is missing.
+    #[test]
+    fn each_hands_off_reason_is_shown() {
+        for (why, short, long) in [
+            (HandsOff::AutoOff, "auto off", "auto off"),
+            (
+                HandsOff::Blocked("stork".into()),
+                "waiting on its block stork",
+                "waiting on its block stork",
+            ),
+            (HandsOff::Attending, "attended", "attended"),
+            (
+                HandsOff::CannotResume("no way to resume it".into()),
+                "not nudged",
+                "not nudged: no way to resume it",
+            ),
+            (
+                HandsOff::StallWarnOff,
+                "not nudged",
+                "not nudged: its turn is open and `recovery.stall_warn` is off",
+            ),
+            (
+                HandsOff::StallNudgeOff,
+                "not nudged",
+                "not nudged: its turn went silent and `recovery.stall_nudge` is off",
+            ),
+            (
+                HandsOff::BlindNudgeOff,
+                "not nudged",
+                "not nudged: its record cannot be read and `recovery.blind_nudge` is off",
+            ),
+            (
+                HandsOff::WaitingForYou("budget spent".into()),
+                "waiting for you",
+                "waiting for you · budget spent",
+            ),
+        ] {
+            let s = AgentState {
+                owed: Some(owing(
+                    message(Since::At(100), Delivery::Delivered),
+                    Case::HandsOff(why.clone()),
+                )),
+                ..state()
+            };
+            assert_eq!(brief(&s, 1000), format!("idle 15m · {short}"), "{why:?}");
+            assert_eq!(line(&s, 1000), format!("idle 15m · {long}"), "{why:?}");
+        }
+        let said_by_the_headline = |activity, why| AgentState {
+            activity,
+            owed: Some(owing(
+                message(Since::At(100), Delivery::Delivered),
+                Case::HandsOff(why),
+            )),
+            ..state()
+        };
+        assert_eq!(
+            brief(
+                &said_by_the_headline(Activity::Interrupted, HandsOff::Interrupted),
+                1000
+            ),
+            "INTERRUPTED 15m"
+        );
+        assert_eq!(
+            brief(
+                &said_by_the_headline(Activity::Asking, HandsOff::Asking),
+                1000
+            ),
+            "asking 15m"
+        );
+        let undelivered = AgentState {
+            activity: Activity::Interrupted,
+            owed: Some(owing(
+                message(Since::At(100), Delivery::NotDelivered),
+                Case::HandsOff(HandsOff::Interrupted),
+            )),
+            ..state()
+        };
+        assert_eq!(
+            brief(&undelivered, 100 + 7200),
+            "UNDELIVERED 2h · message from claude · interrupted"
         );
     }
 
-    /// Owed work keeps every caveat.
+    /// A row says `working` only on the record's own evidence: an open
+    /// turn clank is recovering, delivering to or keeping its hands off is
+    /// a turn that is open, and nothing more.
     #[test]
-    fn an_owing_agent_keeps_its_nudge_caveats() {
-        let s = AgentState {
-            activity: Activity::Idle,
-            suppressors: vec![Suppressor::Delivering],
-            ..unobserved(Vec::new())
+    fn working_is_said_only_on_evidence() {
+        let running = |case: Option<Case>| AgentState {
+            activity: Activity::Working,
+            owed: case.map(|case| owing(message(Since::At(100), Delivery::Delivered), case)),
+            ..state()
         };
-        let shown = line(&s, 1000);
-        for clause in [
-            "waiting for work",
-            "not nudged: no pane named `claude` in /r's tab",
+        for proven in [
+            None,
+            Some(Case::Active(Active::Turn)),
+            Some(Case::Active(Active::NativeRetry)),
         ] {
-            assert!(shown.contains(clause), "{clause}: {shown}");
+            let s = running(proven.clone());
+            assert!(view(s.clone()).working(), "{proven:?}");
+            assert!(brief(&s, 1000).starts_with("working 15m"), "{proven:?}");
         }
+        assert_eq!(
+            brief(&running(Some(Case::Active(Active::NativeRetry))), 1000),
+            "working 15m · retrying itself"
+        );
+        for unproven in [
+            Case::HandsOff(HandsOff::AutoOff),
+            Case::BeingDelivered(2000),
+            Case::Recovering,
+        ] {
+            let s = running(Some(unproven.clone()));
+            assert!(!view(s.clone()).working(), "{unproven:?}");
+            assert!(brief(&s, 1000).starts_with("turn open 15m"), "{unproven:?}");
+        }
+        assert_eq!(
+            brief(&running(Some(Case::BeingDelivered(2000))), 1000),
+            "turn open 15m · being delivered"
+        );
+    }
+
+    /// A stale view shouts nothing and reports nothing owed.
+    #[test]
+    fn a_stale_view_has_no_owed_work_to_show() {
+        let s = AgentState {
+            owed: Some(owing(
+                message(Since::At(0), Delivery::NotDelivered),
+                Case::Recovering,
+            )),
+            ..state()
+        };
+        let stale = View::at(s.clone(), Some("its monitor is gone"), 9000);
+        assert_eq!(stale.undelivered(9000), None);
+        assert_eq!(stale.owed, None);
+        let current = View::at(s, None, 9000);
+        assert_eq!(
+            current.owed,
+            Some(OwedView {
+                age: Some(9000),
+                kind: "message".into(),
+                what: "message from claude".into(),
+                delivery: Delivery::NotDelivered,
+            })
+        );
+    }
+
+    /// A state published before owed work was accounted for, with the
+    /// suppressor list it carried, still loads and says nothing is owed.
+    #[test]
+    fn a_state_published_before_the_ledger_still_loads() {
+        let old: AgentState =
+            serde_json::from_str(include_str!("../../tests/fixtures/formats/state.json")).unwrap();
+        assert_eq!(old.owed, None);
+        assert_eq!(old.activity, Activity::Unobserved);
+        assert_eq!(old.attending.len(), 1);
+        let new: AgentState = serde_json::from_str(include_str!(
+            "../../tests/fixtures/formats/state-owing.json"
+        ))
+        .unwrap();
+        let owed = new.owed.unwrap();
+        assert_eq!(owed.case, Case::HandsOff(HandsOff::Blocked("stork".into())));
+        assert_eq!(owed.oldest.since, Since::At(1793845000));
+        assert_eq!(
+            owed.undelivered.unwrap().delivery,
+            Delivery::InFlight(1793845260)
+        );
     }
 
     /// The line gives every reason the state holds: why the record cannot
@@ -795,11 +1217,13 @@ mod tests {
             ..state()
         };
         let current = View {
+            owed: None,
             state: interrupted.clone(),
             stale: None,
         };
         assert!(current.interrupted());
         let v = View {
+            owed: None,
             state: interrupted,
             stale: Some("its monitor is gone"),
         };

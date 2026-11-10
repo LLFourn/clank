@@ -1,0 +1,52 @@
+{
+  "role": "master",
+  "session": "00000000-0000-4000-8000-000000000001",
+  "tool": "claude",
+  "monitor": {
+    "pid": 10010,
+    "birth": {
+      "v": "mac1",
+      "sec": 1793844431,
+      "usec": 124634
+    }
+  },
+  "activity": {
+    "is": "idle"
+  },
+  "since": 1793845193,
+  "owed": {
+    "oldest": {
+      "kind": "message",
+      "what": "message from claude",
+      "since": {
+        "at": 1793845000
+      },
+      "delivery": {
+        "is": "in_flight",
+        "expires": 1793845260
+      }
+    },
+    "undelivered": {
+      "kind": "message",
+      "what": "message from claude",
+      "since": {
+        "at": 1793845000
+      },
+      "delivery": {
+        "is": "in_flight",
+        "expires": 1793845260
+      }
+    },
+    "warn": 2400,
+    "case": {
+      "is": "hands_off",
+      "detail": {
+        "why": "blocked",
+        "detail": "stork"
+      }
+    }
+  },
+  "nudge": {
+    "is": "nothing"
+  }
+}

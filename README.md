@@ -1042,11 +1042,37 @@ when its session is no longer the agent's.
 
 ### When nothing is delivering
 
-The monitor reads each agent's session record and recovers an agent that
-owes work but is not being reached. All of it is skipped while auto-mode is
-off, a question or block is pending, or the agent is attending work.
+The monitor keeps, for each agent, a ledger of what it is owed: every item,
+whether a pending block withholds it, since when it has been owed, and
+whether it reached the session bound now. An agent that is owed something is
+always in one of four cases, and `clank status` says which:
 
-- **Idle.** An agent whose turn ended with work still owed is nudged after a
+1. **Hands off, with the reason.** Auto-mode is off, the agent's own
+   question or block is pending, it is attending work, its turn was
+   interrupted, or clank has no nudge to send (`not nudged: …`, `waiting
+   for you`). Another agent's block is not a reason: it withholds the
+   review cycle from what is owed, and an event or message is owed all the
+   same.
+2. **Being delivered.** A wake has been handed to the agent's hook, which
+   has a minute to answer for it. After that it was not delivered.
+3. **Working.** Its turn has not ended and its record moved inside
+   `recovery.stall_warn`, or its harness is retrying the turn itself. Only
+   then does a row say `working`; an open turn with nothing to show for it
+   reads `turn open`.
+4. **Recovering**, as below.
+
+An item the bound session has not received for `recovery.stall_warn` reads
+`UNDELIVERED <age> · <what>` in red in the agent's row, whichever case it is
+in. A receipt from a session the label is no longer bound to counts for
+nothing. `clank status -j` carries each agent's oldest owed item under
+`state.owed`: its `age` in seconds (`null` when no record dates it), `kind`
+and `delivery`. Ages and silences are read from what is on disk (the item's
+own record, a block's answer, the session's receipts, the record's last
+write), so restarting
+the monitor moves none of them.
+
+- **Idle.** An agent whose turn ended with work still owed, or that was bound
+  and has not run a turn yet, is nudged after a
   settle time (3 minutes), then once more 15 minutes later, then shown as
   waiting for you.
 - **Unwatched.** When the agent's parked wait ends without delivering

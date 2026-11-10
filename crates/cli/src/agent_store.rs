@@ -563,6 +563,19 @@ impl<'a> BindingGuard<'a> {
     }
 }
 
+impl BindingGuard<'_> {
+    /// Where the label keeps its files.
+    pub(crate) fn agent_dir(&self) -> PathBuf {
+        agents_root(self.repo).join(self.label.as_str())
+    }
+
+    /// Whether `session` of `tool` holds the label. True until the guard
+    /// is dropped: no binding commits while it is held.
+    pub(crate) fn bound_to(&self, tool: Tool, session: &str) -> bool {
+        binding_matches(self.repo, self.label, tool, session)
+    }
+}
+
 /// Hold `label`'s binding lock: no bind, rebind or release of the label
 /// commits until the guard is dropped, so a binding checked under it stays
 /// the binding until then.

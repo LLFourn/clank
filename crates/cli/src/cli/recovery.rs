@@ -539,7 +539,7 @@ pub(crate) enum Action {
 impl Episode {
     fn action(&self) -> Action {
         match (self.kind, self.class.as_str()) {
-            (Kind::Fallback | Kind::Stall, _) | (_, IDLE) => Action::Nudge,
+            (Kind::Fallback, _) | (_, IDLE | STALL) => Action::Nudge,
             _ => Action::Retry,
         }
     }
@@ -705,6 +705,12 @@ impl Episode {
         !matches!(self.state, State::Closed)
     }
 
+    /// Whether it is a stall still watching its quiet period: nothing it
+    /// tried reached the agent, so it owns no attempt and is not followed.
+    fn watches(&self) -> bool {
+        self.kind == Kind::Stall && self.spent() == 0
+    }
+
     /// The turn after which anything new is somebody's progress: the
     /// attempt's own turn once the record has shown it, the failed turn
     /// before that.
@@ -721,18 +727,17 @@ impl Episode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Gate {
     Go,
-    /// Not yet: a question or block is pending, or attendance is live.
+    /// Not yet: the agent's own question or block is pending, attendance
+    /// is live, or a presentation is with its carrier.
     Hold,
     /// Auto mode was turned off.
     AutoOff,
     /// The record could not be read just now, so nothing new can be ruled
     /// out.
     Unobserved,
-    /// An ordinary wait registered: the agent's turn ended the normal way.
-    Deliverer,
     /// The binding moved to another session.
     SessionChanged,
-    /// The agent has no pending work any more.
+    /// Nothing is owed to the agent any more.
     ObligationCleared,
 }
 
@@ -775,6 +780,7 @@ pub(crate) struct Stall {
 }
 
 /// What a decision needs besides the episode and the snapshot.
+#[derive(Clone)]
 pub(crate) struct Ctx<'a> {
     pub(crate) now: u64,
     pub(crate) session: &'a str,
@@ -783,9 +789,15 @@ pub(crate) struct Ctx<'a> {
     pub(crate) transport: Result<Transport, &'static str>,
     /// What the monitor found when it checked, where it checked.
     pub(crate) gate: Option<Gate>,
-    /// The agent owes work and has no wait to take it.
+    /// The reason the last fold gave to keep hands off: manual mode, the
+    /// agent's own question or block, or attendance.
+    pub(crate) hold: Option<crate::cli::agent_state::HandsOff>,
+    /// When the presentation carrying owed work to the agent stops
+    /// counting as a delivery.
+    pub(crate) in_flight_until: Option<u64>,
+    /// Something is owed to the agent.
     pub(crate) obligated: bool,
-    /// Its record is being read.
+    /// Its record is being read, and shows where its turns stand.
     pub(crate) readable: bool,
     pub(crate) fallback: Option<Fallback>,
     /// The agent's roster role.
@@ -799,6 +811,9 @@ pub(crate) struct Ctx<'a> {
     pub(crate) stall: Option<Stall>,
     /// The record being read and how far: a stall's quiet period.
     pub(crate) period: Option<String>,
+    /// Since when that period has been silent with work owed, in unix
+    /// seconds, by what is on disk: never by when a monitor first looked.
+    pub(crate) quiet_since: Option<u64>,
 }
 
 /// How long a claimed attempt has for its transport to answer.
@@ -821,24 +836,157 @@ pub(crate) const STALL: &str = "stall";
 const FALLBACK_CHECKS: usize = 5;
 const FALLBACK_CEILING: u64 = 4 * 3600;
 
+/// The turn an idle episode is about when the record shows none: the
+/// agent has sat at its prompt since it was bound.
+pub(crate) const AT_PROMPT: &str = "at-prompt";
+
+/// Where an agent stands, decided once per look from its record and what
+/// the fold said of it. Recovery acts on this and the published case is
+/// read from it, so a row cannot say one thing while a nudge does another.
+///
+/// There is no standing for "none of these": an agent that is owed work is
+/// held for a reason that is named, has a delivery inside its bound, is
+/// being retried by its own harness, or is to be recovered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Standing {
+    HandsOff(crate::cli::agent_state::HandsOff),
+    /// A presentation is with its carrier until this unix second.
+    BeingDelivered(u64),
+    /// The harness is retrying the latest turn itself.
+    Retrying,
+    /// An episode must be carrying this out.
+    Recover(Trigger),
+}
+
+/// What an episode is opened for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Trigger {
+    Failed {
+        turn: String,
+        class: String,
+    },
+    /// The turn that ended with work owed, or [`AT_PROMPT`].
+    Idle {
+        turn: String,
+    },
+    Stall {
+        turn: String,
+        period: String,
+        since: u64,
+    },
+    Fallback(Fallback),
+}
+
+/// The agent's [`Standing`], or `None` when nothing is owed and nothing
+/// failed. In order: a reason the fold gave to keep hands off, an
+/// interrupted turn, a delivery inside its bound, then what the record
+/// calls for.
+pub(crate) fn standing(snap: &Snapshot, ctx: &Ctx) -> Option<Standing> {
+    use crate::cli::agent_state::HandsOff;
+    if let Some(why) = &ctx.hold {
+        return Some(Standing::HandsOff(why.clone()));
+    }
+    let latest = snap.latest().filter(|_| ctx.readable);
+    if latest.is_some_and(|t| t.outcome == Outcome::Interrupted) {
+        return ctx
+            .obligated
+            .then_some(Standing::HandsOff(HandsOff::Interrupted));
+    }
+    if let Some(until) = ctx.in_flight_until.filter(|until| ctx.now < *until) {
+        return Some(Standing::BeingDelivered(until));
+    }
+    if latest.is_some_and(|t| t.retrying) {
+        return Some(Standing::Retrying);
+    }
+    if let Some(TurnRec {
+        id,
+        outcome: Outcome::Failed(class),
+        ..
+    }) = latest
+    {
+        return Some(Standing::Recover(Trigger::Failed {
+            turn: id.clone(),
+            class: class.clone(),
+        }));
+    }
+    if !ctx.obligated {
+        return None;
+    }
+    let blind = || match &ctx.fallback {
+        Some(f) => Standing::Recover(Trigger::Fallback(f.clone())),
+        None => Standing::HandsOff(HandsOff::BlindNudgeOff),
+    };
+    if !ctx.readable {
+        return Some(blind());
+    }
+    Some(match latest {
+        None => Standing::Recover(Trigger::Idle {
+            turn: AT_PROMPT.to_string(),
+        }),
+        Some(t) if t.outcome == Outcome::Running => match (ctx.stall, &ctx.period, ctx.quiet_since)
+        {
+            (None, _, _) => Standing::HandsOff(HandsOff::StallWarnOff),
+            (Some(_), Some(period), Some(since)) => Standing::Recover(Trigger::Stall {
+                turn: t.id.clone(),
+                period: period.clone(),
+                since,
+            }),
+            // A silence that cannot be timed is a record that cannot be
+            // read for this purpose.
+            (Some(_), _, _) => blind(),
+        },
+        Some(t) => Standing::Recover(Trigger::Idle { turn: t.id.clone() }),
+    })
+}
+
 /// The episode the agent's current state calls for.
 ///
 /// Decided from the whole snapshot, so a batch that read a failure and a
 /// person's next turn together decides once, on the person's turn. Effects
 /// describe the resulting state only.
+#[cfg(test)]
 pub(crate) fn decide(
     prev: Option<Episode>,
     snap: &Snapshot,
     ctx: &Ctx,
 ) -> (Option<Episode>, Vec<Effect>) {
+    decide_as(prev, snap, ctx, standing(snap, ctx).as_ref())
+}
+
+/// [`decide`] for a [`Standing`] already taken of this snapshot and
+/// context. Whatever the standing calls to be recovered has an episode
+/// when this returns: one that is waiting, out, or latched for a person.
+fn decide_as(
+    prev: Option<Episode>,
+    snap: &Snapshot,
+    ctx: &Ctx,
+    standing: Option<&Standing>,
+) -> (Option<Episode>, Vec<Effect>) {
+    use crate::cli::agent_state::HandsOff;
     if matches!(
         ctx.gate,
-        Some(Gate::SessionChanged | Gate::ObligationCleared | Gate::Deliverer)
+        Some(Gate::SessionChanged | Gate::ObligationCleared)
     ) {
         // Nothing is stuck any more. Forgotten rather than closed: if the
         // same failed turn is stuck again later, it is a new episode.
         return (None, Vec::new());
     }
+    // What the monitor found just now stands; otherwise the standing's own
+    // hold does, over a look that found nothing in the way. A policy that
+    // is off holds nothing: it opens no episode, and one already live for
+    // an earlier state of the record runs out by its own rules.
+    let gate = match (ctx.gate, standing) {
+        (Some(g @ (Gate::Hold | Gate::AutoOff)), _) => Some(g),
+        (g, Some(Standing::HandsOff(HandsOff::StallWarnOff | HandsOff::BlindNudgeOff))) => g,
+        (_, Some(Standing::HandsOff(HandsOff::AutoOff))) => Some(Gate::AutoOff),
+        (_, Some(Standing::HandsOff(_) | Standing::BeingDelivered(_))) => Some(Gate::Hold),
+        (g, _) => g,
+    };
+    let ctx = &Ctx {
+        gate,
+        ..ctx.clone()
+    };
+    let quiet = quiet_period(standing, ctx);
     // An episode is its session's and its role's: another role owes other
     // work, so what was armed for the old one is over, however late the
     // change is seen.
@@ -846,60 +994,51 @@ pub(crate) fn decide(
         .filter(|e| e.session == ctx.session && e.role == ctx.role)
         .filter(|e| e.bound.is_none() || e.bound == ctx.bound)
         .filter(|e| e.kind != Kind::Fallback || fallback_stands(e, ctx))
-        .filter(|e| e.kind != Kind::Stall || quiet_period(snap, ctx) == Some(&e.opened_by));
+        // A stall that has nudged owns that attempt and its turn, as any
+        // episode does; one still watching is only its quiet period.
+        .filter(|e| !e.watches() || quiet == Some(&e.opened_by));
 
     if let Some(e) = ep
         .as_mut()
-        .filter(|e| e.live() && !matches!(e.kind, Kind::Fallback | Kind::Stall))
+        .filter(|e| e.live() && e.kind != Kind::Fallback && !e.watches())
     {
         follow(e, snap, ctx);
+        watch(e, standing, ctx);
     }
-    let free = |ep: &Option<Episode>, id: &str| {
-        ep.as_ref()
-            .is_none_or(|e| !e.live() && e.kind != Kind::Fallback && !e.owns(id))
-    };
-    if let Some(latest) = snap.latest().filter(|t| !t.retrying)
-        && free(&ep, &latest.id)
+    // Opened from where the agent stands, whatever its last turn's
+    // outcome: an episode that is over leaves the agent to be recovered
+    // afresh while it is still owed work.
+    if let Some(Standing::Recover(trigger)) = standing
+        && ep.as_ref().is_none_or(|e| !e.live())
     {
-        match &latest.outcome {
-            Outcome::Failed(class) => {
-                ep = Some(opened(Kind::Failed, latest.id.clone(), class.clone(), ctx))
+        ep = match trigger {
+            Trigger::Failed { turn, class } => {
+                Some(opened(Kind::Failed, turn.clone(), class.clone(), ctx))
             }
-            Outcome::Completed if ctx.obligated && snap.anchored() => {
-                ep = Some(opened(Kind::Idle, latest.id.clone(), IDLE.into(), ctx))
-            }
-            _ => {}
-        }
-    }
-    if ep
-        .as_ref()
-        .is_none_or(|e| !e.live() && e.kind != Kind::Fallback)
-        && ctx.obligated
-        && !ctx.readable
-        && let Some(f) = &ctx.fallback
-    {
-        ep = Some(Episode {
-            kind: Kind::Fallback,
-            every: Some(f.every),
-            next_at: Some(ctx.now + f.every),
-            ..blank(f.identity.clone(), String::new(), FALLBACK.into(), ctx)
-        });
-    }
-    if ep
-        .as_ref()
-        .is_none_or(|e| !e.live() && !matches!(e.kind, Kind::Fallback | Kind::Stall))
-        && let (Some(period), Some(stall), Some(latest)) =
-            (quiet_period(snap, ctx), ctx.stall, snap.latest())
-    {
-        ep = Some(Episode {
-            kind: Kind::Stall,
-            next_at: Some(ctx.now + stall.warn),
-            quiet: Some(Silence {
-                since: ctx.now,
-                warned: None,
+            Trigger::Idle { turn } => Some(opened(Kind::Idle, turn.clone(), IDLE.into(), ctx)),
+            Trigger::Fallback(f) => Some(Episode {
+                kind: Kind::Fallback,
+                every: Some(f.every),
+                next_at: Some(ctx.now + f.every),
+                ..blank(f.identity.clone(), String::new(), FALLBACK.into(), ctx)
             }),
-            ..blank(period.clone(), latest.id.clone(), STALL.into(), ctx)
-        });
+            // A period a look just found held is not opened: the hold may
+            // be the agent moving.
+            Trigger::Stall { .. } if quiet.is_none() => ep,
+            Trigger::Stall {
+                turn,
+                period,
+                since,
+            } => Some(Episode {
+                kind: Kind::Stall,
+                next_at: ctx.stall.map(|stall| since + stall.warn),
+                quiet: Some(Silence {
+                    since: *since,
+                    warned: None,
+                }),
+                ..blank(period.clone(), turn.clone(), STALL.into(), ctx)
+            }),
+        };
     }
 
     let mut effects = Vec::new();
@@ -907,27 +1046,80 @@ pub(crate) fn decide(
         match (ctx.gate, e.state, e.next_at) {
             // Held: no deadline, so nothing looks again until a fold says
             // the hold is over.
-            (Some(Gate::Hold | Gate::AutoOff), State::Waiting, _) => e.next_at = None,
-            (_, State::Waiting, None) if e.kind != Kind::Stall => {
-                e.next_at = Some(ctx.now + RETRY_LOOK)
+            (Some(Gate::Hold | Gate::AutoOff), State::Waiting | State::Running, _) => {
+                e.next_at = None
             }
+            (_, State::Waiting, None) if !e.watches() => e.next_at = Some(ctx.now + RETRY_LOOK),
             _ => effects.extend(due(e, snap, ctx)),
         }
     }
     (ep, effects)
 }
 
-/// The quiet period the agent is in, if it is one a stall watches: it owes
-/// work, nothing suppresses it, and its latest turn is running with no
-/// native retry. Losing any of that ends the period.
-fn quiet_period<'a>(snap: &Snapshot, ctx: &'a Ctx) -> Option<&'a String> {
-    ctx.stall?;
-    let running = snap
-        .latest()
-        .is_some_and(|t| t.outcome == Outcome::Running && !t.retrying);
-    (ctx.obligated && matches!(ctx.gate, None | Some(Gate::Go)) && snap.anchored() && running)
-        .then_some(ctx.period.as_ref())
-        .flatten()
+/// Keep the turn `e`'s own attempt started under the watch any open turn
+/// is under, by the episode that started it: no second episode is opened
+/// for its silence, so its spent budget and its latches stand.
+///
+/// While that turn is the open, silent one the standing describes, the
+/// episode carries the silence's clock and a deadline at the stall window.
+/// Where the harness or a hold owns the agent it carries neither. Anywhere
+/// else the turn cannot be watched, and the episode is looked at again
+/// rather than left with nothing due.
+fn watch(e: &mut Episode, standing: Option<&Standing>, ctx: &Ctx) {
+    if e.state != State::Running {
+        if e.class != STALL {
+            e.quiet = None;
+        }
+        return;
+    }
+    match standing {
+        Some(Standing::Recover(Trigger::Stall { turn, since, .. }))
+            if turn == e.anchor() && matches!(ctx.gate, None | Some(Gate::Go)) =>
+        {
+            if e.quiet.as_ref().is_none_or(|q| q.since != *since) {
+                e.quiet = Some(Silence {
+                    since: *since,
+                    warned: None,
+                });
+                e.next_at = ctx.stall.map(|stall| since + stall.warn);
+            }
+        }
+        Some(Standing::Retrying | Standing::HandsOff(_) | Standing::BeingDelivered(_)) => {
+            e.quiet = None;
+            e.next_at = None;
+        }
+        _ => {
+            e.quiet = None;
+            e.next_at.get_or_insert(ctx.now + RETRY_LOOK);
+        }
+    }
+}
+
+/// The quiet period a stall watches, while the standing calls for one and
+/// the look found nothing in its way.
+fn quiet_period<'a>(standing: Option<&'a Standing>, ctx: &Ctx) -> Option<&'a String> {
+    match standing {
+        Some(Standing::Recover(Trigger::Stall { period, .. }))
+            if matches!(ctx.gate, None | Some(Gate::Go)) =>
+        {
+            Some(period)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the record still shows, as the agent's latest state, the turn
+/// `e` is about: that turn, ended as `e` recovers from, or no turn at all
+/// for an agent recovered at its prompt.
+fn stands(e: &Episode, snap: &Snapshot) -> bool {
+    match (
+        e.failed_turn.as_str(),
+        snap.latest().filter(|_| snap.anchored()),
+    ) {
+        (AT_PROMPT, latest) => latest.is_none(),
+        (id, Some(t)) => t.id == id && e.targets(&t.outcome) && !t.retrying,
+        (_, None) => false,
+    }
 }
 
 /// Whether a fallback episode still describes the agent: its record still
@@ -941,16 +1133,6 @@ fn fallback_stands(e: &Episode, ctx: &Ctx) -> bool {
 }
 
 impl Episode {
-    /// Whether this episode has already dealt with the turn `id`.
-    fn owns(&self, id: &str) -> bool {
-        self.opened_by == id
-            || self.failed_turn == id
-            || self
-                .attempts
-                .iter()
-                .any(|a| a.started.as_deref() == Some(id))
-    }
-
     /// The wait before the next attempt, or why there is none. A failure
     /// keeps its class's budget; an idle episode has its own, and a nudged
     /// turn that fails spends from both, so switching refunds nothing.
@@ -1034,78 +1216,118 @@ fn escalate(e: &mut Episode, ctx: &Ctx, why: &str) {
     e.next_at = None;
 }
 
+/// What the record shows an episode about a turn, in the record's order.
+#[derive(Debug, Clone, Copy)]
+enum Seen<'a> {
+    /// The latest attempt's own turn began: the episode owns it.
+    Mine(&'a TurnRec),
+    /// A turn began that the episode cannot call its own.
+    Stranger(&'a TurnRec),
+    /// Where the newest turn the episode owns stands now.
+    Owned(&'a TurnRec),
+}
+
 /// Bring a live episode up to what the record now says.
+///
+/// An episode owns the turn it was opened for and every turn its attempts
+/// started. Each turn begun since the newest of those is either the latest
+/// attempt's, and so joins them, or a stranger's; then the newest owned
+/// turn is looked at as it stands. [`step`] says what each means.
 fn follow(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) {
-    if snap
-        .find(&e.failed_turn)
-        .is_some_and(|t| !e.targets(&t.outcome) && t.outcome != Outcome::Running)
-    {
-        // The harness's own retry finished it, or somebody stopped it.
-        close(e);
-        return;
-    }
     for turn in snap.after(e.anchor()) {
-        if let Some(a) = e.attempts.last_mut()
-            && a.made(turn)
-        {
-            // Clank's own turn, whenever it shows up: a late one after an
-            // escalation is still the uncertain attempt, never a reset.
-            a.started = Some(turn.id.clone());
-            a.disposition = Disposition::Started;
+        let seen = match e.attempts.last().is_some_and(|a| a.made(turn)) {
+            true => Seen::Mine(turn),
+            false => Seen::Stranger(turn),
+        };
+        if !step(e, seen, ctx) {
+            return;
+        }
+    }
+    if let Some(turn) = snap.find(e.anchor()) {
+        step(e, Seen::Owned(turn), ctx);
+    }
+}
+
+/// One transition of an episode on what the record shows it. Whether the
+/// turns after this one are still to be looked at.
+///
+/// Only two things end an episode here. A stranger's turn does: a person
+/// or the harness took the agent back. And an owned turn that finished
+/// with nothing left owed does: there is nothing to recover. Every other
+/// outcome of an owned turn, its failing, its ending with work still owed,
+/// its being stopped, moves the episode on inside itself, so its attempts,
+/// its uncertainty and a latch for a person all stand: a turn clank
+/// started never buys the agent a new budget by ending badly.
+fn step(e: &mut Episode, seen: Seen, ctx: &Ctx) -> bool {
+    let turn = match seen {
+        Seen::Mine(turn) => {
+            // Whenever it shows up: a late one after an escalation is
+            // still the uncertain attempt, never a reset.
+            if let Some(a) = e.attempts.last_mut() {
+                a.started = Some(turn.id.clone());
+                a.disposition = Disposition::Started;
+            }
             if e.state == State::Dispatched {
                 e.state = State::Running;
                 e.next_at = None;
             }
-            continue;
+            return true;
         }
-        match e.attempts.last() {
-            Some(a) if e.state == State::Dispatched && a.disposition == Disposition::Claimed => {
+        Seen::Stranger(turn) => {
+            return match e.attempts.last() {
                 // Until the transport answers, this may be the attempt's
                 // own turn under an id only the answer will name.
-                return;
-            }
-            Some(a) if a.disposition == Disposition::Indeterminate && a.started.is_none() => {
+                Some(a)
+                    if e.state == State::Dispatched && a.disposition == Disposition::Claimed =>
+                {
+                    false
+                }
                 // May be the attempt's turn under an id nobody named. Only
                 // its finishing proves the agent is going again; its
                 // failing must not buy a fresh budget.
-                if matches!(turn.outcome, Outcome::Completed | Outcome::Interrupted) {
-                    close(e);
-                    return;
+                Some(a) if a.disposition == Disposition::Indeterminate && a.started.is_none() => {
+                    let finished =
+                        matches!(turn.outcome, Outcome::Completed | Outcome::Interrupted);
+                    if finished {
+                        close(e);
+                    }
+                    !finished
                 }
-                continue;
-            }
-            _ => {}
+                _ => {
+                    close(e);
+                    false
+                }
+            };
         }
-        // A start nobody can attribute to clank is a person, or the
-        // harness, taking the agent back.
-        close(e);
-        return;
-    }
-    let Some(turn) = e
-        .attempts
-        .last()
-        .filter(|a| a.disposition == Disposition::Started)
-        .and_then(|a| a.started.as_deref())
-        .and_then(|id| snap.find(id))
-        // Already this episode's target: decided when it ended.
-        .filter(|t| t.id != e.failed_turn)
-    else {
-        return;
+        Seen::Owned(turn) => turn,
     };
-    let next = match (&turn.outcome, e.state) {
-        (Outcome::Running, _) => return,
-        // A nudged turn that ended and left the work owed, with no wait to
-        // take it: still idle, on the same budget.
-        (Outcome::Completed, State::Running) if e.kind == Kind::Idle => IDLE.to_string(),
-        (Outcome::Completed | Outcome::Interrupted, _) => return close(e),
+    let class = match (&turn.outcome, e.state) {
+        (Outcome::Running, _) => return false,
+        (Outcome::Completed | Outcome::Interrupted, _) if !ctx.obligated => {
+            close(e);
+            return false;
+        }
         (Outcome::Failed(class), State::Running) => class.clone(),
+        // Ended with the work still owed and no wait to take it: an idle
+        // agent, on what is left of this episode's budget.
+        (Outcome::Completed, State::Running) => IDLE.to_string(),
+        (Outcome::Completed, State::Waiting) if e.class != IDLE => IDLE.to_string(),
+        // A person stopped it: held as any interrupted turn is, until a
+        // turn of theirs takes the agent back.
+        (Outcome::Interrupted, State::Running) => {
+            e.failed_turn = turn.id.clone();
+            e.state = State::Waiting;
+            e.next_at = None;
+            return false;
+        }
         // Already decided: waiting for the next attempt, or latched for a
-        // person, whom a late failure of the uncertain attempt changes
-        // nothing for.
-        (Outcome::Failed(_), _) => return,
+        // person, whom a late end of a turn clank started changes nothing
+        // for. Or an attempt is out: it queues behind the turn it was sent
+        // over, whose end is its own start about to happen.
+        _ => return false,
     };
     e.failed_turn = turn.id.clone();
-    e.class = next;
+    e.class = class;
     match e.next_wait() {
         _ if ctx.transport.is_err() => {
             let why = ctx.transport.expect_err("checked");
@@ -1117,6 +1339,7 @@ fn follow(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) {
         }
         Err(why) => escalate(e, ctx, why),
     }
+    false
 }
 
 impl Attempt {
@@ -1151,7 +1374,7 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
     match e.state {
         // Only a due look reaches here with `Go`, having read the record
         // and asked the gate just now.
-        State::Waiting if e.kind == Kind::Stall => {
+        State::Waiting if e.watches() => {
             if ctx.gate != Some(Gate::Go) {
                 return None;
             }
@@ -1194,11 +1417,7 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
             let Ok(transport) = ctx.transport.map_err(|why| escalate(e, ctx, why)) else {
                 return None;
             };
-            let current = snap.anchored()
-                && snap
-                    .latest()
-                    .is_some_and(|t| t.id == e.failed_turn && e.targets(&t.outcome) && !t.retrying);
-            if !current {
+            if !stands(e, snap) {
                 e.next_at = Some(ctx.now + RETRY_LOOK);
                 return None;
             }
@@ -1215,7 +1434,46 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
             escalate(e, ctx, why);
             None
         }
-        State::Running | State::Escalated | State::Closed => None,
+        // Its own attempt's turn is open: a silence to warn of and then
+        // nudge, once, or a turn it can no longer see.
+        State::Running => match (ctx.gate, e.quiet.as_ref().map(|q| q.warned.is_some())) {
+            (Some(Gate::Go), Some(false)) => {
+                if let Some(q) = e.quiet.as_mut() {
+                    q.warned = Some(ctx.now);
+                }
+                e.next_at = ctx.stall.and_then(|s| s.nudge).map(|n| ctx.now + n);
+                None
+            }
+            (Some(Gate::Go), Some(true)) => {
+                if e.class == STALL {
+                    escalate(e, ctx, "its turn went silent again after clank nudged it");
+                    return None;
+                }
+                let Ok(transport) = ctx.transport.map_err(|why| escalate(e, ctx, why)) else {
+                    return None;
+                };
+                e.failed_turn = e.anchor().to_string();
+                e.class = STALL.into();
+                Some(claim(e, transport, ctx))
+            }
+            (Some(Gate::Go | Gate::Unobserved), None) | (Some(Gate::Unobserved), Some(_)) => {
+                e.unobserved += 1;
+                if e.unobserved as usize >= UNAVAILABLE_LIMIT {
+                    escalate(
+                        e,
+                        ctx,
+                        "its record could not be read to follow the turn clank started",
+                    );
+                } else {
+                    e.next_at = Some(ctx.now + RETRY_LOOK);
+                }
+                None
+            }
+            // A fold's look decides nothing here: the deadline stands for
+            // the look that asks the gate.
+            _ => None,
+        },
+        State::Escalated | State::Closed => None,
     }
 }
 
@@ -1283,9 +1541,16 @@ pub(crate) fn answered(mut e: Episode, n: u32, answer: Answer, ctx: &Ctx) -> Epi
                 e.next_at = Some(a.claimed_at + CONFIRM_WITHIN);
             }
         }
+        // Latched, not closed: the transport looked and found the agent
+        // somewhere the record has not shown, so nothing more is sent
+        // until the record moves.
         Answer::Refused => {
             a.disposition = Disposition::Refused;
-            close(&mut e);
+            escalate(
+                &mut e,
+                ctx,
+                "it was not where clank left it when clank went to act",
+            );
         }
         Answer::Unavailable | Answer::Unreachable(_) if e.kind == Kind::Fallback => {
             a.disposition = Disposition::Unavailable;
@@ -1324,10 +1589,8 @@ pub(crate) struct Facts {
     pub(crate) agent_dir: PathBuf,
     pub(crate) session: clank_core::agent_config::Session,
     pub(crate) auto: bool,
-    /// A deliverer is registered: an ordinary wait that can take work.
-    pub(crate) delivering: bool,
-    /// A newly arriving waiter would be handed work.
-    pub(crate) obligated: bool,
+    /// What it is owed, and what of that reached its bound session.
+    pub(crate) ledger: crate::cli::ledger::Ledger,
     /// Its roster role.
     pub(crate) role: String,
     /// The stable identities of the work it owes.
@@ -1336,9 +1599,12 @@ pub(crate) struct Facts {
     pub(crate) blind_nudge: Option<u64>,
     /// `None` when `recovery.stall_warn` is `off`.
     pub(crate) stall: Option<Stall>,
-    /// A question or block is pending, or attendance is proven: the agent
-    /// is not stalled, whatever its record says.
-    pub(crate) attending: bool,
+    /// Work it attends quiets everything it is owed and has received.
+    pub(crate) attended: bool,
+    /// The pending block it raised itself, by name: its own question to a
+    /// person. Another agent's block is not here; what that withholds is
+    /// in the ledger.
+    pub(crate) blocked_on: Option<String>,
     /// The agent is waiting on a question it asked: its record is read for
     /// what ends it, whether or not the agent owes anything. A cancelled
     /// question has no hook and no Stop, only its result in the record.
@@ -1428,10 +1694,20 @@ struct Watched {
     /// stored, applied in order by the next decision that is.
     answers: Vec<(AttemptRef, Answer)>,
     role: String,
-    attending: bool,
+    ledger: crate::cli::ledger::Ledger,
+    attended: bool,
+    blocked_on: Option<String>,
     asking: bool,
     projection: Projection,
-    delivering: bool,
+    /// When the record was last written, in unix seconds, as of the last
+    /// read of it.
+    last_activity: Option<u64>,
+    /// When the presentation carrying owed work to the agent stops
+    /// counting as a delivery, until that moment has been acted on.
+    in_flight_until: Option<u64>,
+    /// Where the agent stood at its last decision: what that decision
+    /// acted on, and what its published case is read from.
+    standing: Option<Standing>,
     fallback: Option<Fallback>,
     stall: Option<Stall>,
     /// The activity last published, and since when.
@@ -1514,7 +1790,7 @@ impl Pending {
                 (Kind::Fallback, _) => crate::cli::nudge_log::Trigger::Fallback {
                     attempt: self.place(),
                 },
-                (Kind::Stall, _) => crate::cli::nudge_log::Trigger::Stall,
+                (_, STALL) => crate::cli::nudge_log::Trigger::Stall,
                 (_, IDLE) => crate::cli::nudge_log::Trigger::Idle {
                     attempt: self.place(),
                     of: IDLE_WAITS.len() as u32,
@@ -1747,19 +2023,7 @@ impl Driver {
     pub(crate) fn next_due(&self) -> Option<u64> {
         self.agents
             .values()
-            .flat_map(|w| {
-                let held = w.held_until.unwrap_or(0);
-
-                if w.owed {
-                    Some(held)
-                } else {
-                    w.episode
-                        .as_ref()
-                        .filter(|e| e.live())
-                        .and_then(|e| e.next_at)
-                        .map(|at| at.max(held))
-                }
-            })
+            .flat_map(next_look)
             .chain(self.pending.values().map(|(_, p)| p.due))
             .min()
     }
@@ -1794,7 +2058,7 @@ impl Driver {
                     session: session.clone(),
                     agent_dir: f.agent_dir.clone(),
                     auto: f.auto,
-                    obligated: f.obligated,
+                    obligated: !f.ledger.owed().is_empty(),
                     source: None,
                     watch: None,
                     read: None,
@@ -1804,10 +2068,14 @@ impl Driver {
                     owed: false,
                     answers: Vec::new(),
                     role: String::new(),
-                    attending: false,
+                    ledger: Default::default(),
+                    attended: false,
+                    blocked_on: None,
                     asking: false,
                     projection: Default::default(),
-                    delivering: false,
+                    last_activity: None,
+                    in_flight_until: None,
+                    standing: None,
                     fallback: None,
                     stall: None,
                     activity: None,
@@ -1817,17 +2085,19 @@ impl Driver {
                     user_command: false,
                 });
             w.auto = f.auto;
-            w.obligated = f.obligated && !f.delivering;
+            w.obligated = !f.ledger.owed().is_empty();
+            w.in_flight_until = f.ledger.in_flight_until(now);
+            w.ledger = f.ledger.clone();
             w.role = f.role.clone();
             if w.binding.as_ref() != Some(&f.session) {
                 w.binding = Some(f.session.clone());
                 w.unreachable = None;
             }
-            w.attending = f.attending;
+            w.attended = f.attended;
+            w.blocked_on = f.blocked_on.clone();
             w.asking = f.asking;
             w.projection = f.projection.clone();
             unwatched(w);
-            w.delivering = f.delivering;
             w.fallback = f.blind_nudge.map(|every| Fallback {
                 identity: fallback_identity(&f.work),
                 every,
@@ -1848,12 +2118,13 @@ impl Driver {
                 w.activity = None;
             }
             if !w.obligated {
-                let gate = if f.delivering {
-                    Gate::Deliverer
-                } else {
-                    Gate::ObligationCleared
-                };
-                acts.extend(decision(&f.author, w, now, Some(gate), None));
+                acts.extend(decision(
+                    &f.author,
+                    w,
+                    now,
+                    Some(Gate::ObligationCleared),
+                    None,
+                ));
                 if f.asking || w.user_command {
                     watch_record(w, &f.session, &self.cwd, &self.home);
                 } else {
@@ -1865,7 +2136,7 @@ impl Driver {
             // Decided on every fold: only a fold says whether the agent is
             // still eligible, so only a fold can take away, or give back,
             // its permission to be sent anything.
-            acts.extend(decision(&f.author, w, now, suppressed(w), None));
+            acts.extend(decision(&f.author, w, now, None, None));
         }
         self.lost.clear();
         acts.extend(self.sync_watches());
@@ -2010,7 +2281,7 @@ impl Driver {
                     let armed = ensure(w);
                     let lost = !armed && !refresh(w) && was && w.read.is_none();
                     if (armed || lost || w.read.is_some()) && w.obligated {
-                        acts.extend(decision(author, w, now, suppressed(w), None));
+                        acts.extend(decision(author, w, now, None, None));
                     }
                 }
             }
@@ -2030,13 +2301,16 @@ impl Driver {
         let mut acts = Vec::new();
         self.settle_expired(now);
         for (author, w) in self.agents.iter_mut() {
+            // A delivery that ran out of time is looked at as a deadline is:
+            // nothing else marks the moment it stopped being one.
             let due = w
                 .episode
                 .as_ref()
                 .filter(|e| e.live())
                 .and_then(|e| e.next_at)
                 .is_some_and(|at| at <= now)
-                || w.owed;
+                || w.owed
+                || w.in_flight_until.take_if(|at| *at <= now).is_some();
             let due = due && w.held_until.is_none_or(|at| at <= now);
             if !due {
                 continue;
@@ -2052,12 +2326,7 @@ impl Driver {
             // A decision owed across a hold is made from the agent as the
             // folds since have left it, not only as the gate sees it now.
             if !w.obligated {
-                g = match w.delivering {
-                    true => Gate::Deliverer,
-                    false => Gate::ObligationCleared,
-                };
-            } else if let (Gate::Go | Gate::Unobserved, Some(held)) = (g, suppressed(w)) {
-                g = held;
+                g = Gate::ObligationCleared;
             }
             acts.extend(decision(author, w, now, Some(g), None));
         }
@@ -2116,7 +2385,7 @@ impl Driver {
         if !claimed
             || w.session != attempt.session
             || !w.obligated
-            || suppressed(w).is_some()
+            || !matches!(w.standing, Some(Standing::Recover(_)))
             || live.role != e.role
             || w.role != e.role
             || e.bound.as_ref().is_some_and(|b| {
@@ -2129,16 +2398,11 @@ impl Driver {
         }
         let current = match e.kind {
             Kind::Fallback => {
-                w.read.is_none()
-                    && w.fallback.is_some()
-                    && fallback_identity(&live.work) == e.opened_by
+                !legible(w) && w.fallback.is_some() && fallback_identity(&live.work) == e.opened_by
             }
             _ => {
                 refresh(w)
-                    && w.snap.anchored()
-                    && w.snap.latest().is_some_and(|t| {
-                        t.id == e.failed_turn && e.targets(&t.outcome) && !t.retrying
-                    })
+                    && stands(&e, &w.snap)
                     && (e.kind != Kind::Stall || period(w).as_ref() == Some(&e.opened_by))
             }
         };
@@ -2171,8 +2435,11 @@ impl Driver {
     fn publish(&mut self, now: u64) {
         for w in self.agents.values_mut() {
             let activity = activity(w);
-            let since = match &w.activity {
-                Some((a, since)) if *a == activity => *since,
+            // A monitor that takes over an agent takes over its clock: the
+            // activity it finds published has lasted since it was.
+            let since = match (&w.activity, &w.published) {
+                (Some((a, since)), _) if *a == activity => *since,
+                (None, Some(p)) if p.activity == activity && p.session == w.session => p.since,
                 _ => now,
             };
             w.activity = Some((activity.clone(), since));
@@ -2183,7 +2450,7 @@ impl Driver {
                 monitor: self.observer.clone(),
                 activity,
                 since,
-                suppressors: suppressors(w),
+                owed: owing(w),
                 nudge: nudge(w.episode.as_ref()),
                 cannot_resume: match transport_for(w.tool) {
                     Ok(_) => w.unreachable.clone(),
@@ -2261,6 +2528,12 @@ fn arm(w: &mut Watched, path: PathBuf) -> bool {
     let Ok((tail, reader, snap)) = bootstrap(&path, w.tool, &w.session) else {
         return false;
     };
+    // A record whose last write cannot be dated cannot time a silence:
+    // it is not read, and the agent is recovered as one that is not.
+    let Some(written) = written(&path) else {
+        return false;
+    };
+    w.last_activity = Some(written);
     w.read = Some(Reading { path, tail, reader });
     w.snap = snap;
     unwatched(w);
@@ -2343,6 +2616,14 @@ fn unwatched(w: &mut Watched) {
 fn disarm(w: &mut Watched) {
     w.read = None;
     w.watch = None;
+    w.last_activity = None;
+}
+
+/// When the record at `path` was last written, in unix seconds: the one
+/// clock for an agent's silence that no monitor's restart can move.
+fn written(path: &Path) -> Option<u64> {
+    let at = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
 }
 
 /// Read what the record gained. Whether the snapshot is now known to be
@@ -2351,12 +2632,14 @@ fn refresh(w: &mut Watched) -> bool {
     let Some(r) = w.read.as_mut() else {
         return false;
     };
-    let Ok(polled) = r.tail.poll() else {
+    let (Ok(polled), Some(written)) = (r.tail.poll(), written(&r.path)) else {
         // What was read no longer describes a record that can be read.
         w.read = None;
         w.snap = Snapshot::default();
+        w.last_activity = None;
         return false;
     };
+    w.last_activity = Some(written);
     if polled.reset {
         // Replaced or compacted: what was read before describes a record
         // that no longer exists.
@@ -2395,10 +2678,6 @@ fn decision(
     gate: Option<Gate>,
     answer: Option<(&AttemptRef, Answer)>,
 ) -> Vec<Act> {
-    let gate = match gate {
-        None if !w.auto => Some(Gate::AutoOff),
-        g => g,
-    };
     let period = period(w);
     let ctx = Ctx {
         now,
@@ -2406,15 +2685,20 @@ fn decision(
         tool: w.tool,
         transport: transport_for(w.tool),
         gate,
+        hold: hold(w),
+        in_flight_until: w.in_flight_until,
         obligated: w.obligated,
-        readable: w.read.is_some(),
+        readable: legible(w),
         fallback: w.fallback.clone(),
         role: &w.role,
         bound: w.binding.as_ref().map(Bound::of),
         issued: 0,
         stall: w.stall,
         period,
+        quiet_since: quiet_since(w),
     };
+    let standing = standing(&w.snap, &ctx);
+    w.standing = standing.clone().filter(|_| w.obligated);
     w.answers
         .extend(answer.map(|(a, answer)| (a.clone(), answer)));
     if w.held_until.is_some_and(|at| at > now) {
@@ -2447,7 +2731,7 @@ fn decision(
         };
     }
     // An answer may name a turn the record has already shown.
-    let (next, effects) = decide(ep, &w.snap, &ctx);
+    let (next, effects) = decide_as(ep, &w.snap, &ctx, standing.as_ref());
     let high = next
         .iter()
         .flat_map(|e| &e.attempts)
@@ -2475,6 +2759,19 @@ fn decision(
     w.owed = false;
     w.answers.clear();
     w.episode = next;
+    // An agent to be recovered always has a next look: where the episode
+    // has none of its own and rests on no named reason, the decision is
+    // owed again, so recovering is never a state nothing will revisit.
+    if matches!(standing, Some(Standing::Recover(_)))
+        && w.obligated
+        && !matches!(gate, Some(Gate::SessionChanged | Gate::ObligationCleared))
+        && ctx.transport.is_ok()
+        && !rests(w.episode.as_ref())
+        && next_look(w).is_none()
+    {
+        w.owed = true;
+        w.held_until = Some(now + RETRY_LOOK);
+    }
     let Some(e) = w.episode.as_ref() else {
         return Vec::new();
     };
@@ -2514,7 +2811,7 @@ fn decision(
                 transport,
                 text: match (e.action(), e.kind) {
                     (Action::Retry, _) => wake_text(&tag),
-                    (Action::Nudge, Kind::Stall) => stall_text(&tag),
+                    (Action::Nudge, _) if e.class == STALL => stall_text(&tag),
                     (Action::Nudge, _) => nudge_text(&tag),
                 },
                 tag,
@@ -2561,16 +2858,59 @@ pub(crate) struct Live {
     pub(crate) typing_into: Option<Tool>,
 }
 
-/// What holds the agent's nudges back just now, as the last fold saw it:
-/// manual mode, or a question, block or attendance.
-fn suppressed(w: &Watched) -> Option<Gate> {
+/// When `w` is next looked at with nothing else happening: a decision it
+/// is owed, its episode's deadline, or the end of a delivery's bound.
+fn next_look(w: &Watched) -> Option<u64> {
+    let held = w.held_until.unwrap_or(0);
+    if w.owed {
+        return Some(held);
+    }
+    w.episode
+        .as_ref()
+        .filter(|e| e.live())
+        .and_then(|e| e.next_at)
+        .into_iter()
+        .chain(w.in_flight_until)
+        .min()
+        .map(|at| at.max(held))
+}
+
+/// The reason the last fold gave to keep hands off `w`: manual mode, its
+/// own question or block, or attendance. Another agent's block is not
+/// one: what it withholds is not owed, and what it does not withhold is.
+fn hold(w: &Watched) -> Option<crate::cli::agent_state::HandsOff> {
+    use crate::cli::agent_state::HandsOff;
     if !w.auto {
-        Some(Gate::AutoOff)
-    } else if w.attending || w.asking {
-        Some(Gate::Hold)
+        Some(HandsOff::AutoOff)
+    } else if w.asking {
+        Some(HandsOff::Asking)
+    } else if let Some(name) = &w.blocked_on {
+        Some(HandsOff::Blocked(name.clone()))
+    } else if w.attended {
+        Some(HandsOff::Attending)
     } else {
         None
     }
+}
+
+/// Whether `w`'s record says where its turns stand: it is being read,
+/// and its latest turn is the record's.
+fn legible(w: &Watched) -> bool {
+    w.read.is_some() && w.snap.anchored()
+}
+
+/// Since when `w`'s record has been silent with work owed: the latest of
+/// its last write, the first owed item's arrival and the last delivery to
+/// its session, each as recorded on disk. `None` while the record's own
+/// time cannot be read: then there is no silence to measure.
+fn quiet_since(w: &Watched) -> Option<u64> {
+    let written = w.last_activity?;
+    Some(
+        [w.ledger.owed_since(), w.ledger.last_delivery]
+            .into_iter()
+            .flatten()
+            .fold(written, u64::max),
+    )
 }
 
 /// The quiet period `w`'s record is in: the file read, and how far.
@@ -2612,21 +2952,106 @@ fn activity(w: &Watched) -> crate::cli::agent_state::Activity {
     }
 }
 
-fn suppressors(w: &Watched) -> Vec<crate::cli::agent_state::Suppressor> {
-    use crate::cli::agent_state::Suppressor;
-    [
-        (w.attending, Suppressor::Attending),
-        (w.delivering, Suppressor::Delivering),
-        (
-            w.snap.latest().is_some_and(|t| t.retrying),
-            Suppressor::NativeRetry,
-        ),
-        (!w.auto, Suppressor::AutoOff),
-    ]
-    .into_iter()
-    .filter_map(|(on, s)| on.then_some(s))
-    .collect()
+/// The episode's silence watch, if it is watching one: a stall's own, or
+/// that of a turn its attempt started. Whether it has warned.
+fn watching(e: &Episode) -> Option<bool> {
+    let watches = match e.state {
+        State::Waiting => e.watches(),
+        State::Running => true,
+        _ => false,
+    };
+    e.quiet
+        .as_ref()
+        .filter(|_| watches)
+        .map(|q| q.warned.is_some())
 }
+
+/// Whether `episode` rests on a reason that is named and needs no next
+/// look: latched for a person, or warned with the stall's nudge off.
+fn rests(episode: Option<&Episode>) -> bool {
+    episode.is_some_and(|e| {
+        e.state == State::Escalated || (watching(e) == Some(true) && e.next_at.is_none())
+    })
+}
+
+/// What a recovering agent reads when nothing is due for it. Unreachable
+/// while [`decision`] gives every such agent a next look.
+const NOTHING_DUE: &str = "clank has no next step for it";
+
+/// The case an owed agent's [`Standing`] and episode put it in, given
+/// when it is next looked at.
+///
+/// A harness clank cannot resume and a latched episode are judged after
+/// delivery and activity: neither of those calls for a nudge, so the lack
+/// of one is not yet what is true of the agent.
+///
+/// Recovering is only ever said of an agent with a look due: an episode's
+/// deadline, or a decision that is owed. A live episode alone proves
+/// nothing.
+fn case(
+    standing: &Standing,
+    episode: Option<&Episode>,
+    transport: Result<Transport, &'static str>,
+    due: Option<u64>,
+) -> crate::cli::agent_state::Case {
+    use crate::cli::agent_state::{Active, Case, HandsOff};
+    let trigger = match standing {
+        Standing::HandsOff(why) => return Case::HandsOff(why.clone()),
+        Standing::BeingDelivered(until) => return Case::BeingDelivered(*until),
+        Standing::Retrying => return Case::Active(Active::NativeRetry),
+        Standing::Recover(trigger) => trigger,
+    };
+    let warned = episode.and_then(watching);
+    if matches!(trigger, Trigger::Stall { .. }) && warned == Some(false) && due.is_some() {
+        return Case::Active(Active::Turn);
+    }
+    if let Err(why) = transport {
+        return Case::HandsOff(HandsOff::CannotResume(why.to_string()));
+    }
+    match (episode, due) {
+        (Some(e), _) if e.state == State::Escalated => Case::HandsOff(HandsOff::WaitingForYou(
+            e.notice.clone().unwrap_or_default(),
+        )),
+        (Some(e), _) if warned == Some(true) && e.next_at.is_none() => {
+            Case::HandsOff(HandsOff::StallNudgeOff)
+        }
+        (_, Some(_)) => Case::Recovering,
+        (_, None) => Case::HandsOff(HandsOff::WaitingForYou(NOTHING_DUE.into())),
+    }
+}
+
+/// What `w` is owed as status shows it, and the case its last decision's
+/// standing puts it in. `None` when nothing is owed, or nothing has been
+/// decided for it yet.
+fn owing(w: &Watched) -> Option<crate::cli::agent_state::Owing> {
+    use crate::cli::agent_state::{OwedItem, Owing};
+    use crate::cli::ledger::Delivery;
+    let owed = w.ledger.owed();
+    let shown = |o: &crate::cli::ledger::Owed| OwedItem {
+        kind: o.entry.kind.to_string(),
+        what: o.entry.what.clone(),
+        since: o.owed_since,
+        delivery: o.entry.delivery,
+    };
+    Some(Owing {
+        case: case(
+            w.standing.as_ref()?,
+            w.episode.as_ref(),
+            transport_for(w.tool),
+            next_look(w),
+        ),
+        oldest: shown(owed.first()?),
+        undelivered: owed
+            .iter()
+            .find(|o| o.entry.delivery != Delivery::Delivered)
+            .map(shown),
+        warn: w.stall.map_or(STALL_WARN_DEFAULT, |s| s.warn),
+    })
+}
+
+/// How long an owed item may go undelivered before a row says so while
+/// `recovery.stall_warn` is off: that setting's own default.
+const STALL_WARN_DEFAULT: u64 = 40 * 60;
 
 fn nudge(ep: Option<&Episode>) -> crate::cli::agent_state::Nudge {
     use crate::cli::agent_state::Nudge;
@@ -2645,11 +3070,20 @@ fn nudge(ep: Option<&Episode>) -> crate::cli::agent_state::Nudge {
             since: *since,
             at: *next_at,
         },
+        Some(e) if e.watches() && e.state == State::Waiting => Nudge::Nothing,
         Some(Episode {
-            kind: Kind::Stall,
-            state: State::Waiting,
+            state: State::Running,
+            quiet:
+                Some(Silence {
+                    since,
+                    warned: Some(_),
+                }),
+            next_at,
             ..
-        }) => Nudge::Nothing,
+        }) => Nudge::Silent {
+            since: *since,
+            at: *next_at,
+        },
         Some(e) => match e.state {
             State::Waiting => e.next_at.map_or(Nudge::Nothing, Nudge::At),
             State::Dispatched | State::Running => Nudge::InFlight,
@@ -3013,6 +3447,8 @@ pub(crate) mod tests {
             tool: Tool::OpenCode,
             transport: transport.ok_or(crate::cli::resume::NO_CANDIDATE),
             gate,
+            hold: None,
+            in_flight_until: None,
             obligated: false,
             readable: true,
             fallback: None,
@@ -3021,6 +3457,7 @@ pub(crate) mod tests {
             issued: 0,
             stall: None,
             period: None,
+            quiet_since: None,
         }
     }
 
@@ -3332,11 +3769,7 @@ pub(crate) mod tests {
             Some(90 + RETRY_LOOK),
             "a fold with no hold gives the deadline back"
         );
-        for end in [
-            Gate::Deliverer,
-            Gate::SessionChanged,
-            Gate::ObligationCleared,
-        ] {
+        for end in [Gate::SessionChanged, Gate::ObligationCleared] {
             assert_eq!(
                 decide(ep.clone(), &s, &ctx(120, HELPER, Some(end))),
                 (None, Vec::new()),
@@ -3346,15 +3779,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_refused_attempt_closes_and_its_turn_is_never_opened_again() {
+    fn a_refused_attempt_is_left_to_a_person_and_its_turn_is_never_tried_again() {
         let s = snap([started("t1"), failed("t1", "server_error")]);
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0.unwrap();
         let ep = answered(ep, 1, Answer::Refused, &ctx(61, HELPER, None));
-        assert_eq!(ep.state, State::Closed);
+        assert_eq!(ep.state, State::Escalated);
         let (ep, fx) = decide(Some(ep), &s, &ctx(5000, HELPER, GO));
         assert!(acting(&fx).is_empty());
-        assert_eq!(ep.unwrap().state, State::Closed);
+        assert!(
+            told(&ep).is_some_and(|t| t.contains("not where clank left it")),
+            "{ep:?}"
+        );
+        assert_eq!(ep.unwrap().attempts.len(), 1, "latched, not reopened");
     }
 
     #[test]
@@ -3596,13 +4033,13 @@ pub(crate) mod tests {
             agent_dir: dir.to_path_buf(),
             session,
             auto: true,
-            delivering,
-            obligated,
+            ledger: crate::cli::ledger::Ledger::owing_if(obligated && !delivering),
             role: "master".into(),
             work: vec!["continue plan=p".into()],
             blind_nudge: None,
             stall: None,
-            attending: false,
+            attended: false,
+            blocked_on: None,
             asking: false,
             projection: Default::default(),
         }
@@ -3772,8 +4209,19 @@ pub(crate) mod tests {
         assert_eq!(load(dir.path()).unwrap().state, State::Running);
         append(&rollout, &[&line(DONE, "t2")]);
         touched(&mut d, &rollout, 90);
-        assert_eq!(load(dir.path()).unwrap().state, State::Closed, "recovered");
-        assert_eq!(d.next_due(), None);
+        let after = load(dir.path()).unwrap();
+        assert_eq!(
+            (
+                after.opened_by.as_str(),
+                after.class.as_str(),
+                after.state,
+                after.attempts.len()
+            ),
+            ("t1", IDLE, State::Waiting, 1),
+            "recovered: the turn it started ended with work still owed, so the same \
+             episode goes on as an idle agent's, its attempt spent"
+        );
+        assert_eq!(d.next_due(), Some(90 + IDLE_WAITS[1]));
     }
 
     /// A due attempt reads what the record gained since its last event
@@ -3804,11 +4252,10 @@ pub(crate) mod tests {
     #[test]
     fn a_due_attempt_asks_the_gate_about_the_agent_now() {
         enable(Tool::Codex, Some(Transport::CodexStart));
-        for (gate, after) in [
-            (Gate::Hold, Some(State::Waiting)),
-            (Gate::Deliverer, None),
-            (Gate::SessionChanged, None),
-            (Gate::AutoOff, Some(State::Waiting)),
+        for (gate, after, looks_again) in [
+            (Gate::Hold, Some(State::Waiting), Some(60 + RETRY_LOOK)),
+            (Gate::SessionChanged, None, None),
+            (Gate::AutoOff, Some(State::Waiting), None),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let rollout = dir.path().join("rollout.jsonl");
@@ -3830,7 +4277,21 @@ pub(crate) mod tests {
             });
             assert!(dispatches(&acts).is_empty(), "{gate:?}");
             assert_eq!(load(dir.path()).map(|e| e.state), after, "{gate:?}");
-            assert_eq!(d.next_due(), None, "{gate:?}: nothing polls");
+            if gate == Gate::Hold {
+                assert_eq!(
+                    crate::cli::agent_state::load(dir.path())
+                        .unwrap()
+                        .owed
+                        .map(|o| o.case),
+                    Some(crate::cli::agent_state::Case::Recovering),
+                    "recovering, because a look is due"
+                );
+            }
+            assert_eq!(
+                d.next_due(),
+                looks_again,
+                "{gate:?}: only a hold the fold has not reported is looked at again"
+            );
         }
     }
 
@@ -4028,13 +4489,13 @@ pub(crate) mod tests {
             agent_dir: home.path().to_path_buf(),
             session,
             auto: true,
-            delivering: false,
-            obligated: true,
+            ledger: crate::cli::ledger::Ledger::owing_if(true),
             role: "master".into(),
             work: vec!["continue plan=p".into()],
             blind_nudge: None,
             stall: None,
-            attending: false,
+            attended: false,
+            blocked_on: None,
             asking: false,
             projection: Default::default(),
         };
@@ -4255,11 +4716,14 @@ pub(crate) mod tests {
         let acts = d.reconcile(vec![f], 0);
         assert!(dispatches(&acts).is_empty(), "{acts:?}");
         assert_eq!(d.next_due(), None, "nothing is scheduled");
-        assert!(
+        assert_eq!(
             crate::cli::agent_state::load(dir.path())
                 .unwrap()
-                .suppressors
-                .contains(&crate::cli::agent_state::Suppressor::AutoOff)
+                .owed
+                .map(|o| o.case),
+            Some(crate::cli::agent_state::Case::HandsOff(
+                crate::cli::agent_state::HandsOff::AutoOff
+            ))
         );
         d.reconcile(
             vec![codex_facts(
@@ -4666,13 +5130,13 @@ pub(crate) mod tests {
             agent_dir: home.path().to_path_buf(),
             session,
             auto: true,
-            delivering: false,
-            obligated: true,
+            ledger: crate::cli::ledger::Ledger::owing_if(true),
             role: "master".into(),
             work: vec!["continue plan=p".into()],
             blind_nudge: None,
             stall: None,
-            attending: false,
+            attended: false,
+            blocked_on: None,
             asking: false,
             projection: Default::default(),
         };
@@ -5637,10 +6101,12 @@ pub(crate) mod tests {
             assert!(fx.is_empty(), "{gate:?}");
             assert_eq!(ep.unwrap().state, State::Waiting, "{gate:?}");
         }
-        for gone in [Gate::Deliverer, Gate::AutoOff] {
-            let (_, fx) = decide(ep.clone(), &s, &owing(IDLE_WAITS[0], HELPER, Some(gone)));
-            assert!(fx.is_empty(), "{gone:?}");
-        }
+        let (_, fx) = decide(
+            ep.clone(),
+            &s,
+            &owing(IDLE_WAITS[0], HELPER, Some(Gate::AutoOff)),
+        );
+        assert!(fx.is_empty());
         let mut s = s;
         s.apply(started("p1"));
         let (ep, fx) = decide(ep, &s, &owing(IDLE_WAITS[0], HELPER, GO));
@@ -5862,10 +6328,11 @@ pub(crate) mod tests {
             readable: true,
             ..blind("w2")
         };
+        let ep = decide(Some(ep), &none, &readable).0.unwrap();
         assert_eq!(
-            decide(Some(ep), &none, &readable).0,
-            None,
-            "a readable record ends it"
+            (ep.kind, ep.opened_by.as_str()),
+            (Kind::Idle, AT_PROMPT),
+            "a readable record ends it: the agent is recovered at its prompt"
         );
     }
 
@@ -5910,7 +6377,7 @@ pub(crate) mod tests {
             "attending",
             "asking",
             "work cleared",
-            "deliverer",
+            "own block",
             "session",
             "role",
         ] {
@@ -5919,10 +6386,10 @@ pub(crate) mod tests {
             match change {
                 "newer turn" => append(&record, &[&line(STARTED, "t2")]),
                 "auto off" => f.auto = false,
-                "attending" => f.attending = true,
+                "attending" => f.attended = true,
                 "asking" => f.asking = true,
-                "work cleared" => f.obligated = false,
-                "deliverer" => f.delivering = true,
+                "work cleared" => f.ledger = Default::default(),
+                "own block" => f.blocked_on = Some("q".into()),
                 "session" => f = codex_facts(dir.path(), &record, "session-two", true, false),
                 _ => f.role = "commit".into(),
             }
@@ -6017,7 +6484,7 @@ pub(crate) mod tests {
     /// is read and shown idle, with what holds a nudge back.
     #[test]
     fn the_published_state_never_calls_an_unobserved_agent_idle() {
-        use crate::cli::agent_state::{Activity, Nudge, Suppressor, load as published};
+        use crate::cli::agent_state::{Activity, Case, HandsOff, Nudge, load as published};
         let dir = tempfile::tempdir().unwrap();
         let rollout = dir.path().join("rollout.jsonl");
         append(&rollout, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
@@ -6036,7 +6503,7 @@ pub(crate) mod tests {
         assert_eq!(d.next_due(), None);
         let s = published(dir.path()).unwrap();
         assert_eq!(s.activity, Activity::Unobserved);
-        assert_eq!(s.suppressors, [Suppressor::Delivering]);
+        assert_eq!(s.owed, None, "nothing owed puts it in no case");
         assert_eq!(
             (s.session.as_str(), s.role.as_str()),
             ("session-one", "master")
@@ -6070,7 +6537,10 @@ pub(crate) mod tests {
             (Activity::Idle, 5),
             "since is semantic"
         );
-        assert!(s.suppressors.contains(&Suppressor::AutoOff));
+        assert_eq!(
+            s.owed.map(|o| o.case),
+            Some(Case::HandsOff(HandsOff::AutoOff))
+        );
     }
 
     /// The opt-in reaches the driver: an agent owing work whose record
@@ -6150,7 +6620,8 @@ pub(crate) mod tests {
             (
                 "attending",
                 (|dir: &Path, record: &Path| Facts {
-                    attending: true,
+                    attended: true,
+                    blocked_on: None,
                     ..codex_facts(dir, record, "session-one", true, false)
                 }) as fn(&Path, &Path) -> Facts,
             ),
@@ -6189,7 +6660,7 @@ pub(crate) mod tests {
             let mut f = codex_facts(dir.path(), &record, "session-one", true, false);
             match how {
                 "auto off" => f.auto = false,
-                "attending" => f.attending = true,
+                "attending" => f.attended = true,
                 _ => f.asking = true,
             }
             d.reconcile(vec![f], 1);
@@ -6466,7 +6937,7 @@ pub(crate) mod tests {
             let mut f = codex_facts(dir.path(), &record, "session-one", true, false);
             d.reconcile(vec![f.clone()], 1);
             match change {
-                "work cleared" => f.obligated = false,
+                "work cleared" => f.ledger = Default::default(),
                 _ => f.auto = false,
             }
             d.reconcile(vec![f], 2);
@@ -6930,6 +7401,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("record.jsonl");
         append(&record, &[&line(STARTED, "t1"), &line(ITEM, "t1")]);
+        written_at(&record, 0);
         let f = Facts {
             stall: Some(stall),
             ..codex_facts(dir.path(), &record, "session-one", true, false)
@@ -6937,6 +7409,16 @@ pub(crate) mod tests {
         let mut d = driver();
         d.reconcile(vec![f.clone()], 0);
         (dir, record, d, f)
+    }
+
+    /// Date `record`'s last write: the clock its silence is read from.
+    fn written_at(record: &Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(record)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
     }
 
     const ON: Stall = Stall {
@@ -7007,12 +7489,13 @@ pub(crate) mod tests {
     }
 
     /// Record growth before the warning or before the nudge starts a new
-    /// quiet period from the moment it is read, and the record is read
+    /// quiet period from the moment it was written, and the record is read
     /// before a warning is given.
     #[test]
     fn record_growth_rearms_the_stall() {
         let (dir, record, mut d, f) = stalling(ON);
         append(&record, &[&line(ITEM, "t1")]);
+        written_at(&record, WARN);
         d.reconcile(vec![f], WARN);
         go(&mut d, WARN);
         assert!(warnings(dir.path()).is_empty(), "growth no watch reported");
@@ -7020,6 +7503,7 @@ pub(crate) mod tests {
 
         let (dir, record, mut d, _) = stalling(ON);
         append(&record, &[&line(ITEM, "t1")]);
+        written_at(&record, 1000);
         touched(&mut d, &record, 1000);
         assert!(go(&mut d, WARN).is_empty());
         assert!(warnings(dir.path()).is_empty(), "growth before the warning");
@@ -7031,6 +7515,7 @@ pub(crate) mod tests {
         go(&mut d, 1000 + WARN);
         assert_eq!(warnings(dir.path()).len(), 1);
         append(&record, &[&line(ITEM, "t1")]);
+        written_at(&record, 1000 + WARN + 1);
         touched(&mut d, &record, 1000 + WARN + 1);
         assert!(dispatches(&go(&mut d, 1000 + WARN + NUDGE)).is_empty());
         assert_eq!(d.next_due(), Some(1000 + WARN + 1 + WARN));
@@ -7073,18 +7558,19 @@ pub(crate) mod tests {
             "interrupted",
             "attending",
             "auto off",
-            "deliverer",
+            "own block",
             "warn off",
         ] {
             let (dir, record, mut d, mut f) = stalling(ON);
             match how {
                 "interrupted" => {
                     append(&record, &[&line(CODEX_ABORTED_T, "t1")]);
+                    written_at(&record, 1);
                     touched(&mut d, &record, 1);
                 }
-                "attending" => f.attending = true,
+                "attending" => f.attended = true,
                 "auto off" => f.auto = false,
-                "deliverer" => f.delivering = true,
+                "own block" => f.blocked_on = Some("q".into()),
                 _ => f.stall = None,
             }
             d.reconcile(vec![f], 1);
@@ -7140,6 +7626,1440 @@ pub(crate) mod tests {
         assert!(warnings(dir.path()).is_empty());
     }
 
+    use crate::cli::agent_state::{Active, Case, HandsOff, View};
+    use crate::cli::ledger::{Delivery, Entry, Ledger, Obligation, Since};
+
+    fn entry(what: &str, obligation: Obligation, delivery: Delivery) -> Entry {
+        Entry {
+            identity: what.into(),
+            kind: "message",
+            what: what.into(),
+            obligation,
+            delivery,
+        }
+    }
+
+    fn owed_at(what: &str, since: u64, delivery: Delivery) -> Entry {
+        entry(
+            what,
+            Obligation::Owed {
+                owed_since: Since::At(since),
+            },
+            delivery,
+        )
+    }
+
+    fn ledger(entries: Vec<Entry>) -> Ledger {
+        Ledger {
+            entries,
+            last_delivery: None,
+        }
+    }
+
+    /// The published state as a reader at `now` sees it.
+    fn shown(dir: &Path, now: u64) -> View {
+        View::at(crate::cli::agent_state::load(dir).unwrap(), None, now)
+    }
+
+    fn case_of(dir: &Path) -> Option<Case> {
+        crate::cli::agent_state::load(dir)
+            .unwrap()
+            .owed
+            .map(|o| o.case)
+    }
+
+    /// Work a block withholds is not owed: alone it opens nothing, is not
+    /// shown and is never nudged, whatever the record says. A message
+    /// beside it is owed and is recovered.
+    #[test]
+    fn withheld_work_is_not_recovered_and_owed_work_beside_it_is() {
+        let (dir, _record, mut d, f) = stalling(ON);
+        let review = entry(
+            "review of abc1234",
+            Obligation::Withheld {
+                by: vec!["claude/stork-retakes".into()],
+            },
+            Delivery::NotDelivered,
+        );
+        let withheld = Facts {
+            ledger: ledger(vec![review.clone()]),
+            ..f.clone()
+        };
+        d.reconcile(vec![withheld], 1);
+        assert_eq!(d.next_due(), None);
+        for now in [WARN, WARN + NUDGE, 100 * WARN] {
+            assert!(dispatches(&go(&mut d, now)).is_empty());
+            assert_eq!(shown(dir.path(), now).undelivered(now), None);
+        }
+        assert_eq!(case_of(dir.path()), None, "nothing owed is no case");
+        assert!(warnings(dir.path()).is_empty());
+
+        let with_message = Facts {
+            ledger: ledger(vec![
+                owed_at("message from claude", 5000, Delivery::NotDelivered),
+                review,
+            ]),
+            ..f
+        };
+        d.reconcile(vec![with_message], 5000);
+        assert_eq!(d.next_due(), Some(5000 + WARN));
+        go(&mut d, 5000 + WARN);
+        assert_eq!(dispatches(&go(&mut d, 5000 + WARN + NUDGE)).len(), 1);
+    }
+
+    /// A review request that reached the session, whose turn then failed
+    /// on the provider's capacity, is still owed: the failed-turn path
+    /// retries it, and its row never reads as undelivered.
+    #[test]
+    fn delivered_work_whose_turn_failed_is_still_recovered() {
+        enable(Tool::Codex, Some(Transport::CodexStart));
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
+        let f = Facts {
+            stall: Some(ON),
+            ledger: ledger(vec![owed_at("review of abc1234", 0, Delivery::Delivered)]),
+            ..codex_facts(dir.path(), &rollout, "session-one", true, false)
+        };
+        let mut d = driver();
+        d.reconcile(vec![f], 10);
+        assert_eq!(case_of(dir.path()), Some(Case::Recovering));
+        let wait = retries("server_overloaded")[0];
+        let acts = go(&mut d, 10 + wait);
+        let [Act::Dispatch { text, tag, .. }] = acts.as_slice() else {
+            panic!("the failed turn is retried: {acts:?}");
+        };
+        assert_eq!(text, &wake_text(tag));
+        for now in [10, 10 + wait, 100 * WARN] {
+            let v = shown(dir.path(), now);
+            assert_eq!(v.undelivered(now), None, "it was delivered");
+            assert!(!v.line(now).contains("UNDELIVERED"));
+        }
+    }
+
+    /// A presentation with its carrier holds recovery only inside its
+    /// bound. When the carrier never answers, the delivery is over at its
+    /// expiry with nothing else to mark the moment, and the agent is
+    /// recovered as any agent with undelivered work is.
+    #[test]
+    fn a_carrier_that_never_answers_stops_being_a_delivery_at_its_expiry() {
+        enable(Tool::Codex, Some(Transport::Typed));
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
+        const EXPIRES: u64 = 1060;
+        let f = Facts {
+            ledger: ledger(vec![owed_at(
+                "message from claude",
+                1000,
+                Delivery::InFlight(EXPIRES),
+            )]),
+            ..codex_facts(dir.path(), &rollout, "session-one", true, false)
+        };
+        let mut d = driver();
+        d.reconcile(vec![f.clone()], 1000);
+        assert_eq!(case_of(dir.path()), Some(Case::BeingDelivered(EXPIRES)));
+        assert_eq!(
+            shown(dir.path(), 1000 + 10 * WARN).undelivered(1000 + 10 * WARN),
+            Some("UNDELIVERED 6h · message from claude".into()),
+            "a reader long past the bound does not take it for a delivery"
+        );
+        assert_eq!(shown(dir.path(), 1001).undelivered(1001), None);
+        assert_eq!(
+            d.next_due(),
+            Some(EXPIRES),
+            "the expiry itself is a deadline: no fold has to notice it"
+        );
+        assert!(dispatches(&go(&mut d, EXPIRES - 1)).is_empty());
+        assert_eq!(case_of(dir.path()), Some(Case::BeingDelivered(EXPIRES)));
+
+        assert!(dispatches(&go(&mut d, EXPIRES)).is_empty());
+        assert_eq!(
+            case_of(dir.path()),
+            Some(Case::Recovering),
+            "past its bound it is not being delivered"
+        );
+        let due = d.next_due().expect("a nudge is scheduled");
+        let mut sent = dispatches(&go(&mut d, due)).len();
+        if sent == 0 {
+            let due = d.next_due().expect("still scheduled");
+            sent = dispatches(&go(&mut d, due)).len();
+        }
+        assert_eq!(sent, 1, "and it is nudged");
+
+        // Past the bound, a record event alone is decided as recovery:
+        // no deadline has to have cleared the delivery first.
+        let moved = tempfile::tempdir().unwrap();
+        let mut d = driver();
+        let there = Facts {
+            agent_dir: moved.path().to_path_buf(),
+            ..f.clone()
+        };
+        d.reconcile(vec![there], 1000);
+        assert_eq!(case_of(moved.path()), Some(Case::BeingDelivered(EXPIRES)));
+        touched(&mut d, &rollout, EXPIRES + 1);
+        assert_eq!(case_of(moved.path()), Some(Case::Recovering));
+        go(&mut d, EXPIRES + 1);
+        assert!(
+            d.next_due().is_some_and(|at| at > EXPIRES + 1),
+            "and its nudge is scheduled, not held"
+        );
+
+        // The same facts met long after by a monitor that never saw the
+        // delivery begin: an expired one holds nothing back.
+        let fresh = tempfile::tempdir().unwrap();
+        let mut d = driver();
+        d.reconcile(
+            vec![Facts {
+                agent_dir: fresh.path().to_path_buf(),
+                ..f
+            }],
+            EXPIRES + 500,
+        );
+        assert_eq!(case_of(fresh.path()), Some(Case::Recovering));
+    }
+
+    /// A turn that ended a moment ago is not activity, however recently
+    /// its record moved: failed or completed, it is recovered at once.
+    #[test]
+    fn a_turn_that_just_ended_is_recovered_not_called_active() {
+        enable(Tool::Codex, Some(Transport::Typed));
+        for end in [DONE, FAILED] {
+            let dir = tempfile::tempdir().unwrap();
+            let rollout = dir.path().join("rollout.jsonl");
+            append(&rollout, &[&line(STARTED, "t1"), &line(end, "t1")]);
+            written_at(&rollout, 999);
+            let f = Facts {
+                stall: Some(ON),
+                ..codex_facts(dir.path(), &rollout, "session-one", true, false)
+            };
+            let mut d = driver();
+            d.reconcile(vec![f], 1000);
+            assert_eq!(case_of(dir.path()), Some(Case::Recovering), "{end}");
+            assert!(!shown(dir.path(), 1000).working(), "{end}");
+            assert!(d.next_due().is_some_and(|at| at < 1000 + WARN), "{end}");
+        }
+    }
+
+    /// While the harness retries a turn itself, the agent is active on
+    /// that evidence and clank sends nothing.
+    #[test]
+    fn a_native_retry_is_activity_clank_does_not_nudge_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = observed_path(dir.path());
+        append(
+            &record,
+            &[
+                r#"{"session":"ses_abcdef","turn":"started","id":"u1"}"#,
+                r#"{"session":"ses_abcdef","turn":"retry"}"#,
+            ],
+        );
+        written_at(&record, 0);
+        enable(Tool::OpenCode, Some(Transport::Helper));
+        let mut d = driver();
+        d.reconcile(
+            vec![Facts {
+                stall: Some(ON),
+                ..facts("opencode", dir.path(), &record, "ses_abcdef", true, false)
+            }],
+            0,
+        );
+        for now in [0, WARN, WARN + NUDGE, 50 * WARN] {
+            assert!(dispatches(&go(&mut d, now)).is_empty());
+            assert_eq!(
+                case_of(dir.path()),
+                Some(Case::Active(Active::NativeRetry)),
+                "{now}"
+            );
+        }
+        assert!(
+            shown(dir.path(), WARN)
+                .line(WARN)
+                .contains("retrying itself")
+        );
+    }
+
+    /// A monitor restarted at forty minutes of silence, under a
+    /// forty-five minute threshold, still nudges at forty-five: the
+    /// silence is the record's and the owed item's, never the monitor's.
+    #[test]
+    fn a_monitor_restart_does_not_reset_the_silence() {
+        const T0: u64 = 50_000;
+        for restart in [T0 + WARN - 400, T0 + WARN, T0 + WARN + 10] {
+            enable(Tool::Codex, Some(Transport::Typed));
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("record.jsonl");
+            append(&record, &[&line(STARTED, "t1"), &line(ITEM, "t1")]);
+            written_at(&record, T0);
+            let f = Facts {
+                stall: Some(ON),
+                ledger: ledger(vec![owed_at(
+                    "message from claude",
+                    T0 - 9000,
+                    Delivery::NotDelivered,
+                )]),
+                ..codex_facts(dir.path(), &record, "session-one", true, false)
+            };
+            let mut first = driver();
+            first.reconcile(vec![f.clone()], T0 + 5);
+            assert_eq!(first.next_due(), Some(T0 + WARN));
+            let before = restart.min(T0 + WARN + 9);
+            assert!(dispatches(&go(&mut first, before)).is_empty());
+            drop(first);
+
+            let mut second = driver();
+            second.reconcile(vec![f], restart);
+            assert!(
+                dispatches(&go(&mut second, restart.max(T0 + WARN))).is_empty(),
+                "{restart}: warned, not yet nudged"
+            );
+            assert_eq!(warnings(dir.path()).len(), 1, "{restart}: warned once");
+            let nudge_at = second.next_due().expect("the nudge is scheduled");
+            assert!(
+                nudge_at <= T0 + WARN + NUDGE + 10,
+                "{restart}: the nudge is due {nudge_at}, not a window after the restart"
+            );
+            assert!(dispatches(&go(&mut second, nudge_at - 1)).is_empty());
+            assert_eq!(dispatches(&go(&mut second, nudge_at)).len(), 1, "{restart}");
+            assert_eq!(
+                shown(dir.path(), nudge_at).state.since,
+                T0 + 5,
+                "{restart}: and the activity's age is the first monitor's"
+            );
+        }
+    }
+
+    /// An item no record dates is owed since an unknown moment: its age is
+    /// shown as unknown, it is flagged only once the ledger has held it
+    /// for the window, and the stall's silence is the record's alone.
+    #[test]
+    fn an_undated_item_is_never_aged_from_when_the_monitor_looked() {
+        enable(Tool::Codex, Some(Transport::Typed));
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record.jsonl");
+        append(&record, &[&line(STARTED, "t1"), &line(ITEM, "t1")]);
+        written_at(&record, 100);
+        let f = Facts {
+            stall: Some(ON),
+            ledger: ledger(vec![entry(
+                "promotion of next-plan",
+                Obligation::Owed {
+                    owed_since: Since::Unknown { held: 7000 },
+                },
+                Delivery::NotDelivered,
+            )]),
+            ..codex_facts(dir.path(), &record, "session-one", true, false)
+        };
+        let mut d = driver();
+        d.reconcile(vec![f], 90_000);
+        assert_eq!(
+            d.next_due(),
+            Some(100 + WARN),
+            "silent since the record's last write, not since this monitor looked"
+        );
+        let v = shown(dir.path(), 90_000);
+        assert_eq!(v.owed.as_ref().unwrap().age, None, "unknown, not 83000");
+        assert_eq!(
+            v.undelivered(90_000).as_deref(),
+            Some("UNDELIVERED age unknown · promotion of next-plan")
+        );
+        assert_eq!(
+            shown(dir.path(), 7000 + WARN - 1).undelivered(7000 + WARN - 1),
+            None
+        );
+    }
+
+    /// Each reason to keep hands off is the agent's case, is said in its
+    /// line, and is never nudged over, whatever its record shows and
+    /// however long it is left.
+    #[test]
+    fn every_hands_off_reason_is_shown_and_never_nudged() {
+        for (reason, expect, said) in [
+            ("auto off", HandsOff::AutoOff, "auto off"),
+            ("own question", HandsOff::Asking, "asking"),
+            (
+                "own block",
+                HandsOff::Blocked("which".into()),
+                "waiting on its block which",
+            ),
+            ("attending", HandsOff::Attending, "attended"),
+            ("interrupted", HandsOff::Interrupted, "interrupted"),
+            (
+                "cannot resume",
+                HandsOff::CannotResume(crate::cli::resume::NO_CANDIDATE.into()),
+                crate::cli::resume::NO_CANDIDATE,
+            ),
+            (
+                "stall off",
+                HandsOff::StallWarnOff,
+                "`recovery.stall_warn` is off",
+            ),
+            (
+                "nudge off",
+                HandsOff::StallNudgeOff,
+                "`recovery.stall_nudge` is off",
+            ),
+        ] {
+            let (dir, record, mut d, mut f) = stalling(ON);
+            match reason {
+                "auto off" => f.auto = false,
+                "own question" => f.asking = true,
+                "own block" => f.blocked_on = Some("which".into()),
+                "attending" => f.attended = true,
+                "interrupted" => {
+                    append(&record, &[&line(CODEX_ABORTED_T, "t1")]);
+                    written_at(&record, 1);
+                    touched(&mut d, &record, 1);
+                }
+                "cannot resume" => enable(Tool::Codex, None),
+                "stall off" => f.stall = None,
+                _ => {
+                    f.stall = Some(Stall {
+                        warn: WARN,
+                        nudge: None,
+                    })
+                }
+            }
+            d.reconcile(vec![f.clone()], 1);
+            for now in [2, WARN, WARN + NUDGE, 10 * WARN] {
+                assert!(dispatches(&go(&mut d, now)).is_empty(), "{reason} at {now}");
+                d.reconcile(vec![f.clone()], now);
+            }
+            assert_eq!(
+                case_of(dir.path()),
+                Some(Case::HandsOff(expect)),
+                "{reason}"
+            );
+            let line = shown(dir.path(), 10 * WARN).line(10 * WARN);
+            assert!(line.contains(said), "{reason}: {line}");
+            assert!(
+                line.starts_with("UNDELIVERED"),
+                "{reason}: owed and never delivered, so shouted: {line}"
+            );
+            assert!(!shown(dir.path(), 10 * WARN).working(), "{reason}");
+            enable(Tool::Codex, Some(Transport::Typed));
+        }
+    }
+
+    /// A budget that ran out is latched for a person: the case is hands
+    /// off, with what the agent was told, and nothing more is sent.
+    #[test]
+    fn a_spent_budget_is_hands_off_with_its_reason() {
+        enable(Tool::Codex, Some(Transport::Typed));
+        let (dir, record, mut d) = idle_codex();
+        let f = codex_facts(dir.path(), &record, "session-one", true, false);
+        let mut now = 1;
+        for _ in 0..8 {
+            now = d.next_due().unwrap_or(now + 1).max(now + 1);
+            for act in go(&mut d, now) {
+                let Act::Dispatch { attempt, .. } = act else {
+                    continue;
+                };
+                d.answer(&label(), &attempt, Answer::Indeterminate, now + 1);
+            }
+            d.reconcile(vec![f.clone()], now + 2);
+            now += 2;
+        }
+        let Some(Case::HandsOff(HandsOff::WaitingForYou(why))) = case_of(dir.path()) else {
+            panic!("{:?}", case_of(dir.path()));
+        };
+        assert!(why.contains("waiting for you"), "{why}");
+        assert_eq!(d.next_due(), None);
+        let line = shown(dir.path(), now).line(now);
+        assert!(
+            line.contains("waiting for you") && line.contains(&why),
+            "{line}"
+        );
+        assert!(dispatches(&go(&mut d, now + 100 * WARN)).is_empty());
+    }
+
+    /// The ledger never nudges: one silence, however many times it is
+    /// folded, read and looked at, gets the one nudge its episode sends.
+    #[test]
+    fn one_silence_is_nudged_by_one_owner() {
+        let (dir, record, mut d, f) = stalling(ON);
+        let mut sent = 0;
+        for now in (0..=WARN + NUDGE + 3000).step_by(50) {
+            sent += dispatches(&d.reconcile(vec![f.clone()], now)).len();
+            sent += dispatches(&touched(&mut d, &record, now)).len();
+            for act in go(&mut d, now) {
+                let Act::Dispatch { attempt, .. } = act else {
+                    continue;
+                };
+                sent += 1;
+                d.answer(&label(), &attempt, Answer::Submitted { started: None }, now);
+            }
+        }
+        assert_eq!(sent, 1);
+        assert_eq!(warnings(dir.path()).len(), 1);
+    }
+
+    /// Every agent that is owed something is in exactly the case its
+    /// situation names, and ends where that case says it must: across how
+    /// its last turn ended, whether its work was delivered, what a block
+    /// withholds beside it, and every reason to keep hands off. An agent
+    /// nothing holds is never hands off, unless its turn was interrupted,
+    /// and left alone it is nudged; one that is held is held for exactly
+    /// the reason given, and is never nudged.
+    ///
+    /// A registered wait is not an axis: recovery is told nothing of one,
+    /// so none can stand in for a case.
+    #[test]
+    fn an_owed_agent_is_always_in_one_of_the_four_cases() {
+        use crate::cli::agent_state::Nudge;
+        const NOW: u64 = 10_000;
+        let records: [(&str, Vec<String>); 6] = [
+            ("running", vec![line(STARTED, "t1"), line(ITEM, "t1")]),
+            ("completed", vec![line(STARTED, "t1"), line(DONE, "t1")]),
+            ("failed", vec![line(STARTED, "t1"), line(FAILED, "t1")]),
+            (
+                "interrupted",
+                vec![line(STARTED, "t1"), line(CODEX_ABORTED_T, "t1")],
+            ),
+            ("no turn", vec![]),
+            ("unreadable", vec![]),
+        ];
+        let deliveries = [
+            Delivery::NotDelivered,
+            Delivery::InFlight(NOW + 60),
+            Delivery::InFlight(NOW - 1),
+            Delivery::Delivered,
+        ];
+        let holds = [
+            "none",
+            "auto off",
+            "own question",
+            "own block",
+            "attending",
+            "no transport",
+            "stall off",
+            "nudge off",
+            "blind nudge on",
+        ];
+        let cannot_resume = || {
+            Case::HandsOff(HandsOff::CannotResume(
+                crate::cli::resume::NO_CANDIDATE.into(),
+            ))
+        };
+        // The case at the first look, and where it must have settled once
+        // every deadline is met: `None` for a nudge sent.
+        let expected = |outcome: &str, delivery: Delivery, hold: &str| -> (Case, Option<Case>) {
+            let held = |why: HandsOff| (Case::HandsOff(why.clone()), Some(Case::HandsOff(why)));
+            match hold {
+                "auto off" => return held(HandsOff::AutoOff),
+                "own question" => return held(HandsOff::Asking),
+                "own block" => return held(HandsOff::Blocked("q".into())),
+                "attending" => return held(HandsOff::Attending),
+                _ => {}
+            }
+            if outcome == "interrupted" {
+                return held(HandsOff::Interrupted);
+            }
+            let settled = match (outcome, hold) {
+                ("unreadable", "blind nudge on") => None,
+                ("unreadable", _) => Some(Case::HandsOff(HandsOff::BlindNudgeOff)),
+                ("running", "stall off") => Some(Case::HandsOff(HandsOff::StallWarnOff)),
+                (_, "no transport") => Some(cannot_resume()),
+                ("running", "nudge off") => Some(Case::HandsOff(HandsOff::StallNudgeOff)),
+                _ => None,
+            };
+            let first = match (outcome, hold) {
+                _ if delivery == Delivery::InFlight(NOW + 60) => Case::BeingDelivered(NOW + 60),
+                ("unreadable", "blind nudge on") => Case::Recovering,
+                ("unreadable", _) => Case::HandsOff(HandsOff::BlindNudgeOff),
+                ("running", "stall off") => Case::HandsOff(HandsOff::StallWarnOff),
+                ("running", _) => Case::Active(Active::Turn),
+                (_, "no transport") => cannot_resume(),
+                _ => Case::Recovering,
+            };
+            (first, settled)
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut nudged = 0;
+        for (outcome, lines) in &records {
+            for delivery in deliveries {
+                for withheld_beside in [false, true] {
+                    for hold in holds {
+                        let dir = tempfile::tempdir().unwrap();
+                        let record = dir.path().join("record.jsonl");
+                        if *outcome != "unreadable" {
+                            std::fs::write(&record, "").unwrap();
+                            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+                            append(&record, &lines);
+                            written_at(&record, NOW - 10);
+                        }
+                        enable(
+                            Tool::Codex,
+                            (hold != "no transport").then_some(Transport::Typed),
+                        );
+                        let mut entries = vec![owed_at("message from claude", NOW - 20, delivery)];
+                        if withheld_beside {
+                            entries.push(entry(
+                                "review of abc1234",
+                                Obligation::Withheld {
+                                    by: vec!["b".into()],
+                                },
+                                Delivery::NotDelivered,
+                            ));
+                        }
+                        let f = Facts {
+                            auto: hold != "auto off",
+                            asking: hold == "own question",
+                            blocked_on: (hold == "own block").then(|| "q".to_string()),
+                            attended: hold == "attending",
+                            stall: match hold {
+                                "stall off" => None,
+                                "nudge off" => Some(Stall {
+                                    warn: WARN,
+                                    nudge: None,
+                                }),
+                                _ => Some(ON),
+                            },
+                            blind_nudge: (hold == "blind nudge on").then_some(600),
+                            ledger: ledger(entries),
+                            ..codex_facts(dir.path(), &record, "session-one", true, false)
+                        };
+                        let which =
+                            format!("{outcome} / {delivery:?} / {withheld_beside} / {hold}");
+                        let (first, settles) = expected(outcome, delivery, hold);
+                        let mut d = driver();
+                        let mut sent = dispatches(&d.reconcile(vec![f.clone()], NOW)).len();
+                        let state = crate::cli::agent_state::load(dir.path()).unwrap();
+                        let owing = state.owed.clone().unwrap_or_else(|| panic!("{which}"));
+                        assert_eq!(owing.case, first, "{which}");
+                        if owing.case == Case::Recovering {
+                            assert!(
+                                matches!(
+                                    state.nudge,
+                                    Nudge::At(_)
+                                        | Nudge::InFlight
+                                        | Nudge::Silent { at: Some(_), .. }
+                                ),
+                                "{which}: recovering with nothing scheduled: {:?}",
+                                state.nudge
+                            );
+                        }
+                        if matches!(owing.case, Case::Recovering | Case::Active(_))
+                            && hold != "no transport"
+                        {
+                            assert!(
+                                d.next_due().is_some(),
+                                "{which}: {:?} with no look due",
+                                owing.case
+                            );
+                        }
+                        assert_ne!(
+                            owing.case,
+                            Case::HandsOff(HandsOff::WaitingForYou(NOTHING_DUE.into())),
+                            "{which}"
+                        );
+                        seen.insert(std::mem::discriminant(&owing.case));
+
+                        let mut now = NOW;
+                        for _ in 0..12 {
+                            let Some(due) = d.next_due() else {
+                                break;
+                            };
+                            now = due.max(now);
+                            sent += dispatches(&go(&mut d, now)).len();
+                            if sent > 0 {
+                                break;
+                            }
+                        }
+                        match settles {
+                            None => {
+                                assert_eq!(sent, 1, "{which}: nothing holds it, so it is nudged");
+                                nudged += 1;
+                            }
+                            Some(reason) => {
+                                assert_eq!(sent, 0, "{which}: hands off is never nudged");
+                                assert_eq!(case_of(dir.path()), Some(reason), "{which}");
+                                assert_eq!(d.next_due(), None, "{which}: and nothing is pending");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(seen.len(), 4, "every case is reached");
+        assert!(nudged > 0);
+    }
+
+    /// The row and the nudge are read from one standing: whatever case an
+    /// agent is published in, the same look's decision acted on it. An
+    /// interrupted turn is the reason that used to be known to the row and
+    /// not to the gate.
+    #[test]
+    fn the_published_case_is_the_standing_the_decision_acted_on() {
+        enable(Tool::Codex, Some(Transport::Typed));
+        let (dir, record, mut d) = idle_codex();
+        let f = codex_facts(dir.path(), &record, "session-one", true, false);
+        assert_eq!(case_of(dir.path()), Some(Case::Recovering));
+        let due = d.next_due().expect("an idle nudge is scheduled");
+
+        append(
+            &record,
+            &[&line(STARTED, "t2"), &line(CODEX_ABORTED_T, "t2")],
+        );
+        touched(&mut d, &record, 5);
+        assert_eq!(
+            case_of(dir.path()),
+            Some(Case::HandsOff(HandsOff::Interrupted))
+        );
+        assert_eq!(d.next_due(), None, "held by the same reason the row gives");
+        assert!(dispatches(&go(&mut d, due + 10_000)).is_empty());
+
+        for (hold, reason) in [
+            ("auto off", HandsOff::AutoOff),
+            ("attending", HandsOff::Attending),
+        ] {
+            let (dir, record, mut d) = idle_codex();
+            let mut held = f.clone();
+            held.agent_dir = dir.path().to_path_buf();
+            held.session.transcript = Some(record.display().to_string());
+            match hold {
+                "auto off" => held.auto = false,
+                _ => held.attended = true,
+            }
+            d.reconcile(vec![held], 2);
+            assert_eq!(case_of(dir.path()), Some(Case::HandsOff(reason)), "{hold}");
+            assert_eq!(d.next_due(), None, "{hold}");
+        }
+    }
+
+    /// An agent bound and never run sits at its prompt: its record is
+    /// there and shows no turn. Owed work makes it an idle agent like any
+    /// other, nudged after the settle time and again on the idle budget,
+    /// and a turn of its own ends the episode.
+    #[test]
+    fn an_agent_that_never_ran_a_turn_is_recovered_at_its_prompt() {
+        enable(Tool::Codex, Some(Transport::Typed));
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record.jsonl");
+        std::fs::write(&record, "").unwrap();
+        written_at(&record, 0);
+        let f = Facts {
+            stall: Some(ON),
+            ..codex_facts(dir.path(), &record, "session-one", true, false)
+        };
+        let mut d = driver();
+        d.reconcile(vec![f.clone()], 10);
+        assert_eq!(case_of(dir.path()), Some(Case::Recovering));
+        assert_eq!(d.next_due(), Some(10 + IDLE_WAITS[0]));
+        assert!(dispatches(&go(&mut d, 10 + IDLE_WAITS[0] - 1)).is_empty());
+        let acts = go(&mut d, 10 + IDLE_WAITS[0]);
+        let [
+            Act::Dispatch {
+                attempt,
+                text,
+                tag,
+                target,
+                ..
+            },
+        ] = acts.as_slice()
+        else {
+            panic!("nudged at its prompt: {acts:?}");
+        };
+        assert_eq!((text, target.as_str()), (&nudge_text(tag), AT_PROMPT));
+        assert!(d.may_send(&label(), attempt, &live("master")), "sendable");
+
+        append(&record, &[&line(STARTED, "t1")]);
+        written_at(&record, 200);
+        touched(&mut d, &record, 200);
+        assert!(
+            !d.may_send(&label(), attempt, &live("master")),
+            "a turn that began since the claim takes it back"
+        );
+    }
+
+    /// An agent whose recovery `ended` its first turn, with clank's attempt
+    /// at `sent` answered as having started `t2`, and `t2` open in the
+    /// record since `began`: the driver, the facts, and that attempt.
+    fn attempt_turn_open(
+        ended: &str,
+        began: u64,
+    ) -> (tempfile::TempDir, PathBuf, Driver, Facts, u64) {
+        enable(Tool::Codex, Some(Transport::Typed));
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record.jsonl");
+        append(&record, &[&line(STARTED, "t1"), &line(ended, "t1")]);
+        written_at(&record, 0);
+        let f = Facts {
+            stall: Some(ON),
+            ..codex_facts(dir.path(), &record, "session-one", true, false)
+        };
+        let mut d = driver();
+        d.reconcile(vec![f.clone()], 0);
+        let sent = d.next_due().expect("an attempt is scheduled");
+        let acts = go(&mut d, sent);
+        let [(attempt, "t1")] = dispatches(&acts)[..] else {
+            panic!("{acts:?}");
+        };
+        let attempt = attempt.clone();
+        d.answer(
+            &label(),
+            &attempt,
+            Answer::Submitted {
+                started: Some("t2".into()),
+            },
+            sent + 1,
+        );
+        append(&record, &[&line(STARTED, "t2")]);
+        written_at(&record, began);
+        touched(&mut d, &record, began);
+        assert_eq!(load(dir.path()).unwrap().state, State::Running);
+        (dir, record, d, f, sent)
+    }
+
+    /// A turn clank's own retry or nudge started is watched like any open
+    /// turn, by the episode that started it. While its record moves inside
+    /// the stall window the agent is working; once it has been silent for
+    /// the window it is warned of, then nudged once, by that same episode
+    /// on its own attempt count; and a nudge nobody answers for latches it
+    /// for a person. A live episode is never, by itself, recovery.
+    #[test]
+    fn a_turn_clanks_own_attempt_started_cannot_go_silent_unnoticed() {
+        for ended in [FAILED, DONE] {
+            let (dir, record, mut d, f, sent) = attempt_turn_open(ended, 400);
+            let opened_by = load(dir.path()).unwrap().opened_by;
+            assert_eq!(
+                case_of(dir.path()),
+                Some(Case::Active(Active::Turn)),
+                "{ended}"
+            );
+            assert_eq!(
+                d.next_due(),
+                Some(400 + WARN),
+                "{ended}: the window is its deadline"
+            );
+
+            // Its record moves: the window starts again from that write.
+            append(&record, &[&line(ITEM, "t2")]);
+            written_at(&record, 1000);
+            touched(&mut d, &record, 1007);
+            assert_eq!(
+                d.next_due(),
+                Some(1000 + WARN),
+                "{ended}: from the write, not from when it was read"
+            );
+            assert!(dispatches(&go(&mut d, 1000 + WARN - 1)).is_empty());
+            assert!(warnings(dir.path()).is_empty());
+
+            assert!(dispatches(&go(&mut d, 1000 + WARN)).is_empty(), "{ended}");
+            assert_eq!(
+                warnings(dir.path()).len(),
+                1,
+                "{ended}: warned at the window"
+            );
+            assert_eq!(case_of(dir.path()), Some(Case::Recovering), "{ended}");
+            assert_eq!(d.next_due(), Some(1000 + WARN + NUDGE));
+            let line = shown(dir.path(), 1000 + WARN).line(1000 + WARN);
+            assert!(
+                line.contains("silent 40m — nudging in 5m"),
+                "{ended}: {line}"
+            );
+            assert!(!shown(dir.path(), 1000 + WARN).working(), "{ended}");
+
+            d.reconcile(vec![f.clone()], 1000 + WARN + 10);
+            assert!(dispatches(&go(&mut d, 1000 + WARN + NUDGE - 1)).is_empty());
+            let acts = go(&mut d, 1000 + WARN + NUDGE);
+            let [
+                Act::Dispatch {
+                    attempt,
+                    text,
+                    tag,
+                    target,
+                    ..
+                },
+            ] = acts.as_slice()
+            else {
+                panic!("{ended}: nudged once the window and the delay have passed: {acts:?}");
+            };
+            assert_eq!((text, target.as_str()), (&stall_text(tag), "t2"), "{ended}");
+            assert_eq!(
+                attempt.opened_by, opened_by,
+                "{ended}: the same episode's attempt"
+            );
+            assert_eq!(
+                load(dir.path()).unwrap().attempts.len(),
+                2,
+                "{ended}: counted with the attempt that started the turn"
+            );
+            assert!(
+                d.may_send(&label(), attempt, &live("master")),
+                "{ended}: sendable"
+            );
+
+            let attempt = attempt.clone();
+            d.answer(
+                &label(),
+                &attempt,
+                Answer::Submitted { started: None },
+                1000 + WARN + NUDGE + 1,
+            );
+            let mut now = 1000 + WARN + NUDGE + 1;
+            while let Some(due) = d.next_due() {
+                now = due.max(now + 1);
+                assert!(
+                    dispatches(&go(&mut d, now)).is_empty(),
+                    "{ended}: nudged once"
+                );
+                d.reconcile(vec![f.clone()], now);
+            }
+            assert!(
+                matches!(
+                    case_of(dir.path()),
+                    Some(Case::HandsOff(HandsOff::WaitingForYou(_)))
+                ),
+                "{ended}: {:?}",
+                case_of(dir.path())
+            );
+            assert!(sent < 400, "the first attempt came before its turn");
+        }
+    }
+
+    /// The silence nudge queues behind the turn it was sent over, so that
+    /// turn ending is the nudge's turn about to begin, not someone taking
+    /// the agent back. The episode that sent it keeps it through that end,
+    /// whether the end and the nudge's start are read together or apart,
+    /// and names the start as its own. When that turn goes silent too the
+    /// same episode, its two attempts spent, leaves it to a person: no
+    /// other episode opens to nudge again.
+    #[test]
+    fn a_queued_silence_nudge_stays_with_the_episode_that_sent_it() {
+        for ended in [FAILED, DONE] {
+            for together in [true, false] {
+                let which = format!("{ended} / together {together}");
+                let (dir, record, mut d, f, _) = attempt_turn_open(ended, 400);
+                let owner = load(dir.path()).unwrap();
+                go(&mut d, 400 + WARN);
+                let acts = go(&mut d, 400 + WARN + NUDGE);
+                let attempt = dispatches(&acts)[0].0.clone();
+                let at = 400 + WARN + NUDGE + 1;
+                d.answer(
+                    &label(),
+                    &attempt,
+                    Answer::Submitted {
+                        started: Some("t3".into()),
+                    },
+                    at,
+                );
+                let confirm_by = load(dir.path()).unwrap().next_at;
+                assert_eq!(confirm_by, Some(at - 1 + CONFIRM_WITHIN), "{which}");
+
+                append(&record, &[&line(DONE, "t2")]);
+                if !together {
+                    written_at(&record, at);
+                    touched(&mut d, &record, at);
+                    let waiting = load(dir.path()).unwrap();
+                    assert_eq!(
+                        (waiting.state, waiting.attempts.len(), waiting.next_at),
+                        (State::Dispatched, 2, confirm_by),
+                        "{which}: the turn it queued behind ended, and it is still waited on"
+                    );
+                    d.reconcile(vec![f.clone()], at);
+                    assert_eq!(load(dir.path()).unwrap().opened_by, owner.opened_by);
+                }
+                append(&record, &[&line(STARTED, "t3")]);
+                written_at(&record, at);
+                touched(&mut d, &record, at);
+                let running = load(dir.path()).unwrap();
+                assert_eq!(
+                    (
+                        running.kind,
+                        running.opened_by.as_str(),
+                        running.state,
+                        running.attempts.len()
+                    ),
+                    (owner.kind, owner.opened_by.as_str(), State::Running, 2),
+                    "{which}: the same episode, with both attempts spent"
+                );
+                assert_eq!(d.next_due(), Some(at + WARN), "{which}");
+
+                assert!(dispatches(&go(&mut d, at + WARN)).is_empty(), "{which}");
+                assert!(
+                    dispatches(&go(&mut d, at + WARN + NUDGE)).is_empty(),
+                    "{which}: not nudged a second time"
+                );
+                let Some(Case::HandsOff(HandsOff::WaitingForYou(why))) = case_of(dir.path()) else {
+                    panic!("{which}: {:?}", case_of(dir.path()));
+                };
+                assert!(why.contains("silent again"), "{which}: {why}");
+                let latched = load(dir.path()).unwrap();
+                assert_eq!(
+                    (latched.opened_by.as_str(), latched.attempts.len()),
+                    (owner.opened_by.as_str(), 2),
+                    "{which}"
+                );
+                assert_eq!(d.next_due(), None, "{which}");
+
+                let later = at + 20 * WARN;
+                assert!(dispatches(&d.reconcile(vec![f.clone()], later)).is_empty());
+                assert!(
+                    dispatches(&go(&mut d, later + 20 * WARN)).is_empty(),
+                    "{which}"
+                );
+                let still = load(dir.path()).unwrap();
+                assert_eq!(
+                    (still.opened_by.as_str(), still.state, still.attempts.len()),
+                    (owner.opened_by.as_str(), State::Escalated, 2),
+                    "{which}: latched for good, by its one owner"
+                );
+            }
+        }
+    }
+
+    /// The agent latched for a person on a turn clank's nudge started,
+    /// and then that turn ends: on the provider's capacity, the ordinary
+    /// way, or stopped. It is the episode's own turn, so its end is not
+    /// somebody taking the agent back: the latch, the owner and both spent
+    /// attempts stand, whether the same monitor reads the end or one that
+    /// started after it was written. Only a turn the episode does not own
+    /// ends it.
+    #[test]
+    fn a_latched_episodes_own_turn_ending_refunds_nothing() {
+        for origin in [FAILED, DONE] {
+            for end in [FAILED, DONE, CODEX_ABORTED_T] {
+                for restarted in [false, true] {
+                    let which = format!("{origin} / {end} / restarted {restarted}");
+                    let (dir, record, mut d, f, _) = attempt_turn_open(origin, 400);
+                    let owner = load(dir.path()).unwrap();
+                    go(&mut d, 400 + WARN);
+                    let acts = go(&mut d, 400 + WARN + NUDGE);
+                    let attempt = dispatches(&acts)[0].0.clone();
+                    let at = 400 + WARN + NUDGE + 1;
+                    d.answer(
+                        &label(),
+                        &attempt,
+                        Answer::Submitted {
+                            started: Some("t3".into()),
+                        },
+                        at,
+                    );
+                    append(&record, &[&line(DONE, "t2"), &line(STARTED, "t3")]);
+                    written_at(&record, at);
+                    touched(&mut d, &record, at);
+                    go(&mut d, at + WARN);
+                    go(&mut d, at + WARN + NUDGE);
+                    assert_eq!(load(dir.path()).unwrap().state, State::Escalated, "{which}");
+
+                    let ends = at + WARN + NUDGE + 50;
+                    append(&record, &[&line(end, "t3")]);
+                    written_at(&record, ends);
+                    let mut sent = 0;
+                    if restarted {
+                        d = driver();
+                    } else {
+                        sent += dispatches(&touched(&mut d, &record, ends)).len();
+                    }
+                    sent += dispatches(&d.reconcile(vec![f.clone()], ends + 1)).len();
+                    while let Some(due) = d.next_due() {
+                        sent += dispatches(&go(&mut d, due)).len();
+                    }
+                    sent += dispatches(&go(&mut d, ends + 50 * WARN)).len();
+                    assert_eq!(sent, 0, "{which}: nothing more is sent");
+                    let after = load(dir.path()).unwrap();
+                    assert_eq!(
+                        (
+                            after.kind,
+                            after.opened_by.as_str(),
+                            after.state,
+                            after.attempts.len()
+                        ),
+                        (owner.kind, owner.opened_by.as_str(), State::Escalated, 2),
+                        "{which}: the same owner, latched, with nothing refunded"
+                    );
+
+                    append(&record, &[&line(STARTED, "t4")]);
+                    written_at(&record, ends + 60 * WARN);
+                    touched(&mut d, &record, ends + 60 * WARN);
+                    assert_ne!(
+                        load(dir.path()).map(|e| e.opened_by),
+                        Some(owner.opened_by.clone()),
+                        "{which}: a turn that is not its own ends it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every way a turn can move under an episode, by whose turn it is. A
+    /// turn the episode owns, the one it was opened for or one its attempt
+    /// started, completing, failing, being stopped or going silent, leaves
+    /// the same episode in charge with no attempt forgotten, whatever
+    /// state it is in and whatever kind opened it. A turn it does not own
+    /// starting ends it, and only then does another owner appear.
+    #[test]
+    fn an_episode_ends_only_on_a_turn_it_does_not_own() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Moves {
+            OwnedCompletes,
+            OwnedFails,
+            OwnedIsStopped,
+            OwnedGoesSilent,
+            StrangerStarts,
+        }
+        let watched = |now, gate| Ctx {
+            stall: Some(ON),
+            period: Some("stall-1-9".into()),
+            quiet_since: Some(100),
+            ..owing(now, HELPER, gate)
+        };
+        let attempt = |n, disposition, started: Option<&str>| Attempt {
+            n,
+            claimed_at: 50,
+            transport: Transport::Helper.name().into(),
+            target: "t1".into(),
+            tag: format!("clank-recovery-x-{n}"),
+            started: started.map(str::to_string),
+            disposition,
+        };
+        for kind in [Kind::Failed, Kind::Idle, Kind::Stall] {
+            for state in [
+                State::Waiting,
+                State::Dispatched,
+                State::Running,
+                State::Escalated,
+            ] {
+                for moves in [
+                    Moves::OwnedCompletes,
+                    Moves::OwnedFails,
+                    Moves::OwnedIsStopped,
+                    Moves::OwnedGoesSilent,
+                    Moves::StrangerStarts,
+                ] {
+                    let which = format!("{kind:?} / {state:?} / {moves:?}");
+                    let mut s = snap([started("t1")]);
+                    match kind {
+                        Kind::Failed => s.apply(failed("t1", "server_error")),
+                        Kind::Idle => s.apply(done("t1")),
+                        _ => {}
+                    }
+                    // The newest turn it owns: the one its attempt started,
+                    // or, with that attempt still out, the one it was sent
+                    // over.
+                    let (attempts, owned) = match state {
+                        State::Dispatched => (vec![attempt(1, Disposition::Submitted, None)], "t1"),
+                        _ => {
+                            s.apply(started("t2"));
+                            if state == State::Waiting {
+                                s.apply(failed("t2", "server_error"));
+                            }
+                            (vec![attempt(1, Disposition::Started, Some("t2"))], "t2")
+                        }
+                    };
+                    let class = match (state, kind) {
+                        (State::Waiting, _) => "server_error",
+                        (State::Escalated, _) | (_, Kind::Stall) => STALL,
+                        (_, Kind::Idle) => IDLE,
+                        _ => "server_error",
+                    };
+                    let before = Episode {
+                        kind,
+                        state,
+                        attempts,
+                        failed_turn: match state {
+                            State::Waiting => "t2".into(),
+                            _ => "t1".into(),
+                        },
+                        next_at: match state {
+                            State::Waiting => Some(500),
+                            State::Dispatched => Some(50 + CONFIRM_WITHIN),
+                            _ => None,
+                        },
+                        notice: (state == State::Escalated).then(|| "latched".to_string()),
+                        ..blank("owner".into(), "t1".into(), class.into(), &watched(0, None))
+                    };
+                    match moves {
+                        Moves::OwnedCompletes => s.apply(ended(owned, Outcome::Completed)),
+                        Moves::OwnedFails => s.apply(failed(owned, "billing_error")),
+                        Moves::OwnedIsStopped => s.apply(ended(owned, Outcome::Interrupted)),
+                        Moves::OwnedGoesSilent => {}
+                        Moves::StrangerStarts => s.apply(started("x9")),
+                    }
+                    let mut ep = Some(before.clone());
+                    for now in [60, 100 + WARN, 100 + WARN + NUDGE, 100 + 90 * WARN] {
+                        ep = decide(ep, &s, &watched(now, None)).0;
+                        ep = decide(ep, &s, &watched(now, GO)).0;
+                        let Some(e) = &ep else {
+                            panic!("{which}: an owed agent is left with no episode at {now}");
+                        };
+                        match moves {
+                            Moves::StrangerStarts => assert_ne!(
+                                e.opened_by, before.opened_by,
+                                "{which}: a turn it does not own ends it"
+                            ),
+                            _ => {
+                                assert_eq!(
+                                    (e.opened_by.as_str(), e.kind),
+                                    (before.opened_by.as_str(), before.kind),
+                                    "{which}: its own turn moving opens no other owner at {now}"
+                                );
+                                assert!(
+                                    e.attempts.len() >= before.attempts.len()
+                                        && e.attempts[0].n == 1
+                                        && e.live(),
+                                    "{which}: nothing it spent is forgotten at {now}: {e:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A silence nudge whose turn never starts keeps its confirmation
+    /// bound through the end of the turn it queued behind, and is latched
+    /// there as an attempt nobody saw start.
+    #[test]
+    fn a_queued_silence_nudge_that_never_starts_is_latched_at_its_bound() {
+        let (dir, record, mut d, _f, _) = attempt_turn_open(FAILED, 400);
+        go(&mut d, 400 + WARN);
+        let acts = go(&mut d, 400 + WARN + NUDGE);
+        let attempt = dispatches(&acts)[0].0.clone();
+        let at = 400 + WARN + NUDGE;
+        d.answer(
+            &label(),
+            &attempt,
+            Answer::Submitted { started: None },
+            at + 1,
+        );
+        append(&record, &[&line(DONE, "t2")]);
+        written_at(&record, at + 2);
+        touched(&mut d, &record, at + 2);
+        assert_eq!(d.next_due(), Some(at + CONFIRM_WITHIN));
+        assert!(dispatches(&go(&mut d, at + CONFIRM_WITHIN)).is_empty());
+        let latched = load(dir.path()).unwrap();
+        assert_eq!(
+            (latched.state, latched.attempts.len()),
+            (State::Escalated, 2)
+        );
+        assert_eq!(
+            latched.attempts[1].disposition,
+            Disposition::Indeterminate,
+            "it may yet start: never replayed"
+        );
+    }
+
+    /// The same custody where the harness names no turn to the transport
+    /// and the nudge's turn is known by the tag in its text: from a failed
+    /// turn's retry and from an idle nudge, with the end of the turn it
+    /// queued behind read with its start or before it.
+    #[test]
+    fn a_queued_silence_nudge_is_known_by_its_tag() {
+        let watched = |now, gate, since| Ctx {
+            stall: Some(ON),
+            period: Some(format!("stall-1-{since}")),
+            quiet_since: Some(since),
+            ..owing(now, HELPER, gate)
+        };
+        for (end, first) in [
+            (failed("t1", "server_error"), retries("server_error")[0]),
+            (done("t1"), IDLE_WAITS[0]),
+        ] {
+            for together in [true, false] {
+                let which = format!("{end:?} / together {together}");
+                let mut s = snap([started("t1"), end.clone()]);
+                let ep = decide(None, &s, &watched(0, None, 0)).0;
+                let ep = decide(ep, &s, &watched(first, GO, 0)).0.unwrap();
+                let ep = submitted(ep, 1, Some("t2"), first + 1);
+                s.apply(started("t2"));
+                let ep = decide(Some(ep), &s, &watched(1000, None, 1000)).0;
+                let ep = decide(ep, &s, &watched(1000 + WARN, GO, 1000)).0;
+                let (ep, fx) = decide(ep, &s, &watched(1000 + WARN + NUDGE, GO, 1000));
+                let [Effect::Dispatch { n: 2, tag, target }] = fx.as_slice() else {
+                    panic!("{which}: {fx:?}");
+                };
+                assert_eq!(target, "t2", "{which}");
+                let owner = ep.clone().unwrap();
+                let at = 1000 + WARN + NUDGE + 1;
+                let mut ep = Some(submitted(ep.unwrap(), 2, None, at));
+
+                s.apply(ended("t2", Outcome::Completed));
+                if !together {
+                    ep = decide(ep, &s, &watched(at + 1, None, at)).0;
+                    let waiting = ep.as_ref().unwrap();
+                    assert_eq!(
+                        (waiting.state, waiting.attempts.len(), waiting.next_at),
+                        (State::Dispatched, 2, Some(at - 1 + CONFIRM_WITHIN)),
+                        "{which}"
+                    );
+                }
+                s.apply(Fact::Started {
+                    id: "p9".into(),
+                    text: Some(stall_text(tag)),
+                });
+                let ep = decide(ep, &s, &watched(at + 2, None, at + 2)).0;
+                let running = ep.as_ref().unwrap();
+                assert_eq!(
+                    (
+                        running.kind,
+                        running.opened_by.as_str(),
+                        running.state,
+                        running.attempts.len(),
+                        running.attempts[1].started.as_deref()
+                    ),
+                    (
+                        owner.kind,
+                        owner.opened_by.as_str(),
+                        State::Running,
+                        2,
+                        Some("p9")
+                    ),
+                    "{which}"
+                );
+                let ep = decide(ep, &s, &watched(at + 2 + WARN, GO, at + 2)).0;
+                let (ep, fx) = decide(ep, &s, &watched(at + 2 + WARN + NUDGE, GO, at + 2));
+                assert!(fx.is_empty(), "{which}: not nudged a second time");
+                assert!(
+                    told(&ep).is_some_and(|t| t.contains("silent again")),
+                    "{which}: {ep:?}"
+                );
+                assert_eq!(ep.as_ref().unwrap().attempts.len(), 2, "{which}");
+                let (ep, fx) = decide(ep, &s, &watched(at + 90 * WARN, GO, at + 2));
+                assert!(fx.is_empty(), "{which}");
+                let ep = ep.unwrap();
+                assert_eq!(
+                    (ep.opened_by.as_str(), ep.state, ep.attempts.len()),
+                    (owner.opened_by.as_str(), State::Escalated, 2),
+                    "{which}: latched for good, by its one owner"
+                );
+            }
+        }
+    }
+
+    /// The silence of a turn clank started is the record's, so a monitor
+    /// restarted in the middle of it, before the warning or after, warns
+    /// and nudges when the first would have.
+    #[test]
+    fn a_restart_does_not_reset_the_silence_of_a_turn_clank_started() {
+        for ended in [FAILED, DONE] {
+            for restart in [400 + WARN - 300, 400 + WARN + 20] {
+                let (dir, _record, mut d, f, _) = attempt_turn_open(ended, 400);
+                let which = format!("{ended} restarted at {restart}");
+                if restart > 400 + WARN {
+                    go(&mut d, 400 + WARN);
+                    assert_eq!(warnings(dir.path()).len(), 1, "{which}");
+                }
+                drop(d);
+                let mut d = driver();
+                d.reconcile(vec![f], restart);
+                let warn_at = 400 + WARN;
+                if restart < warn_at {
+                    assert_eq!(d.next_due(), Some(warn_at), "{which}");
+                    assert_eq!(
+                        case_of(dir.path()),
+                        Some(Case::Active(Active::Turn)),
+                        "{which}"
+                    );
+                    assert!(dispatches(&go(&mut d, warn_at)).is_empty(), "{which}");
+                }
+                assert_eq!(warnings(dir.path()).len(), 1, "{which}: warned once");
+                assert_eq!(d.next_due(), Some(warn_at + NUDGE), "{which}");
+                assert!(
+                    dispatches(&go(&mut d, warn_at + NUDGE - 1)).is_empty(),
+                    "{which}"
+                );
+                assert_eq!(dispatches(&go(&mut d, warn_at + NUDGE)).len(), 1, "{which}");
+            }
+        }
+    }
+
+    /// With the stall's nudge off the turn clank started is warned of and
+    /// held for that named reason; with the stall watch off it is held for
+    /// that one. Neither is left recovering with nothing due.
+    #[test]
+    fn a_silent_turn_clank_started_rests_only_on_a_named_reason() {
+        let (dir, _record, mut d, f, _) = attempt_turn_open(FAILED, 400);
+        let warn_only = Facts {
+            stall: Some(Stall {
+                warn: WARN,
+                nudge: None,
+            }),
+            ..f.clone()
+        };
+        d.reconcile(vec![warn_only], 401);
+        assert!(dispatches(&go(&mut d, 400 + WARN)).is_empty());
+        assert_eq!(warnings(dir.path()).len(), 1);
+        assert_eq!(
+            case_of(dir.path()),
+            Some(Case::HandsOff(HandsOff::StallNudgeOff))
+        );
+        assert_eq!(d.next_due(), None);
+
+        let (dir, _record, mut d, f, _) = attempt_turn_open(FAILED, 400);
+        d.reconcile(vec![Facts { stall: None, ..f }], 401);
+        assert_eq!(
+            case_of(dir.path()),
+            Some(Case::HandsOff(HandsOff::StallWarnOff))
+        );
+        assert_eq!(d.next_due(), None);
+    }
+
+    /// An open turn whose silence cannot be timed is a record that cannot
+    /// be read for the purpose: it goes the blind nudge's way, or is held
+    /// because that policy is off. It is never left without either.
+    #[test]
+    fn a_silence_that_cannot_be_timed_goes_the_unreadable_records_way() {
+        let running = snap([started("t1")]);
+        let untimed = Ctx {
+            stall: Some(ON),
+            period: Some("stall-1-10".into()),
+            quiet_since: None,
+            ..owing(0, HELPER, None)
+        };
+        assert_eq!(
+            standing(&running, &untimed),
+            Some(Standing::HandsOff(HandsOff::BlindNudgeOff))
+        );
+        let blind = Fallback {
+            identity: "w1".into(),
+            every: 600,
+        };
+        let with_blind = Ctx {
+            fallback: Some(blind.clone()),
+            ..untimed.clone()
+        };
+        assert_eq!(
+            standing(&running, &with_blind),
+            Some(Standing::Recover(Trigger::Fallback(blind)))
+        );
+        let timed = Ctx {
+            quiet_since: Some(5),
+            ..untimed
+        };
+        assert!(matches!(
+            standing(&running, &timed),
+            Some(Standing::Recover(Trigger::Stall { since: 5, .. }))
+        ));
+    }
+
+    /// A decision that cannot be recorded leaves the agent recovering, not
+    /// forgotten: the decision is owed and due, and is made once the disk
+    /// lets it be.
+    #[test]
+    fn a_recovery_that_cannot_be_recorded_is_still_due() {
+        enable(Tool::Codex, Some(Transport::Typed));
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record.jsonl");
+        append(&record, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
+        std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+        let f = codex_facts(dir.path(), &record, "session-one", true, false);
+        let mut d = driver();
+        d.reconcile(vec![f.clone()], 1);
+        assert_eq!(load(dir.path()), None, "nothing could be recorded");
+        assert_eq!(case_of(dir.path()), Some(Case::Recovering));
+        assert_eq!(
+            d.next_due(),
+            Some(1 + RETRY_LOOK),
+            "and the decision is due"
+        );
+        std::fs::write(issued_path(dir.path()), "0").unwrap();
+        go(&mut d, 1 + RETRY_LOOK);
+        assert_eq!(load(dir.path()).map(|e| e.kind), Some(Kind::Idle));
+    }
+
     /// A record replaced, or cut short, is another quiet period.
     #[test]
     fn a_replaced_or_truncated_record_starts_a_new_period() {
@@ -7155,6 +9075,7 @@ pub(crate) mod tests {
                 }
                 _ => std::fs::write(&record, &body).unwrap(),
             }
+            written_at(&record, WARN + 10);
             touched(&mut d, &record, WARN + 10);
             assert!(dispatches(&go(&mut d, WARN + NUDGE)).is_empty(), "{how}");
             assert_eq!(d.next_due(), Some(WARN + 10 + WARN), "{how}");

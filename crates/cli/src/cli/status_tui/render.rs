@@ -761,17 +761,22 @@ pub(super) fn scrollable_header(
             // process without a pane is lost, not gone.
             let gone =
                 view.presence_of(&a.label) == Presence::Missing && !view.lost.contains(&a.label);
-            let not_working = a.state.as_ref().filter(|s| {
-                s.activity()
-                    .is_some_and(|act| *act != crate::cli::agent_state::Activity::Working)
-            });
+            let not_working = a
+                .state
+                .as_ref()
+                .filter(|s| s.activity().is_some() && !s.working());
             if !waiting {
                 if gone {
                     spans.push(dim("  gone".to_string()));
                 } else if let Some(s) = not_working {
                     let now = crate::cli::recovery::unix_now();
                     let brief = s.brief(now);
-                    if s.interrupted() {
+                    if s.undelivered(now).is_some() {
+                        spans.push(colored(
+                            crate::cli::agent_state::UNDELIVERED_SGR,
+                            format!("  {brief}"),
+                        ));
+                    } else if s.interrupted() {
                         let owes = owes(snap, &a.label)
                             .text()
                             .map(|o| format!(" · owes {o}"))
@@ -11832,6 +11837,7 @@ mod tests {
     ) -> crate::cli::agent_state::View {
         use crate::cli::agent_state::{AgentState, Nudge, Observer, View};
         View {
+            owed: None,
             state: AgentState {
                 role: "master".into(),
                 session: "s1".into(),
@@ -11842,7 +11848,7 @@ mod tests {
                 },
                 activity,
                 since: 0,
-                suppressors: Vec::new(),
+                owed: None,
                 nudge: Nudge::WaitingForYou("resuming this harness is not enabled".into()),
                 cannot_resume: Some("no evidence".into()),
                 attending: Vec::new(),
@@ -11902,6 +11908,81 @@ mod tests {
             !r.contains("gone"),
             "running without a pane is not gone: {r}"
         );
+    }
+
+    /// A current view of an agent whose record shows `activity` and who is
+    /// owed a message, `delivery`'s way, since unix second 0, in `case`.
+    fn owing_view(
+        activity: crate::cli::agent_state::Activity,
+        delivery: crate::cli::ledger::Delivery,
+        case: crate::cli::agent_state::Case,
+    ) -> crate::cli::agent_state::View {
+        use crate::cli::agent_state::{OwedItem, Owing, View};
+        let item = OwedItem {
+            kind: "message".into(),
+            what: "message from claude".into(),
+            since: crate::cli::ledger::Since::At(0),
+            delivery,
+        };
+        let mut state = view_of(activity, None).state;
+        state.owed = Some(Owing {
+            undelivered: (delivery != crate::cli::ledger::Delivery::Delivered)
+                .then(|| item.clone()),
+            oldest: item,
+            warn: 2400,
+            case,
+        });
+        View::at(state, None, crate::cli::recovery::unix_now())
+    }
+
+    /// Work the bound session never received is shouted in its agent's own
+    /// row, in bold bright red, with what it is, in place of the spinner.
+    /// Work that was delivered and is still owed reads as its recovery
+    /// state, and a row spins `working` only on the record's own evidence.
+    #[test]
+    fn an_undelivered_agent_row_is_red_and_only_evidence_spins() {
+        use crate::cli::agent_state::{Active, Activity, Case, UNDELIVERED_SGR};
+        use crate::cli::ledger::Delivery;
+        let red = format!("\x1b[{UNDELIVERED_SGR}m");
+        let mut s = two_agent_snap();
+        s.active_plan = Some(plan_state("foo", reviewer_missing("codex")));
+        let row = |s: &StatusSnapshot| {
+            let out = render_at(s, 40, 140, 0, 0, &PanelView::just(Mode::LogScroll)).0;
+            line_with(&out, "codex").to_string()
+        };
+
+        s.agents[1].state = Some(owing_view(
+            Activity::Working,
+            Delivery::NotDelivered,
+            Case::Recovering,
+        ));
+        let codex = row(&s);
+        assert!(codex.contains(&format!("{red}  UNDELIVERED ")), "{codex:?}");
+        assert!(
+            visible(&codex).contains("· message from claude"),
+            "{codex:?}"
+        );
+        assert!(!codex.contains(SPINNER[0]), "{codex:?}");
+        assert!(!visible(&codex).contains("working"), "{codex:?}");
+
+        s.agents[1].state = Some(owing_view(
+            Activity::Working,
+            Delivery::Delivered,
+            Case::Recovering,
+        ));
+        let codex = row(&s);
+        assert!(!codex.contains(&red), "delivered is not shouted: {codex:?}");
+        assert!(visible(&codex).contains("turn open"), "{codex:?}");
+        assert!(!codex.contains(SPINNER[0]), "{codex:?}");
+
+        s.agents[1].state = Some(owing_view(
+            Activity::Working,
+            Delivery::Delivered,
+            Case::Active(Active::Turn),
+        ));
+        let codex = row(&s);
+        assert!(codex.contains(SPINNER[0]), "evidence spins: {codex:?}");
+        assert!(!codex.contains(&red), "{codex:?}");
     }
 
     /// An interrupted agent's row is drawn in capitals and the orange, not

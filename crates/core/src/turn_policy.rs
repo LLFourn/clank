@@ -428,6 +428,24 @@ pub struct Presentation {
     pub identities: Vec<String>,
     pub receipts: Vec<String>,
     pub repeat: RepeatDecision,
+    /// When it was handed to its carrier. Absent from state saved before
+    /// a result had a bound; such a presentation died with its monitor.
+    #[serde(default)]
+    pub handed: Ms,
+}
+
+/// How long a carrier has to answer for the presentation it was handed.
+///
+/// A hook answers as soon as its output is flushed, so a minute is a
+/// carrier that will not answer, not a slow one. Not the park ceiling:
+/// that bounds a wait for work, and this bounds a write.
+pub const DELIVERY_RESULT_WITHIN: Ms = 60_000;
+
+impl Presentation {
+    /// The moment its carrier's silence is a failed delivery.
+    pub fn expires(&self) -> Ms {
+        self.handed.saturating_add(DELIVERY_RESULT_WITHIN)
+    }
 }
 
 /// Text a verdict carries that is not work.
@@ -632,6 +650,8 @@ pub enum ResultOutcome {
     Resolved(Vec<Effect>),
     /// The same result again for the presentation it last settled.
     Duplicate,
+    /// [`Event::ResultOverdue`] found nothing in flight past its bound.
+    InTime,
     /// A result for a presentation that is not in flight, and that this
     /// result did not just settle. The transport makes this impossible,
     /// so it is refused and commits nothing.
@@ -651,6 +671,10 @@ pub enum Event {
     /// the monitor turns a closed connection into this, so every
     /// presentation resolves. Terminal: no later success can exist.
     EmitFailed(PresentationId),
+    /// The presentation in flight has had [`DELIVERY_RESULT_WITHIN`] and
+    /// no result: it failed, terminally, as a closed connection fails it.
+    /// A result that arrives afterwards finds nothing in flight.
+    ResultOverdue,
     CheckInDue,
     /// The check-in fired for these entries could not be delivered, and
     /// why.
@@ -1023,6 +1047,23 @@ impl SessionState {
             .min()
     }
 
+    /// When the presentation in flight stops being a delivery in progress.
+    pub fn delivery_deadline(&self) -> Option<Ms> {
+        self.outstanding.as_ref().map(Presentation::expires)
+    }
+
+    fn overdue(&mut self, facts: &Facts<'_>) -> ResultOutcome {
+        match self
+            .outstanding
+            .as_ref()
+            .filter(|p| facts.now >= p.expires())
+            .map(|p| p.id.clone())
+        {
+            Some(id) => self.settle(id, Resolution::Failed, facts),
+            None => ResultOutcome::InTime,
+        }
+    }
+
     /// Whether this state belongs to the facts' binding. A state for
     /// another session must be replaced, never consulted.
     pub fn bound(&self, facts: &Facts<'_>) -> bool {
@@ -1071,6 +1112,7 @@ impl SessionState {
             Event::Attend(req) => Output::Attend(self.attend(req, facts)),
             Event::Delivered(id) => Output::Result(self.settle(id, Resolution::Delivered, facts)),
             Event::EmitFailed(id) => Output::Result(self.settle(id, Resolution::Failed, facts)),
+            Event::ResultOverdue => Output::Result(self.overdue(facts)),
             Event::CheckInDue => Output::Effects(self.check_in_due(facts)),
             Event::CheckInUndeliverable { check_ins, why } => {
                 self.check_in_undeliverable(&check_ins, why);
@@ -1329,7 +1371,7 @@ impl SessionState {
         if deliverable.is_empty() || self.outstanding.is_some() {
             return Verdict::Park;
         }
-        let p = self.present(&deliverable, place);
+        let p = self.present(&deliverable, place, facts.now);
         let repeat = p.repeat.count();
         let verdict = Verdict::Deliver {
             presentation: p.id.clone(),
@@ -1346,7 +1388,7 @@ impl SessionState {
     /// record. A failed one is never reused: its count belongs to the
     /// episode it was made in, which an observed change may since have
     /// ended.
-    fn present(&mut self, owed: &[OwedItem], place: Option<&TurnPlace>) -> Presentation {
+    fn present(&mut self, owed: &[OwedItem], place: Option<&TurnPlace>, now: Ms) -> Presentation {
         let identities = owed_identities(owed);
         let receipts: Vec<String> = owed.iter().flat_map(|o| o.receipts.clone()).collect();
         self.next_seq += 1;
@@ -1361,6 +1403,7 @@ impl SessionState {
             },
             identities,
             receipts,
+            handed: now,
         }
     }
 
@@ -1561,12 +1604,13 @@ impl SessionState {
     /// owed item, by the same deliverable projection a turn-end presents
     /// from, so work the session never received stays recoverable.
     /// `facts.owed` must be the work actually owed: none owed is quiet.
+    ///
+    /// A pending block is not asked about: what it withholds is already
+    /// absent from `facts.owed`, and what it does not withhold is owed
+    /// whoever raised the block.
     pub fn recovery_quiet(&self, facts: &Facts<'_>) -> Option<Quiet> {
         if !self.bound(facts) {
             return None;
-        }
-        if facts.blocked {
-            return Some(Quiet::Blocked);
         }
         if facts.asking {
             return Some(Quiet::Asking);
@@ -1677,7 +1721,6 @@ fn owed_identities(owed: &[OwedItem]) -> Vec<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quiet {
-    Blocked,
     Asking,
     Attending,
 }
