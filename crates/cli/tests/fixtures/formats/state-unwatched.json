@@ -1,0 +1,24 @@
+{
+  "role": "standby",
+  "session": "00000000-0000-4000-8000-000000000004",
+  "tool": "codex",
+  "monitor": {
+    "pid": 10010,
+    "birth": {
+      "v": "mac1",
+      "sec": 1793844431,
+      "usec": 124634
+    }
+  },
+  "activity": {
+    "is": "unwatched"
+  },
+  "since": 1794313800,
+  "reachability": {
+    "by": "none",
+    "since": 1794313800
+  },
+  "nudge": {
+    "is": "nothing"
+  }
+}

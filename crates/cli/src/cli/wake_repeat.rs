@@ -70,6 +70,13 @@ const WINDOW: u64 = 256 * 1024;
 /// turn's start, so a turn whose prompt lies further back than the window
 /// is unknown, not placed at a later fragment of it.
 pub(crate) fn claude_boundary(transcript: &Path) -> Option<Boundary> {
+    let (newest, started) = claude_scan(transcript)?;
+    started.filter(|b| newest.as_deref() == Some(b.turn.as_str()))
+}
+
+/// The newest turn a Claude transcript names in its last [`WINDOW`], by
+/// any of that turn's records, and the newest prompt record in view.
+fn claude_scan(transcript: &Path) -> Option<(Option<String>, Option<Boundary>)> {
     let (_, lines) = crate::cli::web::transcript::Tail::open(transcript, WINDOW).ok()?;
     let mut newest: Option<String> = None;
     let mut started: Option<Boundary> = None;
@@ -104,7 +111,50 @@ pub(crate) fn claude_boundary(transcript: &Path) -> Option<Boundary> {
             });
         }
     }
-    started.filter(|b| newest.as_deref() == Some(b.turn.as_str()))
+    Some((newest, started))
+}
+
+/// Where a Stop of `tool`'s sits in `record`, as far as the adapter can
+/// say: the turn's boundary; else the turn alone, which a Claude
+/// transcript still names by the turn's later records once its prompt is
+/// further back than the window, and Codex's hook is told (`turn_id`);
+/// else nothing. With it, how much of the record there was to read,
+/// measured before the reading: anything written during it leaves the
+/// record longer than the place vouches for, never shorter.
+pub(crate) fn place(
+    tool: clank_core::Tool,
+    record: Option<&Path>,
+    turn_id: Option<&str>,
+) -> clank_core::turn_policy::TurnPlace {
+    use clank_core::Tool;
+    let read_to = record
+        .filter(|_| matches!(tool, Tool::Claude | Tool::Codex))
+        .and_then(|record| crate::cli::web::transcript::Tail::open(record, 0).ok())
+        .map(|(tail, _)| tail.at())
+        .map(|(file, len)| clank_core::turn_policy::ReadTo { file, len });
+    let boundary = match (tool, record, turn_id) {
+        (Tool::Claude, Some(record), _) => claude_boundary(record),
+        (Tool::Codex, Some(record), Some(turn)) => codex_boundary(record, turn),
+        _ => None,
+    };
+    if let Some(b) = boundary {
+        return clank_core::turn_policy::TurnPlace {
+            turn: Some(b.turn),
+            position: Some(b.position),
+            human_turn: b.human,
+            read_to,
+        };
+    }
+    clank_core::turn_policy::TurnPlace {
+        turn: match (tool, record) {
+            (Tool::Claude, Some(record)) => claude_scan(record).and_then(|(newest, _)| newest),
+            (Tool::Codex, _) => turn_id.map(str::to_string),
+            _ => None,
+        },
+        position: None,
+        human_turn: false,
+        read_to,
+    }
 }
 
 /// The newest event of Codex turn `turn` in its rollout, which a Stop of

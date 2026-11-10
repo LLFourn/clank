@@ -31,6 +31,7 @@ async fn connecting(
     let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
     let hello = Hello {
         proto: PROTO,
+        build: None,
         repo: repo.to_string_lossy().into(),
         who: Who::Agent {
             author: author.to_string(),
@@ -338,6 +339,7 @@ async fn reporting(
     let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
     let hello = Hello {
         proto: PROTO,
+        build: None,
         repo: repo.to_string_lossy().into(),
         who: Who::Agent {
             author: author.to_string(),

@@ -87,6 +87,7 @@ fn stop(tool: Tool, session: &str, position: Option<u64>) -> Report {
                 turn: position.map(|p| format!("turn-{p}")),
                 position,
                 human_turn: false,
+                read_to: None,
             },
         },
         deadline: u64::MAX,

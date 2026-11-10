@@ -775,41 +775,31 @@ impl Turns {
         self.persist(author, None);
     }
 
-    /// Deliverer `conn` ended unanswered. If it was `author`'s park,
-    /// nothing watches the agent: its record, read to `cursor` (inode,
-    /// offset), is the evidence recovery judges that by.
-    pub(crate) fn lost(
-        &mut self,
-        author: &AgentLabel,
-        conn: u64,
-        cursor: impl FnOnce() -> Option<(u64, u64)>,
-        g: &Gathered,
-    ) {
+    /// Deliverer `conn` ended unanswered. If it was `author`'s park, the
+    /// agent has had no waiter since now. Whether its turn is over is the
+    /// Stop that park reported to say, never the park's ending.
+    pub(crate) fn lost(&mut self, author: &AgentLabel, conn: u64, g: &Gathered) {
         let Some(custody) = self.custody(author, g) else {
             return;
         };
         if custody.park != Some(conn) {
             return;
         }
-        custody.state.unwatched = cursor().map(|(record, read)| Unwatched {
-            since: g.now,
-            record,
-            read,
-        });
+        custody.state.unwatched = Some(Unwatched { since: g.now });
         self.persist(author, None);
     }
 
-    /// Recovery saw `author`'s record move off `unwatched`'s cursor: that
-    /// loss is over, for good. A newer one is left alone.
-    pub(crate) fn watched_again(&mut self, author: &AgentLabel, unwatched: Unwatched) {
+    /// `author`'s hook was told to wake it at its deadline, outside any
+    /// step: it is past the Stop that hook reported.
+    pub(crate) fn woken(&mut self, author: &AgentLabel) {
         let Some(custody) = self
             .agents
             .get_mut(author)
-            .filter(|c| c.state.unwatched == Some(unwatched))
+            .filter(|c| c.state.stopped.is_some())
         else {
             return;
         };
-        custody.state.unwatched = None;
+        custody.state.stopped = None;
         self.persist(author, None);
     }
 
@@ -1063,7 +1053,8 @@ impl Turns {
     }
 
     /// What recovery, status and the TUI take of `author`: its attendance,
-    /// its question, once it escalates its repeat count, and a lost park.
+    /// its question, once it escalates its repeat count, a lost park, and
+    /// the Stop it last reported.
     pub(crate) fn projection(
         &mut self,
         author: &AgentLabel,
@@ -1093,6 +1084,7 @@ impl Turns {
                 .map(|r| r.count)
                 .filter(|n| *n >= clank_core::turn_policy::ESCALATE_AT),
             unwatched: custody.state.unwatched,
+            stopped: custody.state.stopped.clone(),
         }
     }
 

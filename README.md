@@ -1071,6 +1071,60 @@ retries hold. The question is over when it is answered, dismissed or cancelled
 in the terminal, when its turn ends or fails, when a newer prompt begins, or
 when its session is no longer the agent's.
 
+### What a row says of an agent
+
+Every state the monitor publishes about an agent rests on something it
+holds. Nothing is shown because nothing else matched.
+
+- **`working <age>`**, with the spinner in the TUI: the agent's latest turn
+  is open in its harness's record, its Stop hook has not reported that turn's
+  end, and the record moved inside `recovery.stall_warn`. An open turn with
+  none of that reads `turn open <age>`.
+- **Nothing** (the resting row), and `waiting for work` in `clank status`:
+  the turn is over and a waiter of the agent's session is connected to the
+  monitor, so the next thing it is owed is handed straight to it.
+- **`unreachable <age>`**: the turn is over and no waiter is connected. Dim
+  when the agent is owed nothing, bright red when it is owed work. The age
+  runs from the later of the turn's end and the last waiter going, and reads
+  `age unknown` when a monitor finds the agent already that way and nothing
+  on disk dates it. A turn that ended
+  less than 20 seconds ago is not called unreachable yet: its Stop hook is on
+  its way to park.
+- **`unknown`**: there is no current state for the agent (no monitor, or one
+  that has not published since the binding changed), its record cannot be
+  read, or its monitor has served for less than about half a minute and
+  cannot yet tell a waiter that has not reattached from one that is gone.
+
+A Stop hook's report is evidence that the turn is over whatever the harness's
+own record says: Codex keeps a turn open in its rollout for as long as its
+Stop hook runs. The report is kept in the agent's turn state
+(`.clank/agents/<label>/turn.json`, `stopped`), against the turn and the place
+in the record the hook read, so it survives a monitor restart. It stops
+counting as soon as the record shows a newer turn or more of the same one,
+and when clank delivers something to the agent. When the hook cannot place
+the Stop (a turn so long that its start is beyond what the hook reads back),
+the report is kept all the same, with the record's file and length as the
+hook saw them: the turn is over while the record is still exactly that, a
+newer turn is running again, and the stopped turn whose record has changed
+since the hook read it, or whose hook did not say what it saw, reads
+`unknown`. It is never `working`, and never nudged as idle. A session start or a
+compaction is never such a report.
+
+Only a connection the monitor holds makes an agent reachable: a wait or a
+parked Stop hook of the session and tool its label is bound to now. The TUI,
+`clank status --watch`, a recovery helper, a wait from a session since
+replaced, and anything a waiter wrote to disk about itself do not.
+`clank status -j` carries the value under `agents[].state.state.reachability`:
+`{"by":"waiter","since":<unix seconds>,"build":"<the waiter's build>"}`,
+`{"by":"none","since":<unix seconds or null>}` or `{"by":"unknown"}`.
+
+An unreachable agent that is owed work is recovered at once as an idle agent
+is (below), without waiting out the stall window, and under every guard a
+nudge always has. A Grok agent in that state is shown `unreachable <age> · not
+nudged` and is never typed at: typed input cancels a running Grok turn, and a
+missing waiter is not permission to type. It is reachable again when its next
+turn arms its wait.
+
 ### When nothing is delivering
 
 The monitor keeps, for each agent, a ledger of what it is owed: every item,
@@ -1086,10 +1140,9 @@ always in one of four cases, and `clank status` says which:
    same.
 2. **Being delivered.** A wake has been handed to the agent's hook, which
    has a minute to answer for it. After that it was not delivered.
-3. **Working.** Its turn has not ended and its record moved inside
-   `recovery.stall_warn`, or its harness is retrying the turn itself. Only
-   then does a row say `working`; an open turn with nothing to show for it
-   reads `turn open`.
+3. **Working.** Its turn has not ended and has been silent for less than
+   `recovery.stall_warn` since it was last owed or delivered something, or
+   its harness is retrying the turn itself.
 4. **Recovering**, as below.
 
 An item the bound session has not received for `recovery.stall_warn` reads
@@ -1106,10 +1159,12 @@ the monitor moves none of them.
   and has not run a turn yet, is nudged after a
   settle time (3 minutes), then once more 15 minutes later, then shown as
   waiting for you.
-- **Unwatched.** When the agent's parked wait ends without delivering
-  anything (its harness restarted, a compaction, a killed hook), `clank
-  status` shows it as `unwatched <age>` rather than working, and it is nudged
-  like an idle agent. Any new activity in its record, or a new wait, clears it.
+- **A lost wait.** When the agent's parked wait ends without delivering
+  anything (its harness restarted, a compaction, a killed hook), the agent
+  has no waiter from then, and that is all the loss says. Its turn is over
+  only if the Stop that wait reported still stands against the record; then
+  it reads `unreachable <age>` and is nudged like an idle agent. If the
+  record has moved on, the turn is running or unknown and is treated as that.
 - **Silent.** A turn that reads as running but whose record has not grown for
   `recovery.stall_warn` (default `40m`) is warned about (`silent 40m —
   nudging in 5m`, in the status line and the timeline), then nudged once

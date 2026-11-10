@@ -1,0 +1,28 @@
+{
+  "role": "standby",
+  "session": "00000000-0000-4000-8000-000000000004",
+  "tool": "codex",
+  "monitor": {
+    "pid": 10010,
+    "birth": {
+      "v": "mac1",
+      "sec": 1793844431,
+      "usec": 124634
+    }
+  },
+  "activity": {
+    "is": "working"
+  },
+  "since": 1794313800,
+  "nudge": {
+    "is": "nothing"
+  },
+  "attending": [
+    {
+      "task": "a0000000000000004",
+      "desc": "Paint the example",
+      "at": "2026-11-09T16:25:00Z",
+      "declared": true
+    }
+  ]
+}

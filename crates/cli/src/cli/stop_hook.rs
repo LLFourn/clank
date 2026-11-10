@@ -174,10 +174,7 @@ impl Arrived {
 /// What a Stop reports of the moment it arrived.
 enum Evidence {
     /// Read from the agent's record by this process, on arrival.
-    Read(
-        Option<super::wake_repeat::Boundary>,
-        Vec<super::question_state::Observation>,
-    ),
+    Read(TurnPlace, Vec<super::question_state::Observation>),
     /// The report the replaced build made of it.
     Carried(Report),
 }
@@ -279,9 +276,13 @@ async fn stop(
     let evidence = match resumed {
         Some(report) => Evidence::Carried(report),
         None => {
-            let boundary = native_boundary(tool, &input);
-            let questions = question_evidence(tool, &input, boundary.as_ref());
-            Evidence::Read(boundary, questions)
+            let place = super::wake_repeat::place(
+                tool,
+                input.transcript_path.as_deref().map(Path::new),
+                input.turn_id.as_deref(),
+            );
+            let questions = question_evidence(tool, &input, &place);
+            Evidence::Read(place, questions)
         }
     };
     let repo = match resolve_hook_repo(repo_override, &input) {
@@ -309,17 +310,11 @@ async fn stop(
     }
     let report = match evidence {
         Evidence::Carried(report) => report,
-        Evidence::Read(boundary, questions) => {
+        Evidence::Read(place, questions) => {
             let stop = TurnEndReport {
                 tool,
                 session: input.session_id.clone(),
-                place: boundary
-                    .map(|b| TurnPlace {
-                        turn: Some(b.turn),
-                        position: Some(b.position),
-                        human_turn: b.human,
-                    })
-                    .unwrap_or_default(),
+                place,
                 tasks: TaskSnapshot::of(&input),
             };
             let deadline = unix_ms(poll_deadline);
@@ -383,38 +378,30 @@ fn unix_ms(at: std::time::Instant) -> u64 {
 
 /// What the Stop proves about the agent's questions: the turn it ends,
 /// and the prompts its record shows behind that turn. Only Claude asks
-/// them.
+/// them. Taken from the one reading of the record the Stop was placed by,
+/// and only where that reading found the turn's own boundary.
 fn question_evidence(
     tool: Tool,
     input: &HookInput,
-    boundary: Option<&super::wake_repeat::Boundary>,
+    place: &TurnPlace,
 ) -> Vec<super::question_state::Observation> {
     use super::question_state::Observation;
-    let (Tool::Claude, Some(b), Some(transcript)) = (tool, boundary, &input.transcript_path) else {
+    let (Tool::Claude, Some(turn), Some(_), Some(transcript)) =
+        (tool, &place.turn, place.position, &input.transcript_path)
+    else {
         return Vec::new();
     };
     let session = input.session_id.as_str().to_string();
     vec![
         Observation::TurnOver {
             session: session.clone(),
-            prompt: b.turn.clone(),
+            prompt: turn.clone(),
         },
         Observation::Behind {
             session,
-            older: super::question_state::prompts_behind(Path::new(transcript), &b.turn),
+            older: super::question_state::prompts_behind(Path::new(transcript), turn),
         },
     ]
-}
-
-/// Where this Stop comes from in the agent's own record, read when the
-/// hook is invoked, before any waiting.
-fn native_boundary(tool: Tool, input: &HookInput) -> Option<super::wake_repeat::Boundary> {
-    let record = Path::new(input.transcript_path.as_deref()?);
-    match tool {
-        Tool::Claude => super::wake_repeat::claude_boundary(record),
-        Tool::Codex => super::wake_repeat::codex_boundary(record, input.turn_id.as_deref()?),
-        _ => None,
-    }
 }
 
 /// The SessionStart payload both tools send: claude documents it, codex

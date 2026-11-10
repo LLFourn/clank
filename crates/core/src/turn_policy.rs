@@ -66,6 +66,44 @@ pub struct TurnPlace {
     pub position: Option<u64>,
     /// The newest turn is positively a person's.
     pub human_turn: bool,
+    /// How much of the record the adapter had in front of it when it read
+    /// this place. `None` where it read no record, and from a hook built
+    /// before it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_to: Option<ReadTo>,
+}
+
+/// A record as an adapter saw it: which file, and its length then. Only
+/// ever compared with the same two measures of the same record, never
+/// with a clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadTo {
+    pub file: u64,
+    pub len: u64,
+}
+
+/// A Stop the agent's hook reported: a turn of the bound session was over
+/// when the monitor was told, whatever the harness's record says of it
+/// while its hook runs. Which turn is only as known as the adapter could
+/// place it, and a reader may claim no more than that.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stopped {
+    /// The turn that ended, where the adapter names it.
+    pub turn: Option<String>,
+    /// That turn's newest boundary in the record as the hook read it. With
+    /// it the Stop speaks for `turn` exactly while the boundary has not
+    /// moved.
+    pub position: Option<u64>,
+    /// The record as the hook saw it. A Stop with no boundary speaks for
+    /// the record's latest turn only while the record is still exactly
+    /// this; without it such a Stop ends no turn. Absent from a Stop kept
+    /// before hooks said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_to: Option<ReadTo>,
+    /// When the monitor was first told: after the hook read the record,
+    /// by however long the report took to arrive. Never evidence that the
+    /// record was unwritten at the Stop.
+    pub at: Ms,
 }
 
 /// One Stop, as the hook observed it.
@@ -721,6 +759,10 @@ pub struct Persisted {
     /// Declaration feedback a wake gate held back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub feedback: Vec<Notice>,
+    /// The Stop last reported on this binding, until the agent was woken
+    /// past it. State saved before Stops were kept has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<Stopped>,
 }
 
 /// The persisted shapes from before attending was only what an agent
@@ -748,6 +790,8 @@ mod legacy {
         unwatched: Option<Unwatched>,
         #[serde(default)]
         feedback: Vec<Notice>,
+        #[serde(default)]
+        stopped: Option<Stopped>,
     }
 
     #[derive(Deserialize)]
@@ -833,6 +877,7 @@ mod legacy {
                 received: s.received,
                 unwatched: s.unwatched,
                 feedback: s.feedback,
+                stopped: s.stopped,
             }
         }
     }
@@ -929,13 +974,12 @@ mod legacy {
     }
 }
 
-/// The current park ended without delivering, at `since`, when the agent's
-/// record (by inode) had been read to `read`.
+/// The current park ended without delivering, at `since`. It dates the
+/// agent having no waiter and says nothing of its turn: a connection is
+/// evidence of reachability only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unwatched {
     pub since: Ms,
-    pub record: u64,
-    pub read: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -967,6 +1011,10 @@ pub struct SessionState {
     /// next Stop that may wake, or that wakes anyway. Handed over once: a
     /// presentation carrying them that fails to emit does not restore them.
     pub feedback: Vec<Notice>,
+    /// The Stop last reported on this binding. Only a turn-end report sets
+    /// it; a wake clank gave the agent since ends it, and a session start
+    /// or a compaction is no evidence either way.
+    pub stopped: Option<Stopped>,
 }
 
 impl SessionState {
@@ -982,6 +1030,7 @@ impl SessionState {
             received: Vec::new(),
             unwatched: None,
             feedback: Vec::new(),
+            stopped: None,
         }
     }
 
@@ -997,6 +1046,7 @@ impl SessionState {
             received: self.received.clone(),
             unwatched: self.unwatched,
             feedback: self.feedback.clone(),
+            stopped: self.stopped.clone(),
         }
     }
 
@@ -1022,6 +1072,7 @@ impl SessionState {
             received,
             unwatched: p.unwatched,
             feedback: p.feedback,
+            stopped: p.stopped,
         }
     }
 
@@ -1120,6 +1171,11 @@ impl SessionState {
             Event::NativeTurnEnd(handoff) => Output::Verdict(self.native_turn_end(handoff, facts)),
             Event::Observed => Output::Effects(Vec::new()),
         };
+        // A notice wakes the agent with no result to wait for: it is past
+        // its Stop as soon as the hook is told.
+        if matches!(out, Output::Verdict(Verdict::Notify(_))) {
+            self.stopped = None;
+        }
         self.prune_received(facts);
         self.forget_stale_repeat(facts);
         out
@@ -1289,6 +1345,7 @@ impl SessionState {
         if facts.binding != Some(&report.session) || !self.bound(facts) {
             return Verdict::Silent(SilentWhy::StaleBinding);
         }
+        self.record_stop(&report.place, facts.now);
         self.resolve_declarations(&report.tasks);
         if let Some(gated) = drive_gate(facts) {
             return gated;
@@ -1299,6 +1356,30 @@ impl SessionState {
         let verdict =
             release_for_user_command(self.deliver_or_park(facts, Some(&report.place)), facts);
         self.with_feedback(verdict, facts)
+    }
+
+    /// Every Stop of the bound session is kept, placed or not: one the
+    /// adapter could not place is still a turn that ended, and replaces
+    /// whatever the last one said. The same report admitted again, by a
+    /// hook that attached to another monitor or a replay, is the same
+    /// Stop and keeps the time it was first reported; one that names no
+    /// turn and saw no record cannot be told from a later one, and is
+    /// dated afresh.
+    fn record_stop(&mut self, place: &TurnPlace, now: Ms) {
+        let again = self.stopped.as_ref().is_some_and(|held| {
+            (held.turn.is_some() || held.read_to.is_some())
+                && held.turn == place.turn
+                && held.position == place.position
+                && held.read_to == place.read_to
+        });
+        if !again {
+            self.stopped = Some(Stopped {
+                turn: place.turn.clone(),
+                position: place.position,
+                read_to: place.read_to,
+                at: now,
+            });
+        }
     }
 
     /// Grok's native Stop: its listing does for declarations what a Stop's
@@ -1499,6 +1580,7 @@ impl SessionState {
         if how == Resolution::Failed {
             return ResultOutcome::Resolved(Vec::new());
         }
+        self.stopped = None;
         let owed = owed_identities(facts.owed);
         for identity in p.identities.into_iter().filter(|i| owed.contains(i)) {
             if let Err(at) = self.received.binary_search(&identity) {
