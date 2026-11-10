@@ -2,11 +2,12 @@
 //! subagent, so work this agent has already been shown does not wake it
 //! again meanwhile. New work still wakes it.
 //!
-//! A declaration takes effect at once and lasts until the agent's next
-//! turn starts, whatever wakes it, or until `--clear`. clank never learns
-//! whether the named work finished, so it never says so: an agent woken
-//! while that work still runs declares it again. At `--expect`, a
-//! declaration still standing is checked in on once.
+//! A declaration takes effect at once. Where the harness's Stop lists its
+//! background tasks (Claude, Grok) it resolves to the one live task whose
+//! description is the name, and ends when a listing no longer has that
+//! task. Elsewhere it stands until `--clear`. No turn start ends it, and
+//! clank never reports the work finished. At `--expect`, a declaration
+//! still standing is checked in on once.
 //!
 //! An agent may attend several things at once; each request adds an entry
 //! or renews what already stands under that name (a run's `--desc`

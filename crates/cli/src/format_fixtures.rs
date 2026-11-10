@@ -367,17 +367,23 @@ fn an_unknown_agent_config_key_survives_update_agent_config() {
 
 // ── state files ───────────────────────────────────────────────────
 
+/// The entries the build that ended a declaration at the next turn start
+/// wrote: the declaration reads as one not yet resolved to a listed task,
+/// whose `seen_turn_end` no longer means anything, and the run keeps its
+/// registration.
 #[test]
-fn turn_state_with_stacked_attendances_reads_and_writes_back_unchanged() {
+fn turn_state_with_turn_scoped_declarations_reads_and_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     place(&dir.path().join("turn.json"), fixture!("turn.json"));
     let stored = crate::cli::turn_custody::load_stored(dir.path()).unwrap();
     assert_eq!(stored.binding.as_str(), SESSION);
     assert_eq!(stored.next_seq, 38);
-    assert_eq!(
-        serde_json::to_value(&stored.attendances).unwrap(),
-        raw(&dir.path().join("turn.json"))["attendances"]
-    );
+    let mut expected = raw(&dir.path().join("turn.json"))["attendances"].clone();
+    expected[0]["work"]["Declared"]
+        .as_object_mut()
+        .unwrap()
+        .remove("seen_turn_end");
+    assert_eq!(serde_json::to_value(&stored.attendances).unwrap(), expected);
     assert_eq!(stored.attendances.len(), 2);
     crate::cli::turn_custody::write_stored(dir.path(), &stored).unwrap();
     assert_eq!(
@@ -388,7 +394,8 @@ fn turn_state_with_stacked_attendances_reads_and_writes_back_unchanged() {
 
 /// The entries a build that resolved attendance against task listings
 /// wrote: a run keeps its registration, so its end is still recorded, and
-/// a named attendance stands until the agent's next turn starts.
+/// a named attendance keeps the task it resolved to, so the next listing
+/// still ends it.
 #[test]
 fn turn_state_with_listed_attendances_reads_as_declared_work() {
     let dir = tempfile::tempdir().unwrap();
@@ -402,7 +409,7 @@ fn turn_state_with_listed_attendances_reads_as_declared_work() {
         serde_json::to_value(&stored.attendances).unwrap(),
         json!([
             {
-                "work": {"Declared": {"name": "Implement the example plan", "seen_turn_end": true}},
+                "work": {"Declared": {"name": "Implement the example plan", "task": "a0000000000000001"}},
                 "desc": "Implement the example plan",
                 "started": 1793845190330u64,
                 "since": 1793845190330u64,
@@ -438,7 +445,7 @@ fn turn_state_with_one_old_attendance_reads_as_its_entries() {
         serde_json::to_value(&stored.attendances).unwrap(),
         json!([
             {
-                "work": {"Declared": {"name": "capture-probe sleeper", "seen_turn_end": true}},
+                "work": {"Declared": {"name": "capture-probe sleeper", "task": "a0000000000000002"}},
                 "desc": "capture-probe sleeper",
                 "started": 1000000,
                 "since": 1000000,

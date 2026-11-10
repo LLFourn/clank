@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use clank_core::turn_policy::{
     AttendReply, AttendRequest, Attending, CheckIn, CheckInRef, Effect, Entry, Event, Facts,
     Handoff, Liveness, Ms, Output, OwedItem, Persisted, Presence, PresentationId, Qualifies, Quiet,
-    ResultOutcome, SessionState, ShellProof, SilentWhy, Unqualified, Unwatched, Verdict, Withheld,
+    ResultOutcome, SessionState, ShellProof, SilentWhy, TaskSnapshot, Unqualified, Unwatched,
+    Verdict, Withheld,
 };
 use clank_core::{AgentLabel, AutoMode, Role, SessionId, SilentReason, Tool};
 
@@ -103,16 +104,22 @@ impl Gathered {
         clank_core::turn_policy::alone_verdict(session, &facts(self, None, &owed, &Process))
     }
 
-    /// Grok's native Stop for `session`, as the monitor would answer it.
+    /// Grok's native Stop for `session`, as the monitor would answer it
+    /// before its listing is applied to any declaration.
     pub(crate) fn handoff_verdict(&self, session: &SessionId, continued: bool) -> Verdict {
         clank_core::turn_policy::handoff_verdict(
-            &Handoff {
-                session: session.clone(),
-                wait_registered: self.waiter,
-                continued,
-            },
+            &self.handoff(session, continued, TaskSnapshot::Unavailable),
             &facts(self, Some(Tool::Grok), &[], &Process),
         )
+    }
+
+    fn handoff(&self, session: &SessionId, continued: bool, tasks: TaskSnapshot) -> Handoff {
+        Handoff {
+            session: session.clone(),
+            wait_registered: self.waiter,
+            continued,
+            tasks,
+        }
     }
 
     /// The header of the question the agent is waiting on, if any.
@@ -502,12 +509,19 @@ impl Turns {
     ) -> Option<Frame> {
         let event = match report {
             Report::Handoff {
-                session, continued, ..
+                session,
+                continued,
+                tasks,
+                ..
             } => {
-                if first {
-                    self.step(author, g, None, Event::NativeTurnEnd(session.clone()));
-                }
-                return Some(frame_of(g.handoff_verdict(session, *continued)));
+                let event = Event::NativeTurnEnd(g.handoff(session, *continued, tasks.clone()));
+                let stepped = first
+                    .then(|| self.step(author, g, Some(Tool::Grok), event))
+                    .flatten();
+                return Some(frame_of(match stepped {
+                    Some(Output::Verdict(verdict)) => verdict,
+                    _ => g.handoff_verdict(session, *continued),
+                }));
             }
             _ if g.owed.is_none() => return None,
             Report::TurnEnd { stop, .. } if first => Event::TurnEnd(stop.clone()),
@@ -528,6 +542,7 @@ impl Turns {
                 identities,
                 repeat,
                 escalated,
+                notices,
             } => {
                 let items: Vec<&WaitItem> = g
                     .owed
@@ -550,6 +565,10 @@ impl Turns {
                     if let Some(more) = super::wake_repeat::escalation(repeat, &duties) {
                         text.push_str(&more);
                     }
+                }
+                for notice in &notices {
+                    text.push_str("\n\n");
+                    text.push_str(&super::wake_render::notice_text(notice));
                 }
                 let text = text.trim_start().to_string();
                 // A session start's context earns receipts only where it
@@ -755,13 +774,18 @@ impl Turns {
             }
             AttendRequest::Clear { .. } => None,
         };
+        let listed = matches!(g.binding, Some((Tool::Claude | Tool::Grok, _)));
         let attending = |verb: &str| {
             let (what, run, expect) = said.clone().expect("an attend names what it attends");
-            let ends = if run {
-                "until its process ends, which wakes you once"
-            } else {
-                "until your next turn starts, whatever wakes you; declare it again then if it \
-                 is still running"
+            let ends = match (run, listed) {
+                (true, _) => "until its process ends, which wakes you once",
+                (false, true) => {
+                    "until your harness stops listing the task with that exact description"
+                }
+                (false, false) => {
+                    "until you clear it with `clank attend --clear` once your harness reports it \
+                     finished"
+                }
             };
             format!(
                 "{verb} {what} {ends}. Work you have already been shown stays quiet and new work \

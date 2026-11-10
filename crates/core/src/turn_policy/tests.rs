@@ -48,7 +48,63 @@ fn report(tool: Tool) -> TurnEndReport {
         tool,
         session: session(),
         place: TurnPlace::default(),
+        tasks: TaskSnapshot::Unavailable,
     }
+}
+
+/// Claude's Stop exactly as captured under `tests/fixtures/stop_hook/`.
+fn claude_stop(fixture: &str) -> TurnEndReport {
+    let path = format!(
+        "{}/tests/fixtures/stop_hook/{fixture}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let input: HookInput = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    TurnEndReport {
+        tasks: TaskSnapshot::of(&input),
+        ..report(Tool::Claude)
+    }
+}
+
+const SUBAGENT_ID: &str = "a25eee2eef81caf3e";
+
+/// A Claude-shaped listing of live subagents, `(id, name)`.
+fn listing(tasks: &[(&str, &str)]) -> TaskSnapshot {
+    TaskSnapshot::Known(
+        tasks
+            .iter()
+            .map(|(id, name)| {
+                BackgroundTask::from(serde_json::json!({
+                    "id": id, "type": "subagent", "status": "running", "description": name,
+                    "agent_type": "general-purpose"
+                }))
+            })
+            .collect(),
+    )
+}
+
+fn listed_stop(tasks: &[(&str, &str)]) -> Event {
+    Event::TurnEnd(TurnEndReport {
+        tasks: listing(tasks),
+        ..report(Tool::Claude)
+    })
+}
+
+/// A Stop whose newest turn is the person's: a prompt typed with no
+/// delivery behind it.
+fn persons_stop(turn: &str, tasks: TaskSnapshot) -> Event {
+    Event::TurnEnd(TurnEndReport {
+        place: TurnPlace {
+            turn: Some(turn.into()),
+            position: None,
+            human_turn: true,
+        },
+        tasks,
+        ..report(Tool::Claude)
+    })
+}
+
+fn bound_to(st: &SessionState) -> Vec<Option<&str>> {
+    st.attendances.iter().map(Entry::task).collect()
 }
 
 fn stop() -> Event {
@@ -234,82 +290,479 @@ fn a_declaration_takes_effect_at_once_for_every_tool() {
     }
 }
 
-/// The declaration lasts until the agent's next turn starts, whatever woke
-/// it: a delivery of new work (a message), or a later Stop, which only a
-/// turn can reach. Ending it claims nothing about the work.
+/// A declared subagent holds while Claude lists it, across turns the
+/// person starts and deliveries of new work alike: no turn start ends it.
+/// Claude's next listing without it ends it, and what it quieted wakes the
+/// agent again.
 #[test]
-fn a_wake_ends_every_standing_declaration_and_reports_none_finished() {
+fn a_declared_subagent_holds_while_listed_and_ends_when_unlisted() {
     let s = session();
     let a = owed("event:a", "read:a");
     let ab = [a[0].clone(), owed("message:b", "read:b")[0].clone()];
-    let mut st = received_then(&s, &a, declare("one"));
-    st.step(declare("two"), &facts(T0, &s, &a));
+    let mut st = received_then(&s, &a, declare(SUBAGENT_NAME));
+    let running = || Event::TurnEnd(claude_stop("stop_subagent_running.json"));
     assert_eq!(
-        verdict(st.step(stop(), &facts(T0 + MINUTE, &s, &a))),
+        verdict(st.step(running(), &facts(T0 + MINUTE, &s, &a))),
         Verdict::Park
     );
+    assert_eq!(bound_to(&st), [Some(SUBAGENT_ID)], "resolved to its task");
+
+    for (at, turn) in [(2, "prompt-1"), (3, "prompt-2")] {
+        let TurnEndReport { tasks, .. } = claude_stop("stop_subagent_running.json");
+        assert_eq!(
+            verdict(st.step(persons_stop(turn, tasks), &facts(T0 + at * MINUTE, &s, &a))),
+            Verdict::Park,
+            "the person's turn {turn} ends nothing"
+        );
+    }
+    let (message, identities) = presented(verdict(
+        st.step(running(), &facts(T0 + 4 * MINUTE, &s, &ab)),
+    ));
+    assert_eq!(identities, ["message:b"], "new work still wakes");
+    committed(st.step(Event::Delivered(message), &facts(T0 + 4 * MINUTE, &s, &ab)));
     assert_eq!(
-        names(&st),
-        ["one", "two"],
-        "the turn they were made in ended"
+        bound_to(&st),
+        [Some(SUBAGENT_ID)],
+        "the turn a delivery starts ends nothing"
+    );
+    assert_eq!(
+        verdict(st.step(running(), &facts(T0 + 5 * MINUTE, &s, &ab))),
+        Verdict::Park
     );
 
-    let (message, identities) = presented(verdict(st.step(
-        Event::Parked(report(Tool::Claude)),
-        &facts(T0 + 2 * MINUTE, &s, &ab),
-    )));
-    assert_eq!(identities, ["message:b"]);
-    assert_eq!(names(&st), ["one", "two"], "a park is not a turn");
-    let out = committed(st.step(Event::Delivered(message), &facts(T0 + 2 * MINUTE, &s, &ab)));
-    assert!(
-        out.iter()
-            .all(|e| matches!(e, Effect::CommitReceipts(_) | Effect::CommitRepeat(_))),
-        "nothing is reported finished: {out:?}"
-    );
-    assert!(st.attendances.is_empty(), "the message started a turn");
-    assert_eq!(st.next_deadline(), None, "their check-ins are gone too");
-
-    st.step(declare("one"), &facts(T0 + 3 * MINUTE, &s, &ab));
-    st.step(declare("two"), &facts(T0 + 3 * MINUTE, &s, &ab));
-    assert_eq!(names(&st), ["one", "two"], "re-declaring restores them");
+    let finished = Event::TurnEnd(claude_stop("stop_subagent_finished.json"));
+    let (_, identities) = presented(verdict(st.step(finished, &facts(T0 + 6 * MINUTE, &s, &ab))));
+    assert!(st.attendances.is_empty(), "the listing no longer has it");
     assert_eq!(
-        verdict(st.step(stop(), &facts(T0 + 4 * MINUTE, &s, &ab))),
-        Verdict::Park,
-        "and they quiet what was received again"
+        identities,
+        ["event:a", "message:b"],
+        "what it quieted wakes"
     );
 }
 
-/// A Stop after one that a declaration already saw is a new turn's end,
-/// whatever started that turn: the declaration ended with its start.
+/// A listing that was not sent says nothing: no number of Stops without
+/// one ends a declaration or counts against its match. Only a known
+/// listing, even an empty one, does.
 #[test]
-fn a_declaration_not_renewed_ends_at_the_next_turn() {
+fn an_omitted_listing_is_not_an_empty_one() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut bound = received_then(&s, &a, declare(SUBAGENT_NAME));
+    bound.step(
+        listed_stop(&[(SUBAGENT_ID, SUBAGENT_NAME)]),
+        &facts(T0, &s, &a),
+    );
+    let mut pending = received_then(&s, &a, declare("not started yet"));
+    for at in 1..=5 {
+        for st in [&mut bound, &mut pending] {
+            assert_eq!(
+                verdict(st.step(stop(), &facts(T0 + at * MINUTE, &s, &a))),
+                Verdict::Park,
+                "omitted listing {at}"
+            );
+        }
+    }
+    assert_eq!(bound_to(&bound), [Some(SUBAGENT_ID)]);
+    assert!(matches!(
+        pending.attendances[0].work,
+        Attending::Declared { misses: 0, .. }
+    ));
+    let (_, identities) = presented(verdict(
+        bound.step(listed_stop(&[]), &facts(T0 + 6 * MINUTE, &s, &a)),
+    ));
+    assert_eq!(identities, ["event:a"]);
+    assert!(bound.attendances.is_empty(), "an empty listing ends it");
+}
+
+/// A declaration is bound to the task it resolved to, not to its name: a
+/// later task reusing the description is not it. Declaring the name again
+/// asks the next listing which task it means now.
+#[test]
+fn a_declaration_is_its_task_not_its_description() {
     let s = session();
     let a = owed("event:a", "read:a");
     let mut st = received_then(&s, &a, declare(SUBAGENT_NAME));
+    st.step(listed_stop(&[("first", SUBAGENT_NAME)]), &facts(T0, &s, &a));
+    assert_eq!(bound_to(&st), [Some("first")]);
+    let (_, identities) = presented(verdict(st.step(
+        listed_stop(&[("second", SUBAGENT_NAME)]),
+        &facts(T0 + MINUTE, &s, &a),
+    )));
+    assert_eq!(identities, ["event:a"], "the first task ended");
+    assert!(st.attendances.is_empty(), "the second is nobody's");
+
+    let mut st = received_then(&s, &a, declare(SUBAGENT_NAME));
+    st.step(listed_stop(&[("first", SUBAGENT_NAME)]), &facts(T0, &s, &a));
+    st.step(declare(SUBAGENT_NAME), &facts(T0 + MINUTE, &s, &a));
+    assert_eq!(bound_to(&st), [Some("first"), None], "a renewal is pending");
+    st.step(
+        listed_stop(&[("first", SUBAGENT_NAME)]),
+        &facts(T0 + 2 * MINUTE, &s, &a),
+    );
+    assert_eq!(bound_to(&st), [Some("first")], "same task: merged");
+    assert_eq!(entry(&st).since, T0 + MINUTE, "on the renewal's clock");
+    st.step(declare(SUBAGENT_NAME), &facts(T0 + 3 * MINUTE, &s, &a));
     assert_eq!(
-        verdict(st.step(stop(), &facts(T0 + MINUTE, &s, &a))),
+        verdict(st.step(
+            listed_stop(&[("second", SUBAGENT_NAME)]),
+            &facts(T0 + 4 * MINUTE, &s, &a),
+        )),
         Verdict::Park
     );
-    let (_, identities) = presented(verdict(st.step(stop(), &facts(T0 + 2 * MINUTE, &s, &a))));
     assert_eq!(
+        bound_to(&st),
+        [Some("second")],
+        "the renewal took the new task"
+    );
+}
+
+/// A listed task nobody declared is ignored: it attends nothing, raises
+/// no notice and wakes nobody, whatever its kind.
+#[test]
+fn a_listed_task_nobody_declared_is_ignored() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let monitor = Event::TurnEnd(claude_stop("stop_monitor_task_running.json"));
+    let subagent = Event::TurnEnd(claude_stop("stop_subagent_running.json"));
+    for event in [monitor, subagent] {
+        let mut st = SessionState::new(s.clone());
+        assert_eq!(
+            verdict(st.step(event.clone(), &facts(T0, &s, &[]))),
+            Verdict::Park,
+            "nothing owed: nothing wakes"
+        );
+        assert!(st.attendances.is_empty());
+        let v = verdict(st.step(event, &facts(T0, &s, &a)));
+        let Verdict::Deliver {
+            identities,
+            notices,
+            ..
+        } = &v
+        else {
+            panic!("{v:?}")
+        };
+        assert_eq!(identities, &["event:a"]);
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(st.recovery_quiet(&facts(T0, &s, &a)), None);
+    }
+}
+
+/// A name that matches nothing listed is given one more listing (the
+/// work may start in the next turn), then dropped with one notice naming
+/// what is listed. Until then it stands as declared.
+#[test]
+fn a_declaration_nothing_listed_matches_is_dropped_with_one_notice() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = received_then(&s, &a, declare("sleeperr"));
+    let listed = || listed_stop(&[(SUBAGENT_ID, SUBAGENT_NAME)]);
+    assert_eq!(
+        verdict(st.step(listed(), &facts(T0 + MINUTE, &s, &a))),
+        Verdict::Park,
+        "one miss is allowed"
+    );
+    let v = verdict(st.step(listed(), &facts(T0 + 2 * MINUTE, &s, &a)));
+    let Verdict::Deliver {
         identities,
-        ["event:a"],
-        "nothing attended: received work wakes again"
+        notices,
+        ..
+    } = v
+    else {
+        panic!("{v:?}")
+    };
+    assert_eq!(identities, ["event:a"], "it no longer quiets anything");
+    assert_eq!(
+        notices,
+        [Notice::NoMatch {
+            name: "sleeperr".into(),
+            live: vec![TaskSummary {
+                id: Some(SUBAGENT_ID.into()),
+                kind: Some("subagent".into()),
+                description: Some(SUBAGENT_NAME.into()),
+            }],
+        }]
     );
     assert!(st.attendances.is_empty());
 
-    let mut renewed = received_then(&s, &a, declare(SUBAGENT_NAME));
-    renewed.step(stop(), &facts(T0 + MINUTE, &s, &a));
-    renewed.step(declare(SUBAGENT_NAME), &facts(T0 + 2 * MINUTE, &s, &a));
+    let mut quiet = SessionState::new(s.clone());
+    quiet.step(declare("sleeperr"), &facts(T0, &s, &[]));
+    quiet.step(listed(), &facts(T0, &s, &[]));
+    assert!(matches!(
+        verdict(quiet.step(listed(), &facts(T0, &s, &[]))),
+        Verdict::Notify(n) if matches!(n.as_slice(), [Notice::NoMatch { .. }])
+    ));
     assert_eq!(
-        verdict(renewed.step(stop(), &facts(T0 + 3 * MINUTE, &s, &a))),
+        verdict(quiet.step(listed(), &facts(T0, &s, &[]))),
         Verdict::Park,
-        "re-declared in the new turn, it stands for that one"
+        "reported once"
     );
-    assert_eq!(entry(&renewed).since, T0 + 2 * MINUTE);
 }
 
-/// A run is not turn-scoped: only its process going ends it.
+/// A name several listed tasks carry binds to none of them.
+#[test]
+fn a_name_several_listed_tasks_carry_is_dropped_with_a_notice() {
+    let s = session();
+    let mut st = standing(&s);
+    let v = verdict(st.step(
+        listed_stop(&[("a1", SUBAGENT_NAME), ("a2", SUBAGENT_NAME)]),
+        &facts(T0, &s, &[]),
+    ));
+    let Verdict::Notify(notices) = v else {
+        panic!("{v:?}")
+    };
+    let [Notice::Ambiguous { name, matches }] = notices.as_slice() else {
+        panic!("{notices:?}")
+    };
+    assert_eq!(name, SUBAGENT_NAME);
+    assert_eq!(matches.len(), 2);
+    assert!(st.attendances.is_empty());
+}
+
+/// Without a listing (Codex, OpenCode) a declaration outlives every turn,
+/// whatever starts it, is checked in on once at `--expect` without ending,
+/// and ends only when the agent clears it.
+#[test]
+fn without_a_listing_only_a_clear_ends_a_declaration() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let ab = [a[0].clone(), owed("message:b", "read:b")[0].clone()];
+    let mut st = received_then(&s, &a, declare("reviewer"));
+    let codex = || Event::TurnEnd(report(Tool::Codex));
+    for at in 1..=3 {
+        assert_eq!(
+            verdict(st.step(codex(), &facts(T0 + at * MINUTE, &s, &a))),
+            Verdict::Park,
+            "turn {at}"
+        );
+    }
+    let (message, _) = presented(verdict(st.step(codex(), &facts(T0 + 4 * MINUTE, &s, &ab))));
+    committed(st.step(Event::Delivered(message), &facts(T0 + 4 * MINUTE, &s, &ab)));
+    assert_eq!(names(&st), ["reviewer"], "a delivered message ends nothing");
+
+    let due = st.next_deadline().unwrap();
+    assert_eq!(
+        check_ins(effects(st.step(Event::CheckInDue, &facts(due, &s, &ab)))).len(),
+        1
+    );
+    assert!(effects(st.step(Event::CheckInDue, &facts(due + MINUTE, &s, &ab))).is_empty());
+    assert_eq!(names(&st), ["reviewer"], "a check-in is not an end");
+
+    let cleared = Event::Attend(AttendRequest::Clear {
+        session: s.clone(),
+        which: Clearing::Named("reviewer".into()),
+    });
+    assert_eq!(
+        attend_reply(st.step(cleared, &facts(due + MINUTE, &s, &ab))),
+        AttendReply::Cleared { removed: 1 }
+    );
+    assert!(st.attendances.is_empty());
+}
+
+/// Declaration feedback, made to fail one way or the other: a name that
+/// two Claude listings never match, or one that two listed tasks carry.
+#[derive(Clone, Copy, Debug)]
+enum Mismatch {
+    NoMatch,
+    Ambiguous,
+}
+
+impl Mismatch {
+    /// Two Stops that drop the declaration `"typo"`.
+    fn stops(self) -> [Event; 2] {
+        match self {
+            Self::NoMatch => [listed_stop(&[]), listed_stop(&[])],
+            Self::Ambiguous => [
+                listed_stop(&[]),
+                listed_stop(&[("a1", "typo"), ("a2", "typo")]),
+            ],
+        }
+    }
+
+    fn is(self, notices: &[Notice]) -> bool {
+        match (self, notices) {
+            (Self::NoMatch, [Notice::NoMatch { name, .. }])
+            | (Self::Ambiguous, [Notice::Ambiguous { name, .. }]) => name == "typo",
+            _ => false,
+        }
+    }
+}
+
+type Gate = fn(Facts<'_>) -> Facts<'_>;
+
+/// What holds a wake back holds declaration feedback back: a pending
+/// question, a block, auto off, or a person's command waiting for the idle
+/// prompt. The listing still ends the declaration
+/// meanwhile, and the feedback is held, not lost: the first Stop or parked
+/// re-step the gates allow wakes with it, and only once.
+#[test]
+fn declaration_feedback_waits_for_the_wake_gate() {
+    let s = session();
+    let gates: [(&str, Gate); 4] = [
+        ("asking", |f| Facts { asking: true, ..f }),
+        ("blocked", |f| Facts { blocked: true, ..f }),
+        ("auto off", |f| Facts {
+            auto: Ok(AutoMode::Off),
+            ..f
+        }),
+        ("a person's command", |f| Facts {
+            user_command: true,
+            ..f
+        }),
+    ];
+    for mismatch in [Mismatch::NoMatch, Mismatch::Ambiguous] {
+        for (gate, gated) in gates {
+            let mut st = SessionState::new(s.clone());
+            st.step(declare("typo"), &facts(T0, &s, &[]));
+            for event in mismatch.stops() {
+                let v = verdict(st.step(event, &gated(facts(T0, &s, &[]))));
+                assert!(
+                    matches!(
+                        v,
+                        Verdict::Park
+                            | Verdict::Silent(SilentWhy::AutoOff | SilentWhy::UserCommand)
+                    ),
+                    "{mismatch:?} {gate}: no wake while gated: {v:?}"
+                );
+            }
+            assert!(
+                st.attendances.is_empty(),
+                "{mismatch:?} {gate}: still ended"
+            );
+            let held = st.persisted();
+            assert_eq!(held.feedback.len(), 1, "{mismatch:?} {gate}: held");
+            let back: Persisted =
+                serde_json::from_str(&serde_json::to_string(&held).unwrap()).unwrap();
+            let mut st = SessionState::restored(back);
+            let v = verdict(st.step(
+                Event::Parked(report(Tool::Claude)),
+                &facts(T0 + MINUTE, &s, &[]),
+            ));
+            assert!(
+                matches!(&v, Verdict::Notify(n) if mismatch.is(n)),
+                "{mismatch:?} {gate}: the gate lifted, across a restart: {v:?}"
+            );
+            assert_eq!(
+                verdict(st.step(stop(), &facts(T0 + MINUTE, &s, &[]))),
+                Verdict::Park,
+                "{mismatch:?} {gate}: once"
+            );
+        }
+    }
+}
+
+/// Held feedback rides a wake the agent gets anyway, gated or not: owed
+/// work presented while a question is pending carries it.
+#[test]
+fn held_feedback_rides_a_presentation_that_wakes_anyway() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = SessionState::new(s.clone());
+    st.step(declare("typo"), &facts(T0, &s, &[]));
+    let asking = |owed| Facts {
+        asking: true,
+        ..facts(T0, &s, owed)
+    };
+    for event in Mismatch::NoMatch.stops() {
+        assert_eq!(verdict(st.step(event, &asking(&[]))), Verdict::Park);
+    }
+    let v = verdict(st.step(stop(), &asking(&a)));
+    assert!(
+        matches!(&v, Verdict::Deliver { notices, .. } if Mismatch::NoMatch.is(notices)),
+        "{v:?}"
+    );
+    assert!(st.feedback.is_empty());
+}
+
+/// Grok's registered waiter already carries the wake, so feedback would
+/// make one of its own: it does only through the wake gate, and the
+/// waiter verdict itself never changes.
+#[test]
+fn a_native_stops_feedback_waits_for_the_wake_gate() {
+    let s = session();
+    let none = || grok_listing(serde_json::json!([]));
+    let twins = || {
+        grok_listing(serde_json::json!([
+            {"id": "g1", "type": "subagent", "status": "running", "description": "typo"},
+            {"id": "g2", "type": "subagent", "status": "running", "description": "typo"}
+        ]))
+    };
+    for mismatch in [Mismatch::NoMatch, Mismatch::Ambiguous] {
+        for gate in ["asking", "blocked", "a person's command"] {
+            let gated = || Facts {
+                asking: gate == "asking",
+                blocked: gate == "blocked",
+                user_command: gate == "a person's command",
+                ..facts(T0, &s, &[])
+            };
+            let mut st = SessionState::new(s.clone());
+            st.step(declare("typo"), &facts(T0, &s, &[]));
+            let second = match mismatch {
+                Mismatch::NoMatch => none(),
+                Mismatch::Ambiguous => twins(),
+            };
+            for tasks in [none(), second] {
+                assert_eq!(
+                    verdict(st.step(native(&s, true, tasks), &gated())),
+                    Verdict::Silent(SilentWhy::WaitArmed),
+                    "{mismatch:?} {gate}"
+                );
+            }
+            assert!(st.attendances.is_empty());
+            let v = verdict(st.step(native(&s, true, none()), &facts(T0, &s, &[])));
+            assert!(
+                matches!(&v, Verdict::Notify(n) if mismatch.is(n)),
+                "{mismatch:?} {gate}: gates open: {v:?}"
+            );
+            assert_eq!(
+                verdict(st.step(native(&s, true, none()), &facts(T0, &s, &[]))),
+                Verdict::Silent(SilentWhy::WaitArmed),
+                "{mismatch:?} {gate}: once, and the waiter verdict is back"
+            );
+        }
+    }
+}
+
+/// One listed match with no id could never be told ended from any other
+/// task: the declaration is dropped at once, saying so, not as a miss.
+#[test]
+fn a_match_with_no_id_is_dropped_as_untrackable() {
+    let s = session();
+    let mut st = SessionState::new(s.clone());
+    st.step(declare("typo"), &facts(T0, &s, &[]));
+    let nameless = TaskSnapshot::Known(vec![BackgroundTask::from(serde_json::json!({
+        "type": "subagent", "status": "running", "description": "typo"
+    }))]);
+    let v = verdict(st.step(
+        Event::TurnEnd(TurnEndReport {
+            tasks: nameless,
+            ..report(Tool::Claude)
+        }),
+        &facts(T0, &s, &[]),
+    ));
+    assert!(
+        matches!(&v, Verdict::Notify(n) if matches!(n.as_slice(),
+            [Notice::Untrackable { name, task }] if name == "typo" && task.id.is_none())),
+        "{v:?}"
+    );
+    assert!(st.attendances.is_empty());
+}
+
+/// With every gate open, feedback wakes the agent at the Stop that drops
+/// the declaration, for either mismatch.
+#[test]
+fn declaration_feedback_wakes_when_the_gates_allow() {
+    let s = session();
+    for mismatch in [Mismatch::NoMatch, Mismatch::Ambiguous] {
+        let mut st = SessionState::new(s.clone());
+        st.step(declare("typo"), &facts(T0, &s, &[]));
+        let [first, second] = mismatch.stops();
+        assert_eq!(verdict(st.step(first, &facts(T0, &s, &[]))), Verdict::Park);
+        let v = verdict(st.step(second, &facts(T0, &s, &[])));
+        assert!(matches!(&v, Verdict::Notify(n) if mismatch.is(n)), "{v:?}");
+    }
+}
+
+/// A run outlives every turn: only its process going ends it.
 #[test]
 fn a_run_in_flight_keeps_the_agent_attending_across_turns() {
     let s = session();
@@ -770,6 +1223,7 @@ fn a_native_handoff_asks_for_one_wait_through_the_drive_gate() {
         session: s.clone(),
         wait_registered,
         continued,
+        tasks: TaskSnapshot::Unavailable,
     };
     let on = facts(T0, &s, &[]);
     assert_eq!(
@@ -813,6 +1267,9 @@ mod old_bytes {
     pub const OTHER_RENEWAL: &str = r#"{"binding":"00000000-0000-0000-0000-000000000000","attendance":{"Standing":{"task_id":"a25eee2eef81caf3e","kind":"Subagent","desc":"capture-probe sleeper","since":1000000,"expect":600000,"shell":null,"check_in":"Armed","renewal":{"selector":{"RunDesc":"test run"},"desc":"test run","since":1120000,"expect":1200000,"shell":{"pid":7001,"token":"mac1:7001:1"}}}},"repeat":null,"outstanding":null,"outstanding_episode_broken":false,"resolved":null,"next_seq":3,"received":["event:a"],"unwatched":null}"#;
     /// The set of entries resolved against task listings, as the last
     /// build before this one wrote it.
+    /// Declarations as the build that ended them at the next turn start
+    /// wrote them, one with its turn already ended.
+    pub const TURN_SCOPED: &str = r#"{"binding":"00000000-0000-0000-0000-000000000000","attendances":[{"work":{"Declared":{"name":"capture-probe sleeper","seen_turn_end":true}},"desc":"capture-probe sleeper","started":1000000,"since":1000000,"expect":600000,"check_in":"Armed"},{"work":{"Declared":{"name":"reviewer","seen_turn_end":false}},"desc":"reviewer","started":1000000,"since":1000000,"expect":600000,"check_in":"Fired"}],"repeat":null,"outstanding":null,"outstanding_episode_broken":false,"resolved":null,"next_seq":3,"received":["event:a"],"unwatched":null}"#;
     pub const LISTED: &str = r#"{"binding":"00000000-0000-0000-0000-000000000000","attendances":[{"selector":{"Name":"capture-probe sleeper"},"resolved":{"task_id":"a25eee2eef81caf3e","kind":"Subagent"},"desc":"capture-probe sleeper","since":1000000,"expect":600000,"shell":null,"check_in":"Armed"},{"selector":{"RunDesc":"test run"},"resolved":null,"desc":"test run","since":1060000,"expect":600000,"shell":{"pid":7001,"token":"mac1:7001:1"},"check_in":"Unarmed"},{"selector":{"Name":"watcher"},"resolved":{"task_id":"m1","kind":{"Unknown":"monitor"}},"desc":null,"since":1000000,"expect":600000,"shell":null,"check_in":{"Withheld":"AutoOff"}}],"repeat":null,"outstanding":null,"outstanding_episode_broken":false,"resolved":null,"next_seq":3,"received":["event:a"],"unwatched":null}"#;
 }
 
@@ -821,16 +1278,25 @@ fn restore(bytes: &str) -> SessionState {
 }
 
 /// State saved by every older build loads: a run keeps its registration,
-/// so its end is still recorded, and a named attendance stands until the
-/// agent's next turn starts.
+/// so its end is still recorded, and a named attendance keeps the task a
+/// listing resolved it to, so the next listing still ends it.
 #[test]
 fn every_older_saved_shape_loads_with_its_runs_registered() {
     let s = session();
-    let declared = |name: &str, since, expect, check_in| Entry {
+    let bound = |name: &str, task: &str, since, expect, check_in| Entry {
         work: Attending::Declared {
             name: name.into(),
-            seen_turn_end: true,
+            task: Some(task.into()),
+            misses: 0,
         },
+        desc: name.into(),
+        started: since,
+        since,
+        expect,
+        check_in,
+    };
+    let declared = |name: &str, since, expect, check_in| Entry {
+        work: Attending::declared(name.into()),
         desc: name.into(),
         started: since,
         since,
@@ -854,7 +1320,7 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
     assert_eq!(
         restore(old_bytes::OTHER_RENEWAL).attendances,
         [
-            declared(SUBAGENT_NAME, T0, 10 * MINUTE, CheckIn::Armed),
+            bound(SUBAGENT_NAME, SUBAGENT_ID, T0, 10 * MINUTE, CheckIn::Armed),
             test_run(T0 + 2 * MINUTE, 20 * MINUTE),
         ]
     );
@@ -862,10 +1328,11 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
     assert_eq!(
         listed.attendances,
         [
-            declared(SUBAGENT_NAME, T0, 10 * MINUTE, CheckIn::Armed),
+            bound(SUBAGENT_NAME, SUBAGENT_ID, T0, 10 * MINUTE, CheckIn::Armed),
             test_run(T0 + MINUTE, 10 * MINUTE),
-            declared(
+            bound(
                 "watcher",
+                "m1",
                 T0,
                 10 * MINUTE,
                 CheckIn::Withheld(Withheld::AutoOff)
@@ -876,7 +1343,31 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
 
     let mut st = restore(old_bytes::LISTED);
     st.step(stop(), &facts(T0 + 2 * MINUTE, &s, &[]));
-    assert_eq!(names(&st), ["test run"], "the declarations' turn is over");
+    assert_eq!(names(&st).len(), 3, "a Stop without a listing ends nothing");
+    st.step(
+        listed_stop(&[(SUBAGENT_ID, SUBAGENT_NAME)]),
+        &facts(T0 + 2 * MINUTE, &s, &[]),
+    );
+    assert_eq!(
+        names(&st),
+        [SUBAGENT_NAME, "test run"],
+        "the listing ends the task it no longer has"
+    );
+
+    let turn_scoped = restore(old_bytes::TURN_SCOPED);
+    assert_eq!(
+        turn_scoped.attendances,
+        [
+            declared(SUBAGENT_NAME, T0, 10 * MINUTE, CheckIn::Armed),
+            declared("reviewer", T0, 10 * MINUTE, CheckIn::Fired),
+        ]
+    );
+    let mut st = turn_scoped.clone();
+    st.step(stop(), &facts(T0 + MINUTE, &s, &[]));
+    assert_eq!(
+        st.attendances, turn_scoped.attendances,
+        "no turn start ends them now"
+    );
 
     let back: Persisted =
         serde_json::from_str(&serde_json::to_string(&listed.persisted()).unwrap()).unwrap();
@@ -1554,28 +2045,86 @@ fn a_waiting_user_command_ends_a_park_and_nothing_else() {
     ));
 }
 
-/// Grok's Stop is answered by the handoff, but it is a turn end all the
-/// same: a declaration it sees ends at the next one.
+/// Grok's `backgroundTasks`, as its native Stop sends them.
+fn grok_listing(tasks: serde_json::Value) -> TaskSnapshot {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Stop {
+        background_tasks: Option<Vec<BackgroundTask>>,
+    }
+    let stop: Stop = serde_json::from_value(serde_json::json!({"backgroundTasks": tasks})).unwrap();
+    TaskSnapshot::listed(stop.background_tasks)
+}
+
+fn native(s: &SessionId, wait_registered: bool, tasks: TaskSnapshot) -> Event {
+    Event::NativeTurnEnd(Handoff {
+        session: s.clone(),
+        wait_registered,
+        continued: false,
+        tasks,
+    })
+}
+
+/// Grok's native Stop resolves and ends declarations by its own listing,
+/// for its own session only, and its waiter verdict is the handoff's
+/// alone: the listing never says whether a wait runs. A run outlives it.
 #[test]
-fn a_native_stop_ends_declarations_like_any_turn_end() {
+fn a_native_stop_ends_declarations_by_its_listing_and_keeps_its_verdict() {
     let s = session();
     let mut st = standing(&s);
     st.step(run("test run", 7001), &facts(T0, &s, &[]));
-    st.step(Event::NativeTurnEnd(other_session()), &facts(T0, &s, &[]));
-    st.step(Event::NativeTurnEnd(s.clone()), &facts(T0, &s, &[]));
+    let sub = serde_json::json!([{"id": "g1", "type": "subagent", "status": "running",
+        "description": SUBAGENT_NAME, "agentType": "explore"}]);
+    let wait = serde_json::json!([{"id": "w1", "type": "shell", "status": "running",
+        "command": "clank wait"}]);
+    let other = other_session();
     assert_eq!(
-        names(&st),
-        [SUBAGENT_NAME, "test run"],
-        "its own turn ended"
+        verdict(st.step(
+            native(&other, false, grok_listing(serde_json::json!([]))),
+            &facts(T0, &s, &[])
+        )),
+        Verdict::Silent(SilentWhy::StaleBinding)
     );
-    st.step(Event::NativeTurnEnd(other_session()), &facts(T0, &s, &[]));
     assert_eq!(
-        names(&st),
-        [SUBAGENT_NAME, "test run"],
-        "another session's is not"
+        bound_to(&st),
+        [None, None],
+        "another session's listing is not"
     );
-    st.step(Event::NativeTurnEnd(s.clone()), &facts(T0, &s, &[]));
-    assert_eq!(names(&st), ["test run"], "a run outlives turns");
+    assert_eq!(
+        verdict(st.step(
+            native(&s, false, grok_listing(sub.clone())),
+            &facts(T0, &s, &[])
+        )),
+        Verdict::Notify(vec![Notice::ArmWait])
+    );
+    assert_eq!(bound_to(&st), [Some("g1"), None]);
+    assert_eq!(
+        verdict(st.step(
+            native(&s, false, grok_listing(wait.clone())),
+            &facts(T0, &s, &[])
+        )),
+        Verdict::Notify(vec![Notice::ArmWait]),
+        "a listed `clank wait` is not a registered waiter"
+    );
+    assert_eq!(names(&st), ["test run"], "Grok stopped listing it");
+    assert_eq!(
+        verdict(st.step(
+            native(&s, true, TaskSnapshot::Unavailable),
+            &facts(T0, &s, &[])
+        )),
+        Verdict::Silent(SilentWhy::WaitArmed)
+    );
+
+    let mut st = standing(&s);
+    st.step(
+        native(&s, true, grok_listing(wait.clone())),
+        &facts(T0, &s, &[]),
+    );
+    let v = verdict(st.step(native(&s, true, grok_listing(wait)), &facts(T0, &s, &[])));
+    assert!(
+        matches!(&v, Verdict::Notify(n) if matches!(n.as_slice(), [Notice::NoMatch { .. }])),
+        "a wait already armed still reports the agent's own declaration: {v:?}"
+    );
 }
 
 /// A run whose process cannot be seen has not ended: it keeps its

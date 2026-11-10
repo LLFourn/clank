@@ -6,8 +6,7 @@
 //!
 //! - claude stdin: `{ session_id, transcript_path, cwd,
 //!   stop_hook_active, last_assistant_message, ... }` plus
-//!   claude-only extras (`effort`, `background_tasks`, ...), none of
-//!   which clank reads.
+//!   claude-only extras (`effort`, `background_tasks`, ...).
 //! - codex stdin: same common fields plus codex-only extras
 //!   (`turn_id`, `model`, ...).
 //!
@@ -37,9 +36,9 @@ use crate::ids::SessionId;
 /// Both tools include all of these.
 ///
 /// `#[serde(default)]` on optional fields and ignoring unknown
-/// extras (claude's `effort` / `background_tasks` / `session_crons`,
-/// codex's `turn_id` / `model`) keeps the type forward-compatible
-/// with either agent adding fields later.
+/// extras (claude's `effort` / `session_crons`, codex's `model`)
+/// keeps the type forward-compatible with either agent adding fields
+/// later.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct HookInput {
     pub session_id: SessionId,
@@ -59,6 +58,59 @@ pub struct HookInput {
     /// send one.
     #[serde(default)]
     pub turn_id: Option<String>,
+    /// The harness's own live background work at this Stop. `None` when
+    /// the payload omits the field (codex), which says nothing about
+    /// whether anything is running; `Some(vec![])` says nothing is.
+    #[serde(default)]
+    pub background_tasks: Option<Vec<BackgroundTask>>,
+}
+
+/// One entry of a harness's Stop-time task listing: Claude's
+/// `background_tasks`, Grok's `backgroundTasks`.
+///
+/// Observed shapes (`crates/core/tests/fixtures/stop_hook/`): a subagent is
+/// `{id, type: "subagent", status, description, agent_type}` with its name
+/// in `description`; a finished task leaves the list rather than turning
+/// `completed`. Every field is optional, and `raw` keeps the whole entry as
+/// observed, so a field clank does not read is never lost.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "serde_json::Value", into = "serde_json::Value")]
+pub struct BackgroundTask {
+    /// The harness's stable id for the task.
+    pub id: Option<String>,
+    pub status: Option<String>,
+    /// `subagent`, `shell`, `monitor`, … .
+    pub kind: Option<String>,
+    /// A subagent's name; what a `clank attend` declaration matches.
+    pub description: Option<String>,
+    pub raw: serde_json::Value,
+}
+
+impl BackgroundTask {
+    /// Still running by its own status: a harness that keeps a finished
+    /// task in the list marks it `completed`.
+    pub fn live(&self) -> bool {
+        self.status.as_deref() != Some("completed")
+    }
+}
+
+impl From<BackgroundTask> for serde_json::Value {
+    fn from(task: BackgroundTask) -> Self {
+        task.raw
+    }
+}
+
+impl From<serde_json::Value> for BackgroundTask {
+    fn from(raw: serde_json::Value) -> Self {
+        let text = |key: &str| raw.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        Self {
+            id: text("id"),
+            status: text("status"),
+            kind: text("type"),
+            description: text("description"),
+            raw,
+        }
+    }
 }
 
 /// What the stop-hook adapter decides to emit after evaluating
@@ -188,24 +240,39 @@ mod tests {
         assert!(parsed.last_assistant_message.is_none());
     }
 
-    /// A harness's task listing is an extra like any other: a payload that
-    /// carries one still parses, and nothing in what clank reads holds it.
+    fn fixture(name: &str) -> HookInput {
+        let path = format!(
+            "{}/tests/fixtures/stop_hook/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    }
+
+    /// Claude's captured Stops: a running subagent is listed by its id and
+    /// name, a finished one leaves an empty list, and a payload without the
+    /// field (codex) is no listing at all rather than an empty one.
     #[test]
-    fn a_payload_with_a_task_listing_parses_and_keeps_none_of_it() {
-        let bare = r#"{"session_id":"session-one","cwd":"/repo","stop_hook_active":false}"#;
-        let listed = r#"{
-            "session_id": "session-one",
-            "cwd": "/repo",
-            "stop_hook_active": false,
-            "background_tasks": [
-                {"id": "a25eee2", "type": "subagent", "status": "running",
-                 "description": "capture-probe sleeper"},
-                {"id": "b1", "type": "shell", "command": "cargo test"}
-            ]
-        }"#;
-        let bare: HookInput = serde_json::from_str(bare).unwrap();
-        let listed: HookInput = serde_json::from_str(listed).unwrap();
-        assert_eq!(listed, bare);
+    fn a_claude_stop_carries_its_listing_and_an_omitted_one_is_none() {
+        let running = fixture("stop_subagent_running.json");
+        let tasks = running.background_tasks.expect("a listing");
+        let [task] = tasks.as_slice() else {
+            panic!("{tasks:?}")
+        };
+        assert_eq!(task.id.as_deref(), Some("a25eee2eef81caf3e"));
+        assert_eq!(task.kind.as_deref(), Some("subagent"));
+        assert_eq!(task.description.as_deref(), Some("capture-probe sleeper"));
+        assert!(task.live());
+        assert_eq!(task.raw["agent_type"], "general-purpose", "kept whole");
+
+        assert_eq!(
+            fixture("stop_subagent_finished.json").background_tasks,
+            Some(vec![])
+        );
+        let bare: HookInput = serde_json::from_str(
+            r#"{"session_id":"session-one","cwd":"/r","stop_hook_active":false}"#,
+        )
+        .unwrap();
+        assert_eq!(bare.background_tasks, None);
     }
 
     #[test]

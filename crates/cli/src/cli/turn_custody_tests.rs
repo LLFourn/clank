@@ -80,6 +80,7 @@ fn gathered(repo: &Path, who: &str, owed: &[clank_core::wait::WaitItem]) -> Gath
 fn stop(tool: Tool, session: &str, position: Option<u64>) -> Report {
     Report::TurnEnd {
         stop: TurnEndReport {
+            tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
             tool,
             session: sid(session),
             place: TurnPlace {
@@ -122,7 +123,12 @@ fn a_declaration_is_in_force_at_once_and_shown() {
         let mut turns = Turns::new(repo.path().to_path_buf());
         let g = gathered(repo.path(), "agent", &[]);
         let said = attend_name(&mut turns, "agent", "session-one", &g);
-        assert!(said.contains("until your next turn starts"), "{said}");
+        let ends = match tool {
+            Tool::Claude => "until your harness stops listing the task with that exact description",
+            _ => "until you clear it with `clank attend --clear` once your harness reports it",
+        };
+        assert!(said.contains(ends), "{tool:?}: {said}");
+        assert!(!said.contains("next turn"), "{said}");
         assert!(said.contains("after 10m"), "{said}");
         assert!(!said.contains("listed"), "{said}");
         let shown = turns.projection(&label("agent"), &g).attended;
@@ -144,6 +150,46 @@ fn a_declaration_is_in_force_at_once_and_shown() {
             "the monitor keeps it beside the agent"
         );
     }
+}
+
+/// A declaration Claude's listing never matches is reported once, in the
+/// text of the wake that Stop already carries.
+#[test]
+fn a_declaration_notice_rides_the_stops_presentation() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let listed = || match stop(Tool::Claude, "session-one", None) {
+        Report::TurnEnd {
+            stop,
+            deadline,
+            questions,
+        } => Report::TurnEnd {
+            stop: TurnEndReport {
+                tasks: clank_core::turn_policy::TaskSnapshot::Known(vec![
+                    clank_core::BackgroundTask::from(serde_json::json!({"id": "a1",
+                        "type": "subagent", "status": "running", "description": "sleeper"})),
+                ]),
+                ..stop
+            },
+            deadline,
+            questions,
+        },
+        other => other,
+    };
+    let quiet = gathered(repo.path(), "claude", &[]);
+    attend_name(&mut turns, "claude", "session-one", &quiet);
+    let frame = turns.answer(&author, 1, &listed(), true, &quiet).unwrap();
+    assert_eq!(frame.verdict, WireVerdict::Park, "one listing may miss");
+    let owed = [message("7")];
+    let g = gathered(repo.path(), "claude", &owed);
+    let frame = turns.answer(&author, 2, &listed(), true, &g).unwrap();
+    assert!(frame.presentation().is_some(), "{frame:?}");
+    let text = frame.rendered.expect("rendered");
+    assert!(text.contains("message: 7"), "{text}");
+    assert!(text.contains("matched no background task"), "{text}");
+    assert!(text.contains("subagent \"sleeper\" (a1)"), "{text}");
+    assert!(turns.projection(&author, &g).attended.is_empty());
 }
 
 /// A restarted monitor keeps the declaration in force with its original
@@ -1120,6 +1166,7 @@ fn a_grok_handoff_is_answered_without_waiting_for_a_fold() {
     let mut turns = Turns::new(repo.path().to_path_buf());
     let unfolded = Gathered::of(repo.path(), &author, None);
     let handoff = Report::Handoff {
+        tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
         session: sid("session-one"),
         continued: false,
         deadline: u64::MAX,
@@ -1145,19 +1192,51 @@ fn a_grok_handoff_is_answered_without_waiting_for_a_fold() {
     assert!(turns.state(&author).is_none_or(|s| s.outstanding.is_none()));
 
     attend_name(&mut turns, "grok", "session-one", &unfolded);
-    turns.answer(&author, 3, &handoff, true, &unfolded).unwrap();
+    for conn in 3..6 {
+        turns
+            .answer(&author, conn, &handoff, true, &unfolded)
+            .unwrap();
+    }
+    assert_eq!(
+        turns.projection(&author, &unfolded).attended.len(),
+        1,
+        "Stops without a listing end no declaration"
+    );
+    let listed = |tasks: serde_json::Value| Report::Handoff {
+        tasks: clank_core::turn_policy::TaskSnapshot::Known(serde_json::from_value(tasks).unwrap()),
+        session: sid("session-one"),
+        continued: false,
+        deadline: u64::MAX,
+    };
+    let running = listed(serde_json::json!([{"id": "g1", "type": "subagent",
+        "status": "running", "description": SUBAGENT, "agentType": "explore"}]));
+    let frame = turns.answer(&author, 6, &running, true, &unfolded).unwrap();
+    assert_eq!(
+        frame.rendered.as_deref(),
+        Some(super::super::wake_render::ARM_WAIT)
+    );
+    assert_eq!(
+        turns.state(&author).unwrap().attendances[0].task(),
+        Some("g1"),
+        "resolved by Grok's own listing, and persisted"
+    );
     turns
-        .answer(&author, 3, &handoff, false, &unfolded)
+        .answer(&author, 7, &running, false, &unfolded)
+        .unwrap();
+    turns
+        .answer(&author, 8, &listed(serde_json::json!([])), false, &unfolded)
         .unwrap();
     assert_eq!(
         turns.projection(&author, &unfolded).attended.len(),
         1,
-        "the Stop it was declared before ended its turn; a re-step is no Stop"
+        "a re-step is no Stop"
     );
-    turns.answer(&author, 4, &handoff, true, &unfolded).unwrap();
+    turns
+        .answer(&author, 9, &listed(serde_json::json!([])), true, &unfolded)
+        .unwrap();
     assert!(
         turns.projection(&author, &unfolded).attended.is_empty(),
-        "the next Stop is a turn later: the declaration is over"
+        "Grok stopped listing it: the declaration is over"
     );
 }
 

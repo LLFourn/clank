@@ -73,8 +73,8 @@ fn input(repo: &Path, session: &SessionId, event: &str, tasks: serde_json::Value
     .unwrap()
 }
 
-/// The Stop reads no task list: a listed running `clank wait` and an
-/// absent `backgroundTasks` decide the same. Only the monitor's
+/// The waiter is never read from the task list: a listed running `clank
+/// wait` and an absent `backgroundTasks` decide the same. Only the monitor's
 /// registration of the wait says it runs, and the continuation of the turn
 /// asked to arm one treats its not-yet-registered wait as pending.
 #[test]
@@ -107,6 +107,38 @@ fn the_waiter_is_the_monitors_registration_never_a_task_list() {
         None,
         "a wait just armed may not have registered yet; a failed one must not loop"
     );
+}
+
+/// A native Stop reports Grok's `backgroundTasks` as sent, for the monitor
+/// to resolve and end declarations by: an omitted field is no listing, and
+/// an empty one says nothing runs.
+#[test]
+fn a_stop_reports_its_native_listing_and_an_omitted_one_as_none() {
+    let (_temp, repo, _, session, _) = fixture();
+    let subagent = json!({"id": "g1", "type": "subagent", "status": "running",
+        "description": "sleeper", "agentType": "explore"});
+    let tasks = |stop: Input| match report(stop, 0) {
+        Report::Handoff { tasks, .. } => tasks,
+        other => panic!("{other:?}"),
+    };
+    let listed = tasks(input(&repo, &session, "stop", json!([subagent.clone()])));
+    let TaskSnapshot::Known(listed) = listed else {
+        panic!("{listed:?}")
+    };
+    let [task] = listed.as_slice() else {
+        panic!("{listed:?}")
+    };
+    assert_eq!(task.id.as_deref(), Some("g1"));
+    assert_eq!(task.description.as_deref(), Some("sleeper"));
+    assert_eq!(task.raw, subagent, "kept as sent");
+    assert_eq!(
+        tasks(input(&repo, &session, "stop", json!([]))),
+        TaskSnapshot::Known(vec![])
+    );
+    let bare: Input = serde_json::from_value(json!({"hookEventName": "stop",
+        "sessionId": session, "cwd": repo, "reason": "end_turn"}))
+    .unwrap();
+    assert_eq!(tasks(bare), TaskSnapshot::Unavailable);
 }
 
 /// A Grok start binds its session only while it is unbound: a session

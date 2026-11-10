@@ -79,6 +79,7 @@ fn repo_with(owed: bool) -> (tempfile::TempDir, AgentLabel) {
 fn stop(session: &str, deadline: u64) -> Report {
     Report::TurnEnd {
         stop: clank_core::turn_policy::TurnEndReport {
+            tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
             tool: clank_core::Tool::Claude,
             session: clank_core::SessionId::parse(session).unwrap(),
             place: Default::default(),
@@ -233,6 +234,7 @@ async fn a_handoff_alone_is_answered_by_the_native_rule_and_holds_no_wait() {
     )
     .unwrap();
     let handoff = |continued| Report::Handoff {
+        tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
         session: session.clone(),
         continued,
         deadline: u64::MAX,

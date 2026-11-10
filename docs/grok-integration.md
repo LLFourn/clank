@@ -13,7 +13,8 @@ is no tool-call registration handshake.
    `CLANK_AGENT`. A lookup-only session cannot silently claim another label.
 3. At a main-session turn end (`reason: end_turn`; subagent stops are ignored),
    the native Stop hook reports to the repo's monitor whether this Stop is a
-   continuation (`stopHookActive`); it reads no `backgroundTasks`. The monitor
+   continuation (`stopHookActive`), with its `backgroundTasks`, which resolve
+   and end only the agent's own `clank attend` declarations. The monitor
    knows whether the session's wait runs from its own registration of it: a
    wait connected for that session and still open. It decides: nothing if a
    wait is registered, this is the continuation (whose just-armed wait may not
@@ -58,7 +59,7 @@ The monitor never asks again in a continuation (`stopHookActive`), so arming is
 one request per turn. An immediately completed wait may already be absent from the task snapshot;
 Stop lets that continuation end so Grok can deliver its completion. A failed wait
 is visible through its tool result and is not repeatedly relaunched by Stop.
-An omitted native task snapshot is a visible adapter error, not proof of idleness.
+An omitted `backgroundTasks` is no listing, not an empty one: it ends no declaration.
 
 An idle waiter blocks on the existing monitor socket. It creates no adapter state
 file, lease, extra socket, filesystem watcher, registration helper or periodic
@@ -90,7 +91,8 @@ authenticated model consumes background completion notifications. Notifications
 must be enabled in the actual Grok session.
 
 The official hook documentation describes in-flight `backgroundTasks`, which
-Clank does not read, and the native `stopHookActive` continuation flag. The terminal-tool source's current
+Clank reads only to resolve and end declarations (never for the waiter), and
+the native `stopHookActive` continuation flag. The terminal-tool source's current
 contract maps `block_until_ms: 0` directly to background execution and returns
 `BackgroundTaskStarted` from that path, independently of whether the command has
 already completed. This is not an inline foreground-return path that Clank must

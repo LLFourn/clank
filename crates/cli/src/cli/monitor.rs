@@ -191,8 +191,8 @@ pub(crate) enum Control {
         expect_ms: u64,
         proof: clank_core::turn_policy::ShellProof,
     },
-    /// A `clank attend` declaration, standing until `author`'s next turn
-    /// starts.
+    /// A `clank attend` declaration, standing until the harness's listing
+    /// no longer has its task or `author` clears it.
     Attend {
         author: String,
         session: clank_core::SessionId,
@@ -8636,6 +8636,7 @@ mod recovery_tests {
         let deliver = |session: &str, n: u64| {
             let report = crate::cli::turn_wire::Report::TurnEnd {
                 stop: clank_core::turn_policy::TurnEndReport {
+                    tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
                     tool: clank_core::Tool::Codex,
                     session: clank_core::SessionId::parse(session).unwrap(),
                     place: clank_core::turn_policy::TurnPlace {
@@ -8698,6 +8699,7 @@ mod recovery_tests {
             crate::cli::turn_custody::Gathered::of(repo.path(), &codex, Some((&owed_now(), None)));
         let stop = crate::cli::turn_wire::Report::TurnEnd {
             stop: clank_core::turn_policy::TurnEndReport {
+                tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
                 tool: clank_core::Tool::Codex,
                 session: clank_core::SessionId::parse("session-one").unwrap(),
                 place: Default::default(),
@@ -17224,6 +17226,7 @@ mod user_command_tests {
             report: Some(Reporting {
                 report: crate::cli::turn_wire::Report::TurnEnd {
                     stop: clank_core::turn_policy::TurnEndReport {
+                        tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
                         tool: clank_core::Tool::Claude,
                         session: clank_core::SessionId::parse(session).unwrap(),
                         place: Default::default(),

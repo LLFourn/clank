@@ -780,20 +780,62 @@ pub(crate) fn receipt_candidates<'a>(
 
 /// The heartbeat a parked hook wakes with at its deadline. It must not
 /// read as work: an agent woken with no items and no explanation will
-/// look for a reason and invent one. It starts a turn like any wake, so
-/// it ends every `clank attend` declaration.
+/// look for a reason and invent one.
 pub(crate) const REARM_REASON: &str = "clank: no work pending — the wait reached its ceiling and \
-is re-arming. This is a heartbeat, not a task. Re-declare with `clank attend` any declared work \
-still running, then end your turn; the next hook parks a fresh wait.";
+is re-arming. This is a heartbeat, not a task. End your turn; the next hook parks a fresh wait.";
 
 /// What an agent is told when no monitor can present its work.
 pub(crate) const MONITOR_UNAVAILABLE: &str =
     "clank's monitor is unavailable; work is owed — run `clank status`.";
 
-/// The text a notice wakes with.
+/// A listed task as a declaration notice names it.
+fn task_line(t: &clank_core::turn_policy::TaskSummary) -> String {
+    let mut line = format!("  - {}", t.kind.as_deref().unwrap_or("task"));
+    if let Some(name) = &t.description {
+        line.push_str(&format!(" \"{name}\""));
+    }
+    if let Some(id) = &t.id {
+        line.push_str(&format!(" ({id})"));
+    }
+    line
+}
+
+/// The text a notice wakes with. A declaration notice answers the agent's
+/// own `clank attend`: it says what the name matched and what is listed,
+/// so the agent can declare by the right name.
 pub(crate) fn notice_text(notice: &clank_core::turn_policy::Notice) -> String {
     use clank_core::turn_policy::Notice;
+    let lines = |tasks: &[clank_core::turn_policy::TaskSummary]| {
+        tasks.iter().map(task_line).collect::<Vec<_>>().join("\n")
+    };
     match notice {
+        Notice::NoMatch { name, live } => {
+            let listed = if live.is_empty() {
+                "Your harness lists no background work.".to_string()
+            } else {
+                format!("Your harness lists:\n{}", lines(live))
+            };
+            format!(
+                "clank: `clank attend {}` matched no background task your harness lists, so it \
+                 is dropped; nothing else you attend changed. A declaration names a task by its \
+                 exact description (a subagent's name). {listed}",
+                crate::shell_quote::shell_quote(name)
+            )
+        }
+        Notice::Untrackable { name, task } => format!(
+            "clank: `clank attend {}` matched one listed task, but it carries no id, so clank \
+             cannot tell when it ends; the declaration is dropped and nothing else you attend \
+             changed:\n{}",
+            crate::shell_quote::shell_quote(name),
+            task_line(task)
+        ),
+        Notice::Ambiguous { name, matches } => format!(
+            "clank: `clank attend {}` matched {} listed tasks, so it attends none of them; \
+             nothing else you attend changed:\n{}\nGive each a name only it has.",
+            crate::shell_quote::shell_quote(name),
+            matches.len(),
+            lines(matches)
+        ),
         Notice::MonitorUnavailable => MONITOR_UNAVAILABLE.to_string(),
         Notice::ArmWait => ARM_WAIT.to_string(),
     }
@@ -810,8 +852,8 @@ pub(crate) const ARM_WAIT: &str = "Run `clank wait` as one background terminal t
 /// every value in its recipe is filled in, so it can be pasted. One line:
 /// it is typed into the agent's pane.
 ///
-/// It starts a turn, which ends every declaration: the recipe re-declares,
-/// and only a `clank run` is said to wake the agent when it ends.
+/// A deadline is not an end: the check-in claims nothing finished, and
+/// says what does end each kind of entry.
 pub(crate) fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> String {
     use crate::shell_quote::shell_quote;
     let each: Vec<String> = lines
@@ -824,7 +866,7 @@ pub(crate) fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> S
             let (what, keep) = if line.run {
                 ("the `clank run`", "give it longer")
             } else {
-                ("declared work", "if it is still running, declare it again")
+                ("declared work", "if it needs longer, renew it")
             };
             format!(
                 "{what} \"{subject}\" has been going for {} — you expected {}; {keep} with \
@@ -838,8 +880,9 @@ pub(crate) fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> S
     format!(
         "clank check-in: {}. Nothing has been cancelled and nothing has failed. This is a \
          check-in, not a task: look at its output so far, renew what needs longer, and end your \
-         turn. A `clank run` wakes you when its process ends; nothing tells you when declared \
-         work finishes.",
+         turn. A `clank run` wakes you when its process ends. A declaration stands until your \
+         harness stops listing that work or you `clank attend --clear` it; clank itself never wakes \
+         you when declared work finishes.",
         each.join("; ")
     )
 }
@@ -893,7 +936,8 @@ mod tests {
     /// One check-in names every entry due with it, each with a renewal
     /// that is one shell-safe line however its name reads: user text must
     /// arrive as the same letters, not run. Only a run is promised a wake
-    /// at its end; declared work is told to declare it again.
+    /// at its end; a declaration is told what ends it, and nothing claims
+    /// it finished.
     #[test]
     fn one_check_in_names_each_due_entry_with_a_shell_safe_renewal() {
         let text = check_in_text(&[
@@ -913,14 +957,63 @@ mod tests {
             text.contains("declared work \"sleeper\" has been going for 1m"),
             "{text}"
         );
-        assert!(text.contains("declare it again"), "{text}");
+        assert!(!text.contains("declare it again"), "{text}");
         assert!(text.contains("check-in, not a"), "{text}");
         assert!(
-            text.contains("nothing tells you when declared work finishes"),
+            text.contains(
+                "A declaration stands until your harness stops listing that work or you `clank \
+                 attend --clear` it; clank itself never wakes you when declared work finishes"
+            ),
             "{text}"
         );
         assert!(!text.contains("its completion still wakes you"), "{text}");
         assert!(!text.contains('\n'), "it is typed into a pane: one line");
+    }
+
+    /// Each declaration notice names the agent's own request, shell-safe,
+    /// and the listed work it was matched against.
+    #[test]
+    fn a_declaration_notice_names_the_request_and_the_listing() {
+        use clank_core::turn_policy::{Notice, TaskSummary};
+        let task = |id: &str, kind: &str, name: &str| TaskSummary {
+            id: Some(id.into()),
+            kind: Some(kind.into()),
+            description: Some(name.into()),
+        };
+        let text = notice_text(&Notice::NoMatch {
+            name: "it's".into(),
+            live: vec![task("a25", "subagent", "sleeper")],
+        });
+        assert!(
+            text.contains("`clank attend 'it'\\''s'` matched no background task"),
+            "{text}"
+        );
+        assert!(text.contains("  - subagent \"sleeper\" (a25)"), "{text}");
+        let none = notice_text(&Notice::NoMatch {
+            name: "x".into(),
+            live: vec![],
+        });
+        assert!(none.contains("lists no background work"), "{none}");
+        let text = notice_text(&Notice::Ambiguous {
+            name: "twin".into(),
+            matches: vec![
+                task("a1", "subagent", "twin"),
+                task("a2", "subagent", "twin"),
+            ],
+        });
+        assert!(text.contains("matched 2 listed tasks"), "{text}");
+        assert!(text.contains("(a1)") && text.contains("(a2)"), "{text}");
+        let text = notice_text(&Notice::Untrackable {
+            name: "solo".into(),
+            task: TaskSummary {
+                id: None,
+                kind: Some("subagent".into()),
+                description: Some("solo".into()),
+            },
+        });
+        assert!(text.contains("carries no id"), "{text}");
+        assert!(!text.contains("matched no"), "{text}");
+        assert!(text.contains("  - subagent \"solo\""), "{text}");
     }
 
     #[test]
