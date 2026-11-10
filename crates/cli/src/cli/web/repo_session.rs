@@ -357,6 +357,7 @@ impl Backend for RepoSession {
 }
 
 fn store_attachment(repo: &Path, media_type: &str, bytes: &[u8]) -> anyhow::Result<String> {
+    let _permit = crate::upgrade::writing()?;
     anyhow::ensure!(
         !bytes.is_empty() && bytes.len() <= clank_web::bridge::MAX_UPLOAD_BYTES,
         "invalid attachment size"

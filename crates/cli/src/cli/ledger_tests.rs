@@ -479,7 +479,15 @@ fn a_receipt_from_another_session_counts_for_nothing() {
     };
     let record = |session: &str, identity: &str, at| {
         let guard = crate::agent_store::hold_binding(repo.path(), &agent).unwrap();
-        receive(&guard, Tool::Codex, session, &[identity.to_string()], at).unwrap()
+        receive(
+            &guard,
+            Tool::Codex,
+            session,
+            &[identity.to_string()],
+            at,
+            &crate::upgrade::process().settling(),
+        )
+        .unwrap()
     };
     bind("old-session");
     assert!(record("old-session", MESSAGE, 50));

@@ -145,6 +145,7 @@ impl Seen {
     /// direction: at worst a backend that replays old ids produces
     /// duplicates, which is the trade this whole plan already makes.
     pub(crate) fn forget_all(&mut self) -> std::io::Result<()> {
+        let _permit = crate::upgrade::writing()?;
         self.warm.clear();
         match std::fs::remove_dir_all(&self.dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -153,6 +154,7 @@ impl Seen {
     }
 
     fn write(&self, id: &str) -> std::io::Result<()> {
+        let _permit = crate::upgrade::writing()?;
         std::fs::create_dir_all(&self.dir)?;
         let path = self.file(id);
         let tmp = path.with_extension("tmp");

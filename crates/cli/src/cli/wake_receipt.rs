@@ -381,6 +381,7 @@ pub(crate) async fn dispatch(
     mut prepared: Prepared,
     tool: clank_core::Tool,
     binding_current: impl Fn() -> bool,
+    _permit: &crate::upgrade::Permit,
 ) {
     use std::fmt::Write;
     if prepared.batches.is_empty() && prepared.diagnostics.0.is_empty() {
@@ -755,6 +756,7 @@ mod tests {
             fixture.prepared(),
             clank_core::Tool::Codex,
             || true,
+            &crate::upgrade::process().settling(),
         )
         .await;
         let receipt: serde_json::Value =
@@ -790,6 +792,7 @@ mod tests {
             fixture.prepared(),
             clank_core::Tool::Codex,
             || true,
+            &crate::upgrade::process().settling(),
         )
         .await;
         assert!(!fixture.rows()[0].acked);
@@ -808,6 +811,7 @@ mod tests {
             fixture.prepared(),
             clank_core::Tool::Claude,
             || true,
+            &crate::upgrade::process().settling(),
         )
         .await;
         assert!(!fixture.output.exists());
@@ -828,6 +832,7 @@ mod tests {
             fixture.prepared(),
             clank_core::Tool::Claude,
             || true,
+            &crate::upgrade::process().settling(),
         )
         .await;
         assert!(!fixture.output.exists());
@@ -882,6 +887,7 @@ mod tests {
             prepared,
             clank_core::Tool::Claude,
             || true,
+            &crate::upgrade::process().settling(),
         )
         .await;
         assert!(start.elapsed() < std::time::Duration::from_millis(1500));

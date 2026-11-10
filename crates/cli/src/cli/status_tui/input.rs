@@ -2390,6 +2390,9 @@ pub(super) struct PanelView<'a> {
     /// Bound sessions whose process is still running after their pane
     /// disappeared. Read-only worker observation for the agent mark.
     pub(super) lost: std::collections::BTreeSet<String>,
+    /// This TUI runs a build that is no longer the installed one, and
+    /// has not restarted itself.
+    pub(super) stale_build: bool,
 }
 
 impl<'a> PanelView<'a> {
@@ -2424,6 +2427,7 @@ impl<'a> PanelView<'a> {
             remote_page: None,
             presence: None,
             lost: Default::default(),
+            stale_build: false,
         }
     }
 }

@@ -30,6 +30,17 @@
 //! monitor reads the connection closing without a result as a failed
 //! emit. Nothing here reads or writes an agent's state.
 //!
+//! # An install under a parked Stop (`--handoff`)
+//!
+//! A hook parked in step 3 looks at its installation on a beat. When a
+//! different build is installed it becomes that build in place: `exec`
+//! closes the child's pipes, which ends the child as a killed hook would,
+//! and the new image starts a child of its own, so the frames between a
+//! hook and its child are always one build's. What only the old image
+//! held crosses in a [`super::hook_handoff::Handoff`]. An `exec` that
+//! fails changes nothing: the park, its child and its report stand, and
+//! it is tried again.
+//!
 //! # A PostCompact (`--post-compact`)
 //!
 //! A compaction can end the parked Stop wait, and runs no Stop after
@@ -87,18 +98,14 @@ pub(crate) async fn run(args: StopHookArgs, host: &mut impl Host) -> anyhow::Res
     // wait's deadline must be measured from here too.
     let started = std::time::Instant::now();
     let tool: Tool = args.tool.into();
-    let turn = match host.input() {
-        Ok(input) => {
+    let arrived = match args.handoff.as_deref() {
+        Some(path) => super::hook_handoff::Handoff::take(path).and_then(Arrived::resumed),
+        None => host.input().and_then(|raw| Arrived::fresh(raw, started)),
+    };
+    let turn = match arrived {
+        Ok(arrived) => {
             let repo = args.repo.as_deref();
-            stop(
-                tool,
-                repo,
-                input,
-                started,
-                args.post_compact,
-                host.spawner(),
-            )
-            .await
+            stop(tool, repo, arrived, args.post_compact, &*host).await
         }
         Err(e) => Turn::said(HookOutcome::Diagnostic { message: e }),
     };
@@ -110,10 +117,73 @@ pub(crate) async fn run(args: StopHookArgs, host: &mut impl Host) -> anyhow::Res
 
 /// What a Stop or PostCompact reads, starts, writes and ends with.
 pub(crate) trait Host {
-    fn input(&mut self) -> Result<HookInput, String>;
+    /// The hook input, as the harness wrote it.
+    fn input(&mut self) -> Result<String, String>;
     fn spawner(&self) -> &dyn Spawn;
     fn streams(&mut self) -> (&mut dyn std::io::Write, &mut dyn std::io::Write);
     fn exit(&mut self, code: i32);
+    /// Whether this process still runs the installed build.
+    fn authority(&self) -> crate::upgrade::Authority;
+    /// Become the installed build, resuming from the handoff at
+    /// `handoff`. Returns only if that failed.
+    fn become_installed(&self, handoff: &Path) -> std::io::Error;
+}
+
+/// A Stop's input and how long its wait may be held: read from the
+/// harness, or handed over by the build this process replaced.
+struct Arrived {
+    raw: String,
+    input: HookInput,
+    /// The report the replaced build armed its park with.
+    resumed: Option<Report>,
+    /// When the hook can no longer hold its wait.
+    poll_deadline: std::time::Instant,
+}
+
+impl Arrived {
+    fn fresh(raw: String, started: std::time::Instant) -> Result<Self, String> {
+        Ok(Arrived {
+            input: parse_input(&raw)?,
+            raw,
+            resumed: None,
+            poll_deadline: poll_deadline(started),
+        })
+    }
+
+    /// The deadline is the report's own, and never later than a hook
+    /// started now would get: whatever the handoff says, the runner's
+    /// ceiling is not outstayed.
+    fn resumed(handoff: super::hook_handoff::Handoff) -> Result<Self, String> {
+        let now = std::time::Instant::now();
+        let ceiling = poll_deadline(now);
+        let left = std::time::Duration::from_millis(
+            handoff
+                .report
+                .deadline()
+                .saturating_sub(super::turn_custody::now_ms()),
+        );
+        Ok(Arrived {
+            input: parse_input(&handoff.input)?,
+            raw: handoff.input,
+            poll_deadline: now.checked_add(left).map_or(ceiling, |by| by.min(ceiling)),
+            resumed: Some(handoff.report),
+        })
+    }
+}
+
+/// What a Stop reports of the moment it arrived.
+enum Evidence {
+    /// Read from the agent's record by this process, on arrival.
+    Read(
+        Option<super::wake_repeat::Boundary>,
+        Vec<super::question_state::Observation>,
+    ),
+    /// The report the replaced build made of it.
+    Carried(Report),
+}
+
+fn parse_input(raw: &str) -> Result<HookInput, String> {
+    serde_json::from_str(raw).map_err(|e| format!("hook: parsing stdin JSON: {e}"))
 }
 
 /// This process: its stdio, `clank wait --turn-end` children, its exit.
@@ -132,8 +202,17 @@ impl ProcessHost {
 }
 
 impl Host for ProcessHost {
-    fn input(&mut self) -> Result<HookInput, String> {
-        read_hook_stdin()
+    fn input(&mut self) -> Result<String, String> {
+        read_stdin()
+    }
+    fn authority(&self) -> crate::upgrade::Authority {
+        crate::upgrade::process().clone()
+    }
+    fn become_installed(&self, handoff: &Path) -> std::io::Error {
+        crate::upgrade::exec_installed(super::hook_handoff::resumed_args(
+            std::env::args_os().skip(1),
+            handoff,
+        ))
     }
     fn spawner(&self) -> &dyn Spawn {
         &Spawner
@@ -184,15 +263,27 @@ impl Binding {
 async fn stop(
     tool: Tool,
     repo_override: Option<&Path>,
-    input: HookInput,
-    started: std::time::Instant,
+    arrived: Arrived,
     compacted: bool,
-    spawner: &dyn Spawn,
+    host: &impl Host,
 ) -> Turn {
+    let Arrived {
+        raw,
+        input,
+        resumed,
+        poll_deadline,
+    } = arrived;
     // Read now, before any waiting: where in the agent's record this Stop
-    // came from, not wherever the record has got to by delivery.
-    let boundary = native_boundary(tool, &input);
-    let questions = question_evidence(tool, &input, boundary.as_ref());
+    // came from, not wherever the record has got to by delivery. A
+    // resumed hook is past that moment, and carries what was read then.
+    let evidence = match resumed {
+        Some(report) => Evidence::Carried(report),
+        None => {
+            let boundary = native_boundary(tool, &input);
+            let questions = question_evidence(tool, &input, boundary.as_ref());
+            Evidence::Read(boundary, questions)
+        }
+    };
     let repo = match resolve_hook_repo(repo_override, &input) {
         Ok(r) => r,
         Err(message) => return Turn::said(HookOutcome::Diagnostic { message }),
@@ -216,40 +307,59 @@ async fn stop(
             why: SilentReason::StaleBinding,
         });
     }
-    let stop = TurnEndReport {
-        tool,
-        session: input.session_id.clone(),
-        place: boundary
-            .map(|b| TurnPlace {
-                turn: Some(b.turn),
-                position: Some(b.position),
-                human_turn: b.human,
-            })
-            .unwrap_or_default(),
-        tasks: TaskSnapshot::of(&input),
-    };
-    let deadline = unix_ms(poll_deadline(started));
-    // A compaction ends no turn, so it is no evidence about questions.
-    let report = match compacted {
-        true => Report::Compacted { stop, deadline },
-        false => Report::TurnEnd {
-            stop,
-            deadline,
-            questions,
-        },
+    let report = match evidence {
+        Evidence::Carried(report) => report,
+        Evidence::Read(boundary, questions) => {
+            let stop = TurnEndReport {
+                tool,
+                session: input.session_id.clone(),
+                place: boundary
+                    .map(|b| TurnPlace {
+                        turn: Some(b.turn),
+                        position: Some(b.position),
+                        human_turn: b.human,
+                    })
+                    .unwrap_or_default(),
+                tasks: TaskSnapshot::of(&input),
+            };
+            let deadline = unix_ms(poll_deadline);
+            // A compaction ends no turn, so it is no evidence about questions.
+            match compacted {
+                true => Report::Compacted { stop, deadline },
+                false => Report::TurnEnd {
+                    stop,
+                    deadline,
+                    questions,
+                },
+            }
+        }
     };
     let mut life = super::hook_owner::lifetime_for(tool, &super::hook_owner::Native);
-    let carried =
-        await_verdict_under_deadline(verdict_deadline(started), tool, true, &mut life, || {
-            spawner.spawn(
+    let handoff = super::hook_handoff::Handoff::new(raw, report.clone());
+    let mut replacing = crate::upgrade::Replacing::new(host.authority(), |_| {
+        if let Err(why) = super::monitor::ensure_runtime_dir() {
+            return std::io::Error::other(why);
+        }
+        let dir = super::monitor::runtime_dir(rustix::process::getuid().as_raw());
+        handoff.hand_to(&dir, |path| host.become_installed(path))
+    });
+    let carried = await_verdict_under_deadline(
+        verdict_deadline(poll_deadline),
+        tool,
+        true,
+        &mut life,
+        &mut replacing,
+        || {
+            host.spawner().spawn(
                 &binding.repo,
                 &binding.label,
                 &binding.session,
                 tool,
                 &report,
             )
-        })
-        .await;
+        },
+    )
+    .await;
     match carried {
         Ok((frame, wait)) => Turn {
             outcome: frame.outcome(),
@@ -427,6 +537,7 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
         binding_tool,
         false,
         &mut super::hook_owner::Lifetime::Unbound,
+        &mut crate::upgrade::Replacing::never(),
         || {
             Spawner.spawn(
                 &binding.repo,
@@ -459,6 +570,7 @@ pub(super) async fn answer_once(
         tool,
         false,
         &mut super::hook_owner::Lifetime::Unbound,
+        &mut crate::upgrade::Replacing::never(),
         || Spawner.spawn(repo, label, session, tool, &report),
     )
     .await;
@@ -787,9 +899,10 @@ fn poll_deadline(started: std::time::Instant) -> std::time::Instant {
     started + ceiling.saturating_sub(margin)
 }
 
-/// When the hook stops waiting for a verdict at all.
-fn verdict_deadline(started: std::time::Instant) -> std::time::Instant {
-    poll_deadline(started) + VERDICT_GRACE
+/// When the hook stops waiting for a verdict at all, given when its
+/// report says it can no longer hold the wait.
+fn verdict_deadline(poll_deadline: std::time::Instant) -> std::time::Instant {
+    poll_deadline + VERDICT_GRACE
 }
 
 /// Await `fut` until `deadline`. `None` = the deadline won, and `fut` was
@@ -810,11 +923,19 @@ async fn under_deadline<F: std::future::Future>(
 /// is nobody left to deliver to. A deadline with no verdict frames the
 /// one the tool takes at its deadline, so a slow monitor never puts the
 /// agent to sleep.
+///
+/// While no terminal verdict has been read the hook is parked, holding
+/// nothing but its report, and that is where `replacing` may turn it into
+/// the installed build. A verdict in hand always goes first: once one is
+/// read this process emits it, answers for it and exits by itself.
 async fn await_verdict_under_deadline<W: Run>(
     deadline: std::time::Instant,
     tool: Tool,
     parks: bool,
     life: &mut Lifetime,
+    replacing: &mut crate::upgrade::Replacing<
+        impl FnMut(&crate::build_stamp::Build) -> std::io::Error,
+    >,
     arm: impl FnOnce() -> Result<W, String>,
 ) -> Result<(Frame, W), Frame> {
     let owner_gone = || {
@@ -838,7 +959,16 @@ async fn await_verdict_under_deadline<W: Run>(
         Ok(w) => w,
         Err(message) => return Err(Frame::bare(WireVerdict::Diagnostic { message })),
     };
-    let ran = under_deadline(wait.verdict_until(life.ended()), deadline).await;
+    let parked = async {
+        let verdict = wait.verdict_until(life.ended());
+        tokio::pin!(verdict);
+        tokio::select! {
+            biased;
+            ran = &mut verdict => ran,
+            never = replacing.parked() => match never {},
+        }
+    };
+    let ran = under_deadline(parked, deadline).await;
     match ran {
         Some(Ran::Abandoned) => {
             wait.shutdown().await;
@@ -860,12 +990,16 @@ async fn await_verdict_under_deadline<W: Run>(
     }
 }
 
-pub(crate) fn read_hook_stdin() -> Result<HookInput, String> {
+fn read_stdin() -> Result<String, String> {
     let mut buf = String::new();
-    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-        return Err(format!("hook: reading stdin: {e}"));
+    match std::io::stdin().read_to_string(&mut buf) {
+        Ok(_) => Ok(buf),
+        Err(e) => Err(format!("hook: reading stdin: {e}")),
     }
-    serde_json::from_str(&buf).map_err(|e| format!("hook: parsing stdin JSON: {e}"))
+}
+
+pub(crate) fn read_hook_stdin() -> Result<HookInput, String> {
+    parse_input(&read_stdin()?)
 }
 
 /// The repo a SessionStart binds in: `--repo` exactly, else the worktree

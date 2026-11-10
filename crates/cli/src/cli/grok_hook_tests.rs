@@ -369,7 +369,10 @@ async fn the_childs_no_monitor_notices_block_groks_stop_with_the_reason() {
             no_binary as fn() -> crate::cli::monitor::Attempt,
             "clank cannot start its monitor: starting one failed: no binary.",
         ),
-        (newer, "clank was upgraded;"),
+        (
+            newer,
+            "clank cannot start its monitor: the monitor speaks a newer protocol.",
+        ),
     ] {
         let [frame] = unserved(&handoff(), attempt)
             .await

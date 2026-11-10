@@ -1862,6 +1862,7 @@ async fn only_a_positive_result_establishes_a_delivery() {
             identities: commit.presented().to_vec(),
         },
         || true,
+        &crate::upgrade::process().settling(),
     );
     assert_eq!(
         seen(&turns),
@@ -1923,4 +1924,151 @@ async fn a_committed_delivery_leaves_the_bound_sessions_receipt() {
         !crate::cli::presentation::receipts_path(&dir).exists(),
         "a session that no longer holds the label is given no receipt"
     );
+}
+
+fn turn_file(fixture: &super::super::wake_receipt::fixtures::Fixture) -> PathBuf {
+    crate::agent_store::agents_root(&fixture.repo)
+        .join(fixture.author.as_str())
+        .join("turn.json")
+}
+
+/// A newer clank installed after a presentation left and before its
+/// result came back. The monitor is stale from that moment: it answers
+/// no other report and writes nothing new. The presentation it had
+/// already handed out is still settled in full, its result on disk and
+/// its receipts committed, and only then is the monitor at the point
+/// where going loses nothing.
+#[tokio::test]
+async fn an_install_between_a_presentation_and_its_result_loses_neither() {
+    use crate::upgrade::Standing;
+    let fixture = receipt_fixture(Tool::Claude);
+    let installed = crate::upgrade::tests::Installed::current();
+    let authority = installed.authority();
+    // Every writer the commit reaches answers to the same authority, as
+    // in the monitor, so one that asked for a new permit would show.
+    let _as = crate::upgrade::tests::AsProcess::of(&authority);
+    let mut turns = Turns::new(fixture.repo.clone()).guarded_by(authority.clone());
+    let (frame, g) = present_receipt(&fixture, &mut turns, Tool::Claude, 1);
+    let presentation = frame.presentation().expect("presented").clone();
+    let in_flight = std::fs::read(turn_file(&fixture)).unwrap();
+
+    installed.replace(1);
+    assert!(
+        matches!(authority.look(), Standing::Quiescing { in_flight: 1, .. }),
+        "{:?}",
+        authority.standing()
+    );
+    assert_eq!(
+        turns.answer(
+            &fixture.author,
+            2,
+            &stop(Tool::Claude, &fixture.session, None),
+            true,
+            &g
+        ),
+        None,
+        "a stale monitor answers nothing new"
+    );
+    assert_eq!(std::fs::read(turn_file(&fixture)).unwrap(), in_flight);
+
+    std::fs::write(fixture.marker(), "flushed").unwrap();
+    let commit = turns
+        .result(
+            &fixture.author,
+            1,
+            TurnResult::Delivered { presentation },
+            &g,
+        )
+        .unwrap()
+        .expect("the delivery commits");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(turn_file(&fixture)).unwrap()).unwrap();
+    assert!(
+        stored["outstanding"].is_null(),
+        "the result was not written: {stored}"
+    );
+    assert!(
+        matches!(authority.standing(), Standing::Quiescing { .. }),
+        "its receipts are still owed"
+    );
+    commit.run(&fixture.repo).await;
+    assert!(
+        fixture.rows()[0].woken_at.is_some(),
+        "the receipt committed"
+    );
+    assert!(
+        matches!(authority.standing(), Standing::Replaceable { .. }),
+        "{:?}",
+        authority.standing()
+    );
+}
+
+/// The same install, and a hook that never answers: its carrier closing
+/// fails the presentation, on disk too, and the monitor is free to go.
+/// Freezing writes never leaves it waiting on something it may not write.
+#[test]
+fn a_stale_monitors_failed_presentation_is_written_and_frees_it() {
+    use crate::upgrade::Standing;
+    let fixture = receipt_fixture(Tool::Claude);
+    let installed = crate::upgrade::tests::Installed::current();
+    let authority = installed.authority();
+    let mut turns = Turns::new(fixture.repo.clone()).guarded_by(authority.clone());
+    let (_, g) = present_receipt(&fixture, &mut turns, Tool::Claude, 1);
+    installed.replace(1);
+    assert!(matches!(authority.look(), Standing::Quiescing { .. }));
+
+    turns.closed(&fixture.author, 1, &g);
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(turn_file(&fixture)).unwrap()).unwrap();
+    assert!(stored["outstanding"].is_null(), "{stored}");
+    assert!(matches!(authority.standing(), Standing::Replaceable { .. }));
+}
+
+/// A monitor already stale when a Stop arrives steps nothing and writes
+/// nothing: the report is whole for the monitor that follows.
+#[test]
+fn a_stale_monitor_answers_no_report_and_writes_no_turn_state() {
+    let fixture = receipt_fixture(Tool::Claude);
+    let installed = crate::upgrade::tests::Installed::current();
+    let mut turns = Turns::new(fixture.repo.clone()).guarded_by(installed.authority());
+    installed.replace(1);
+    let g = Gathered::of(
+        &fixture.repo,
+        &fixture.author,
+        Some((std::slice::from_ref(&fixture.item), Some(&fixture.cwd))),
+    );
+    for report in [
+        stop(Tool::Claude, &fixture.session, None),
+        Report::Handoff {
+            session: sid(&fixture.session),
+            continued: false,
+            tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            deadline: u64::MAX,
+        },
+    ] {
+        assert_eq!(turns.answer(&fixture.author, 1, &report, true, &g), None);
+    }
+    assert!(!turns.presenting(&fixture.author));
+    assert!(!turn_file(&fixture).exists());
+}
+
+/// An agent that lost its binding under a stale monitor keeps its turn
+/// state on disk for the monitor that follows, which retires it the same
+/// way; on its own build the monitor removes it.
+#[test]
+fn a_stale_monitor_leaves_an_unbound_agents_turn_state_for_its_successor() {
+    let fixture = receipt_fixture(Tool::Claude);
+    let installed = crate::upgrade::tests::Installed::current();
+    let mut turns = Turns::new(fixture.repo.clone()).guarded_by(installed.authority());
+    let (_, g) = present_receipt(&fixture, &mut turns, Tool::Claude, 1);
+    turns.closed(&fixture.author, 1, &g);
+    assert!(turn_file(&fixture).exists());
+
+    installed.replace(1);
+    turns.retire(&fixture.author);
+    assert!(turn_file(&fixture).exists(), "a stale monitor removed it");
+
+    installed.install(crate::build_stamp::running());
+    turns.retire(&fixture.author);
+    assert!(!turn_file(&fixture).exists());
 }

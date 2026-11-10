@@ -136,6 +136,9 @@ pub(crate) fn load(agent_dir: &Path) -> Option<State> {
 /// it only settles the projection on the binding. An unreadable record or
 /// binding leaves the record as it is.
 pub(crate) fn observe(agent_dir: &Path, observations: impl IntoIterator<Item = Observation>) {
+    let Ok(_permit) = crate::upgrade::writing() else {
+        return;
+    };
     if std::fs::create_dir_all(agent_dir).is_err() {
         return;
     }

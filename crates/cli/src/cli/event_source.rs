@@ -15,6 +15,11 @@ pub(crate) enum SourceOrigin {
 pub(crate) enum Durability {
     Logged,
     Transient,
+    /// Not logged because this process has seen a newer clank installed
+    /// and logs nothing. Unlike a transient it is not presented either:
+    /// the process that follows reads the event again and presents it
+    /// once, from its log.
+    Refused,
 }
 
 pub(crate) type Emission = (WaitItem, Durability);

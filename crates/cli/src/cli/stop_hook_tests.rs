@@ -26,6 +26,38 @@ fn hook_input(session: &str) -> HookInput {
     .unwrap()
 }
 
+/// `input`, as read from a harness just now.
+fn arrived(input: HookInput) -> Arrived {
+    Arrived {
+        raw: String::new(),
+        input,
+        resumed: None,
+        poll_deadline: poll_deadline(std::time::Instant::now()),
+    }
+}
+
+/// A host that only starts carriers: nothing is installed over it.
+struct Spawns<'a>(&'a dyn Spawn);
+
+impl Host for Spawns<'_> {
+    fn input(&mut self) -> Result<String, String> {
+        unreachable!("the input is supplied")
+    }
+    fn spawner(&self) -> &dyn Spawn {
+        self.0
+    }
+    fn streams(&mut self) -> (&mut dyn std::io::Write, &mut dyn std::io::Write) {
+        unreachable!("nothing is emitted through the host")
+    }
+    fn exit(&mut self, _: i32) {}
+    fn authority(&self) -> crate::upgrade::Authority {
+        crate::upgrade::Authority::unwatched()
+    }
+    fn become_installed(&self, _: &Path) -> std::io::Error {
+        panic!("nothing is installed over a test")
+    }
+}
+
 fn bind_tool(repo: &Path, label: &str, session: &str, tool: Tool) -> AgentLabel {
     let label = AgentLabel::parse(label).unwrap();
     let sid = clank_core::ids::SessionId::parse(session).unwrap();
@@ -92,7 +124,7 @@ fn the_deadlines_sit_under_the_runner_ceiling() {
     let started = std::time::Instant::now();
     let ceiling = std::time::Duration::from_secs(crate::cli::setup::HOOK_TIMEOUT_SECS);
     assert!(
-        verdict_deadline(started) < started + ceiling,
+        verdict_deadline(poll_deadline(started)) < started + ceiling,
         "the hook stops waiting BEFORE the runner kills it"
     );
     assert_eq!(
@@ -101,7 +133,7 @@ fn the_deadlines_sit_under_the_runner_ceiling() {
         "the report's deadline leaves exactly the margin"
     );
     assert_eq!(
-        verdict_deadline(started) - poll_deadline(started),
+        verdict_deadline(poll_deadline(started)) - poll_deadline(started),
         VERDICT_GRACE,
         "and the hook waits past it only for the verdict the deadline produces"
     );
@@ -229,10 +261,17 @@ async fn owner_loss_near_the_deadline_keeps_its_silence_and_its_shutdown() {
         shutdown: std::time::Duration::from_secs(2),
         done: done.clone(),
     };
-    let got = await_verdict_under_deadline(deadline, Tool::Codex, true, &mut life, || {
-        let _ = end.send(());
-        Ok(wait)
-    })
+    let got = await_verdict_under_deadline(
+        deadline,
+        Tool::Codex,
+        true,
+        &mut life,
+        &mut crate::upgrade::Replacing::never(),
+        || {
+            let _ = end.send(());
+            Ok(wait)
+        },
+    )
     .await;
     assert!(owner_gone(&got));
     assert!(
@@ -245,12 +284,18 @@ async fn owner_loss_near_the_deadline_keeps_its_silence_and_its_shutdown() {
 async fn an_owner_gone_before_arming_spawns_no_wait() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut armed = false;
-    let got =
-        await_verdict_under_deadline(deadline, Tool::Codex, true, &mut Lifetime::Gone, || {
+    let got = await_verdict_under_deadline(
+        deadline,
+        Tool::Codex,
+        true,
+        &mut Lifetime::Gone,
+        &mut crate::upgrade::Replacing::never(),
+        || {
             armed = true;
             Ok(pending_wait())
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(owner_gone(&got));
     assert!(!armed);
 }
@@ -273,12 +318,19 @@ async fn an_owner_ending_mid_wait_drops_the_wait_silently() {
     });
     let got = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        await_verdict_under_deadline(deadline, Tool::Codex, true, &mut life, || {
-            Ok(plain(async move {
-                let _guard = guard;
-                std::future::pending::<Result<Frame, String>>().await
-            }))
-        }),
+        await_verdict_under_deadline(
+            deadline,
+            Tool::Codex,
+            true,
+            &mut life,
+            &mut crate::upgrade::Replacing::never(),
+            || {
+                Ok(plain(async move {
+                    let _guard = guard;
+                    std::future::pending::<Result<Frame, String>>().await
+                }))
+            },
+        ),
     )
     .await
     .expect("the owner's exit ends the wait at once");
@@ -293,12 +345,19 @@ async fn an_owner_ending_mid_wait_drops_the_wait_silently() {
 async fn owner_loss_outranks_a_verdict_the_wait_already_has() {
     let (mut life, end) = Lifetime::signalled();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let got = await_verdict_under_deadline(deadline, Tool::Codex, true, &mut life, || {
-        Ok(plain(async move {
-            let _ = end.send(());
-            Ok(delivered())
-        }))
-    })
+    let got = await_verdict_under_deadline(
+        deadline,
+        Tool::Codex,
+        true,
+        &mut life,
+        &mut crate::upgrade::Replacing::never(),
+        || {
+            Ok(plain(async move {
+                let _ = end.send(());
+                Ok(delivered())
+            }))
+        },
+    )
     .await;
     assert!(owner_gone(&got));
 }
@@ -307,9 +366,14 @@ async fn owner_loss_outranks_a_verdict_the_wait_already_has() {
 async fn a_live_owner_lets_the_verdict_through() {
     let (mut life, _end) = Lifetime::signalled();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let got = await_verdict_under_deadline(deadline, Tool::Codex, true, &mut life, || {
-        Ok(plain(async { Ok(delivered()) }))
-    })
+    let got = await_verdict_under_deadline(
+        deadline,
+        Tool::Codex,
+        true,
+        &mut life,
+        &mut crate::upgrade::Replacing::never(),
+        || Ok(plain(async { Ok(delivered()) })),
+    )
     .await;
     assert!(matches!(got, Ok((ref frame, _)) if frame == &delivered()));
 }
@@ -321,11 +385,15 @@ async fn a_live_owner_lets_the_verdict_through() {
 async fn the_deadline_re_arms_without_spinning_opencode() {
     for tool in [Tool::Claude, Tool::Codex] {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let got =
-            await_verdict_under_deadline(deadline, tool, true, &mut Lifetime::Unbound, || {
-                Ok(pending_wait())
-            })
-            .await;
+        let got = await_verdict_under_deadline(
+            deadline,
+            tool,
+            true,
+            &mut Lifetime::Unbound,
+            &mut crate::upgrade::Replacing::never(),
+            || Ok(pending_wait()),
+        )
+        .await;
         let Err(frame) = got else {
             panic!("{tool:?} must re-arm at the deadline");
         };
@@ -340,6 +408,7 @@ async fn the_deadline_re_arms_without_spinning_opencode() {
         Tool::OpenCode,
         true,
         &mut Lifetime::Unbound,
+        &mut crate::upgrade::Replacing::never(),
         || Ok(pending_wait()),
     )
     .await;
@@ -352,36 +421,52 @@ async fn the_deadline_re_arms_without_spinning_opencode() {
 async fn the_pre_check_exit_re_arms_without_arming_a_wait() {
     let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let armed = std::cell::Cell::new(false);
-    let got =
-        await_verdict_under_deadline(past, Tool::Claude, true, &mut Lifetime::Unbound, || {
+    let got = await_verdict_under_deadline(
+        past,
+        Tool::Claude,
+        true,
+        &mut Lifetime::Unbound,
+        &mut crate::upgrade::Replacing::never(),
+        || {
             armed.set(true);
             Ok(pending_wait())
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(
         matches!(got, Err(ref f) if matches!(f.outcome(), HookOutcome::Continue { .. })),
         "the pre-check must re-arm too"
     );
     assert!(!armed.get(), "it must short-circuit BEFORE arming");
-    let got =
-        await_verdict_under_deadline(past, Tool::OpenCode, true, &mut Lifetime::Unbound, || {
-            Ok(pending_wait())
-        })
-        .await;
+    let got = await_verdict_under_deadline(
+        past,
+        Tool::OpenCode,
+        true,
+        &mut Lifetime::Unbound,
+        &mut crate::upgrade::Replacing::never(),
+        || Ok(pending_wait()),
+    )
+    .await;
     assert!(matches!(got, Err(ref f) if f.outcome() == HookOutcome::RenewWait));
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_verdict_arriving_before_the_deadline_survives_the_seam() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-    let got =
-        await_verdict_under_deadline(deadline, Tool::Claude, true, &mut Lifetime::Unbound, || {
+    let got = await_verdict_under_deadline(
+        deadline,
+        Tool::Claude,
+        true,
+        &mut Lifetime::Unbound,
+        &mut crate::upgrade::Replacing::never(),
+        || {
             Ok(plain(async {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 Ok(delivered())
             }))
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(matches!(got, Ok((ref f, _)) if f == &delivered()));
 }
 
@@ -394,6 +479,7 @@ async fn consecutive_expiries_each_re_arm() {
             Tool::Claude,
             true,
             &mut Lifetime::Unbound,
+            &mut crate::upgrade::Replacing::never(),
             || Ok(pending_wait()),
         )
         .await;
@@ -414,6 +500,7 @@ async fn a_session_start_out_of_time_says_nothing() {
         Tool::Claude,
         false,
         &mut Lifetime::Unbound,
+        &mut crate::upgrade::Replacing::never(),
         || Ok(pending_wait()),
     )
     .await;
@@ -473,9 +560,14 @@ async fn owner_loss_closes_the_pipe_and_collects_the_wait_after_its_own_shutdown
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let _ = end.send(());
     });
-    let got = await_verdict_under_deadline(deadline, Tool::Codex, true, &mut life, || {
-        OwnedWait::spawn(cmd, &stop_report())
-    })
+    let got = await_verdict_under_deadline(
+        deadline,
+        Tool::Codex,
+        true,
+        &mut life,
+        &mut crate::upgrade::Replacing::never(),
+        || OwnedWait::spawn(cmd, &stop_report()),
+    )
     .await;
     assert!(owner_gone(&got));
     assert!(
@@ -737,15 +829,12 @@ async fn a_failed_or_partial_flush_is_a_failed_emit() {
 /// is answered with no result, so it earns no receipt.
 #[tokio::test(start_paused = true)]
 async fn the_childs_no_monitor_notices_wake_through_each_adapter() {
-    use crate::cli::turn_child::tests::{outage_frame, upgraded_frame};
+    use crate::cli::turn_child::tests::outage_frame;
     for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
-        for (frame, says) in [
-            (
-                outage_frame(tool).await,
-                "clank cannot start its monitor: starting one failed: no binary.",
-            ),
-            (upgraded_frame(tool).await, "clank was upgraded;"),
-        ] {
+        for (frame, says) in [(
+            outage_frame(tool).await,
+            "clank cannot start its monitor: starting one failed: no binary.",
+        )] {
             assert!(frame.presentation().is_none(), "{tool:?}: {frame:?}");
             let text = frame.rendered.clone().expect("the notice has its text");
             assert!(text.starts_with(says), "{tool:?}: {text}");
@@ -820,7 +909,7 @@ async fn a_verdict_that_presents_nothing_answers_nothing() {
         Frame::bare(WireVerdict::RenewWait),
         Frame::text(
             WireVerdict::Notify,
-            crate::cli::wake_render::UPGRADED.into(),
+            crate::cli::wake_render::MONITOR_UNANSWERED.into(),
         ),
     ] {
         let answered = Answered::default();
@@ -894,10 +983,9 @@ async fn the_report_carries_the_stops_evidence() {
         let turn = stop(
             Tool::Claude,
             Some(&repo),
-            input,
-            std::time::Instant::now(),
+            arrived(input),
             false,
-            &recorder,
+            &Spawns(&recorder),
         )
         .await;
         assert!(
@@ -931,10 +1019,9 @@ async fn unresolved_identity_is_a_diagnostic() {
     let turn = stop(
         Tool::Claude,
         Some(dir.path()),
-        hook_input("sess-unbound"),
-        std::time::Instant::now(),
+        arrived(hook_input("sess-unbound")),
         false,
-        &Unreachable,
+        &Spawns(&Unreachable),
     )
     .await;
     assert!(matches!(turn.outcome, HookOutcome::Diagnostic { .. }));
@@ -981,10 +1068,9 @@ async fn a_stop_from_a_worktree_subdirectory_reports_for_that_worktree() {
     stop(
         Tool::Claude,
         None,
-        input.clone(),
-        std::time::Instant::now(),
+        arrived(input.clone()),
         false,
-        &recorder,
+        &Spawns(&recorder),
     )
     .await;
     assert_eq!(
@@ -1449,4 +1535,278 @@ fn a_bootstrap_start_leaves_the_marker() {
         Some((Tool::Claude, fresh.into()))
     );
     assert_eq!(resume_pending(repo, "claude"), Some(armed.into()));
+}
+
+/// A [`crate::upgrade::Replacing`] over `installed` whose every attempt
+/// fails, counted in `tried`.
+fn failing<'a>(
+    installed: &crate::upgrade::tests::Installed,
+    tried: &'a std::cell::Cell<usize>,
+) -> crate::upgrade::Replacing<impl FnMut(&crate::build_stamp::Build) -> std::io::Error> {
+    crate::upgrade::Replacing::new(installed.authority(), move |_| {
+        tried.set(tried.get() + 1);
+        std::io::Error::other("the binary is missing mid-install")
+    })
+}
+
+/// A parked hook under a newer install tries to become it on a beat. Each
+/// attempt that fails leaves the park exactly as it was: still held, the
+/// attempt repeated, and the verdict that finally comes is the one it
+/// frames.
+#[tokio::test(start_paused = true)]
+async fn a_parked_hook_whose_replacement_fails_stays_parked_and_retries() {
+    let installed = crate::upgrade::tests::Installed::current();
+    installed.replace(1);
+    let tried = std::cell::Cell::new(0);
+    let mut replacing = failing(&installed, &tried);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let got = await_verdict_under_deadline(
+        deadline,
+        Tool::Claude,
+        true,
+        &mut Lifetime::Unbound,
+        &mut replacing,
+        || {
+            Ok(plain(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(delivered())
+            }))
+        },
+    )
+    .await;
+    assert_eq!(got.ok().map(|(frame, _)| frame), Some(delivered()));
+    assert!(tried.get() > 3, "retried through the park: {}", tried.get());
+}
+
+/// With its own build still installed a parked hook asks for nothing.
+#[tokio::test(start_paused = true)]
+async fn a_parked_hook_of_the_installed_build_is_left_alone() {
+    let installed = crate::upgrade::tests::Installed::current();
+    let tried = std::cell::Cell::new(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let got = await_verdict_under_deadline(
+        deadline,
+        Tool::Claude,
+        true,
+        &mut Lifetime::Unbound,
+        &mut failing(&installed, &tried),
+        || {
+            Ok(plain(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(delivered())
+            }))
+        },
+    )
+    .await;
+    assert!(got.is_ok());
+    assert_eq!(tried.get(), 0);
+}
+
+/// A verdict already in hand goes first: a hook holding a presentation
+/// frames it and answers for it as the build that received it, however
+/// stale that build is.
+#[tokio::test(start_paused = true)]
+async fn a_hook_with_a_verdict_in_hand_is_not_replaced() {
+    let installed = crate::upgrade::tests::Installed::current();
+    installed.replace(1);
+    let tried = std::cell::Cell::new(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let got = await_verdict_under_deadline(
+        deadline,
+        Tool::Claude,
+        true,
+        &mut Lifetime::Unbound,
+        &mut failing(&installed, &tried),
+        || Ok(plain(async { Ok(delivered()) })),
+    )
+    .await;
+    assert_eq!(got.ok().map(|(frame, _)| frame), Some(delivered()));
+    assert_eq!(tried.get(), 0, "mid-presentation is not a safe point");
+}
+
+/// A host of a build that has been replaced: it starts carriers over
+/// pipes the test holds, and records each handoff it is asked to resume
+/// the installed build from, which it never becomes.
+struct Replaced {
+    authority: crate::upgrade::Authority,
+    /// Each carrier's report, its owner pipe, and its verdict pipe until
+    /// the test takes that to speak as the carrier.
+    carriers: std::cell::RefCell<Vec<Carrier>>,
+    handoffs:
+        std::cell::RefCell<Vec<(PathBuf, Result<super::super::hook_handoff::Handoff, String>)>>,
+}
+
+struct Carrier {
+    report: Report,
+    _owner_pipe: tokio::io::DuplexStream,
+    verdicts: Option<tokio::io::DuplexStream>,
+}
+
+impl Spawn for Replaced {
+    fn spawn(
+        &self,
+        _: &Path,
+        _: &AgentLabel,
+        _: &str,
+        _: Tool,
+        report: &Report,
+    ) -> Result<OwnedWait, String> {
+        let (owner_end, owner_read) = tokio::io::duplex(64 * 1024);
+        let (frames_write, frames) = tokio::io::duplex(64 * 1024);
+        self.carriers.borrow_mut().push(Carrier {
+            report: report.clone(),
+            _owner_pipe: owner_read,
+            verdicts: Some(frames_write),
+        });
+        OwnedWait::over(None, Box::new(owner_end), Box::new(frames), None, report)
+    }
+}
+
+impl Host for Replaced {
+    fn input(&mut self) -> Result<String, String> {
+        unreachable!("the input is supplied")
+    }
+    fn spawner(&self) -> &dyn Spawn {
+        self
+    }
+    fn streams(&mut self) -> (&mut dyn std::io::Write, &mut dyn std::io::Write) {
+        unreachable!("nothing is emitted through the host")
+    }
+    fn exit(&mut self, _: i32) {}
+    fn authority(&self) -> crate::upgrade::Authority {
+        self.authority.clone()
+    }
+    fn become_installed(&self, handoff: &Path) -> std::io::Error {
+        let read = std::fs::read(handoff)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| super::super::hook_handoff::Handoff::parse(&bytes));
+        self.handoffs
+            .borrow_mut()
+            .push((handoff.to_path_buf(), read));
+        std::io::Error::other("the binary is missing mid-install")
+    }
+}
+
+/// The whole Stop under a newer install. While parked it offers the
+/// installed build a handoff holding its input byte for byte and the very
+/// report its carrier was armed with; each failed attempt leaves no file,
+/// no second carrier and nothing emitted; and the presentation that then
+/// arrives is the Stop's answer.
+#[tokio::test(start_paused = true)]
+async fn a_stale_parked_stop_hands_over_its_input_and_report_and_survives_failure() {
+    use tokio::io::AsyncWriteExt;
+    let repo = init_repo();
+    bind_tool(repo.path(), "claude", "sess-moving", Tool::Claude);
+    let raw = serde_json::json!({
+        "session_id": "sess-moving",
+        "cwd": repo.path(),
+        "stop_hook_active": false,
+        "an_extra_the_harness_sent": [1, 2, 3],
+    })
+    .to_string();
+    let installed = crate::upgrade::tests::Installed::current();
+    installed.replace(1);
+    let host = Replaced {
+        authority: installed.authority(),
+        carriers: Default::default(),
+        handoffs: Default::default(),
+    };
+    let arrived = Arrived::fresh(raw.clone(), std::time::Instant::now()).unwrap();
+    let presents = async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let line = serde_json::to_string(&delivered()).unwrap();
+        let mut verdicts = host.carriers.borrow_mut()[0]
+            .verdicts
+            .take()
+            .expect("the one carrier");
+        verdicts
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+    };
+    let (turn, ()) = tokio::join!(
+        stop(Tool::Claude, Some(repo.path()), arrived, false, &host),
+        presents
+    );
+
+    assert_eq!(turn.presentation, delivered().presentation().cloned());
+    assert!(
+        turn.wait.is_some(),
+        "the carrier that presented answers for it"
+    );
+    let carriers = host.carriers.borrow();
+    assert_eq!(carriers.len(), 1, "one carrier throughout");
+    let handoffs = host.handoffs.borrow();
+    assert!(handoffs.len() > 1, "a failed attempt is made again");
+    for (path, read) in handoffs.iter() {
+        let handoff = read.as_ref().expect("the installed build can read it");
+        assert_eq!(handoff.input, raw);
+        assert_eq!(handoff.report, carriers[0].report);
+        assert!(!path.exists(), "a failed attempt leaves its handoff behind");
+    }
+}
+
+/// The installed build, resumed from a handoff, carries the report it was
+/// handed and not one read again now: the same evidence, the same
+/// deadline, and a wait held no longer than the first build would have.
+#[tokio::test]
+async fn a_resumed_stop_carries_the_report_it_was_handed() {
+    let repo = init_repo();
+    bind_tool(repo.path(), "claude", "sess-resumed", Tool::Claude);
+    let raw = serde_json::json!({
+        "session_id": "sess-resumed",
+        "cwd": repo.path(),
+        "stop_hook_active": false,
+    })
+    .to_string();
+    let left = std::time::Duration::from_secs(600);
+    let report = Report::TurnEnd {
+        stop: TurnEndReport {
+            tool: Tool::Claude,
+            session: clank_core::SessionId::parse("sess-resumed").unwrap(),
+            place: TurnPlace {
+                turn: Some("the-turn-the-first-build-read".into()),
+                position: Some(4242),
+                human_turn: true,
+            },
+            tasks: TaskSnapshot::Unavailable,
+        },
+        deadline: super::super::turn_custody::now_ms() + left.as_millis() as u64,
+        questions: Vec::new(),
+    };
+    let handoff = super::super::hook_handoff::Handoff::new(raw, report.clone());
+    let arrived = Arrived::resumed(handoff).unwrap();
+    let until = arrived
+        .poll_deadline
+        .saturating_duration_since(std::time::Instant::now());
+    assert!(
+        until <= left && until > left - std::time::Duration::from_secs(5),
+        "{until:?}"
+    );
+    let recorder = Recorder::default();
+    stop(
+        Tool::Claude,
+        Some(repo.path()),
+        arrived,
+        false,
+        &Spawns(&recorder),
+    )
+    .await;
+    assert_eq!(recorder.0.borrow()[0].2, report);
+
+    let Report::TurnEnd { stop, .. } = report else {
+        unreachable!()
+    };
+    let unbounded = super::super::hook_handoff::Handoff::new(
+        serde_json::json!({"session_id": "sess-resumed", "cwd": repo.path()}).to_string(),
+        Report::Compacted {
+            stop,
+            deadline: u64::MAX,
+        },
+    );
+    let arrived = Arrived::resumed(unbounded).unwrap();
+    assert!(
+        arrived.poll_deadline <= poll_deadline(std::time::Instant::now()),
+        "a handoff cannot keep a hook past the runner's ceiling"
+    );
 }

@@ -88,6 +88,7 @@ pub(crate) fn stop_argv(pane: &str, tool: clank_core::vocab::Tool) -> Vec<String
 /// Interrupt `pane`'s turn with its tool's key, under the pane's lock.
 /// Writes no text, so it needs no reading of the input.
 pub(crate) fn stop_pane(session: &Endpoint, pane: &str, tool: Tool) -> anyhow::Result<()> {
+    let _permit = crate::upgrade::writing()?;
     run_sync(async {
         let _lock = lock_pane(session, pane)?;
         Zellij { session, pane }
@@ -425,6 +426,8 @@ impl Target<'_> {
 /// OpenCode, whose input cannot be read, get the interrupt key, the text
 /// and Enter unread, and only the transport answers for them.
 pub(crate) async fn nudge(target: Target<'_>, text: &Admitted) -> Result<Delivered, Unconfirmed> {
+    let _permit =
+        crate::upgrade::writing().map_err(|stale| Unconfirmed::Refused(stale.to_string()))?;
     let _lock = lock_pane_async(target.session, target.pane, Reserve::Wait)
         .await
         .map_err(Unconfirmed::Refused)?;
@@ -503,6 +506,8 @@ pub(crate) async fn submit_async(
     target: Target<'_>,
     text: &Admitted,
 ) -> Result<Delivered, PaneWrite> {
+    let _permit =
+        crate::upgrade::writing().map_err(|stale| PaneWrite::NotStarted(stale.to_string()))?;
     let _lock = lock_pane_async(target.session, target.pane, Reserve::Defer)
         .await
         .map_err(PaneWrite::NotStarted)?;
@@ -546,6 +551,8 @@ pub(crate) async fn wake_for_events_async(
     target: Target<'_>,
     hint: &Admitted,
 ) -> Result<Delivered, Unconfirmed> {
+    let _permit =
+        crate::upgrade::writing().map_err(|stale| Unconfirmed::Refused(stale.to_string()))?;
     interrupt_and_submit_reserving(target, hint, Reserve::Defer).await
 }
 
@@ -868,6 +875,7 @@ pub(crate) fn say_to_pane_for_tool(
     tool: Tool,
     text: &Admitted,
 ) -> anyhow::Result<()> {
+    let _permit = crate::upgrade::writing()?;
     run_sync(async {
         let _lock = lock_pane(session, pane)?;
         say_on(&Zellij { session, pane }, pane, tool, text).await

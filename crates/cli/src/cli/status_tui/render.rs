@@ -393,6 +393,7 @@ pub(super) fn render_at(
         view.reach.clone(),
         view.remote,
         remote_in_body,
+        view.stale_build,
     ));
 
     // The SCROLLABLE header (everything between the pinned bar and the
@@ -1943,6 +1944,8 @@ pub(super) fn bar(
     // than re-derived here from the roster, so the bar cannot come to
     // disagree with what is actually on screen.
     remote_in_body: bool,
+    // This process runs a build that is no longer the installed one.
+    stale_build: bool,
 ) -> String {
     let (left, right) = bar_text(snap);
     // The instruments own the LAST cells of the bar — their width plus
@@ -1950,7 +1953,7 @@ pub(super) fn bar(
     // they never displace the lamp: always in the same place, which is
     // what makes them readable at a glance. Measured, not assumed
     // (codex on d855068).
-    let items = cluster(reach, remote, remote_in_body);
+    let items = cluster(reach, remote, remote_in_body, stale_build);
     // NO instruments, no margin and no band: the trailing `+ 1` is the
     // gap AFTER the last one, and with none it was an empty patch that
     // cost the bar a cell — dropping the right segment at widths where
@@ -2024,9 +2027,15 @@ pub(super) fn cluster(
     remote: crate::cli::status_tui::remote::Shown,
     // Whether the BODY is drawing the remote row this frame.
     remote_in_body: bool,
+    stale_build: bool,
 ) -> Vec<(String, crate::cli::status_tui::derive::Hue)> {
     use crate::cli::status_tui::derive::Hue;
     let mut items = Vec::new();
+    // Said nowhere else: a TUI that could not restart itself is showing
+    // what an older clank makes of newer files.
+    if stale_build {
+        items.push((crate::upgrade::STALE_BADGE.to_string(), Hue::Yellow));
+    }
     // An ALARM: drawn only when something is wrong, and said nowhere
     // else, so it earns the cells whatever the body is doing.
     if let Some(alarm) = zellij_alarm(&reach) {
@@ -6403,6 +6412,7 @@ mod tests {
                             remote_page: None,
                             presence: None,
                             lost: Default::default(),
+                            stale_build: false,
                             lift,
                         };
                         let header_len = scrollable_header(s, rows, 60, 0, &view).len();
@@ -6454,6 +6464,7 @@ mod tests {
             remote_page: None,
             presence: None,
             lost: Default::default(),
+            stale_build: false,
             lift,
         }
     }
@@ -6688,6 +6699,7 @@ mod tests {
             remote_page: None,
             presence: None,
             lost: Default::default(),
+            stale_build: false,
         };
         let rule_of = |offset: usize| {
             let out = render_at(&s, 12, 60, offset, 0, &view).0;
@@ -7234,7 +7246,15 @@ mod tests {
             // Wide enough for the longest alarm. `false`: the body draws
             // no remote row here, so the lamp is carried and this test's
             // tail assertion still holds.
-            let line = bar(&s, &color, 80, reach.clone(), Default::default(), false);
+            let line = bar(
+                &s,
+                &color,
+                80,
+                reach.clone(),
+                Default::default(),
+                false,
+                false,
+            );
             let v = visible_untrimmed(&line);
             assert_eq!(v.contains("! "), says.is_some(), "{reach:?}: `{v}`");
             assert!(v.ends_with(&format!("{REMOTE_ICON} ")), "{reach:?}: `{v}`");
@@ -7274,6 +7294,7 @@ mod tests {
             reach.clone(),
             Default::default(),
             true,
+            false,
         ));
         assert!(v.contains("! zellij unknown"), "`{v}`");
         assert!(!v.contains("sqlite"), "the reason is not the bar's: `{v}`");
@@ -7309,6 +7330,7 @@ mod tests {
                         reach.clone(),
                         Default::default(),
                         in_body,
+                        false,
                     ));
                     assert_eq!(
                         display_width(&v),
@@ -7812,7 +7834,7 @@ mod tests {
         // The narrowest width that holds left + a two-column gap +
         // right. With the patch still reserved, one more was needed.
         let exact = display_width(&left) + 2 + display_width(&right);
-        let line = bar(&s, &color, exact, Connected, Shown::On, true);
+        let line = bar(&s, &color, exact, Connected, Shown::On, true, false);
         let v = visible_untrimmed(&line);
         assert_eq!(display_width(&v), exact);
         assert!(
@@ -7836,6 +7858,7 @@ mod tests {
             crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             Shown::On,
             true,
+            false,
         );
         assert!(alarmed.contains(BAND_BG), "an alarm still gets its band");
         assert_eq!(
@@ -7933,7 +7956,15 @@ mod tests {
             for cols in [8, 12, 20, 40, 80] {
                 // The body draws no row: the lamp is there, in its
                 // own hue, in the last cells.
-                let line = bar(&s, &state_color(&s).sgr(), cols, Connected, remote, false);
+                let line = bar(
+                    &s,
+                    &state_color(&s).sgr(),
+                    cols,
+                    Connected,
+                    remote,
+                    false,
+                    false,
+                );
                 let v = visible_untrimmed(&line);
                 assert_eq!(display_width(&v), cols, "{remote:?} at {cols}: `{v}`");
                 assert!(
@@ -7946,7 +7977,15 @@ mod tests {
                 );
 
                 // The body draws the row: no lamp at all.
-                let with_body = bar(&s, &state_color(&s).sgr(), cols, Connected, remote, true);
+                let with_body = bar(
+                    &s,
+                    &state_color(&s).sgr(),
+                    cols,
+                    Connected,
+                    remote,
+                    true,
+                    false,
+                );
                 assert!(
                     !visible_untrimmed(&with_body).contains(REMOTE_ICON),
                     "{remote:?} at {cols} repeats the body: {:?}",
@@ -7959,7 +7998,17 @@ mod tests {
         // all — no cell of it is spent on something said below.
         let bars: Vec<String> = [Off, Starting, Stopping, On, Failed]
             .into_iter()
-            .map(|r| visible_untrimmed(&bar(&s, &state_color(&s).sgr(), 40, Connected, r, true)))
+            .map(|r| {
+                visible_untrimmed(&bar(
+                    &s,
+                    &state_color(&s).sgr(),
+                    40,
+                    Connected,
+                    r,
+                    true,
+                    false,
+                ))
+            })
             .collect();
         assert!(
             bars.windows(2).all(|w| w[0] == w[1]),
@@ -7977,6 +8026,7 @@ mod tests {
                 NotInSession,
                 Off,
                 in_body,
+                false,
             ));
             assert!(
                 v.contains("! no zellij"),
@@ -7998,6 +8048,7 @@ mod tests {
             3,
             Connected,
             Default::default(),
+            false,
             false,
         ));
         assert_eq!(display_width(&v), 3);
@@ -8563,6 +8614,7 @@ mod tests {
                 remote_page: None,
                 presence: None,
                 lost: Default::default(),
+                stale_build: false,
             },
         )
         .0;
@@ -8621,6 +8673,7 @@ mod tests {
             remote_page: None,
             presence: None,
             lost: Default::default(),
+            stale_build: false,
         };
 
         // Tiny pane: never more lines than rows, and no element spans
@@ -8734,6 +8787,7 @@ mod tests {
                 remote_page: None,
                 presence: None,
                 lost: Default::default(),
+                stale_build: false,
             },
         )
         .0
@@ -10314,6 +10368,7 @@ mod tests {
             remote_page: None,
             presence: None,
             lost: Default::default(),
+            stale_build: false,
         };
         let lines = render_at(&s, 40, 80, 0, 0, &view).0;
         assert!(
@@ -12041,6 +12096,45 @@ mod tests {
         assert!(!line_with(&out, "codex").contains("INTERRUPTED"), "{out:?}");
     }
 
+    /// A TUI that runs a build no longer installed, and has not restarted
+    /// itself, says so in its bar, beside whatever else the bar says; one
+    /// that is current says nothing of it.
+    #[test]
+    fn the_bar_says_this_tui_runs_a_replaced_build() {
+        use crate::cli::status_tui::remote::Shown;
+        use crate::cli::status_tui::zellij::ZellijReach;
+        let s = two_agent_snap();
+        let color = state_color(&s).sgr();
+        let bar_of = |stale| {
+            visible(&bar(
+                &s,
+                &color,
+                120,
+                ZellijReach::Connected,
+                Shown::On,
+                true,
+                stale,
+            ))
+        };
+        let stale = bar_of(true);
+        assert!(
+            stale.contains("newer clank installed · restart to upgrade"),
+            "{stale}"
+        );
+        assert!(stale.starts_with(&bar_text(&s).0), "{stale}");
+        assert!(!bar_of(false).contains("newer clank"));
+        let view = PanelView {
+            stale_build: true,
+            ..PanelView::just(Mode::LogScroll)
+        };
+        let screen = render_at(&s, 40, 120, 0, 0, &view).0;
+        assert!(
+            visible(&screen[0]).contains(crate::upgrade::STALE_BADGE),
+            "{:?}",
+            screen[0]
+        );
+    }
+
     /// The bar says INTERRUPTED, off the lamp in the orange, when every
     /// agent it names is currently interrupted, and its role's verb
     /// otherwise.
@@ -12057,7 +12151,15 @@ mod tests {
         s.agents[1].state = Some(view_of(Activity::Interrupted, None));
         assert_eq!(bar_text(&s).0, "👀 CODEX INTERRUPTED");
         let color = state_color(&s).sgr();
-        let line = bar(&s, &color, 80, ZellijReach::Connected, Shown::Off, true);
+        let line = bar(
+            &s,
+            &color,
+            80,
+            ZellijReach::Connected,
+            Shown::Off,
+            true,
+            false,
+        );
         assert!(
             line.contains(&format!(
                 "\x1b[0;{INTERRUPTED_SGR}mINTERRUPTED\x1b[0;1;7;{color}m"

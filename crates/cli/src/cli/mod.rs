@@ -36,6 +36,7 @@ pub mod github;
 pub(crate) mod grok_hook;
 pub(crate) mod grok_launch;
 pub(crate) mod grok_setup;
+pub(crate) mod hook_handoff;
 pub(crate) mod hook_owner;
 pub mod html;
 pub mod html_highlight;
@@ -1144,6 +1145,11 @@ pub struct StopHookArgs {
     /// beside the asyncrewake Stop entry.
     #[arg(long, conflicts_with = "session_start")]
     pub post_compact: bool,
+    /// Resume the parked hook this process replaced, from the handoff it
+    /// left here. Passed only by clank itself, when a newer build is
+    /// installed under a parked hook.
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub handoff: Option<PathBuf>,
     /// Delivery-loop mode, written into the installed entry by
     /// `clank setup` (claude-asyncrewake-work-loop). The hook obeys
     /// ITS OWN argv — never a runtime capability probe — so the

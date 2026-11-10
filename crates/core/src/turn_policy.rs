@@ -472,9 +472,6 @@ pub enum Notice {
     /// A monitor took a report that never parks and gave no verdict
     /// before its hook had to answer.
     MonitorUnanswered,
-    /// The repo's monitor is of a newer build, which this process cannot
-    /// follow: the agent's next wait runs the installed one.
-    Upgraded,
     /// Grok's native handoff: run `clank wait` in the background, whose
     /// completion wakes the agent.
     ArmWait,

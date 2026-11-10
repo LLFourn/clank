@@ -204,7 +204,11 @@ fn path_in(namespace: &std::path::Path, repo: &std::path::Path) -> std::path::Pa
 }
 
 /// Replace the published account whole.
-pub(crate) fn publish(repo: &std::path::Path, account: &Account) -> std::io::Result<()> {
+pub(crate) fn publish(
+    repo: &std::path::Path,
+    account: &Account,
+    _permit: &crate::upgrade::Permit,
+) -> std::io::Result<()> {
     let path = path(repo);
     let tmp = path.with_extension("json.tmp");
     std::fs::write(
@@ -224,6 +228,10 @@ pub(crate) enum Live {
     /// No monitor runs for this repo, or the account is not the running
     /// one's: nothing is known, which is not the same as stopped.
     Unavailable,
+    /// A monitor is published for this repo and its account is there, in
+    /// a shape this build cannot read: another clank build wrote it. Not
+    /// the same as no monitor.
+    Unreadable,
 }
 
 /// Read the account, trusting it only while the monitor that wrote it is
@@ -263,7 +271,8 @@ fn live_in(namespace: &std::path::Path, repo: &std::path::Path) -> Live {
             let producers = followed_producers(repo, &account);
             Live::Monitor(account, producers)
         }
-        _ => Live::Unavailable,
+        Ok(_) => Live::Unavailable,
+        Err(_) => Live::Unreadable,
     }
 }
 
@@ -294,7 +303,7 @@ impl Live {
             Live::Monitor(_, producers) => producers
                 .get(&(source.agent.to_string(), source.key.clone()))
                 .copied(),
-            Live::Unavailable => None,
+            Live::Unavailable | Live::Unreadable => None,
         }
     }
 
@@ -305,7 +314,7 @@ impl Live {
                 .sources
                 .iter()
                 .find(|h| h.agent == source.agent.as_str() && h.key == source.key),
-            Live::Unavailable => None,
+            Live::Unavailable | Live::Unreadable => None,
         }
     }
 }
@@ -444,6 +453,11 @@ fn ended(exit: Option<i32>, error: &Option<String>) -> String {
     }
 }
 
+/// What every source reads as while its monitor's account is one this
+/// build cannot read.
+pub(crate) const ACCOUNT_UNREADABLE: &str =
+    "unknown: the monitor's account is from another clank build";
+
 /// What the monitor says `source` is doing at `now`, in a few words.
 /// Without a running monitor nothing is known, which is said, not taken
 /// for stopped.
@@ -451,6 +465,7 @@ pub(crate) fn state_text(source: &ConfiguredSource, live: &Live, now: u64) -> St
     use crate::cli::event_source::Lifecycle;
     let hosted = match live {
         Live::Unavailable => return "monitor not running".to_string(),
+        Live::Unreadable => return ACCOUNT_UNREADABLE.to_string(),
         Live::Monitor(..) => match live.of(source) {
             Some(hosted) => hosted,
             None => return "not hosted".to_string(),
@@ -526,9 +541,11 @@ fn polling_text(r: &crate::cli::github::progress::PollRecord, now: u64) -> Strin
 /// [`state_text`] in a word, for counting.
 pub(crate) fn state_word(source: &ConfiguredSource, live: &Live, now: u64) -> &'static str {
     use crate::cli::event_source::Lifecycle;
-    let Live::Monitor(..) = live else {
-        return "monitor not running";
-    };
+    match live {
+        Live::Monitor(..) => {}
+        Live::Unavailable => return "monitor not running",
+        Live::Unreadable => return ACCOUNT_UNREADABLE,
+    }
     let Some(hosted) = live.of(source) else {
         return "not hosted";
     };
@@ -790,6 +807,58 @@ mod tests {
             text.starts_with("degraded (reported by another clank version)"),
             "{text}"
         );
+    }
+
+    /// "monitor not running", for a running monitor, was the bug. An
+    /// account a published monitor wrote in a shape this build cannot
+    /// read is said to be that, in every wording a source is shown in;
+    /// only a repo with no monitor published reads as having none.
+    #[test]
+    fn an_account_this_build_cannot_read_is_never_a_monitor_not_running() {
+        let me = rustix::process::getuid().as_raw();
+        let ns = tempfile::tempdir().unwrap();
+        let namespace = ns.path().join("run");
+        let repo = tempfile::tempdir().unwrap();
+        let ours = std::process::id() as i32;
+        let source = ConfiguredSource::of(
+            &AgentLabel::parse("claude").unwrap(),
+            &serde_json::from_str(
+                r#"{"kind":"github","repo":"LLFourn/clank","events":["ci_passed"]}"#,
+            )
+            .unwrap(),
+        );
+        std::fs::create_dir_all(&namespace).unwrap();
+        let newer = r#"{"monitor":{"pid":1,"build":"ff"},"hosted":{"claude":[]}}"#;
+        std::fs::write(path_in(&namespace, repo.path()), newer).unwrap();
+        assert_eq!(
+            live_in(&namespace, repo.path()),
+            Live::Unavailable,
+            "nothing is published, so nothing vouches for the file"
+        );
+
+        crate::cli::monitor::publish_in(
+            repo.path(),
+            &namespace,
+            me,
+            &crate::cli::monitor::Descriptor {
+                proto: crate::cli::monitor::PROTO,
+                pid: ours,
+                repo: repo.path().display().to_string(),
+                socket: "/nowhere.sock".into(),
+                build: None,
+            },
+        )
+        .unwrap();
+        let live = live_in(&namespace, repo.path());
+        assert_eq!(live, Live::Unreadable);
+        for said in [
+            state_text(&source, &live, 0),
+            state_word(&source, &live, 0).to_string(),
+        ] {
+            assert_eq!(said, ACCOUNT_UNREADABLE);
+            assert!(!said.contains("not running"), "{said}");
+        }
+        assert_eq!(live.of(&source), None);
     }
 
     fn hosted(source: &ConfiguredSource, lifecycle: crate::cli::event_source::Lifecycle) -> Hosted {

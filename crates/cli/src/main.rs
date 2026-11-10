@@ -7,6 +7,11 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::from_arg_matches(&clank::cli::command::cli().get_matches())
         .unwrap_or_else(|e| e.exit());
+    // Here and not in the library: a test drives the same commands from a
+    // binary that is nobody's installation.
+    if cli.command.outlives_an_install() {
+        clank::upgrade::arm();
+    }
     if let Err(e) = dispatch(cli).await {
         let code = exit_code_for(&e);
         eprintln!("{e:#}");

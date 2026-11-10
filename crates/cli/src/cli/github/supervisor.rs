@@ -37,6 +37,9 @@ pub(crate) fn write_watch_sidecar(
     origin: SourceOrigin,
     key: &str,
 ) {
+    let Ok(_permit) = crate::upgrade::writing() else {
+        return;
+    };
     let meta = dir.join(format!("{key}.meta.json"));
     let res = match (origin, &src.prompt) {
         (SourceOrigin::Cli, Some(p)) => std::fs::create_dir_all(dir)

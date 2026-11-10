@@ -80,9 +80,14 @@ pub(super) async fn run(args: crate::cli::EventsShowArgs) -> anyhow::Result<()> 
             &mut stdout.lock(),
         )?;
     }
-    crate::cli::wake_receipt::dispatch(&repo, &reader.author, prepared, reader.tool, || {
-        reader.current(&repo)
-    })
+    crate::cli::wake_receipt::dispatch(
+        &repo,
+        &reader.author,
+        prepared,
+        reader.tool,
+        || reader.current(&repo),
+        &crate::upgrade::process().settling(),
+    )
     .await;
     Ok(())
 }
@@ -117,6 +122,7 @@ fn present(
             ident: selected.row.ident.clone(),
         }],
         || reader.current(repo),
+        &crate::upgrade::process().settling(),
     );
     Ok(())
 }

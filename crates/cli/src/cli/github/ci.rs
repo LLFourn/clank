@@ -418,6 +418,11 @@ impl CiHorizon {
     /// next arm a silent re-establish, never a wrong wake.
     pub(crate) fn save(&self, path: Option<&std::path::Path>) {
         let Some(path) = path else { return };
+        // A stale monitor remembers nothing for its successor: what it
+        // could not log must still be news to the one that follows.
+        let Ok(_permit) = crate::upgrade::writing() else {
+            return;
+        };
         let Ok(bytes) = serde_json::to_vec(self) else {
             return;
         };

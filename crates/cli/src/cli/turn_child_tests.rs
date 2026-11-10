@@ -3,7 +3,7 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::monitor::{Conn, OUTAGE_BUDGET};
-use super::super::wake_render::{UPGRADED, monitor_outage};
+use super::super::wake_render::monitor_outage;
 
 pub(crate) const SESSION: &str = "session-unmonitored";
 
@@ -148,6 +148,24 @@ async fn carried(
     report: &Report,
     attach: Attach<'_>,
 ) -> Vec<Frame> {
+    carried_by(
+        repo,
+        author,
+        report,
+        attach,
+        &crate::upgrade::Authority::unwatched(),
+    )
+    .await
+}
+
+/// [`carried`], by a child of the build `authority` judges.
+async fn carried_by(
+    repo: &Path,
+    author: &AgentLabel,
+    report: &Report,
+    attach: Attach<'_>,
+    authority: &crate::upgrade::Authority,
+) -> Vec<Frame> {
     let (owner_read, mut stdin) = std::io::pipe().unwrap();
     writeln!(stdin, "{}", serde_json::to_string(report).unwrap()).unwrap();
     let mut out = Vec::new();
@@ -158,6 +176,7 @@ async fn carried(
         Owner::reading(owner_read),
         &mut out,
         attach,
+        authority,
     )
     .await;
     drop(stdin);
@@ -190,15 +209,6 @@ pub(crate) async fn outage_frame(tool: clank_core::Tool) -> Frame {
     frame
 }
 
-/// The frame the child prints when a newer build's monitor refuses it.
-pub(crate) async fn upgraded_frame(tool: clank_core::Tool) -> Frame {
-    let [frame] = unserved(&stop_of(tool, u64::MAX), newer)
-        .await
-        .try_into()
-        .expect("one frame");
-    frame
-}
-
 /// The frame the child prints for a report it cannot parse.
 pub(crate) async fn unparsed_frame() -> Frame {
     let (repo, author) = repo_with(clank_core::Tool::Claude, true);
@@ -213,6 +223,7 @@ pub(crate) async fn unparsed_frame() -> Frame {
         Owner::reading(owner_read),
         &mut out,
         &attach,
+        &crate::upgrade::Authority::unwatched(),
     )
     .await;
     let [frame] = frames(out).try_into().expect("one frame");
@@ -296,24 +307,48 @@ async fn an_outage_past_its_budget_wakes_with_the_reason_and_no_work() {
     );
 }
 
-/// A monitor of a newer build cannot be followed: the park ends with one
-/// notice, at once, after one attempt.
+/// A child of a build that has been replaced, refused by the installed
+/// build's monitor for three outage budgets: it goes on trying, tells its
+/// agent nothing and records no outage, and its park ends as an
+/// uneventful one does. Its hook is what moves; the upgrade costs no turn.
 #[tokio::test(start_paused = true)]
-async fn a_newer_monitors_refusal_ends_the_park_with_one_notice() {
+async fn a_stale_child_goes_on_trying_and_tells_its_agent_nothing() {
     let (repo, author) = repo_with(clank_core::Tool::Claude, true);
+    let installed = crate::upgrade::tests::Installed::current();
+    let authority = installed.authority();
+    installed.replace(1);
     let attempts = AtomicUsize::new(0);
     let attach = |_: Who| -> Attaching<'_> {
         attempts.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { newer() })
     };
-    let began = tokio::time::Instant::now();
-    let printed = carried(repo.path(), &author, &stop(u64::MAX), &attach).await;
+    let report = stop(within(OUTAGE_BUDGET * 3));
+    let printed = carried_by(repo.path(), &author, &report, &attach, &authority).await;
     assert_eq!(
         printed,
-        vec![Frame::text(WireVerdict::Notify, UPGRADED.to_string())]
+        vec![super::super::turn_custody::Turns::deadline_frame(
+            clank_core::Tool::Claude
+        )]
     );
-    assert_eq!(attempts.into_inner(), 1);
-    assert_eq!(began.elapsed(), std::time::Duration::ZERO);
+    assert!(!told(repo.path(), &author), "no outage was announced");
+    assert!(
+        attempts.into_inner() as u32 > OUTAGE_BUDGET.as_secs() as u32 * 2 / 8,
+        "it went on trying past the outage budget"
+    );
+}
+
+/// The same refusal, to a child whose own build is still the installed
+/// one, is an outage like any other: nothing says an upgrade explains it.
+#[tokio::test(start_paused = true)]
+async fn a_newer_monitor_with_no_newer_install_is_an_outage() {
+    let printed = unserved(&stop(u64::MAX), newer).await;
+    assert_eq!(
+        printed,
+        vec![Frame::text(
+            WireVerdict::Notify,
+            monitor_outage("the monitor speaks a newer protocol")
+        )]
+    );
 }
 
 /// A report that never parks is told of a retry still failing at its
@@ -507,6 +542,7 @@ async fn the_owners_eof_ends_a_failing_retry_at_once() {
         Owner::reading(owner_read),
         &mut out,
         &attach,
+        &crate::upgrade::Authority::unwatched(),
     )
     .await;
     assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
@@ -581,6 +617,7 @@ async fn a_hook_gone_before_its_report_ends_the_child() {
         Owner::reading(owner_read),
         &mut out,
         &attach,
+        &crate::upgrade::Authority::unwatched(),
     )
     .await;
     assert!(out.is_empty());
@@ -609,13 +646,21 @@ async fn a_handoff_is_carried_to_a_monitor_and_holds_no_wait() {
         Owner::reading(owner_read),
         &mut out,
         &attach,
+        &crate::upgrade::Authority::unwatched(),
     )
     .await;
     drop(stdin);
-    assert_eq!(*held.lock().unwrap(), vec![None]);
+    let held = held.lock().unwrap();
+    assert!(
+        !held.is_empty() && held.iter().all(Option::is_none),
+        "{held:?}"
+    );
     assert_eq!(
         frames(out),
-        vec![Frame::text(WireVerdict::Notify, UPGRADED.to_string())]
+        vec![Frame::text(
+            WireVerdict::Notify,
+            monitor_outage("the monitor speaks a newer protocol")
+        )]
     );
 }
 
@@ -736,6 +781,7 @@ async fn the_owners_eof_ends_a_connected_exchange_at_once() {
             Owner::reading(owner_read),
             &mut out,
             &attach,
+            &crate::upgrade::Authority::unwatched(),
         ),
     )
     .await
@@ -783,7 +829,16 @@ pub(crate) fn handoff_child(repo: &Path, author: &AgentLabel, out: &mut HookPipe
             let report = handoff_by(within(std::time::Duration::from_secs(10)));
             writeln!(stdin, "{}", serde_json::to_string(&report).unwrap()).unwrap();
             let attach = |_: Who| -> Attaching<'_> { Box::pin(async { no_binary() }) };
-            carry(repo, author, None, Owner::reading(owner_read), out, &attach).await;
+            carry(
+                repo,
+                author,
+                None,
+                Owner::reading(owner_read),
+                out,
+                &attach,
+                &crate::upgrade::Authority::unwatched(),
+            )
+            .await;
             drop(stdin);
         });
 }
@@ -928,4 +983,154 @@ async fn a_hooks_own_result_is_what_is_forwarded() {
         TurnResult::EmitFailed { .. }
     ));
     assert!(started.elapsed() < super::RESULT_WITHIN);
+}
+
+fn retiring() -> Attempt {
+    Attempt::LeaseHeld("the retiring monitor still holds the lease".into())
+}
+
+/// An upgrade as a freshly started child of the installed build meets it:
+/// the old monitor holds the lease for longer than an outage is allowed,
+/// while it hears out its hooks and drains, and then the installed
+/// monitor answers. The park is held through all of it, the agent is told
+/// nothing, and the only verdict printed is the new monitor's.
+#[tokio::test(start_paused = true)]
+async fn a_park_outwaits_a_retiring_monitor_longer_than_an_outage() {
+    let (repo, author) = repo_with(clank_core::Tool::Claude, true);
+    let seventy = OUTAGE_BUDGET + std::time::Duration::from_secs(10);
+    let began = tokio::time::Instant::now();
+    let woke = || Frame::text(WireVerdict::Notify, "the installed monitor's word".into());
+    let staying = std::sync::Mutex::new(None);
+    let attach = |_: Who| -> Attaching<'_> {
+        let attempt = match began.elapsed() < seventy {
+            true => retiring(),
+            false => {
+                let (conn, monitor) = monitor_saying(woke());
+                *staying.lock().unwrap() = Some(monitor);
+                Attempt::Shared(conn)
+            }
+        };
+        Box::pin(async move { attempt })
+    };
+    let printed = carried(repo.path(), &author, &stop(u64::MAX), &attach).await;
+    assert_eq!(printed, vec![woke()]);
+    assert!(began.elapsed() >= seventy);
+    assert!(!told(repo.path(), &author), "a retirement is not an outage");
+}
+
+/// A monitor that is going and never goes is an outage after all, once
+/// everything it and its successor are allowed has passed, and no sooner.
+#[tokio::test(start_paused = true)]
+async fn a_retirement_that_never_ends_is_told_at_its_own_bound() {
+    use super::super::monitor::RETIREMENT_BUDGET;
+    let began = tokio::time::Instant::now();
+    let printed = unserved(&stop(u64::MAX), retiring).await;
+    assert_eq!(
+        printed,
+        vec![Frame::text(
+            WireVerdict::Notify,
+            monitor_outage("the retiring monitor still holds the lease")
+        )]
+    );
+    let took = began.elapsed();
+    assert!(
+        took >= RETIREMENT_BUDGET && took < RETIREMENT_BUDGET + OUTAGE_BUDGET,
+        "{took:?}"
+    );
+}
+
+/// A report that cannot park, caught by a retirement, costs its agent no
+/// turn either way it meets it: unattached behind the old monitor's
+/// lease until its deadline, or attached to an old monitor that answers
+/// nothing new while it settles. Each ends with a diagnostic, which wakes
+/// nobody, and no notice is recorded as given.
+#[tokio::test(start_paused = true)]
+async fn a_report_that_cannot_wait_out_a_retirement_ends_quietly() {
+    use super::super::monitor::{DescribedBuild, Descriptor};
+    let quiet = |printed: &[Frame]| {
+        matches!(
+            printed,
+            [Frame {
+                verdict: WireVerdict::Diagnostic { .. },
+                rendered: None
+            }]
+        )
+    };
+    let ten = std::time::Duration::from_secs(10);
+
+    let printed = unserved(&handoff_by(within(ten)), retiring).await;
+    assert!(quiet(&printed), "{printed:?}");
+
+    let (repo, author) = repo_with(clank_core::Tool::Grok, true);
+    let mut other = crate::build_stamp::running().0;
+    other[0] ^= 1;
+    super::super::monitor::publish(
+        repo.path(),
+        &Descriptor {
+            build: Some(DescribedBuild {
+                running: crate::build_stamp::Stamp(other).to_string(),
+                version: None,
+                installed_at: "/bin/clank".into(),
+                source: crate::build_stamp::Source::Invocation,
+            }),
+            ..super::super::monitor::describe(
+                repo.path(),
+                std::process::id() as i32,
+                Path::new("/nowhere.sock"),
+            )
+        },
+    )
+    .unwrap();
+    let monitors = std::sync::Mutex::new(Vec::new());
+    let attach = |_: Who| -> Attaching<'_> {
+        let (conn, monitor) = monitor_only_beating();
+        monitors.lock().unwrap().push(monitor);
+        Box::pin(async move { Attempt::Shared(conn) })
+    };
+    let printed = carried(repo.path(), &author, &handoff_by(within(ten)), &attach).await;
+    let _ = std::fs::remove_file(super::super::monitor::runtime_path(repo.path(), "json"));
+    assert!(quiet(&printed), "{printed:?}");
+    assert!(!told(repo.path(), &author));
+}
+
+/// A park whose child is not the client repairing the repo, while the
+/// old monitor is still going: it is told only that another client is
+/// starting one, for longer than an outage is allowed, and holds on
+/// without a word to its agent until the installed monitor answers.
+#[tokio::test(start_paused = true)]
+async fn a_park_behind_another_clients_repair_outwaits_the_retirement() {
+    use super::super::monitor::{Descriptor, PROTO};
+    let (repo, author) = repo_with(clank_core::Tool::Claude, true);
+    super::super::monitor::publish(
+        repo.path(),
+        &Descriptor {
+            proto: PROTO - 1,
+            ..super::super::monitor::describe(
+                repo.path(),
+                std::process::id() as i32,
+                Path::new("/nowhere.sock"),
+            )
+        },
+    )
+    .unwrap();
+    let seventy = OUTAGE_BUDGET + std::time::Duration::from_secs(10);
+    let began = tokio::time::Instant::now();
+    let woke = || Frame::text(WireVerdict::Notify, "the installed monitor's word".into());
+    let staying = std::sync::Mutex::new(None);
+    let attach = |_: Who| -> Attaching<'_> {
+        let attempt = match began.elapsed() < seventy {
+            true => Attempt::Busy("another client is already starting one".into()),
+            false => {
+                let (conn, monitor) = monitor_saying(woke());
+                *staying.lock().unwrap() = Some(monitor);
+                Attempt::Shared(conn)
+            }
+        };
+        Box::pin(async move { attempt })
+    };
+    let printed = carried(repo.path(), &author, &stop(u64::MAX), &attach).await;
+    let _ = std::fs::remove_file(super::super::monitor::runtime_path(repo.path(), "json"));
+    assert_eq!(printed, vec![woke()]);
+    assert!(began.elapsed() >= seventy);
+    assert!(!told(repo.path(), &author));
 }

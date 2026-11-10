@@ -64,8 +64,9 @@ pub(crate) fn receive(
     session: &str,
     identities: &[String],
     at: u64,
+    permit: &crate::upgrade::Permit,
 ) -> std::io::Result<bool> {
-    receive_with(guard, tool, session, identities, at, |_| {})
+    receive_with(guard, tool, session, identities, at, permit, |_| {})
 }
 
 /// [`receive`], calling `before_write` with the label's directory once the
@@ -76,6 +77,7 @@ fn receive_with(
     session: &str,
     identities: &[String],
     at: u64,
+    _permit: &crate::upgrade::Permit,
     before_write: impl FnOnce(&Path),
 ) -> std::io::Result<bool> {
     if !guard.bound_to(tool, session) {
@@ -122,6 +124,7 @@ pub(crate) fn record_delivered(
     session: &str,
     carried: &Carried,
     current: impl Fn() -> bool,
+    permit: &crate::upgrade::Permit,
 ) {
     let received = match carried.identities.is_empty() {
         true => Ok(true),
@@ -134,6 +137,7 @@ pub(crate) fn record_delivered(
                     session,
                     &carried.identities,
                     super::github::log::now_epoch(),
+                    permit,
                 )
             }),
     };
@@ -142,13 +146,13 @@ pub(crate) fn record_delivered(
             "clank: wake delivered; could not record its receipt, so it reads as undelivered: {e}"
         );
     }
-    record(repo, author, &carried.events, &current);
+    record(repo, author, &carried.events, &current, permit);
     for answer in &carried.answers {
         // A presentation speaks for its own agent's blocks only.
         if &answer.agent != author {
             continue;
         }
-        if let Err(e) = super::block::receive(repo, answer, &current) {
+        if let Err(e) = super::block::receive(repo, answer, &current, permit) {
             eprintln!(
                 "clank: wake delivered; could not receive the answer to `{}/{}`, so it stays \
                  owed: {e:#}",
@@ -163,6 +167,7 @@ pub(crate) fn record(
     author: &AgentLabel,
     selected: &[EventPresentation],
     current: impl Fn() -> bool,
+    permit: &crate::upgrade::Permit,
 ) {
     let dir = crate::agent_store::agents_root(repo)
         .join(author.as_str())
@@ -189,8 +194,9 @@ pub(crate) fn record(
         if !dir.join(format!("{source}.jsonl")).is_file() {
             continue;
         }
-        let result = super::github::log::EventLog::open(&dir, source).and_then(|mut log| {
-            log.append_presentations(&keys, super::github::log::now_epoch(), &current)
+        let result = super::github::log::EventLog::open(&dir, source).and_then(|log| {
+            log.under(permit)
+                .append_presentations(&keys, super::github::log::now_epoch(), &current)
         });
         if result.is_err() {
             failures += 1;

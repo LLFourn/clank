@@ -1687,6 +1687,11 @@ struct Watched {
     /// this, so a failing disk is not retried in a tight loop, nor by the
     /// events its own failed writes cause.
     held_until: Option<u64>,
+    /// Held from the claim of an attempt until its answer is recorded. A
+    /// monitor that sees a newer clank installed in between still records
+    /// what became of the nudge it sent, so the monitor that follows does
+    /// not send it again; and it claims no new one, having no permit to.
+    in_flight: Option<crate::upgrade::Permit>,
     /// A decision is owed once the hold ends, whether or not there is an
     /// episode with a deadline to carry it.
     owed: bool,
@@ -1981,6 +1986,9 @@ impl Driver {
     /// Write `author`'s pending attempts into `dir`, or remove the file when
     /// none is left. Best effort: a lost file loses history, never a retry.
     fn save_pending_in(&self, author: &clank_core::ids::AgentLabel, dir: &Path) {
+        let Ok(_permit) = crate::upgrade::writing() else {
+            return;
+        };
         let mine: Vec<&Pending> = self
             .pending
             .iter()
@@ -2065,6 +2073,7 @@ impl Driver {
                     snap: Snapshot::default(),
                     episode: load(&f.agent_dir),
                     held_until: None,
+                    in_flight: None,
                     owed: false,
                     answers: Vec::new(),
                     role: String::new(),
@@ -2460,8 +2469,12 @@ impl Driver {
                 asking: w.projection.asking.clone(),
                 repeated: w.projection.repeated,
             };
-            if w.published.as_ref() != Some(&state) {
-                crate::cli::agent_state::store(&w.agent_dir, &state);
+            // A state left unpublished by a stale monitor stays owed to
+            // `published`, so the monitor that follows writes it.
+            if w.published.as_ref() != Some(&state)
+                && let Ok(permit) = crate::upgrade::process().permit()
+            {
+                crate::cli::agent_state::store(&w.agent_dir, &state, &permit);
                 w.published = Some(state);
             }
         }
@@ -2671,6 +2684,16 @@ fn refresh(w: &mut Watched) -> bool {
 ///
 /// A dispatch is returned only once the claim behind it is on disk: a side
 /// effect with no durable claim could be repeated after a restart.
+/// Whether `ep` has an attempt out whose answer has not come back.
+fn awaiting_answer(ep: &Option<Episode>) -> bool {
+    ep.as_ref().is_some_and(|e| {
+        e.state == State::Dispatched
+            && e.attempts
+                .last()
+                .is_some_and(|a| a.disposition == Disposition::Claimed)
+    })
+}
+
 fn decision(
     author: &clank_core::ids::AgentLabel,
     w: &mut Watched,
@@ -2741,20 +2764,41 @@ fn decision(
     // The number is claimed before the episode that uses it, and neither
     // is acted on until both are stored: an attempt's identity must
     // outlive its episode, which a reset may forget.
-    let stored = match high > issued {
-        true => store_issued(&w.agent_dir, high),
-        false => Ok(()),
-    }
-    .and_then(|()| match durable(&next) != durable(&prev) {
-        true => store(&w.agent_dir, durable(&next)),
-        false => Ok(()),
+    let writes = high > issued || durable(&next) != durable(&prev);
+    let permit = match (writes, w.in_flight.take()) {
+        (_, Some(held)) => Ok(Some(held)),
+        (true, None) => crate::upgrade::writing().map(Some),
+        (false, None) => Ok(None),
+    };
+    let stored = permit.map_err(std::io::Error::from).and_then(|permit| {
+        if let Some(permit) = &permit {
+            if high > issued {
+                store_issued_under(&w.agent_dir, high, permit)?;
+            }
+            if durable(&next) != durable(&prev) {
+                store_under(&w.agent_dir, durable(&next), permit)?;
+            }
+        }
+        Ok(permit)
     });
-    if let Err(e) = stored {
-        eprintln!("monitor: could not record `{author}`'s recovery, so nothing was done: {e}");
-        w.held_until = Some(now + RETRY_LOOK);
-        w.owed = true;
-        return Vec::new();
-    }
+    let permit = match stored {
+        Ok(permit) => permit,
+        Err(e) => {
+            match e
+                .get_ref()
+                .is_some_and(|inner| inner.is::<crate::upgrade::Stale>())
+            {
+                true => tracing::debug!(%author, %e, "recovery left undecided"),
+                false => eprintln!(
+                    "monitor: could not record `{author}`'s recovery, so nothing was done: {e}"
+                ),
+            }
+            w.held_until = Some(now + RETRY_LOOK);
+            w.owed = true;
+            return Vec::new();
+        }
+    };
+    w.in_flight = permit.filter(|_| awaiting_answer(&next));
     w.held_until = None;
     w.owed = false;
     w.answers.clear();
@@ -3125,7 +3169,16 @@ pub(crate) fn load_issued(agent_dir: &Path) -> std::io::Result<u32> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn store_issued(agent_dir: &Path, n: u32) -> std::io::Result<()> {
+    store_issued_under(agent_dir, n, &crate::upgrade::writing()?)
+}
+
+fn store_issued_under(
+    agent_dir: &Path,
+    n: u32,
+    _permit: &crate::upgrade::Permit,
+) -> std::io::Result<()> {
     let path = issued_path(agent_dir);
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec(&n)?)?;
@@ -3150,7 +3203,16 @@ pub(crate) fn load(agent_dir: &Path) -> Option<Episode> {
 }
 
 /// Persist, or remove, the agent's episode.
+#[cfg(test)]
 pub(crate) fn store(agent_dir: &Path, ep: Option<&Episode>) -> std::io::Result<()> {
+    store_under(agent_dir, ep, &crate::upgrade::writing()?)
+}
+
+fn store_under(
+    agent_dir: &Path,
+    ep: Option<&Episode>,
+    _permit: &crate::upgrade::Permit,
+) -> std::io::Result<()> {
     let path = episode_path(agent_dir);
     match ep {
         None => match std::fs::remove_file(&path) {
@@ -3217,6 +3279,7 @@ pub(crate) fn retry_announcement(tool: Tool) -> &'static str {
 /// Append one turn a harness reported for itself, for its session. The
 /// monitor is the record's only writer.
 pub(crate) fn observe(agent_dir: &Path, line: &serde_json::Value) -> std::io::Result<()> {
+    let _permit = crate::upgrade::writing()?;
     use std::io::Write as _;
     std::fs::create_dir_all(agent_dir)?;
     let mut f = std::fs::OpenOptions::new()
@@ -4160,6 +4223,112 @@ pub(crate) mod tests {
             "a person's turn ends it"
         );
         assert_eq!(waiting_for_you(dir.path()), None);
+    }
+
+    /// A nudge sent before a newer clank was installed is still answered
+    /// for afterwards: the monitor that sent it records what became of
+    /// it, so the monitor that follows does not send it again. That is
+    /// all it records. It claims and sends nothing new, and what its
+    /// agents' records do next is left for its successor to read.
+    #[test]
+    fn a_stale_monitor_records_the_nudge_it_sent_and_sends_no_other() {
+        use crate::upgrade::Standing;
+        use crate::upgrade::tests::{AsProcess, Installed};
+        enable(Tool::Codex, Some(Transport::CodexStart));
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+        let facts = || {
+            vec![codex_facts(
+                dir.path(),
+                &rollout,
+                "session-one",
+                true,
+                false,
+            )]
+        };
+        let mut d = driver();
+        d.reconcile(facts(), 0);
+        let acts = d.due(60, |_, _| Gate::Go);
+        let sent = dispatches(&acts);
+        let [(attempt, "t1")] = sent.as_slice() else {
+            panic!("{acts:?}")
+        };
+        let attempt = (*attempt).clone();
+        let recorded = || {
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path() != rollout)
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(e.path()).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+
+        installed.replace(1);
+        assert!(
+            matches!(authority.look(), Standing::Quiescing { in_flight: 1, .. }),
+            "the nudge in flight holds the monitor: {:?}",
+            authority.standing()
+        );
+        d.answer(
+            &label(),
+            &attempt,
+            Answer::Submitted {
+                started: Some("t2".into()),
+            },
+            61,
+        );
+        assert_eq!(
+            load(dir.path()).unwrap().attempts[0].disposition,
+            Disposition::Submitted,
+            "what became of the nudge was not recorded"
+        );
+        assert!(matches!(authority.standing(), Standing::Replaceable { .. }));
+
+        let settled = recorded();
+        append(&rollout, &[&line(STARTED, "t2")]);
+        touched(&mut d, &rollout, 62);
+        append(&rollout, &[&line(DONE, "t2")]);
+        touched(&mut d, &rollout, 90);
+        let acts = d.due(90 + IDLE_WAITS[1], |_, _| Gate::Go);
+        assert!(dispatches(&acts).is_empty(), "{acts:?}");
+        assert_eq!(recorded(), settled, "nothing after the answer is written");
+
+        // A monitor stale before it ever looked claims and sends nothing.
+        let other = tempfile::tempdir().unwrap();
+        let record = other.path().join("rollout.jsonl");
+        append(&record, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
+        let mut late = driver();
+        late.reconcile(
+            vec![codex_facts(
+                other.path(),
+                &record,
+                "session-two",
+                true,
+                false,
+            )],
+            0,
+        );
+        let acts = late.due(60, |_, _| Gate::Go);
+        assert!(
+            dispatches(&acts).is_empty(),
+            "a stale monitor nudged: {acts:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(other.path()).unwrap().count(),
+            1,
+            "only the agent's own record is there"
+        );
     }
 
     /// With a transport enabled: the deadline dispatches against the failed

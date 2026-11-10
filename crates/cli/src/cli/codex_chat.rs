@@ -131,6 +131,7 @@ fn route(last: Option<&Value>) -> anyhow::Result<Route> {
 /// caller should use the terminal fallback. Once a mutation is sent,
 /// an error is reported instead of risking a duplicate fallback send.
 pub(crate) fn send(thread: &str, text: &super::pane_input::Admitted) -> anyhow::Result<bool> {
+    let _permit = crate::upgrade::writing()?;
     let text = text.as_str();
     if text.is_empty() {
         return Ok(true);

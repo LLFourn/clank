@@ -49,6 +49,9 @@ const STAGING_PREFIX: &str = ".send-";
 /// Interrupted legacy sends may leave staging hard links. Unlinking them
 /// preserves published messages; migration holds the old inbox lock.
 fn clear_staging(dir: &Path) {
+    let Ok(_permit) = crate::upgrade::writing() else {
+        return;
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

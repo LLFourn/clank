@@ -80,6 +80,7 @@ fn update_with(
     record: &Path,
     change: impl FnOnce(&mut BTreeSet<String>),
 ) -> anyhow::Result<BTreeSet<String>> {
+    let _permit = crate::upgrade::writing()?;
     use std::io::Write;
     let lock_path = record.with_extension("lock");
     let lock = std::fs::OpenOptions::new()

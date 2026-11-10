@@ -1342,8 +1342,12 @@ pub(crate) enum Attempt {
     Busy(String),
     /// The repo was free to start a monitor in, and starting it failed.
     SpawnFailed(String),
-    /// Nothing serves the repo and nothing was started: its lease stayed
-    /// held, or the handoff ran out of time first.
+    /// Nothing serves this client and nothing was started, because the
+    /// repo's lease is still held: a monitor that no longer answers is on
+    /// its way out, and its successor can start only once it has gone.
+    LeaseHeld(String),
+    /// Nothing serves the repo and nothing was started: the handoff ran
+    /// out of time first.
     NotStarted(String),
     /// A monitor was started and had not admitted this client by the
     /// deadline.
@@ -1360,6 +1364,7 @@ impl Attempt {
             | Attempt::Unproven(why)
             | Attempt::Busy(why)
             | Attempt::SpawnFailed(why)
+            | Attempt::LeaseHeld(why)
             | Attempt::NotStarted(why)
             | Attempt::Unattached(why) => Some(why),
         }
@@ -1375,30 +1380,82 @@ impl From<Attempt> for Attached {
     }
 }
 
-/// Why a waiter that must have a monitor did not get one from an attempt.
+/// Why a waiter that must have a monitor has none this time. Either way
+/// it tries again; what differs is how long that may go on before its
+/// agent is told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Unserved {
-    /// A newer build's monitor keeps the repo. No retry by this process
-    /// can attach to it.
-    Upgraded(String),
-    /// Nothing attached this time; another attempt may.
-    Retry(String),
+    /// A monitor still holds the repo and is known to be going: the
+    /// ordinary course of an upgrade, given [`RETIREMENT_BUDGET`].
+    Retiring(String),
+    /// Anything else, given [`OUTAGE_BUDGET`]. A refusal by a newer
+    /// build's monitor is one: its waiter becomes that build when the
+    /// installation says so, and nothing else explains it.
+    Failed(String),
+}
+
+impl Unserved {
+    pub(crate) fn why(&self) -> &str {
+        match self {
+            Unserved::Retiring(why) | Unserved::Failed(why) => why,
+        }
+    }
 }
 
 impl Attempt {
-    /// The connection, or what a waiter that never decides for itself does
-    /// about not having one.
-    pub(crate) fn served(self) -> Result<Conn, Unserved> {
+    /// The connection, or why a waiter of `repo` that never decides for
+    /// itself has none this time.
+    ///
+    /// A retirement is read from what is known of the repo, not from how
+    /// this client's own attempt happened to end. A lease still held says
+    /// so; so does a monitor of another build still published for the
+    /// repo, whichever client is repairing and however this one's turn
+    /// behind it went. Only a refusal by a newer monitor is left as it
+    /// is: there this process is the one that is out of date.
+    pub(crate) fn served(self, repo: &std::path::Path) -> Result<Conn, Unserved> {
         match self {
             Attempt::Shared(conn) => Ok(conn),
-            Attempt::Newer(why) => Err(Unserved::Upgraded(why)),
-            Attempt::Theirs(why)
-            | Attempt::Unproven(why)
-            | Attempt::Busy(why)
-            | Attempt::SpawnFailed(why)
-            | Attempt::NotStarted(why)
-            | Attempt::Unattached(why) => Err(Unserved::Retry(why)),
+            Attempt::LeaseHeld(why) => Err(Unserved::Retiring(why)),
+            Attempt::Newer(why) => Err(Unserved::Failed(why)),
+            other => {
+                let why = other.why().unwrap_or_default().to_string();
+                Err(match outgoing(repo) {
+                    true => Unserved::Retiring(why),
+                    false => Unserved::Failed(why),
+                })
+            }
         }
+    }
+}
+
+/// How long a waiter goes on for a monitor known to be on its way out
+/// before it tells its agent: everything that monitor and its successor
+/// are allowed. A stale monitor may hear out the presentations it handed
+/// to hooks, then drain its producers and retire, then settle; and the
+/// monitor that follows has to start and admit the waiter.
+pub(crate) const RETIREMENT_BUDGET: Duration = QUIESCE_BUDGET
+    .saturating_add(LEASE_RETIREMENT)
+    .saturating_add(SETTLE_BUDGET)
+    .saturating_add(SPAWN_SETTLE)
+    .saturating_add(ATTACH_BUDGET);
+
+/// Whether the monitor published for `repo` runs a build other than this
+/// process's. To a process of the installed build that is a monitor on
+/// its way out: it retires by itself once it has settled what it handed
+/// out, and answers nothing new meanwhile.
+pub(crate) fn outgoing(repo: &std::path::Path) -> bool {
+    // A descriptor outlives a monitor that died: one whose process is
+    // known to be gone is nobody going, and what follows is an outage.
+    let there = |pid: i32| crate::signal::probe_process(pid) != crate::signal::Probe::Gone;
+    match published(repo) {
+        Published::Ours(descriptor) => {
+            there(descriptor.pid)
+                && descriptor
+                    .build
+                    .is_some_and(|build| build.running != crate::build_stamp::running().to_string())
+        }
+        Published::Other { pid, .. } => pid.is_none_or(there),
+        _ => false,
     }
 }
 
@@ -1424,6 +1481,9 @@ pub(crate) const OUTAGE_RETRY_CAP: Duration = Duration::from_secs(8);
 #[derive(Debug, Default)]
 pub(crate) struct Outage {
     since: Option<tokio::time::Instant>,
+    /// When the attempts began failing for no known reason: a monitor
+    /// seen to be retiring since is a reason, and starts this again.
+    failing_since: Option<tokio::time::Instant>,
     pause: Duration,
 }
 
@@ -1433,15 +1493,28 @@ impl Outage {
         *self = Outage::default();
     }
 
-    /// An attempt, or a connection, ended without a monitor at `now`: how
-    /// long to pause before the next attempt, or `None` once the outage
-    /// has outlasted [`OUTAGE_BUDGET`].
+    /// An attempt, or a connection, ended without a monitor at `now`,
+    /// for `unserved`: how long to pause before the next attempt, or
+    /// `None` once the outage has outlasted its budget. A retirement has
+    /// [`RETIREMENT_BUDGET`] from the first loss; failures for no known
+    /// reason have [`OUTAGE_BUDGET`] from the first of them.
     ///
     /// The first loss since a monitor answered pauses for nothing: a
     /// monitor that retired is followed at once.
-    pub(crate) fn lost(&mut self, now: tokio::time::Instant) -> Option<Duration> {
+    pub(crate) fn lost(
+        &mut self,
+        now: tokio::time::Instant,
+        unserved: &Unserved,
+    ) -> Option<Duration> {
         let since = *self.since.get_or_insert(now);
-        if now.saturating_duration_since(since) >= OUTAGE_BUDGET {
+        let (from, budget) = match unserved {
+            Unserved::Retiring(_) => {
+                self.failing_since = None;
+                (since, RETIREMENT_BUDGET)
+            }
+            Unserved::Failed(_) => (*self.failing_since.get_or_insert(now), OUTAGE_BUDGET),
+        };
+        if now.saturating_duration_since(from) >= budget {
             return None;
         }
         let pause = self.pause;
@@ -1462,35 +1535,160 @@ mod outage_tests {
     /// until a monitor answers.
     #[tokio::test(start_paused = true)]
     async fn an_outage_backs_off_until_its_budget_and_an_answer_ends_it() {
+        let failed = Unserved::Failed("why".into());
         let mut outage = Outage::default();
         let began = tokio::time::Instant::now();
-        let pauses: Vec<_> = (0..7).filter_map(|_| outage.lost(began)).collect();
+        let pauses: Vec<_> = (0..7).filter_map(|_| outage.lost(began, &failed)).collect();
         assert_eq!(
             pauses,
             [0, 500, 1000, 2000, 4000, 8000, 8000].map(Duration::from_millis)
         );
         let last = began + OUTAGE_BUDGET - Duration::from_millis(1);
-        assert_eq!(outage.lost(last), Some(OUTAGE_RETRY_CAP));
-        assert_eq!(outage.lost(began + OUTAGE_BUDGET), None);
+        assert_eq!(outage.lost(last, &failed), Some(OUTAGE_RETRY_CAP));
+        assert_eq!(outage.lost(began + OUTAGE_BUDGET, &failed), None);
 
         outage.answered();
         assert_eq!(
-            outage.lost(began + OUTAGE_BUDGET),
+            outage.lost(began + OUTAGE_BUDGET, &failed),
             Some(Duration::ZERO),
             "an answer ends the outage, so the next loss begins a new one"
         );
     }
 
-    /// Only a newer build's monitor is unfollowable. Every other way an
-    /// attempt ends without a connection is tried again.
-    #[test]
-    fn only_a_newer_monitor_is_not_retried() {
-        let why = || "why".to_string();
-        assert_eq!(
-            Attempt::Newer(why()).served().err(),
-            Some(Unserved::Upgraded(why()))
+    /// A monitor known to be on its way out is waited for as long as it
+    /// and its successor are allowed, which is longer than an outage is;
+    /// failures for no known reason are held to the outage budget from
+    /// the first of them, whenever they begin.
+    #[tokio::test(start_paused = true)]
+    async fn a_retirement_is_given_what_it_is_allowed_and_a_failure_no_more() {
+        let (retiring, failed) = (
+            Unserved::Retiring("its lease is still held".into()),
+            Unserved::Failed("why".into()),
         );
+        assert_eq!(
+            RETIREMENT_BUDGET,
+            QUIESCE_BUDGET + LEASE_RETIREMENT + SETTLE_BUDGET + SPAWN_SETTLE + ATTACH_BUDGET,
+            "what the old monitor may take, and the new one to start"
+        );
+        assert!(RETIREMENT_BUDGET > OUTAGE_BUDGET);
+
+        let mut outage = Outage::default();
+        let began = tokio::time::Instant::now();
+        let at = |d: Duration| began + d;
+        assert!(outage.lost(began, &retiring).is_some());
+        assert!(
+            outage
+                .lost(at(RETIREMENT_BUDGET - Duration::from_millis(1)), &retiring)
+                .is_some(),
+            "past the outage budget, inside the retirement's"
+        );
+        assert_eq!(outage.lost(at(RETIREMENT_BUDGET), &retiring), None);
+
+        let mut outage = Outage::default();
+        assert!(outage.lost(began, &retiring).is_some());
+        let stopped = at(OUTAGE_BUDGET + Duration::from_secs(5));
+        assert!(
+            outage.lost(stopped, &failed).is_some(),
+            "a failure is counted from when the failing began"
+        );
+        assert!(
+            outage
+                .lost(stopped + OUTAGE_BUDGET - Duration::from_millis(1), &failed)
+                .is_some()
+        );
+        assert_eq!(outage.lost(stopped + OUTAGE_BUDGET, &failed), None);
+    }
+
+    /// A monitor going is known from the repo, whichever way a client's
+    /// own attempt ended: behind another client's repair, unattached,
+    /// unable to start. With a monitor of another build still published
+    /// and alive, each of those is a retirement. A descriptor of this
+    /// build, or of a monitor that is dead, makes none of them one; and a
+    /// newer monitor's refusal never is.
+    #[test]
+    fn a_retirement_is_read_from_the_repo_not_from_who_won_the_repair() {
+        let why = || "why".to_string();
+        let contenders = || {
+            [
+                Attempt::Theirs(why()),
+                Attempt::Unproven(why()),
+                Attempt::Busy(why()),
+                Attempt::SpawnFailed(why()),
+                Attempt::NotStarted(why()),
+                Attempt::Unattached(why()),
+            ]
+        };
+        let me = std::process::id() as i32;
+        let other_build = |repo: &std::path::Path, pid: i32| Descriptor {
+            build: Some(DescribedBuild {
+                running: "00000000000000000000000000000000".into(),
+                version: None,
+                installed_at: "/bin/clank".into(),
+                source: crate::build_stamp::Source::Invocation,
+            }),
+            ..describe(repo, pid, std::path::Path::new("/nowhere.sock"))
+        };
+
+        let going = TempRepo::new();
+        publish(going.path(), &other_build(going.path(), me)).unwrap();
+        assert!(outgoing(going.path()));
+        for attempt in contenders() {
+            assert_eq!(
+                attempt.served(going.path()).err(),
+                Some(Unserved::Retiring(why()))
+            );
+        }
+        assert_eq!(
+            Attempt::Newer(why()).served(going.path()).err(),
+            Some(Unserved::Failed(why())),
+            "there this process is the one out of date"
+        );
+
+        let older = TempRepo::new();
+        publish(
+            older.path(),
+            &Descriptor {
+                proto: PROTO - 1,
+                ..describe(older.path(), me, std::path::Path::new("/nowhere.sock"))
+            },
+        )
+        .unwrap();
+        assert!(outgoing(older.path()), "another protocol is another build");
+
+        let dead = TempRepo::new();
+        publish(dead.path(), &other_build(dead.path(), i32::MAX - 7)).unwrap();
+        let ours = TempRepo::new();
+        publish(
+            ours.path(),
+            &Descriptor {
+                build: Some(DescribedBuild {
+                    running: crate::build_stamp::running().to_string(),
+                    version: None,
+                    installed_at: "/bin/clank".into(),
+                    source: crate::build_stamp::Source::Invocation,
+                }),
+                ..describe(ours.path(), me, std::path::Path::new("/nowhere.sock"))
+            },
+        )
+        .unwrap();
+        for settled in [&dead, &ours] {
+            assert!(!outgoing(settled.path()));
+            for attempt in contenders() {
+                assert_eq!(
+                    attempt.served(settled.path()).err(),
+                    Some(Unserved::Failed(why()))
+                );
+            }
+        }
+    }
+
+    /// Every way an attempt ends without a connection is tried again.
+    #[test]
+    fn every_unattached_attempt_is_retried() {
+        let repo = TempRepo::new();
+        let why = || "why".to_string();
         for attempt in [
+            Attempt::Newer(why()),
             Attempt::Theirs(why()),
             Attempt::Unproven(why()),
             Attempt::Busy(why()),
@@ -1498,8 +1696,17 @@ mod outage_tests {
             Attempt::NotStarted(why()),
             Attempt::Unattached(why()),
         ] {
-            assert_eq!(attempt.served().err(), Some(Unserved::Retry(why())));
+            assert_eq!(
+                attempt.served(repo.path()).err(),
+                Some(Unserved::Failed(why())),
+                "nothing says a monitor is going"
+            );
         }
+        assert_eq!(
+            Attempt::LeaseHeld(why()).served(repo.path()).err(),
+            Some(Unserved::Retiring(why())),
+            "a lease still held is a monitor going, not an outage"
+        );
     }
 }
 
@@ -2284,7 +2491,7 @@ pub(crate) async fn attach_or_spawn_until(
         // Still held when time ran out. This client does its own work;
         // a monitor that cannot own the repo helps nobody.
         Ownership::Busy => {
-            return Attempt::NotStarted(format!("{why}, and its lease is still held"));
+            return Attempt::LeaseHeld(format!("{why}, and its lease is still held"));
         }
     }
 
@@ -3068,18 +3275,20 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         }),
         None => crate::build_stamp::rendezvous(),
     };
-    let mut installation = installed
-        .as_ref()
-        .map(|r| crate::build_stamp::Installation::at(r.path.clone()));
-    if let Some(installation) = &mut installation
-        && let crate::build_stamp::Install::Replaced(other) = installation.look(running)
-    {
-        eprintln!(
-            "monitor: {} holds build {}, not this one ({running}); not starting",
-            installation.path().display(),
-            other.stamp
+    let authority = crate::upgrade::process();
+    if let Some(installed) = &installed {
+        authority.watch(
+            crate::build_stamp::Installation::at(installed.path.clone()),
+            running,
         );
-        return Ok(());
+        if let Some(other) = authority.look().stale() {
+            eprintln!(
+                "monitor: {} holds build {}, not this one ({running}); not starting",
+                installed.path.display(),
+                other.stamp
+            );
+            return Ok(());
+        }
     }
 
     // The lease first: everything after it assumes no other owner,
@@ -3098,14 +3307,15 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         source: r.source,
     });
     let mut tenure = Tenure::new(lease);
-    if let (Some(installation), Some(installed)) = (installation, installed.as_ref()) {
+    if let Some(installed) = installed.as_ref() {
         let (repo, birth) = (repo.clone(), crate::proc_identity::token_for(pid));
         let (installed_at, source) = (
             installed.path.to_string_lossy().into_owned(),
             installed.source,
         );
         tenure = tenure.with_build(Built::new(
-            installation,
+            authority.clone(),
+            installed.path.clone(),
             running,
             Box::new(move |install| {
                 let observation = Observation {
@@ -3273,7 +3483,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         done: mut uc_done,
     } = uc_wakes;
     let ended = loop {
-        if tenure.retiring() {
+        if tenure.standing_down(std::time::Instant::now()) {
             tenure
                 .watch
                 .begin_retiring(LEASE_RETIREMENT + SETTLE_BUDGET);
@@ -4849,6 +5059,9 @@ async fn typed_send(
     asks: &tokio::sync::mpsc::UnboundedSender<Authorize>,
 ) -> crate::cli::recovery::Answer {
     use crate::cli::recovery::{Answer, Transport};
+    let Ok(_permit) = crate::upgrade::writing() else {
+        return Answer::Unavailable;
+    };
     let (target, screen) = match typist.locate(repo.clone(), author.clone()).await {
         Ok(located) => located,
         Err(why) => return Answer::Unreachable(why),
@@ -4875,6 +5088,7 @@ async fn deliver_check_in(
     done: tokio::sync::mpsc::UnboundedSender<CheckedIn>,
 ) {
     let outcome = async {
+        let _permit = crate::upgrade::writing().map_err(|stale| stale.to_string())?;
         let (target, screen) = typist.locate(repo, due.author.clone()).await?;
         let (reply, answer) = tokio::sync::oneshot::channel();
         asks.send(CheckInAsk {
@@ -5109,10 +5323,19 @@ fn act_on_recovery(
     owned: &mut OwnedTasks,
 ) {
     use crate::cli::recovery::{Act, Answer, Transport};
+    // One look for the batch: a monitor on a replaced build sends none of
+    // it, by any transport, and says so to recovery as a transport that
+    // was not there.
+    let permit = crate::upgrade::writing();
     for act in acts {
         match act {
             Act::Watch(path) => records.watch(path),
             Act::Unwatch(path) => records.unwatch(path),
+            Act::Dispatch {
+                author, attempt, ..
+            } if permit.is_err() => {
+                let _ = answers.send((author, attempt, Answer::Unavailable));
+            }
             Act::Dispatch {
                 author,
                 attempt,
@@ -5356,9 +5579,12 @@ pub(crate) enum Settled {
     },
 }
 
-/// A monitor's view of its own build against the installation.
+/// A monitor's view of its own build against the installation: the
+/// authority every writer in this process answers to, looked at from the
+/// loop.
 pub(crate) struct Built {
-    installation: crate::build_stamp::Installation,
+    authority: crate::upgrade::Authority,
+    installed_at: std::path::PathBuf,
     running: crate::build_stamp::Stamp,
     shown: Option<crate::build_stamp::Install>,
     /// Records a changed state where status reads it.
@@ -5366,13 +5592,16 @@ pub(crate) struct Built {
 }
 
 impl Built {
+    /// `authority` watches the installation at `installed_at`.
     pub(crate) fn new(
-        installation: crate::build_stamp::Installation,
+        authority: crate::upgrade::Authority,
+        installed_at: std::path::PathBuf,
         running: crate::build_stamp::Stamp,
         note: Box<dyn Fn(&crate::build_stamp::Install) + Send>,
     ) -> Self {
         Built {
-            installation,
+            authority,
+            installed_at,
             running,
             shown: None,
             note,
@@ -5380,21 +5609,29 @@ impl Built {
     }
 
     /// Look at the installation, noting and logging only a change.
-    fn look(&mut self) -> crate::build_stamp::Install {
-        let install = self.installation.look(self.running);
-        if self.shown.as_ref() != Some(&install) {
+    fn look(&mut self) -> crate::upgrade::Standing {
+        let standing = self.authority.look();
+        if let Some(install) = self.authority.seen()
+            && self.shown.as_ref() != Some(&install)
+        {
             eprintln!(
                 "monitor: installation {} at {}: {install:?} (running {})",
-                self.installation.path().display(),
+                self.installed_at.display(),
                 timestamp(),
                 self.running
             );
             (self.note)(&install);
-            self.shown = Some(install.clone());
+            self.shown = Some(install);
         }
-        install
+        standing
     }
 }
+
+/// How long a monitor that has seen a newer clank installed goes on
+/// hearing the results of presentations it had already handed out: the
+/// bound their hooks answer within.
+const QUIESCE_BUDGET: Duration =
+    Duration::from_millis(clank_core::turn_policy::DELIVERY_RESULT_WITHIN);
 
 /// The loop's hold on the repo, and the only code that re-takes the
 /// lease, publishes for it or gives it up.
@@ -5403,6 +5640,9 @@ pub(crate) struct Tenure {
     watch: std::sync::Arc<LeaseWatch>,
     retiring: bool,
     build: Option<Built>,
+    /// Set when a stale build began retiring: until then it stays to
+    /// settle what is in flight.
+    quiesce_by: Option<std::time::Instant>,
 }
 
 impl Tenure {
@@ -5413,6 +5653,7 @@ impl Tenure {
             watch,
             retiring: false,
             build: None,
+            quiesce_by: None,
         }
     }
 
@@ -5433,9 +5674,10 @@ impl Tenure {
         // The build first: a stale build retires before the lease could
         // be repaired or the descriptor republished.
         if let Some(build) = &mut self.build
-            && let crate::build_stamp::Install::Replaced(installed) = build.look()
+            && let Some(installed) = build.look().stale()
         {
             self.retiring = true;
+            self.quiesce_by = Some(std::time::Instant::now() + QUIESCE_BUDGET);
             return Settled::Stale {
                 running: build.running,
                 installed: installed.stamp,
@@ -5483,8 +5725,20 @@ impl Tenure {
         matches!(self.settle(publish), Settled::Owner | Settled::Retaken(_))
     }
 
-    pub(crate) fn retiring(&self) -> bool {
-        self.retiring
+    /// Whether the loop gives the repo up now. A lease lost to another
+    /// owner goes at once. A stale build stays for the work it has in
+    /// flight, a presentation handed out before the install was seen,
+    /// whose result and receipts would be lost with this monitor, and for
+    /// no longer than its hook has to answer.
+    pub(crate) fn standing_down(&self, now: std::time::Instant) -> bool {
+        let quiescing = self.quiesce_by.is_some_and(|by| now < by)
+            && self.build.as_ref().is_some_and(|build| {
+                matches!(
+                    build.authority.standing(),
+                    crate::upgrade::Standing::Quiescing { .. }
+                )
+            });
+        self.retiring && !quiescing
     }
 
     fn given_up(&self) -> Detection {
@@ -5558,7 +5812,11 @@ fn publish_sources(
     if last.as_ref() == Some(&account) {
         return;
     }
-    match crate::cli::source_status::publish(repo, &account) {
+    let published = crate::upgrade::process()
+        .permit()
+        .map_err(std::io::Error::from)
+        .and_then(|permit| crate::cli::source_status::publish(repo, &account, &permit));
+    match published {
         Ok(()) => {
             *last = Some(account);
             for client in clients.iter().filter(|c| c.who == Served::Observer) {
@@ -6108,7 +6366,7 @@ fn reconcile_timers(
 fn transient_of(emission: crate::cli::event_source::Emission) -> Vec<WaitItem> {
     use crate::cli::event_source::Durability;
     match emission {
-        (_, Durability::Logged) => Vec::new(),
+        (_, Durability::Logged | Durability::Refused) => Vec::new(),
         (item, Durability::Transient) => vec![item],
     }
 }
@@ -8727,6 +8985,33 @@ mod recovery_tests {
             "a delivered dispatch answers through its helper"
         );
 
+        // A monitor on a replaced build hands the same helper nothing:
+        // the attempt is answered as a transport that was not there.
+        {
+            use crate::upgrade::tests::{AsProcess, Installed};
+            let installed = Installed::current();
+            let authority = installed.authority();
+            let _as = AsProcess::of(&authority);
+            installed.replace(1);
+            act_on_recovery(
+                repo.path(),
+                &clients,
+                vec![dispatch(&author)],
+                &tx,
+                &tokio::sync::mpsc::unbounded_channel().0,
+                &records(),
+                &mut owned,
+            );
+            assert!(
+                helper_rx.try_recv().is_err(),
+                "a stale monitor sent a retry"
+            );
+            assert_eq!(
+                answers.try_recv().unwrap(),
+                (author.clone(), attempt(), Answer::Unavailable)
+            );
+        }
+
         act_on_recovery(
             repo.path(),
             &[],
@@ -8740,6 +9025,45 @@ mod recovery_tests {
             answers.try_recv().unwrap(),
             (author, attempt(), Answer::Unavailable)
         );
+    }
+
+    /// A typed nudge is not typed by a monitor on a replaced build: the
+    /// pane is not even looked for.
+    #[tokio::test]
+    async fn a_stale_monitor_types_no_nudge() {
+        use crate::upgrade::tests::{AsProcess, Installed};
+        let c = Claimed::by_policy();
+        let typist = Listed {
+            scan: crate::cli::open_zellij::SessionScan {
+                panes: Vec::new(),
+                unanswered: Vec::new(),
+                listing_failed: false,
+            },
+            screen: Some(CODEX_EMPTY.to_string()),
+            result: || Ok(crate::cli::pane_input::Delivered::Whole),
+            typed: Default::default(),
+        };
+        let (asks, _heard) = tokio::sync::mpsc::unbounded_channel::<Authorize>();
+        let send = || {
+            typed_send(
+                c.repo.path().to_path_buf(),
+                c.codex.clone(),
+                c.attempt.clone(),
+                "carry on".into(),
+                &typist,
+                &asks,
+            )
+        };
+        assert!(
+            matches!(send().await, Answer::Unreachable(_)),
+            "on its own build it looks for the pane, which this listing lacks"
+        );
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+        installed.replace(1);
+        assert_eq!(send().await, Answer::Unavailable);
+        assert!(typist.typed.lock().unwrap().is_empty());
     }
 
     /// A helper is kept alive with beats and is never handed inbox work,
@@ -9512,6 +9836,7 @@ mod recovery_tests {
             "session-one",
             &[identity],
             50,
+            &crate::upgrade::process().settling(),
         );
         assert!(recorded.unwrap(), "the bound session's receipt is taken");
         assert_eq!(
@@ -16937,7 +17262,10 @@ mod lease_tests {
         std::fs::remove_file(&path).unwrap();
         let _successor = take(&dir, &path).unwrap();
         assert!(!tenure.may_act(&publish));
-        assert!(tenure.retiring());
+        assert!(
+            tenure.standing_down(std::time::Instant::now()),
+            "a lease another holds is given up at once"
+        );
         assert_eq!(published.get(), 0);
     }
 
@@ -17380,7 +17708,8 @@ mod build_tests {
         let lease = acquire_lease(repo.path()).unwrap();
         let lease_path = lease.path().to_path_buf();
         let mut tenure = Tenure::new(lease).with_build(Built::new(
-            Installation::at(path.clone()),
+            crate::upgrade::Authority::watching(Installation::at(path.clone()), running()),
+            path.clone(),
             running(),
             note,
         ));
@@ -17414,6 +17743,49 @@ mod build_tests {
         );
     }
 
+    /// A stale build stands down once nothing it handed out is still in
+    /// flight, or once the bound its hooks answer within has passed, and
+    /// the loop asks exactly that before every wake.
+    #[test]
+    fn a_stale_build_stands_down_when_nothing_is_in_flight() {
+        let repo = repo();
+        let bin = tempfile::tempdir().unwrap();
+        let path = bin.path().join("clank");
+        install(&path, running());
+        let authority =
+            crate::upgrade::Authority::watching(Installation::at(path.clone()), running());
+        let (_, note) = noted();
+        let mut tenure = Tenure::new(acquire_lease(repo.path()).unwrap()).with_build(Built::new(
+            authority.clone(),
+            path.clone(),
+            running(),
+            note,
+        ));
+        let (_, publish) = counting();
+        let now = std::time::Instant::now();
+        assert!(tenure.may_act(&publish) && !tenure.standing_down(now));
+
+        let presenting = authority.permit().expect("current");
+        install(&path, other());
+        assert!(!tenure.may_act(&publish), "stale at once");
+        assert!(!tenure.standing_down(std::time::Instant::now()));
+        assert!(
+            tenure.standing_down(std::time::Instant::now() + QUIESCE_BUDGET),
+            "a hook that never answers does not hold the monitor"
+        );
+        drop(presenting);
+        assert!(tenure.standing_down(std::time::Instant::now()));
+
+        let src = include_str!("monitor.rs");
+        let from = src.find("let ended = loop {").expect("the loop");
+        assert!(
+            src[from..].starts_with(
+                "let ended = loop {\n        if tenure.standing_down(std::time::Instant::now()) {"
+            ),
+            "the loop's first question"
+        );
+    }
+
     /// The old monitor's last word lands under its own process, never on
     /// the routing descriptor: a successor that took the repo after the
     /// old one's last owner look keeps it.
@@ -17444,7 +17816,8 @@ mod build_tests {
         let lease = acquire_lease(repo.path()).unwrap();
         let lease_path = lease.path().to_path_buf();
         let mut tenure = Tenure::new(lease).with_build(Built::new(
-            Installation::at(path.clone()),
+            crate::upgrade::Authority::watching(Installation::at(path.clone()), running()),
+            path.clone(),
             running(),
             note,
         ));

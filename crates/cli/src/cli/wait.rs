@@ -234,7 +234,7 @@ async fn run_automatic_grok(
         args.events.is_empty(),
         "automatic Grok wait uses monitor-hosted sources; configure wait_events or use auto off for invocation-only --event sources"
     );
-    let (items, cwd) = monitored(repo, author, binding, |who| {
+    let (items, cwd) = monitored(repo, author, binding, &mut replaced_as_started(), |who| {
         crate::cli::monitor::attempt_with(repo, who, crate::cli::monitor::spawn_monitor)
     })
     .await?;
@@ -272,6 +272,7 @@ fn deliver_grok_wake(
             session.as_str(),
             &super::wake_render::carried(&mirrored),
             || binding.ensure_current(repo, author).is_ok(),
+            &crate::upgrade::process().settling(),
         );
     }
     Ok(())
@@ -420,9 +421,13 @@ async fn items_with_context(
     binding.ensure_current(&repo, &author)?;
 
     let Some(own) = OwnFold::of(args.peek, &sources) else {
-        let (items, cwd) = monitored(&repo, &author, &binding, |who| {
-            crate::cli::monitor::attempt_with(&repo, who, crate::cli::monitor::spawn_monitor)
-        })
+        let (items, cwd) = monitored(
+            &repo,
+            &author,
+            &binding,
+            &mut replaced_as_started(),
+            |who| crate::cli::monitor::attempt_with(&repo, who, crate::cli::monitor::spawn_monitor),
+        )
         .await?;
         *source_cwd = cwd;
         return Ok(Some(items));
@@ -941,22 +946,32 @@ impl WakeSources {
 /// decides it is owed, and nothing this process folds.
 ///
 /// A monitor that goes away is followed, every time. With none to be had
-/// within [`crate::cli::monitor::OUTAGE_BUDGET`], or one of a newer build,
-/// the wait fails saying so, which is what wakes whoever armed it. A
-/// session is told of one outage once, by this or by its hook: a wait
-/// armed again inside it goes on trying and does not fail a second time.
+/// within [`crate::cli::monitor::OUTAGE_BUDGET`] the wait fails saying so,
+/// which is what wakes whoever armed it. A session is told of one outage
+/// once, by this or by its hook: a wait armed again inside it goes on
+/// trying and does not fail a second time.
+///
+/// While it holds no items the wait is parked, and that is where
+/// `replacing` turns it into the installed build: on a beat while a
+/// monitor serves it, and whenever one is lost or refuses it. A wait that
+/// is stale and could not be replaced goes on trying both, and fails for
+/// no outage: an upgrade costs the agent no turn.
 ///
 /// The attaching is a parameter because no test may start a monitor.
 async fn monitored<F>(
     repo: &Path,
     author: &AgentLabel,
     binding: &WaitBinding,
+    replacing: &mut crate::upgrade::Replacing<
+        impl FnMut(&crate::build_stamp::Build) -> std::io::Error,
+    >,
     attach: impl Fn(crate::cli::monitor::Who) -> F,
 ) -> anyhow::Result<(Vec<WaitItem>, Option<PathBuf>)>
 where
     F: std::future::Future<Output = crate::cli::monitor::Attempt>,
 {
     use crate::cli::monitor::Unserved;
+    use crate::upgrade::{Hosting, Pass};
     let mut outage = crate::cli::monitor::Outage::default();
     let session = binding.0.as_ref().map(|(_, session)| session);
     loop {
@@ -967,25 +982,32 @@ where
             has_cli_sources: false,
             turn_end: None,
         };
-        let why = match attach(who).await.served() {
+        let unserved = match attach(who).await.served(repo) {
             Ok(conn) => {
                 tracing::debug!(%author, "monitor subscription registered");
                 let grace = crate::cli::monitor::BEAT_GRACE;
-                match shared_wait_within(conn, repo, author, binding, grace, &mut outage).await? {
+                let shared = shared_wait_within(conn, repo, author, binding, grace, &mut outage);
+                tokio::pin!(shared);
+                let ended = tokio::select! {
+                    // Items in hand go out before anything else is considered.
+                    biased;
+                    ended = &mut shared => ended?,
+                    never = replacing.parked() => match never {},
+                };
+                match ended {
                     Shared::Woke(items, cwd) => return Ok((items, cwd)),
-                    Shared::Lost(why) => why,
+                    Shared::Lost(why) => Unserved::Failed(why),
                 }
             }
-            Err(Unserved::Upgraded(why)) => {
-                tracing::debug!(%why, "the monitor is of a newer build");
-                anyhow::bail!(
-                    "clank was upgraded; ending this wait so the next one uses the new build"
-                );
-            }
-            Err(Unserved::Retry(why)) => why,
+            Err(unserved) => unserved,
         };
+        let why = unserved.why();
         tracing::debug!(%why, "no monitor serves this wait");
-        let pause = match outage.lost(tokio::time::Instant::now()) {
+        if replacing.pass(Hosting::Nothing) != Pass::Current {
+            tokio::time::sleep(replacing.due_in()).await;
+            continue;
+        }
+        let pause = match outage.lost(tokio::time::Instant::now(), &unserved) {
             Some(pause) => pause,
             // Failing is all this wait can say, so committing to fail is
             // its delivery. An unbound wait has nobody's notice to share
@@ -1011,6 +1033,15 @@ where
         };
         tokio::time::sleep(pause).await;
     }
+}
+
+/// How a parked wait becomes the installed build: the same arguments,
+/// environment and stdio, which are all it holds.
+fn replaced_as_started()
+-> crate::upgrade::Replacing<impl FnMut(&crate::build_stamp::Build) -> std::io::Error> {
+    crate::upgrade::Replacing::new(crate::upgrade::process().clone(), |_| {
+        crate::upgrade::exec_installed_as_started()
+    })
 }
 
 /// How a wait's time on one monitor connection ended.
@@ -3369,18 +3400,24 @@ mod shared_tests {
         use crate::cli::monitor::Attempt;
         let (repo, author, binding) = unbound();
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let (items, _) = monitored(repo.path(), &author, &binding, |_| {
-            let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move {
-                Attempt::Shared(match nth {
-                    0..3 => monitor_leaving_after(vec![Note::Beat]),
-                    _ => monitor_saying(vec![Note::Items {
-                        source_cwd: None,
-                        items: vec![promote()],
-                    }]),
-                })
-            }
-        })
+        let (items, _) = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| {
+                let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    Attempt::Shared(match nth {
+                        0..3 => monitor_leaving_after(vec![Note::Beat]),
+                        _ => monitor_saying(vec![Note::Items {
+                            source_cwd: None,
+                            items: vec![promote()],
+                        }]),
+                    })
+                }
+            },
+        )
         .await
         .expect("the fourth monitor delivers");
         assert_eq!(attempts.into_inner(), 4, "each lost monitor was followed");
@@ -3388,6 +3425,204 @@ mod shared_tests {
             matches!(items.as_slice(), [WaitItem::PromoteFromQueue { .. }]),
             "{items:?}"
         );
+    }
+
+    /// A wait of the installed build that finds the old build's monitor
+    /// still holding the repo waits out its retirement, and ends attached
+    /// to the monitor the installed build starts. Being current itself, it
+    /// asks to be replaced by nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_wait_outwaits_an_old_monitor_and_attaches_to_the_installed_one() {
+        use crate::cli::monitor::Attempt;
+        let (repo, author, binding) = unbound();
+        let installed = crate::upgrade::tests::Installed::current();
+        let mut replacing = crate::upgrade::Replacing::new(installed.authority(), |_| {
+            panic!("the installed build has nothing to become")
+        });
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let (items, _) = monitored(repo.path(), &author, &binding, &mut replacing, |_| {
+            let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                match nth {
+                    0..3 => Attempt::LeaseHeld("the retiring monitor still holds the lease".into()),
+                    _ => Attempt::Shared(monitor_saying(vec![Note::Items {
+                        source_cwd: None,
+                        items: vec![promote()],
+                    }])),
+                }
+            }
+        })
+        .await
+        .expect("the installed build's monitor delivers");
+        assert_eq!(attempts.into_inner(), 4);
+        assert!(
+            matches!(items.as_slice(), [WaitItem::PromoteFromQueue { .. }]),
+            "{items:?}"
+        );
+    }
+
+    /// The upgrade as a freshly started wait of the installed build meets
+    /// it: the old monitor holds the lease for seventy seconds, longer
+    /// than an outage is allowed, while it hears out its hooks and drains,
+    /// and then the installed monitor delivers. The wait is held through
+    /// all of it and fails for nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_outwaits_a_retiring_monitor_longer_than_an_outage() {
+        use crate::cli::monitor::{Attempt, OUTAGE_BUDGET};
+        let (repo, author, binding) = unbound();
+        let seventy = OUTAGE_BUDGET + Duration::from_secs(10);
+        let began = tokio::time::Instant::now();
+        let (items, _) = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| async move {
+                match began.elapsed() < seventy {
+                    true => Attempt::LeaseHeld("the retiring monitor still holds the lease".into()),
+                    false => Attempt::Shared(monitor_saying(vec![Note::Items {
+                        source_cwd: None,
+                        items: vec![promote()],
+                    }])),
+                }
+            },
+        )
+        .await
+        .expect("a retirement is not an outage");
+        assert!(began.elapsed() >= seventy);
+        assert!(matches!(
+            items.as_slice(),
+            [WaitItem::PromoteFromQueue { .. }]
+        ));
+    }
+
+    /// Two agents' waits arrive while an old monitor is still going and
+    /// a third client is the one starting its successor. Neither holds
+    /// the repair, so each is told only that somebody else is starting
+    /// one, for seventy seconds. Both wait it out and are served by the
+    /// installed monitor: the retirement is known from the repo, to every
+    /// contender. With nothing published the same seventy seconds is an
+    /// outage, as it always was.
+    #[tokio::test(start_paused = true)]
+    async fn every_contender_outwaits_a_retiring_monitor() {
+        use crate::cli::monitor::{Attempt, Descriptor, OUTAGE_BUDGET, PROTO, TempRepo};
+        let seventy = OUTAGE_BUDGET + Duration::from_secs(10);
+        let began = tokio::time::Instant::now();
+        let contend = |repo: &Path, who: &str, began: tokio::time::Instant| {
+            let (repo, author) = (repo.to_path_buf(), AgentLabel::parse(who).unwrap());
+            async move {
+                monitored(
+                    &repo,
+                    &author,
+                    &WaitBinding(None, WaitPolicy::Manual),
+                    &mut crate::upgrade::Replacing::never(),
+                    |_| async move {
+                        match began.elapsed() < seventy {
+                            true => Attempt::Busy(
+                                "no monitor answers, and another client is already starting one"
+                                    .into(),
+                            ),
+                            false => Attempt::Shared(monitor_saying(vec![Note::Items {
+                                source_cwd: None,
+                                items: vec![promote()],
+                            }])),
+                        }
+                    },
+                )
+                .await
+            }
+        };
+
+        let going = TempRepo::new();
+        crate::cli::monitor::publish(
+            going.path(),
+            &Descriptor {
+                proto: PROTO - 1,
+                ..crate::cli::monitor::describe(
+                    going.path(),
+                    std::process::id() as i32,
+                    Path::new("/nowhere.sock"),
+                )
+            },
+        )
+        .unwrap();
+        let (claude, codex) = tokio::join!(
+            contend(going.path(), "claude", began),
+            contend(going.path(), "codex", began)
+        );
+        for served in [claude, codex] {
+            let (items, _) = served.expect("a contender spent its outage budget on a retirement");
+            assert!(matches!(
+                items.as_slice(),
+                [WaitItem::PromoteFromQueue { .. }]
+            ));
+        }
+        assert!(began.elapsed() >= seventy);
+
+        let quiet = TempRepo::new();
+        let failed = contend(quiet.path(), "claude", tokio::time::Instant::now())
+            .await
+            .expect_err("nothing says a monitor is going");
+        assert!(
+            failed
+                .to_string()
+                .ends_with("another client is already starting one"),
+            "{failed}"
+        );
+    }
+
+    /// A monitor that is going and never goes fails the wait after all,
+    /// once everything it and its successor are allowed has passed.
+    #[tokio::test(start_paused = true)]
+    async fn a_retirement_that_never_ends_fails_the_wait_at_its_own_bound() {
+        use crate::cli::monitor::{Attempt, OUTAGE_BUDGET, RETIREMENT_BUDGET};
+        let (repo, author, binding) = unbound();
+        let began = tokio::time::Instant::now();
+        let failed = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| async { Attempt::LeaseHeld("its lease is still held".into()) },
+        )
+        .await
+        .expect_err("it never went");
+        assert_eq!(
+            failed.to_string(),
+            "clank cannot start its monitor: its lease is still held"
+        );
+        let took = began.elapsed();
+        assert!(
+            took >= RETIREMENT_BUDGET && took < RETIREMENT_BUDGET + OUTAGE_BUDGET,
+            "{took:?}"
+        );
+    }
+
+    /// A parked wait served by a monitor is replaced on a beat, with no
+    /// monitor lost: an install is noticed while everything is healthy.
+    #[tokio::test(start_paused = true)]
+    async fn a_served_wait_asks_to_be_replaced_on_a_beat() {
+        use crate::cli::monitor::Attempt;
+        let (repo, author, binding) = unbound();
+        let installed = crate::upgrade::tests::Installed::current();
+        let build = installed.replace(1);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let (monitor_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let conn = std::cell::RefCell::new(Some(crate::cli::monitor::Conn::over(client_end)));
+        {
+            let mut replacing = crate::upgrade::Replacing::new(installed.authority(), |build| {
+                asked.borrow_mut().push(build.stamp);
+                std::io::Error::other("no exec in a test")
+            });
+            let waiting = monitored(repo.path(), &author, &binding, &mut replacing, |_| {
+                let conn = conn.borrow_mut().take().expect("attached once");
+                async move { Attempt::Shared(conn) }
+            });
+            let parked = tokio::time::timeout(crate::upgrade::BEAT * 2, waiting).await;
+            assert!(parked.is_err(), "the wait ended: {parked:?}");
+        }
+        drop(monitor_end);
+        assert_eq!(asked.borrow().first(), Some(&build));
     }
 
     /// With no monitor to be had, the wait goes on trying for the outage
@@ -3399,10 +3634,16 @@ mod shared_tests {
         let (repo, author, binding) = unbound();
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let began = tokio::time::Instant::now();
-        let failed = monitored(repo.path(), &author, &binding, |_| {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { Attempt::SpawnFailed("starting one failed: no binary".into()) }
-        })
+        let failed = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Attempt::SpawnFailed("starting one failed: no binary".into()) }
+            },
+        )
         .await
         .expect_err("no monitor is not a wake with work");
         assert_eq!(
@@ -3442,9 +3683,13 @@ mod shared_tests {
         );
         let told = || crate::cli::turn_child::tests::told(repo.path(), &author);
 
-        let failed = monitored(repo.path(), &author, &binding, |_| async {
-            Attempt::SpawnFailed("starting one failed: no binary".into())
-        })
+        let failed = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| async { Attempt::SpawnFailed("starting one failed: no binary".into()) },
+        )
         .await
         .expect_err("the first wait of an outage says so");
         assert_eq!(
@@ -3455,18 +3700,24 @@ mod shared_tests {
 
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let began = tokio::time::Instant::now();
-        let (items, _) = monitored(repo.path(), &author, &binding, |_| {
-            let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move {
-                match nth {
-                    0..40 => Attempt::SpawnFailed("starting one failed: no binary".into()),
-                    _ => Attempt::Shared(monitor_saying(vec![Note::Items {
-                        source_cwd: None,
-                        items: vec![promote()],
-                    }])),
+        let (items, _) = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| {
+                let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    match nth {
+                        0..40 => Attempt::SpawnFailed("starting one failed: no binary".into()),
+                        _ => Attempt::Shared(monitor_saying(vec![Note::Items {
+                            source_cwd: None,
+                            items: vec![promote()],
+                        }])),
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("a wait already told of the outage does not fail again");
         assert_eq!(items.len(), 1);
@@ -3491,27 +3742,39 @@ mod shared_tests {
         let told = || crate::cli::turn_child::tests::told(repo.path(), &author);
         let no_binary = || Attempt::SpawnFailed("starting one failed: no binary".into());
 
-        monitored(repo.path(), &author, &binding, |_| async { no_binary() })
-            .await
-            .expect_err("the first outage is announced");
+        monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| async { no_binary() },
+        )
+        .await
+        .expect_err("the first outage is announced");
         assert!(told());
 
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let again = monitored(repo.path(), &author, &binding, |_| {
-            let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move {
-                match nth {
-                    0 => Attempt::Shared(monitor_leaving_after(vec![Note::Beat])),
-                    1..60 => no_binary(),
-                    // Reached only by a wait that went on trying in
-                    // silence, which is what must not happen here.
-                    _ => Attempt::Shared(monitor_saying(vec![Note::Items {
-                        source_cwd: None,
-                        items: vec![promote()],
-                    }])),
+        let again = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| {
+                let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    match nth {
+                        0 => Attempt::Shared(monitor_leaving_after(vec![Note::Beat])),
+                        1..60 => no_binary(),
+                        // Reached only by a wait that went on trying in
+                        // silence, which is what must not happen here.
+                        _ => Attempt::Shared(monitor_saying(vec![Note::Items {
+                            source_cwd: None,
+                            items: vec![promote()],
+                        }])),
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .expect_err("the outage after a monitor served it is a new one");
         assert_eq!(
@@ -3549,18 +3812,26 @@ mod shared_tests {
                 .start_paused(true)
                 .build()
                 .unwrap()
-                .block_on(monitored(repo.path(), &author, &binding, |_| {
-                    let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    async move {
-                        match nth {
-                            0..40 => Attempt::SpawnFailed("starting one failed: no binary".into()),
-                            _ => Attempt::Shared(monitor_saying(vec![Note::Items {
-                                source_cwd: None,
-                                items: vec![promote()],
-                            }])),
+                .block_on(monitored(
+                    repo.path(),
+                    &author,
+                    &binding,
+                    &mut crate::upgrade::Replacing::never(),
+                    |_| {
+                        let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async move {
+                            match nth {
+                                0..40 => {
+                                    Attempt::SpawnFailed("starting one failed: no binary".into())
+                                }
+                                _ => Attempt::Shared(monitor_saying(vec![Note::Items {
+                                    source_cwd: None,
+                                    items: vec![promote()],
+                                }])),
+                            }
                         }
-                    }
-                }))
+                    },
+                ))
         });
         assert_eq!(announcements(&hook), 1);
         assert!(
@@ -3569,26 +3840,59 @@ mod shared_tests {
         );
     }
 
-    /// A monitor of a newer build cannot be followed by this process: the
-    /// wait ends at once, so the next one runs the installed build.
+    /// The stranded waiter of 10 Nov: a parked wait outlived by install
+    /// after install, refused by each new monitor. It asks to become every
+    /// build as it is installed, backs off when it cannot, and never fails
+    /// its agent with an outage or an upgrade notice.
     #[tokio::test(start_paused = true)]
-    async fn a_wait_refused_by_a_newer_monitor_ends_at_once() {
+    async fn a_wait_outlived_by_installs_asks_to_become_each_and_never_fails() {
         use crate::cli::monitor::Attempt;
         let (repo, author, binding) = unbound();
-        let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let began = tokio::time::Instant::now();
-        let failed = monitored(repo.path(), &author, &binding, |_| {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { Attempt::Newer("the monitor speaks proto 99".into()) }
-        })
+        let installed = crate::upgrade::tests::Installed::current();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut builds = Vec::new();
+        {
+            let mut replacing = crate::upgrade::Replacing::new(installed.authority(), |build| {
+                asked.borrow_mut().push(build.stamp);
+                std::io::Error::other("the binary is missing mid-install")
+            });
+            let waiting = monitored(repo.path(), &author, &binding, &mut replacing, |_| async {
+                Attempt::Newer("the monitor speaks proto 99".into())
+            });
+            tokio::pin!(waiting);
+            for n in 1..=4 {
+                builds.push(installed.replace(n));
+                let outlived =
+                    tokio::time::timeout(crate::cli::monitor::OUTAGE_BUDGET * 2, &mut waiting)
+                        .await;
+                assert!(outlived.is_err(), "the wait ended: {outlived:?}");
+            }
+        }
+        let mut asked = asked.into_inner();
+        assert!(asked.len() > builds.len(), "a failed attempt is retried");
+        asked.dedup();
+        assert_eq!(asked, builds, "each build, as it was installed");
+    }
+
+    /// A refusal by a newer monitor, with this build still the installed
+    /// one, is retried like any other attempt and ends as an outage does.
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_monitor_with_no_newer_install_is_an_outage() {
+        use crate::cli::monitor::Attempt;
+        let (repo, author, binding) = unbound();
+        let failed = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| async { Attempt::Newer("the monitor speaks proto 99".into()) },
+        )
         .await
-        .expect_err("a refusal is not a wake with work");
-        assert!(
-            failed.to_string().starts_with("clank was upgraded;"),
-            "{failed}"
+        .expect_err("no monitor serves it");
+        assert_eq!(
+            failed.to_string(),
+            "clank cannot start its monitor: the monitor speaks proto 99"
         );
-        assert_eq!(attempts.into_inner(), 1);
-        assert_eq!(began.elapsed(), Duration::ZERO);
     }
 
     /// A repo whose monitor admits anyone who asks.
@@ -3659,12 +3963,25 @@ mod shared_tests {
         let calls: Vec<_> = production.match_indices("monitored(").collect();
         assert_eq!(calls.len(), 2, "the plain wait and Grok's waiter");
         for (at, _) in calls {
-            let call = &production[at..at + 200];
+            let call = &production[at..at + 320];
             assert!(
                 call.contains("attempt_with(") && call.contains("monitor::spawn_monitor"),
                 "a monitored wait must pass the REAL starter, not a stub: {call}"
             );
+            assert!(
+                call.contains("&mut replaced_as_started()"),
+                "and the real way to become the installed build: {call}"
+            );
         }
+        let from = production
+            .find("fn replaced_as_started()")
+            .expect("the replacement");
+        let body = &production[from..from + 400];
+        assert!(
+            body.contains("crate::upgrade::process().clone()")
+                && body.contains("crate::upgrade::exec_installed_as_started()"),
+            "this process's own authority, and the same arguments: {body}"
+        );
     }
 
     /// The wait's own fold and watcher are behind [`OwnFold`], and nothing
@@ -3717,7 +4034,7 @@ mod shared_tests {
             |_| Err(std::io::Error::other("a test must not start a monitor")),
         )
         .await
-        .served()
+        .served(repo)
         .ok()
     }
 

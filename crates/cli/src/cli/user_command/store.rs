@@ -336,6 +336,7 @@ impl Held {
 
     /// Replace the record atomically, synced to disk before this returns.
     pub(crate) fn save(&self, record: &Record) -> anyhow::Result<()> {
+        let _permit = crate::upgrade::writing()?;
         use std::io::Write;
         let mut tmp = tempfile::Builder::new()
             .prefix(".uc-")

@@ -1561,6 +1561,7 @@ pub(crate) fn record_producer(
     key: &str,
     record: &Producer,
 ) -> std::io::Result<()> {
+    let _permit = crate::upgrade::writing()?;
     let body = serde_json::to_vec(record)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let path = producer_path(store_dir, key);

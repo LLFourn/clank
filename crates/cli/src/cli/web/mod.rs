@@ -120,6 +120,9 @@ fn say_with(
     ) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     use clank_core::vocab::Tool;
+    // Before either route: a host on a replaced build says nothing to an
+    // agent, natively or typed.
+    let _permit = crate::upgrade::writing()?;
     let tool = pane_tool(repo, table, pane)?;
     let admitted = crate::cli::pane_input::Admitted::new(text);
     if tool == Tool::Codex {
@@ -986,6 +989,9 @@ const ATTACHMENTS_KEPT: usize = 20;
 
 /// Delete all but the newest [`ATTACHMENTS_KEPT`] files in `dir`.
 fn prune_attachments(dir: &Path) {
+    let Ok(_permit) = crate::upgrade::writing() else {
+        return;
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1256,6 +1262,40 @@ fn library_candidates(home: Option<&Path>) -> anyhow::Result<serde_json::Value> 
 
 #[cfg(test)]
 mod tests {
+    /// What the remote asks of a TUI kept running on a replaced build is
+    /// refused where the change would be written, with the reason the
+    /// TUI's own bar gives, and nothing is changed.
+    #[test]
+    fn a_stale_host_refuses_a_remote_ask_and_says_why() {
+        use crate::upgrade::tests::{AsProcess, Installed};
+        let repo = crate::cli::status_tui::fixtures::detail_repo();
+        let label = clank_core::ids::AgentLabel::parse("codex").unwrap();
+        let ask = || super::AgentAsk::AutoMode {
+            label: "codex".into(),
+            mode: clank_core::vocab::AutoMode::On,
+        };
+        let armed = || {
+            crate::agent_store::load_agent_config(repo.path(), &label)
+                .unwrap()
+                .and_then(|cfg| cfg.auto_mode)
+        };
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+
+        installed.replace(1);
+        let why = super::perform_agent_action(repo.path(), None, ask()).unwrap_err();
+        assert!(
+            format!("{why:#}").contains(crate::upgrade::STALE_BADGE),
+            "{why:#}"
+        );
+        assert_eq!(armed(), None);
+
+        installed.install(crate::build_stamp::running());
+        super::perform_agent_action(repo.path(), None, ask()).unwrap();
+        assert_eq!(armed(), Some(clank_core::vocab::AutoMode::On));
+    }
+
     /// The bridge's `say` types as the pane's OWN tool, resolved from the
     /// agent table (it once typed every non-Codex pane as Claude), and hands
     /// the terminal and Codex's native path the ADMITTED text: a leading `!`
@@ -1326,6 +1366,45 @@ mod tests {
             )
             .is_err(),
             "a pane that is not an agent here"
+        );
+
+        // A host kept running on a replaced build says nothing to any
+        // agent: neither the native route nor the typed one is reached,
+        // and the remote is told why in the bar's own words.
+        use crate::upgrade::tests::{AsProcess, Installed};
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+        installed.replace(1);
+        let (mut natively, mut by_typing) = (0, 0);
+        for pane in ["3", "1"] {
+            let refused = say_with(
+                repo.path(),
+                &table,
+                pane,
+                "carry on",
+                |_, _| {
+                    natively += 1;
+                    Ok(true)
+                },
+                |_, _| {
+                    by_typing += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(
+                format!("{refused:#}").contains(crate::upgrade::STALE_BADGE),
+                "{refused:#}"
+            );
+        }
+        assert_eq!((natively, by_typing), (0, 0));
+        let endpoint = crate::cli::zellij_endpoint::Endpoint::fixture_here("/nowhere");
+        let stopped =
+            crate::cli::pane_input::stop_pane(&endpoint, "terminal_1", Tool::Claude).unwrap_err();
+        assert!(
+            format!("{stopped:#}").contains(crate::upgrade::STALE_BADGE),
+            "{stopped:#}"
         );
     }
 

@@ -114,6 +114,9 @@ impl Coordinator {
             &mut c.item,
             self.interrupt.clone(),
         );
+        if durability == crate::cli::event_source::Durability::Refused {
+            return true;
+        }
         self.tx.send((c.item, durability)).is_ok()
     }
 
@@ -1969,6 +1972,175 @@ mod tests {
             joined.is_ok(),
             "abort must cancel the pending fetch, not hang"
         );
+    }
+
+    /// A poll by a monitor that has seen a newer clank installed finds an
+    /// event it may not log. It moves no cursor past it: no row and no
+    /// ETag of that read reach the disk, so the monitor that follows asks
+    /// with the ETag from before the event, is given it again, and logs
+    /// it. A saved ETag would have earned the successor a 304 straight
+    /// past the event.
+    #[tokio::test(start_paused = true)]
+    async fn an_event_a_stale_monitor_could_not_log_is_read_again_by_its_successor() {
+        use crate::upgrade::tests::{AsProcess, Installed};
+        // A server that honours ETags: nothing new for a reader that has
+        // the newest one.
+        fn server(_page: u32, etag: Option<String>) -> anyhow::Result<GhResponse> {
+            Ok(match etag.as_deref() {
+                Some("\"e2\"") => GhResponse::NotModified {
+                    poll_interval: None,
+                },
+                _ => ok(vec![issue("2", 2), issue("1", 1)], Some("\"e2\""), None),
+            })
+        }
+        let dir = wal_tempdir();
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+        let watch = |f: std::sync::Arc<ScriptFetcher>| {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let tx = crate::cli::event_source::EmissionSink::from(tx);
+            let d = dir.clone();
+            let run = tokio::spawn(async move {
+                poll_loop(
+                    &src(&[GithubEventKind::IssueOpened], true),
+                    FeedSide {
+                        fetcher: &*f,
+                        login: &FixedLogin("me"),
+                    },
+                    ChecksSide {
+                        reader: &NoCi,
+                        state: Some(d.join("t.ci.json")),
+                    },
+                    &tx,
+                    "k",
+                    Some(open_log(&d)),
+                    Default::default(),
+                )
+                .await;
+            });
+            (run, rx)
+        };
+
+        let old = std::sync::Arc::new(ScriptFetcher::new(vec![
+            Box::new(|_p, _e| Ok(ok(vec![issue("1", 1)], Some("\"e1\""), None))),
+            // The baseline pages on until a page is empty.
+            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+            Box::new(server),
+        ]));
+        let (run, mut presented) = watch(old.clone());
+        settle().await;
+        assert_eq!(open_log(&dir).load().etag.as_deref(), Some("\"e1\""));
+        installed.replace(1);
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        settle().await;
+        assert!(old.calls.lock().unwrap().len() >= 2, "it read the event");
+        assert!(
+            presented.try_recv().is_err(),
+            "a stale monitor presented an event it could not log, which its successor \
+             will present again"
+        );
+        run.abort();
+        let _ = run.await;
+        let left = open_log(&dir).load();
+        assert!(left.unhandled.is_empty(), "a stale monitor logged a row");
+        assert_eq!(
+            left.etag.as_deref(),
+            Some("\"e1\""),
+            "the cursor moved past an event that was never logged"
+        );
+
+        installed.install(crate::build_stamp::running());
+        let new = std::sync::Arc::new(ScriptFetcher::new(vec![Box::new(server)]));
+        let (run, mut emitted) = watch(new.clone());
+        let woke = tokio::time::timeout(Duration::from_secs(300), emitted.recv())
+            .await
+            .expect("the successor is given the event again")
+            .expect("open");
+        let (WaitItem::GithubEvent { number, .. }, _) = &woke else {
+            unreachable!()
+        };
+        assert_eq!(*number, Some(2));
+        assert_eq!(
+            new.calls.lock().unwrap()[0].1.as_deref(),
+            Some("\"e1\""),
+            "asked with the ETag from before the event"
+        );
+        assert_eq!(open_log(&dir).load().unhandled.len(), 1, "and logged it");
+        run.abort();
+    }
+
+    /// The checks' half of the same: a build goes red while the monitor
+    /// reading it is on a replaced build. It presents nothing, logs
+    /// nothing and remembers nothing, so to the monitor that follows the
+    /// red build is still news, announced once and logged. A horizon
+    /// saved by the stale read would have made it old news to everyone.
+    #[tokio::test(start_paused = true)]
+    async fn a_red_build_a_stale_monitor_saw_is_announced_once_by_its_successor() {
+        use crate::upgrade::tests::{AsProcess, Installed};
+        let dir = wal_tempdir();
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+        let watch = |rounds| {
+            let ci = ScriptCi::new(rounds);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let tx = crate::cli::event_source::EmissionSink::from(tx);
+            let d = dir.clone();
+            let run = tokio::spawn(async move {
+                poll_loop(
+                    &src(&[GithubEventKind::CiFailed], true),
+                    FeedSide {
+                        fetcher: &ScriptFetcher::new(vec![]),
+                        login: &FixedLogin("me"),
+                    },
+                    ChecksSide {
+                        reader: &ci,
+                        state: Some(d.join("t.ci.json")),
+                    },
+                    &tx,
+                    "k",
+                    Some(open_log(&d)),
+                    Default::default(),
+                )
+                .await;
+            });
+            (run, rx)
+        };
+
+        let (run, mut presented) = watch(vec![vec![], vec![red(7, "head1", "fmt")]]);
+        settle().await;
+        let remembered = std::fs::read(dir.join("t.ci.json")).expect("the horizon is established");
+        installed.replace(1);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        settle().await;
+        run.abort();
+        let _ = run.await;
+        assert!(
+            presented.try_recv().is_err(),
+            "a stale monitor announced it"
+        );
+        assert!(open_log(&dir).load().unhandled.is_empty());
+        assert_eq!(
+            std::fs::read(dir.join("t.ci.json")).unwrap(),
+            remembered,
+            "a stale monitor remembered a build it never announced"
+        );
+
+        installed.install(crate::build_stamp::running());
+        let (run, mut presented) = watch(vec![vec![red(7, "head1", "fmt")]]);
+        let woke = tokio::time::timeout(Duration::from_secs(600), presented.recv())
+            .await
+            .expect("the successor announces the red build")
+            .expect("open");
+        let (WaitItem::GithubEvent { event, .. }, _) = &woke else {
+            unreachable!()
+        };
+        assert_eq!(event, "ci_failed");
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(presented.try_recv().is_err(), "once");
+        assert_eq!(open_log(&dir).load().unhandled.len(), 1);
+        run.abort();
     }
 
     /// Cold arm: the baseline writes observation records; a SECOND arm

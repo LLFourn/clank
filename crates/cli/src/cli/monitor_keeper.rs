@@ -1002,7 +1002,10 @@ mod tests {
                 super::super::connect_within,
                 |_| false,
             ));
-        assert!(matches!(got, Attempt::NotStarted(_)), "{got:?}");
+        assert!(
+            matches!(got, Attempt::LeaseHeld(_)),
+            "a lease that stays held is a monitor going, said as that: {got:?}"
+        );
 
         let quiet = super::super::TempRepo::new();
         assert!(matches!(

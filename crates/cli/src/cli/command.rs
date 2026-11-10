@@ -438,6 +438,28 @@ pub enum Command {
     Docs(crate::cli::docs::DocsArgs),
 }
 
+impl Command {
+    /// Whether this command's process can still be running when a newer
+    /// clank is installed, and replaces itself or says so when one is: a
+    /// wait its monitor serves, a parked hook, the TUI, a status watch.
+    /// A session start is over in seconds, and binds: it is not one.
+    /// The monitor watches the installation it was started for, by
+    /// itself. A wait that folds for itself (`--peek`, `--for`, `--event`)
+    /// owns producers and an invocation an exec would end, so it is left
+    /// as it is and watches nothing.
+    pub fn outlives_an_install(&self) -> bool {
+        match self {
+            Command::Wait(args) => {
+                let wait = &args.wait;
+                wait.turn_end || !(wait.peek || wait.r#for.is_some() || !wait.events.is_empty())
+            }
+            Command::StopHook(args) => !args.session_start,
+            Command::Tui(_) | Command::Status(_) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Run the parsed command. The bin's `main` owns process concerns —
 /// SIGPIPE, tracing, the exit code — and calls this for the rest.
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -1475,6 +1497,53 @@ mod tests {
             Some("foo"),
         );
         assert_eq!(read(&["clank", "feedback", "read"]).plan, None);
+    }
+
+    /// The processes that watch for an install are the ones that can
+    /// outlive one and lose nothing by an exec. A wait that folds for
+    /// itself owns producers an exec would end, and a one-shot command is
+    /// over before an install matters to it.
+    #[test]
+    fn only_a_process_an_exec_can_carry_over_watches_its_installation() {
+        let watches = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+                .command
+                .outlives_an_install()
+        };
+        for watching in [
+            &["clank", "wait"][..],
+            &[
+                "clank",
+                "wait",
+                "--turn-end",
+                "--die-with-owner",
+                "--author",
+                "claude",
+            ],
+            &["clank", "stop-hook", "--tool", "claude"],
+            &[
+                "clank",
+                "stop-hook",
+                "--tool",
+                "claude",
+                "--handoff",
+                "/run/h.json",
+            ],
+            &["clank", "tui"],
+            &["clank", "status", "--watch"],
+        ] {
+            assert!(watches(watching), "{watching:?}");
+        }
+        for unwatched in [
+            &["clank", "wait", "--peek"][..],
+            &["clank", "stop-hook", "--tool", "claude", "--session-start"],
+            &["clank", "wait", "--event", "{}"],
+            &["clank", "send", "--to", "claude", "--message", "hello"],
+            &["clank", "monitor", "upgrade"],
+        ] {
+            assert!(!watches(unwatched), "{unwatched:?}");
+        }
     }
 
     #[test]

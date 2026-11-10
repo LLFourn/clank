@@ -367,6 +367,46 @@ fn an_unknown_agent_config_key_survives_update_agent_config() {
 
 // ── state files ───────────────────────────────────────────────────
 
+/// What a parked Stop hook of the build before this one left for the
+/// installed build it became: the harness's own input, byte for byte, and
+/// the report its park was armed with, the evidence and the deadline
+/// included. Written again, it is the same bytes.
+#[test]
+fn a_hook_handoff_reads_as_what_the_parked_hook_held() {
+    use crate::cli::turn_wire::Report;
+    let bytes = fixture!("hook-handoff.json");
+    let handoff = crate::cli::hook_handoff::Handoff::parse(bytes.as_bytes()).unwrap();
+    let input: clank_core::HookInput = serde_json::from_str(&handoff.input).unwrap();
+    assert_eq!(input.session_id.as_str(), SESSION);
+    assert_eq!(input.cwd, "/w/example");
+    assert!(handoff.input.contains("\"permission_mode\":\"default\""));
+    let Report::TurnEnd {
+        stop,
+        deadline,
+        questions,
+    } = &handoff.report
+    else {
+        panic!("{:?}", handoff.report);
+    };
+    assert_eq!(stop.tool, Tool::Claude);
+    assert_eq!(stop.session.as_str(), SESSION);
+    assert_eq!(stop.place.turn.as_deref(), Some("prompt-41"));
+    assert_eq!(stop.place.position, Some(8812));
+    assert!(stop.place.human_turn);
+    assert_eq!(
+        stop.tasks,
+        clank_core::turn_policy::TaskSnapshot::of(&input),
+        "the listing the Stop carried"
+    );
+    assert_eq!(*deadline, 1793845190330);
+    assert_eq!(questions.len(), 2);
+    assert_eq!(
+        serde_json::to_string(&handoff).unwrap(),
+        bytes.trim_end(),
+        "a handoff written by this build is the same format"
+    );
+}
+
 /// The entries the build that ended a declaration at the next turn start
 /// wrote: the declaration reads as one not yet resolved to a listed task,
 /// whose `seen_turn_end` no longer means anything, and the run keeps its
@@ -385,7 +425,12 @@ fn turn_state_with_turn_scoped_declarations_reads_and_round_trips() {
         .remove("seen_turn_end");
     assert_eq!(serde_json::to_value(&stored.attendances).unwrap(), expected);
     assert_eq!(stored.attendances.len(), 2);
-    crate::cli::turn_custody::write_stored(dir.path(), &stored).unwrap();
+    crate::cli::turn_custody::write_stored(
+        dir.path(),
+        &stored,
+        &crate::upgrade::process().permit().unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         crate::cli::turn_custody::load_stored(dir.path()),
         Some(stored)
@@ -426,7 +471,12 @@ fn turn_state_with_listed_attendances_reads_as_declared_work() {
             }
         ])
     );
-    crate::cli::turn_custody::write_stored(dir.path(), &stored).unwrap();
+    crate::cli::turn_custody::write_stored(
+        dir.path(),
+        &stored,
+        &crate::upgrade::process().permit().unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         crate::cli::turn_custody::load_stored(dir.path()),
         Some(stored)
@@ -464,7 +514,12 @@ fn turn_state_with_one_old_attendance_reads_as_its_entries() {
         "the standing attendance and its renewal for another task"
     );
     assert_eq!(stored.received, ["event:a"]);
-    crate::cli::turn_custody::write_stored(dir.path(), &stored).unwrap();
+    crate::cli::turn_custody::write_stored(
+        dir.path(),
+        &stored,
+        &crate::upgrade::process().permit().unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         crate::cli::turn_custody::load_stored(dir.path()),
         Some(stored)
@@ -538,7 +593,11 @@ fn a_published_state_with_one_attendance_reads_as_a_list() {
         Some("Implement the example plan")
     );
     assert!(state.attending[0].declared);
-    crate::cli::agent_state::store(dir.path(), &state);
+    crate::cli::agent_state::store(
+        dir.path(),
+        &state,
+        &crate::upgrade::process().permit().unwrap(),
+    );
     assert_eq!(crate::cli::agent_state::load(dir.path()), Some(state));
     assert!(raw(&dir.path().join("state.json"))["attending"].is_array());
 }

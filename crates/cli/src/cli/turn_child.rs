@@ -11,11 +11,15 @@
 //! It never decides anything about work. A monitor that goes away is
 //! followed, every time, through the ordinary attach-or-spawn. When none
 //! can be had within [`super::monitor::OUTAGE_BUDGET`] or the report's
-//! deadline, or the one there is belongs to a newer build, it wakes the
-//! agent with a notice that says so and carries no work: nothing is
-//! presented and no receipt is earned. An outage is announced to a
-//! session once: until a monitor answers it, later children go on trying
-//! and end as an uneventful park does.
+//! deadline, it wakes the agent with a notice that says so and carries no
+//! work: nothing is presented and no receipt is earned. An outage is
+//! announced to a session once: until a monitor answers it, later
+//! children go on trying and end as an uneventful park does.
+//!
+//! A child of a build that is no longer the installed one says none of
+//! that. Its hook is about to become the installed build and start the
+//! child that can follow the new monitor, so it goes on trying quietly
+//! until its pipe closes: an upgrade costs the agent no turn.
 
 use std::io::Write;
 use std::path::Path;
@@ -104,6 +108,7 @@ pub(crate) async fn run(args: super::WaitArgs) -> anyhow::Result<()> {
         owner,
         &mut out,
         &attach,
+        &crate::upgrade::process(),
     )
     .await;
     Ok(())
@@ -119,6 +124,7 @@ pub(crate) async fn carry(
     mut owner: Owner,
     out: &mut impl Write,
     attach: Attach<'_>,
+    authority: &crate::upgrade::Authority,
 ) {
     let report = match owner.next().await {
         Said::Line(line) => match serde_json::from_str::<Report>(&line) {
@@ -153,6 +159,11 @@ pub(crate) async fn carry(
         false => by,
     };
     let mut outage = Outage::default();
+    let mut stale = false;
+    // The last attempt found a monitor on its way out. A report that
+    // cannot wait that out ends quietly: its agent's next Stop asks the
+    // monitor that follows.
+    let mut retiring = false;
     let mut why = "no monitor answered before the wait's deadline".to_string();
     let answered = || {
         if let Err(e) = crate::agent_store::outage_served(repo, author, report.session()) {
@@ -174,7 +185,7 @@ pub(crate) async fn carry(
             attempt = attach(who) => attempt,
             () = passes(by) => break,
         };
-        why = match attempt.served() {
+        let unserved = match attempt.served(repo) {
             Ok(conn) => {
                 let hand = shared(
                     conn,
@@ -187,7 +198,7 @@ pub(crate) async fn carry(
                 );
                 match hand.await {
                     Hand::Done => return,
-                    Hand::Lost(why) => why,
+                    Hand::Lost(why) => Unserved::Failed(why),
                     Hand::Unanswered if report.parks() => {
                         emit_final(
                             out,
@@ -196,20 +207,22 @@ pub(crate) async fn carry(
                         return;
                     }
                     Hand::Unanswered => {
-                        if !told_once(repo, author, &report, Notice::MonitorUnanswered, out) {
+                        // A monitor of a replaced build answers nothing
+                        // new while it settles what it handed out: that
+                        // silence is the upgrade, and no news to an agent.
+                        if super::monitor::outgoing(repo)
+                            || !told_once(repo, author, &report, Notice::MonitorUnanswered, out)
+                        {
                             emit_final(out, &still("the monitor has not answered"));
                         }
                         return;
                     }
                 }
             }
-            Err(Unserved::Upgraded(why)) => {
-                tracing::debug!(%why, "the monitor is of a newer build");
-                emit_final(out, &unmonitored(repo, author, &report, Notice::Upgraded));
-                return;
-            }
-            Err(Unserved::Retry(why)) => why,
+            Err(unserved) => unserved,
         };
+        why = unserved.why().to_string();
+        retiring = matches!(unserved, Unserved::Retiring(_));
         tracing::debug!(%why, "no monitor holds this report");
         // Nobody else can say so while there is no monitor: a session that
         // no longer holds the label is owed nothing, not even the notice.
@@ -221,8 +234,12 @@ pub(crate) async fn carry(
         ) {
             return;
         }
-        let pause = match outage.lost(tokio::time::Instant::now()) {
+        // A monitor lost or an attach refused is when a stale child finds
+        // out it is one.
+        stale = authority.look().stale().is_some();
+        let pause = match outage.lost(tokio::time::Instant::now(), &unserved) {
             Some(pause) => pause,
+            None if stale => OUTAGE_RETRY_CAP,
             None => match told_once(repo, author, &report, outage_of(&why), out) {
                 true => return,
                 false => OUTAGE_RETRY_CAP,
@@ -243,7 +260,7 @@ pub(crate) async fn carry(
             out,
             &super::turn_custody::Turns::deadline_frame(report.tool()),
         );
-    } else if !told_once(repo, author, &report, outage_of(&why), out) {
+    } else if stale || retiring || !told_once(repo, author, &report, outage_of(&why), out) {
         emit_final(out, &still(&format!("clank still has no monitor: {why}")));
     }
 }
