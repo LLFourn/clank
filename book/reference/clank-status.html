@@ -26,7 +26,8 @@
 <dl class="terms">
   <dt id="option-repo"><code>--repo &lt;PATH&gt;</code></dt>
   <dd>
-<p>Repo root. Defaults to the cwd&#39;s git toplevel</p>
+<p>Repo root. Defaults to the cwd&#39;s git toplevel. With <code>--watch -j</code> it may be given more than once, to watch every repo named in one process</p>
+<p>May be repeated.</p>
   </dd>
   <dt id="option-json"><code>-j, --json</code></dt>
   <dd>
@@ -42,7 +43,12 @@
   </dd>
   <dt id="option-watch"><code>--watch</code></dt>
   <dd>
-<p>Watch for changes and re-print status when it changes. Never exits on its own. With <code>-j</code>, emits one compact JSON line per update</p>
+<p>Watch for changes and re-print status when it changes. Never exits on its own. With <code>-j</code>, emits one compact JSON line per update.</p>
+<p>Watching several repos (<code>--repo</code> more than once, or <code>--repos-from</code>), each line is one repo&#39;s snapshot with a <code>repo</code> field, the repo&#39;s absolute path with symlinks resolved, written only when that repo&#39;s snapshot changes. A repo that cannot be watched gets one line <code>{&quot;repo&quot;: …, &quot;error&quot;: …}</code> and is tried again when its path changes or it is added again; the others carry on.</p>
+  </dd>
+  <dt id="option-repos_from"><code>--repos-from &lt;PATH|-&gt;</code></dt>
+  <dd>
+<p>Watch the repos listed in PATH, one per line, as well as any <code>--repo</code>. <code>-</code> reads them from stdin and keeps reading: a line <code>+PATH</code> adds a repo, <code>-PATH</code> removes one, and a bare <code>PATH</code> adds it. At the end of stdin the set stays as it is</p>
   </dd>
   <dt id="option-help"><code>-h, --help</code></dt>
   <dd>
@@ -53,7 +59,9 @@
 <pre><code>clank status
 # keep re-printing as things change
 clank status --watch
-clank status -j</code></pre>
+clank status -j
+# one JSON line per repo per change; +PATH / -PATH on stdin
+clank status --watch -j --repos-from -</code></pre>
   </article>
 </main>
 <nav class="rail" id="chapters" aria-label="Commands">

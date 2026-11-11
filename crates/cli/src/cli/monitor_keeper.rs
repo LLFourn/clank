@@ -330,7 +330,10 @@ where
     }
 
     fn watch_locally(&mut self) {
-        self.local = reconcile_after(&self.wake, (self.watch)(self.local_tx.clone()));
+        self.local = reconcile_after(
+            &crate::fs_notice::Wake::from(self.wake.clone()),
+            (self.watch)(self.local_tx.clone()),
+        );
     }
 
     fn handoff(&mut self) {

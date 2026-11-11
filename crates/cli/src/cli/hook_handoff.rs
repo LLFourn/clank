@@ -44,29 +44,10 @@ impl Handoff {
         dir: &Path,
         exec: impl FnOnce(&Path) -> std::io::Error,
     ) -> std::io::Error {
-        let path = match self.write(dir) {
-            Ok(path) => path,
-            Err(e) => return e,
-        };
-        let failed = exec(&path);
-        let _ = std::fs::remove_file(&path);
-        failed
-    }
-
-    fn write(&self, dir: &Path) -> std::io::Result<PathBuf> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        // The pid is kept across the exec, so the name is this hook's
-        // alone, and an attempt that failed is overwritten by the next.
-        let path = dir.join(format!("hook-handoff-{}.json", std::process::id()));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(&serde_json::to_vec(self).map_err(std::io::Error::other)?)?;
-        Ok(path)
+        match serde_json::to_vec(self) {
+            Ok(bytes) => hand_over(dir, "hook-handoff", &bytes, exec),
+            Err(e) => std::io::Error::other(e),
+        }
     }
 
     /// Read the handoff a replaced build left at `path`, and remove it.
@@ -90,6 +71,40 @@ impl Handoff {
             )),
         }
     }
+}
+
+/// Write `bytes` to a file named for `stem` in `dir` that only this user
+/// can read, run `exec` on its path, and remove it again if `exec` came
+/// back: a replacement that failed leaves nothing behind.
+pub(crate) fn hand_over(
+    dir: &Path,
+    stem: &str,
+    bytes: &[u8],
+    exec: impl FnOnce(&Path) -> std::io::Error,
+) -> std::io::Error {
+    let path = match write_private(dir, stem, bytes) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let failed = exec(&path);
+    let _ = std::fs::remove_file(&path);
+    failed
+}
+
+fn write_private(dir: &Path, stem: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // The pid is kept across the exec, so the name is this process's
+    // alone, and an attempt that failed is overwritten by the next.
+    let path = dir.join(format!("{stem}-{}.json", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(bytes)?;
+    Ok(path)
 }
 
 /// The arguments the installed build is started with: the ones this

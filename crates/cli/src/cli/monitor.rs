@@ -2614,10 +2614,10 @@ impl Hangup {
 /// closes it too; `stop` shuts it from this end. An observer is sent a
 /// note only when the fold moved, so silence is the healthy idle state
 /// and is never read as loss.
-fn forward_beats(
+fn forward_beats<M: Clone + Send + Sync + 'static>(
     mut conn: Conn,
     repo: std::path::PathBuf,
-    wake: std::sync::mpsc::Sender<()>,
+    wake: crate::fs_notice::Wake<M>,
     stop: std::sync::Arc<Hangup>,
     fault: crate::fs_notice::Fault,
 ) {
@@ -2629,7 +2629,7 @@ fn forward_beats(
             }
             match conn.next_note() {
                 Ok(_) => {
-                    if wake.send(()).is_err() {
+                    if !wake.ring() {
                         return;
                     }
                 }
@@ -2655,7 +2655,7 @@ fn forward_beats(
         );
         if let Err(e) = &attached {
             crate::fs_notice::record(&fault, format!("cannot watch {}: {e:#}", repo.display()));
-            let _ = wake.send(());
+            wake.ring();
         }
         let Some(watcher) = reconcile_after(&wake, attached) else {
             return;
@@ -2679,8 +2679,8 @@ fn forward_beats(
 /// that watched a real directory passed whether or not this sent
 /// anything, which is a test that proves nothing. The ordering is
 /// still guaranteed — `attached` is evaluated before the call.
-fn reconcile_after<W>(
-    wake: &std::sync::mpsc::Sender<()>,
+fn reconcile_after<W, M: Clone>(
+    wake: &crate::fs_notice::Wake<M>,
     attached: anyhow::Result<W>,
 ) -> Option<W> {
     let watcher = match attached {
@@ -2692,7 +2692,7 @@ fn reconcile_after<W>(
             return None;
         }
     };
-    let _ = wake.send(());
+    wake.ring();
     Some(watcher)
 }
 
@@ -2731,10 +2731,11 @@ impl Drop for CoreWakes {
 /// refolded on every change, alongside one per parked wait. A
 /// subscriber computes nothing — it is told the fold moved and rebuilds
 /// only what it displays.
-pub(crate) fn core_wakes(
+pub(crate) fn core_wakes<M: Clone + Send + Sync + 'static>(
     repo: &std::path::Path,
-    wake: std::sync::mpsc::Sender<()>,
+    wake: impl Into<crate::fs_notice::Wake<M>>,
 ) -> anyhow::Result<CoreWakes> {
+    let wake = wake.into();
     let stop = std::sync::Arc::new(Hangup::default());
     let fault = crate::fs_notice::Fault::default();
     match subscribe(repo) {
@@ -17232,7 +17233,8 @@ something to promote
     #[test]
     fn the_handoff_wakes_the_consumer_once_it_is_watching() {
         let (tx, rx) = std::sync::mpsc::channel();
-        assert!(reconcile_after(&tx, Ok(())).is_some());
+        let wake = crate::fs_notice::Wake::from(tx);
+        assert!(reconcile_after(&wake, Ok(())).is_some());
         assert_eq!(
             rx.try_recv(),
             Ok(()),
@@ -17246,7 +17248,7 @@ something to promote
         );
 
         let failed: anyhow::Result<()> = Err(anyhow::anyhow!("no watcher"));
-        assert!(reconcile_after(&tx, failed).is_none());
+        assert!(reconcile_after(&wake, failed).is_none());
         assert_eq!(
             rx.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty),

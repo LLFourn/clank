@@ -445,6 +445,53 @@ a shown process exits, clank is installed, you type, or a clock on screen
 is due to read differently. An idle repo costs them nothing, and the
 working tree is walked once per change, not once per look. A watcher that
 fails ends `status --watch` with an error; the TUI says so on screen.
+
+### Watching many repos
+
+A dashboard of several repos needs one process, not one per repo:
+
+```sh
+clank status --watch -j --repo ~/src/a --repo ~/src/b
+clank status --watch -j --repos-from repos.txt   # one path per line
+clank status --watch -j --repos-from -           # paths on stdin
+```
+
+Each line is one repo's status JSON with a `repo` field, the repo's
+absolute path with symlinks resolved, written only when that repo's status
+changes; lines of different repos never interleave. The first line of
+each repo is its full status.
+
+```text
+{"repo":"/Users/me/src/a","repo_basename":"a","branch":"main", …}
+{"repo":"/Users/me/src/gone","error":"open `/Users/me/src/gone`: …"}
+```
+
+With `--repos-from -`, stdin stays open and changes the set as the watch
+runs: `+PATH` adds a repo, `-PATH` removes one, and a bare `PATH` adds it.
+At the end of stdin the set stays as it is. A removed repo gets no more
+lines. A line that names no repo (`+` alone, or bytes that are not UTF-8)
+gets an `error` line naming it, and the watch goes on.
+
+A repo that cannot be watched (it does not exist, is not a Git repo, or
+its watcher failed) gets one `error` line and the others carry on. It is
+tried again when its path changes, which is how one not made yet starts
+once it appears, or when it is added again. A failure that is not one
+repo's, such as stdin becoming unreadable, ends the watch with an error.
+
+Work is per repo: an event in one repo looks only at that repo, and idle
+repos cost nothing. One worktree stream serves every repo, and the Git
+config files repos share (global, XDG, a shared excludes file) are
+watched once. Adding or removing repos restarts that stream once per
+change, and every repo is looked at again for what the restart may have
+missed. Each repo adds about 14 file descriptors and two idle threads with
+no monitor running, and about 3 descriptors when its monitor runs. The
+watch raises its open-file limit as far as the system allows.
+
+When clank is installed, the watch restarts itself as the new build with
+the set as it stands (including repos added or removed on stdin, and a
+line half written), goes on reading stdin, and writes every repo's line
+once more.
+
 Status JSON carries `active_plan` and `last_finished` as objects or `null`;
 `last_finished` is shown only when no plan is active. A finished run carries
 `duration_secs`, from its accepted intro to finalize by Git author time (clock

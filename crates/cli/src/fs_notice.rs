@@ -44,6 +44,40 @@ pub(crate) fn notice(res: &notify::Result<notify::Event>) -> Notice<'_> {
     Notice::Changed(&event.paths)
 }
 
+/// Where a watcher says something changed: a channel, and what it says
+/// there, so one owner can hear many watchers on one channel and tell
+/// them apart.
+pub(crate) struct Wake<M = ()> {
+    tx: std::sync::mpsc::Sender<M>,
+    says: M,
+}
+
+impl<M: Clone> Clone for Wake<M> {
+    fn clone(&self) -> Self {
+        Wake {
+            tx: self.tx.clone(),
+            says: self.says.clone(),
+        }
+    }
+}
+
+impl<M: Clone> Wake<M> {
+    pub(crate) fn new(tx: std::sync::mpsc::Sender<M>, says: M) -> Self {
+        Wake { tx, says }
+    }
+
+    /// Say it. False once nobody listens.
+    pub(crate) fn ring(&self) -> bool {
+        self.tx.send(self.says.clone()).is_ok()
+    }
+}
+
+impl From<std::sync::mpsc::Sender<()>> for Wake {
+    fn from(tx: std::sync::mpsc::Sender<()>) -> Self {
+        Wake::new(tx, ())
+    }
+}
+
 /// Where a watcher records that it failed, for its owner to read.
 pub(crate) type Fault = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 

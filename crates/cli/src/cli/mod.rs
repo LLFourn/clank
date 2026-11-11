@@ -85,6 +85,7 @@ pub mod stash;
 pub(crate) mod stash_txn;
 pub mod status;
 pub(crate) mod status_tui;
+pub(crate) mod status_watch;
 pub mod stop_hook;
 pub mod team;
 pub mod teams_config;
@@ -525,9 +526,11 @@ pub struct DiffArgs {
 
 #[derive(Args, Debug)]
 pub struct StatusArgs {
-    /// Repo root. Defaults to the cwd's git toplevel.
+    /// Repo root. Defaults to the cwd's git toplevel. With `--watch -j`
+    /// it may be given more than once, to watch every repo named in one
+    /// process.
     #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
+    pub repo: Vec<PathBuf>,
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
@@ -543,8 +546,30 @@ pub struct StatusArgs {
     /// Watch for changes and re-print status when it changes.
     /// Never exits on its own. With `-j`, emits one compact JSON
     /// line per update.
+    ///
+    /// Watching several repos (`--repo` more than once, or
+    /// `--repos-from`), each line is one repo's snapshot with a `repo`
+    /// field, the repo's absolute path with symlinks resolved, written
+    /// only when that repo's snapshot changes. A repo that cannot be
+    /// watched gets one line `{"repo": …, "error": …}` and is tried
+    /// again when its path changes or it is added again; the others
+    /// carry on.
     #[arg(long)]
     pub watch: bool,
+    /// Watch the repos listed in PATH, one per line, as well as any
+    /// `--repo`. `-` reads them from stdin and keeps reading: a line
+    /// `+PATH` adds a repo, `-PATH` removes one, and a bare `PATH` adds
+    /// it. At the end of stdin the set stays as it is.
+    #[arg(long, value_name = "PATH|-", requires_all = ["watch", "json"])]
+    pub repos_from: Option<PathBuf>,
+    /// The repo set a replaced build of this watch handed over.
+    #[arg(
+        long,
+        hide = true,
+        requires_all = ["watch", "json"],
+        conflicts_with_all = ["repo", "repos_from"]
+    )]
+    pub handoff: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
