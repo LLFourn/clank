@@ -23,11 +23,39 @@ pub(crate) fn duration(secs: u64) -> String {
     }
 }
 
-/// The resolution of [`coarse`] in seconds. The surfaces that use it
-/// repaint on the status loop's idle cadence, and a unit finer than
-/// that cadence would show a value the next paint is too late to
-/// correct.
+/// The resolution of [`coarse`] in seconds.
 pub(crate) const COARSE_RESOLUTION_SECS: i64 = 60;
+
+/// The unit [`duration`] says an age of `secs` in.
+fn unit_of(secs: i64) -> i64 {
+    match secs {
+        s if s < 60 => 1,
+        s if s < 3600 => 60,
+        s if s < 86_400 => 3600,
+        _ => 86_400,
+    }
+}
+
+/// Seconds until [`short`] of an age now `secs` old reads differently.
+pub(crate) fn short_changes_in(secs: i64) -> i64 {
+    let secs = secs.max(0);
+    unit_of(secs) - secs % unit_of(secs)
+}
+
+/// Seconds until [`coarse`] of an age now `secs` old reads differently.
+pub(crate) fn coarse_changes_in(secs: i64) -> i64 {
+    match secs.max(0) {
+        s if s < COARSE_RESOLUTION_SECS => COARSE_RESOLUTION_SECS - s,
+        s => short_changes_in(s),
+    }
+}
+
+/// Seconds until [`short`] of a countdown with `left` seconds to go
+/// reads differently.
+pub(crate) fn countdown_changes_in(left: i64) -> i64 {
+    let left = left.max(0);
+    left % unit_of(left) + 1
+}
 
 /// [`short`] at minute resolution: anything under a minute reads
 /// `now` rather than a second count that would sit frozen on screen
@@ -80,6 +108,29 @@ pub(crate) fn written_at(path: &Path) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each deadline names the very second its text changes: the same
+    /// text the second before it (the units only grow, so the same
+    /// throughout), a different one at it.
+    #[test]
+    fn a_shown_age_changes_exactly_at_its_deadline() {
+        let ages = (0..4000).chain(86_000..87_000).chain(170_000..173_000);
+        for s in ages {
+            for (what, text, after) in [
+                ("short", short as fn(i64) -> String, short_changes_in(s)),
+                ("coarse", coarse, coarse_changes_in(s)),
+            ] {
+                assert!(after > 0, "{what} {s}");
+                assert_eq!(text(s + after - 1), text(s), "{what} {s}+{after}-1");
+                assert_ne!(text(s + after), text(s), "{what} {s}+{after}");
+            }
+            if s > 0 {
+                let after = countdown_changes_in(s);
+                assert_eq!(short(s - after + 1), short(s), "countdown {s}-{after}+1");
+                assert_ne!(short(s - after), short(s), "countdown {s}-{after}");
+            }
+        }
+    }
 
     #[test]
     fn one_unit_at_every_boundary() {

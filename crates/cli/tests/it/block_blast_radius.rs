@@ -51,8 +51,6 @@ fn args_for(repo: &Path, author: &str, peek: bool, events: Vec<String>) -> WaitA
         r#for: None,
         peek,
         no_cache: false,
-        poll: true,
-        no_poll: false,
     }
 }
 

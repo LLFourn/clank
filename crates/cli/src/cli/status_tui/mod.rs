@@ -98,6 +98,9 @@ enum Ev {
     Worker,
     /// The remote server spoke or ended; drained the same way.
     Remote,
+    /// Where this build stands against its installation may have moved.
+    /// Every turn looks first, so the event only has to end the wait.
+    Installed,
 }
 
 /// Execute a confirmed roster mutation via the existing `clank agent`
@@ -2096,9 +2099,6 @@ fn copyable(data: &OverlayData) -> Option<&str> {
 /// How long the overlay says `copied` before going back to `y copy`.
 const COPIED_FOR: Duration = Duration::from_secs(2);
 
-/// How long an overlay with nothing to say waits for an event.
-const OVERLAY_IDLE: Duration = Duration::from_secs(60);
-
 /// Whether the overlay is still saying `copied`, and for how much
 /// longer.
 ///
@@ -2118,11 +2118,11 @@ impl Hint {
         matches!(self, Hint::Copied(_))
     }
     /// How long the loop may sleep on this hint: just long enough to
-    /// come back and unsay it, or the idle backstop.
-    fn wait(self) -> Duration {
+    /// come back and unsay it, or until an event.
+    fn wait(self) -> Option<Duration> {
         match self {
-            Hint::Copied(left) => left,
-            Hint::Idle => OVERLAY_IDLE,
+            Hint::Copied(left) => Some(left),
+            Hint::Idle => None,
         }
     }
 }
@@ -3033,20 +3033,90 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
 /// fast tick.
 const SPINNER_TICK: Duration = Duration::from_millis(500);
 
-/// How long the pane sleeps with nothing animating. Every elapsed
-/// clank draws is minute-resolution ([`crate::age::coarse`]), so this
-/// is what keeps them true: a repaint at least as often as the
-/// smallest unit shown, and no timer of their own.
-const IDLE_TICK: Duration = Duration::from_secs(60);
-
-/// The repaint cadence. Ages on screen never raise it — they are
-/// recomputed by the paint that was going to happen anyway.
-fn paint_interval(spinner_visible: bool) -> Duration {
-    if spinner_visible {
-        SPINNER_TICK
-    } else {
-        IDLE_TICK
+/// Receive the next event, or time out at `wait`; with no `wait`,
+/// block until an event.
+fn recv_until(
+    rx: &mpsc::Receiver<Ev>,
+    wait: Option<Duration>,
+) -> Result<Ev, mpsc::RecvTimeoutError> {
+    match wait {
+        Some(wait) => rx.recv_timeout(wait),
+        None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
     }
+}
+
+/// How long the loop may sleep before something on its own clock is
+/// due: the spinner's next frame, a deferred refresh, a failed
+/// rebuild's retry, a failed replacement's, a timer falling due, a clock
+/// on screen changing. `None` when nothing is: the loop then sleeps
+/// until an event.
+fn turn_wait(
+    snapshot: &StatusSnapshot,
+    spinner_visible: bool,
+    deferred: Option<Duration>,
+    rebuild_retry: Option<Duration>,
+    replacement_retry: Option<Duration>,
+    now: i64,
+) -> Option<Duration> {
+    [
+        spinner_visible.then_some(SPINNER_TICK),
+        deferred,
+        rebuild_retry,
+        replacement_retry,
+        until_next_due(snapshot, now),
+        clocks_change_in(snapshot, now),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+/// How long until a clock the pane draws reads differently, each a
+/// deadline of its own: a log row's age, an agent's activity age and
+/// the thresholds its row is judged by, an attendance's age, a timer's
+/// countdown, a draft's age. `None` when nothing drawn moves with the
+/// clock. Never a tick: an idle pane with nothing young on it sleeps
+/// for hours.
+fn clocks_change_in(snapshot: &StatusSnapshot, now: i64) -> Option<Duration> {
+    let age = |at: i64| crate::age::short_changes_in(now - at);
+    let rows = snapshot.log_rows.iter().filter_map(|row| {
+        use crate::cli::log::OnelineRow;
+        let at = match row {
+            OnelineRow::Commit { at, .. } | OnelineRow::PlainCommit { at, .. } => *at,
+            OnelineRow::Github { at, .. } | OnelineRow::Nudge { at, .. } => *at as i64,
+            OnelineRow::Review { at, .. } => (*at)?,
+            OnelineRow::Header { .. } | OnelineRow::Notice(_) | OnelineRow::RunEnd => return None,
+        };
+        Some(crate::age::coarse_changes_in(now - at))
+    });
+    let agents = snapshot.agents.iter().flat_map(|agent| {
+        let state = agent
+            .state
+            .as_ref()
+            .and_then(|s| s.changes_at(now.max(0) as u64))
+            .map(|at| at as i64 - now);
+        let attending = agent
+            .attending
+            .iter()
+            .filter_map(|att| att.age_from().map(age));
+        state.into_iter().chain(attending)
+    });
+    let countdowns = snapshot.sources.iter().filter_map(|s| match s.timer {
+        Some(crate::cli::timer_source::TimerState::Due(at)) if at as i64 > now => {
+            Some(crate::age::countdown_changes_in(at as i64 - now))
+        }
+        _ => None,
+    });
+    let drafts = snapshot.drafts.iter().filter_map(|d| {
+        let at = d.modified?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(age(at.as_secs() as i64))
+    });
+    rows.chain(agents)
+        .chain(countdowns)
+        .chain(drafts)
+        .filter(|secs| *secs > 0)
+        .min()
+        .map(|secs| Duration::from_secs(secs as u64))
 }
 
 /// What restarting this TUI into a newer build would break: a remote
@@ -3161,23 +3231,16 @@ fn close_turn<T: PartialEq>(
     }
 }
 
-/// The loop's recv timeout: the `base` cadence (spinner tick when one is
-/// visible, else the idle backstop), shortened to the time left before a
-/// DEFERRED refresh may run — so a coalesced burst still rebuilds within
-/// [`REBUILD_MIN`] (trailing edge), and a lone deferred wake fires within
-/// the interval rather than waiting for the next unrelated event. Pure →
-/// unit-tested.
+/// The time left before a DEFERRED refresh may run, while one is
+/// pending — so a coalesced burst still rebuilds within [`REBUILD_MIN`]
+/// (trailing edge), and a lone deferred wake fires within the interval
+/// rather than waiting for the next unrelated event. Pure → unit-tested.
 fn deferred_wait(
-    base: Duration,
     refresh_pending: bool,
     since_last_rebuild: Duration,
     min_interval: Duration,
-) -> Duration {
-    if refresh_pending {
-        base.min(min_interval.saturating_sub(since_last_rebuild))
-    } else {
-        base
-    }
+) -> Option<Duration> {
+    refresh_pending.then(|| min_interval.saturating_sub(since_last_rebuild))
 }
 
 /// Backoff before RETRYING a failed rebuild
@@ -3236,9 +3299,12 @@ fn behind_overlay(ev: &Ev) -> BehindOverlay {
             refresh: false,
             fill: true,
         },
-        Ev::Stdin(_) | Ev::Content { .. } | Ev::Process(_) | Ev::Worker | Ev::Remote => {
-            BehindOverlay::default()
-        }
+        Ev::Stdin(_)
+        | Ev::Content { .. }
+        | Ev::Process(_)
+        | Ev::Worker
+        | Ev::Remote
+        | Ev::Installed => BehindOverlay::default(),
     }
 }
 
@@ -3267,20 +3333,17 @@ fn coalesce(events: impl IntoIterator<Item = Ev>) -> Batch {
                 state,
             } => b.content.push((generation, target, state)),
             Ev::Process(completion) => b.process.push(completion),
-            Ev::Worker | Ev::Remote => {}
+            Ev::Worker | Ev::Remote | Ev::Installed => {}
         }
     }
     b
 }
 
-/// The TUI loop, fully event-driven: the watcher covers the
-/// working tree (gitignore-filtered), `.clank/`, and the git dir;
-/// SIGWINCH arrives on the same channel, so a resize is just
-/// another wake. Between events there is nothing to redraw —
-/// nothing rendered is clock-relative — so the only timeout is a
-/// slow backstop against watcher pathologies the error channel
-/// doesn't surface (tui-event-driven-dirty-stats).
-/// `clank tui`: resolve the repo and run the loop.
+/// `clank tui`: resolve the repo and run the loop. The loop is
+/// event-driven: the watchers cover the working tree, `.clank/` and the
+/// git dirs, an install and a shown process's exit wake it, and SIGWINCH
+/// and keys arrive on the same channel. Its only timeouts are deadlines
+/// of its own ([`turn_wait`]).
 pub async fn run(args: crate::cli::TuiArgs) -> anyhow::Result<()> {
     let repo = crate::cli::resolve_repo(args.repo.as_deref())?;
     let basename = crate::cli::repo_basename(&repo)?;
@@ -3305,7 +3368,8 @@ pub(crate) async fn run_tui(
     let _lease = lease::acquire(&repo).map_err(|why| anyhow::anyhow!("{why}"))?;
 
     let (tx, rx) = mpsc::channel::<()>();
-    let watchers = watch_tui_paths(tx, &repo, crate::cli::monitor::spawn_monitor)?;
+    let git_status = crate::cli::status::GitStatus::default();
+    let watchers = watch_tui_paths(tx, &repo, &git_status, crate::cli::monitor::spawn_monitor)?;
     // Resize is NOT a data change, so SIGWINCH gets its OWN channel and
     // maps to `Ev::Resize` — otherwise the nothing-changed gate (which
     // only fires on `Ev::Refresh`) would swallow it and leave a taller
@@ -3339,6 +3403,9 @@ pub(crate) async fn run_tui(
     // anything from a missing status.
     let mut served = remote_owner::Served::starting(&repo);
     let mut remote_notice = None;
+    // The agents' panes as the remote last heard of them: it lists
+    // its own panes again when the TUI's listing finds a different set.
+    let mut panes_told = None;
     let (remote_req_tx, remote_req_rx) = mpsc::channel::<String>();
     let runtime = {
         let wake = ev_tx.clone();
@@ -3366,7 +3433,6 @@ pub(crate) async fn run_tui(
                         as std::sync::Arc<dyn crate::cli::web::Panes>,
                 )
             }),
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             remote::Browser,
             std::sync::Arc::new(move || {
@@ -3396,6 +3462,13 @@ pub(crate) async fn run_tui(
         screen = Some(AltScreen::enter());
         failed
     });
+    let _installs = replacing.authority().subscribe({
+        let wake = ev_tx.clone();
+        move || {
+            let _ = wake.send(Ev::Installed);
+        }
+    });
+    let mut said_fault = false;
     {
         let ev_tx = ev_tx.clone();
         std::thread::spawn(move || {
@@ -3437,7 +3510,7 @@ pub(crate) async fn run_tui(
     // Probe the input signature BEFORE the first build so any change
     // racing the build re-builds next wake (under-gate, never over-gate).
     let mut gate = RebuildGate::new(
-        crate::cli::status::input_signature(&repo).ok(),
+        crate::cli::status::input_signature(&repo, &git_status).ok(),
         watchers.keeper.fresh(),
     );
     // Consecutive failed refreshes (tui-transient-refresh-resilience);
@@ -3445,8 +3518,23 @@ pub(crate) async fn run_tui(
     // the bounded self-retry after a failure.
     let mut refresh_failures: u32 = 0;
     let mut refresh_retry_at: Option<std::time::Instant> = None;
-    let mut snapshot =
-        StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
+    let mut snapshot = StatusSnapshot::build_with(
+        &repo,
+        &basename,
+        home.as_deref(),
+        policy,
+        None,
+        true,
+        &git_status,
+    )
+    .await?;
+    let mut exits = crate::cli::status::ProcessExits::new({
+        let wake = ev_tx_async.clone();
+        move || {
+            let _ = wake.send(Ev::Refresh);
+        }
+    });
+    exits.track(&repo);
     // Roster→pane convergence is the worker's job; this is a channel
     // send, not zellij work (tui-reconcile-off-loop).
     reconcile_worker.observe(&snapshot);
@@ -3547,6 +3635,21 @@ pub(crate) async fn run_tui(
             ))
             .stale();
         let refused_before = crate::upgrade::process().refusals();
+        if !said_fault
+            && let Some(why) = watchers
+                .git
+                .fault()
+                .or_else(|| watchers.keeper.fault())
+                .or_else(|| exits.fault())
+        {
+            said_fault = true;
+            detail = Some(Overlay::error(
+                "the pane stopped following the repo".to_string(),
+                format!(
+                    "{why}. Nothing on screen will change now; quit and run `clank tui` again."
+                ),
+            ));
+        }
         reconcile_wait_process(
             &mut mode,
             &mut wait_page,
@@ -3567,6 +3670,9 @@ pub(crate) async fn run_tui(
         // Answer web requests even while a document overlay owns the TUI.
         // Keep the outcomes for the normal panel path to paint afterward.
         let reopen_outcomes = reconcile_worker.outcomes();
+        if !reopen_outcomes.is_empty() {
+            remote.panes_changed();
+        }
         for (label, outcome) in &reopen_outcomes {
             if let Some(index) = reopen_pending.iter().position(|(name, _)| name == label)
                 && let Some((_, Some(answer))) = reopen_pending.remove(index)
@@ -3593,7 +3699,7 @@ pub(crate) async fn run_tui(
         // A document overlay owns the whole pane until dismissed:
         // render it, route its own (scroll / back) keys, and skip the
         // normal log/panel path. Nothing here animates, so the wait is
-        // the slow backstop.
+        // for an event, or for the `copied` hint to lapse.
         if detail.is_some() {
             let page = (rows as usize).saturating_sub(3).max(1);
             let overlay = detail.as_ref().unwrap();
@@ -3633,7 +3739,7 @@ pub(crate) async fn run_tui(
                 }
             };
             paint(&lines);
-            let ev = ev_rx.recv_timeout(hint.wait());
+            let ev = recv_until(&ev_rx, hint.wait());
             // The page beneath is hidden, not gone: what a wake means
             // for it is decided once, here, and carried out of this
             // loop — the flush at the loop bottom is never reached
@@ -3725,7 +3831,8 @@ pub(crate) async fn run_tui(
                 // The overlay hides the notice row; the answer is
                 // drained and painted once the overlay closes. A refresh
                 // and a resize were noted above.
-                Ok(Ev::Refresh) | Ok(Ev::Resize) | Ok(Ev::Worker) | Ok(Ev::Remote) => {}
+                Ok(Ev::Refresh) | Ok(Ev::Resize) | Ok(Ev::Worker) | Ok(Ev::Remote)
+                | Ok(Ev::Installed) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("event channel disconnected")
@@ -3745,6 +3852,10 @@ pub(crate) async fn run_tui(
             continue;
         }
         let presence = reconcile_worker.presence();
+        if presence != panes_told {
+            remote.panes_changed();
+            panes_told = presence.clone();
+        }
         mode = settle_detail_cursor(mode, &snapshot.agents, &presence, &mut detail_shown);
         crate::cli::status_tui::input::settle_seen_session(
             mode,
@@ -3910,7 +4021,6 @@ pub(crate) async fn run_tui(
         // screen when a roster exists — tick whenever any agent is active
         // (no window math; the log carries no placeholders).
         let spinner_visible = !in_prog.is_empty() && !snapshot.agents.is_empty();
-        let base = paint_interval(spinner_visible);
         // A scheduled retry that has come due is promoted to a normal
         // deferred refresh; a pending one caps the sleep so the
         // deadline actually fires (a plain Timeout wake loops back
@@ -3921,18 +4031,16 @@ pub(crate) async fn run_tui(
             refresh_pending = true;
             refresh_retry_at = None;
         }
-        let wait = deferred_wait(base, refresh_pending, last_rebuild.elapsed(), REBUILD_MIN);
-        let wait = match refresh_retry_at {
-            Some(at) => wait.min(at.saturating_duration_since(std::time::Instant::now())),
-            None => wait,
-        };
-        let wait = match until_next_due(&snapshot, crate::age::now()) {
-            Some(due) => wait.min(due),
-            None => wait,
-        };
-        let wait = wait.min(replacing.due_in());
+        let wait = turn_wait(
+            &snapshot,
+            spinner_visible,
+            deferred_wait(refresh_pending, last_rebuild.elapsed(), REBUILD_MIN),
+            refresh_retry_at.map(|at| at.saturating_duration_since(std::time::Instant::now())),
+            replacing.retry_in(),
+            crate::age::now(),
+        );
 
-        match ev_rx.recv_timeout(wait) {
+        match recv_until(&ev_rx, wait) {
             // Drain the whole queued burst in ONE pass: keystrokes apply
             // in arrival order, and any number of Refresh/Resize fold to a
             // single flag (coalesce), so a watcher storm costs one repaint
@@ -5461,11 +5569,9 @@ pub(crate) async fn run_tui(
             Err(mpsc::RecvTimeoutError::Timeout) if spinner_visible => {
                 frame = frame.wrapping_add(1);
             }
-            // The sources account lives outside the repo and only a
-            // monitor of this build's protocol wakes us for it, so the
-            // idle tick asks the nothing-changed gate whether it moved:
-            // a source's last check must not freeze into a false red.
-            Err(mpsc::RecvTimeoutError::Timeout) => refresh_pending = true,
+            // A deadline: a clock on screen, a deferred refresh or a
+            // retry. The pass above and the flush below do the rest.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("event channel disconnected")
             }
@@ -5495,7 +5601,7 @@ pub(crate) async fn run_tui(
             // Nothing-changed gate (lloyd's invariant): a wake that touched
             // no snapshot input is dropped — no rebuild, no log re-fold, no
             // repaint. The probe is far cheaper than the work it guards.
-            let sig = crate::cli::status::input_signature(&repo).ok();
+            let sig = crate::cli::status::input_signature(&repo, &git_status).ok();
             if let Some(due) = gate.due(sig) {
                 // Capture index-addressed targets by LABEL from the OLD
                 // state before rebuilding — external roster/library edits
@@ -5553,13 +5659,14 @@ pub(crate) async fn run_tui(
                 // and must not advance the accepted signature — see
                 // [`apply_refresh`].
                 let held = held_entry(mode, &snapshot, cols, &log);
-                let rebuilt = StatusSnapshot::build_async(
+                let rebuilt = StatusSnapshot::build_with(
                     &repo,
                     &basename,
                     home.as_deref(),
                     policy,
                     None,
                     true,
+                    &git_status,
                 )
                 .await
                 .map_err(|e| format!("{e:#}"));
@@ -5601,6 +5708,7 @@ pub(crate) async fn run_tui(
                 refind_entry(&mut log, held, &snapshot, cols);
                 if refresh_ok {
                     gate.accept(due);
+                    exits.track(&repo);
                     refresh_retry_at = None;
                 } else {
                     refresh_retry_at =
@@ -6353,13 +6461,13 @@ pub(crate) mod tests {
         let at = Instant::now();
 
         assert_eq!(super::hint_at(None, at), super::Hint::Idle);
-        assert_eq!(super::hint_at(None, at).wait(), super::OVERLAY_IDLE);
+        assert_eq!(super::hint_at(None, at).wait(), None);
 
         // Fresh: says copied, and sleeps only until it stops being true.
         let fresh = super::hint_at(Some(at), at);
         assert_eq!(fresh, super::Hint::Copied(super::COPIED_FOR));
         assert!(fresh.saying_copied());
-        assert_eq!(fresh.wait(), super::COPIED_FOR);
+        assert_eq!(fresh.wait(), Some(super::COPIED_FOR));
 
         // A hair before the boundary: still copied, and the sleep left
         // is small but never zero, so the repaint is still owed.
@@ -6372,7 +6480,7 @@ pub(crate) mod tests {
         assert!(!exact.saying_copied());
         assert_eq!(
             exact.wait(),
-            super::OVERLAY_IDLE,
+            None,
             "an expired hint owes no repaint, or the overlay busy-loops"
         );
 
@@ -8114,25 +8222,70 @@ pub(crate) mod tests {
         );
     }
 
-    /// An elapsed on screen costs the pane nothing: it is recomputed
-    /// by a paint that was already going to happen, so the cadence is
-    /// still decided by the spinner alone. And the idle cadence is
-    /// what keeps a minute-resolution age true — a repaint no rarer
-    /// than the smallest unit shown.
+    /// With nothing owed and nothing on screen moving with the clock,
+    /// the loop sleeps until an event, however long that is. Each clock
+    /// it draws wakes it at the second that clock reads differently, and
+    /// at no other.
     #[test]
-    fn a_clock_on_screen_arms_nothing_of_its_own() {
-        assert_eq!(paint_interval(true), SPINNER_TICK);
+    fn an_idle_pane_sleeps_until_an_event_or_a_clock_it_draws() {
+        let now = 10_000_000;
+        let mut s = crate::cli::status_tui::fixtures::snap(None, vec![]);
+        s.log_rows.clear();
+        s.agents.clear();
+        s.sources.clear();
+        s.drafts.clear();
+        let idle = |s: &StatusSnapshot| turn_wait(s, false, None, None, None, now);
+        assert_eq!(idle(&s), None, "no tick of any kind");
+
+        let commit = |age: i64| crate::cli::log::OnelineRow::Commit {
+            sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            at: now - age,
+            subject: "a commit".into(),
+            marker: crate::cli::log::RowMarker::Plain,
+            stands_for: None,
+        };
+        s.log_rows = vec![commit(30)];
         assert_eq!(
-            paint_interval(false),
-            IDLE_TICK,
-            "ages do not shorten the idle sleep"
+            idle(&s),
+            Some(Duration::from_secs(30)),
+            "`now` until a minute"
         );
-        assert!(
-            IDLE_TICK.as_secs() as i64 <= crate::age::COARSE_RESOLUTION_SECS,
-            "a {}s repaint cannot keep a {}s unit honest",
-            IDLE_TICK.as_secs(),
-            crate::age::COARSE_RESOLUTION_SECS
+        s.log_rows = vec![commit(2 * 3600 + 10)];
+        assert_eq!(idle(&s), Some(Duration::from_secs(3590)), "`2h` until `3h`");
+        s.log_rows = vec![commit(2 * 3600 + 10), commit(5 * 60 + 1)];
+        assert_eq!(idle(&s), Some(Duration::from_secs(59)), "the soonest clock");
+
+        s.drafts = vec![crate::cli::queue::Draft {
+            name: "idea".into(),
+            path: "idea.md".into(),
+            title: None,
+            modified: Some(std::time::UNIX_EPOCH + Duration::from_secs((now - 20) as u64)),
+        }];
+        assert_eq!(
+            idle(&s),
+            Some(Duration::from_secs(1)),
+            "a draft says seconds"
         );
+
+        s.log_rows.clear();
+        s.drafts.clear();
+        for (owed, why) in [
+            (turn_wait(&s, true, None, None, None, now), "the spinner"),
+            (
+                turn_wait(&s, false, Some(Duration::from_millis(300)), None, None, now),
+                "a deferred refresh",
+            ),
+            (
+                turn_wait(&s, false, None, Some(Duration::from_secs(4)), None, now),
+                "a failed rebuild's retry",
+            ),
+            (
+                turn_wait(&s, false, None, None, Some(Duration::from_secs(2)), now),
+                "a failed replacement's retry",
+            ),
+        ] {
+            assert!(owed.is_some(), "{why} is a timer the loop set itself");
+        }
     }
 
     /// One significant token of Rust source.
@@ -8534,7 +8687,7 @@ pub(crate) mod tests {
             .find("letrefused_before=crate::upgrade::process().refusals();")
             .expect("the count is taken");
         let recv = flat
-            .find("matchev_rx.recv_timeout(wait){")
+            .find("matchrecv_until(&ev_rx,wait){")
             .expect("the panel's own receive");
         let said = flat
             .find(
@@ -8545,7 +8698,8 @@ pub(crate) mod tests {
     }
 
     /// The loop asks on every pass, ahead of the gate an install never
-    /// moves, with what the TUI hosts now, and wakes for the next look.
+    /// moves, with what the TUI hosts now; it is woken by an install, and
+    /// sleeps only as long as [`turn_wait`] allows.
     #[test]
     fn the_loop_looks_for_an_install_on_every_pass() {
         let whole = include_str!("mod.rs");
@@ -8563,13 +8717,20 @@ pub(crate) mod tests {
             !flat[top..pass].contains(['{', ';']),
             "the loop's first statement, under no condition"
         );
-        let capped = flat
-            .find("letwait=wait.min(replacing.due_in());")
-            .expect("the wait is capped at the next look");
+        let subscribed = flat
+            .find("let_installs=replacing.authority().subscribe(")
+            .expect("woken by an install");
+        let waited = flat
+            .find("letwait=turn_wait(")
+            .expect("the wait is the loop's own timers");
         let recv = flat
-            .find("matchev_rx.recv_timeout(wait){")
+            .find("matchrecv_until(&ev_rx,wait){")
             .expect("the panel's own receive");
-        assert!(pass < capped && capped < recv);
+        assert!(subscribed < top && pass < waited && waited < recv);
+        assert!(
+            flat[waited..recv].contains("replacing.retry_in()"),
+            "a failed replacement's retry is one of them"
+        );
     }
 
     #[test]
@@ -8591,7 +8752,17 @@ pub(crate) mod tests {
         let _close: Close = close_turn;
         let _health: Health = crate::cli::status::process_health;
 
-        const RECV: &[&str] = &["match", "ev_rx", ".", "recv_timeout", "(", "wait", ")", "{"];
+        const RECV: &[&str] = &[
+            "match",
+            "recv_until",
+            "(",
+            "&",
+            "ev_rx",
+            ",",
+            "wait",
+            ")",
+            "{",
+        ];
         const CLOSE: &[&str] = &["refresh_pending", "=", "close_turn", "("];
         const FLUSH: &[&str] = &[
             "if",
@@ -8869,6 +9040,7 @@ pub(crate) mod tests {
         let sig = || {
             input_signature_with(
                 p,
+                &Default::default(),
                 ProcessHealth {
                     attendances: 0,
                     monitor: crate::cli::monitor::Liveness::None,
@@ -8888,7 +9060,7 @@ pub(crate) mod tests {
             None,
             wake,
             fresh,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(crate::cli::monitor::Hangup::default()),
         );
         keeper.handoff();
         assert_eq!(woken.try_iter().count(), 1, "the panel is woken for it");
@@ -8911,8 +9083,11 @@ pub(crate) mod tests {
         let src = include_str!("mod.rs");
         let from = src.find("pub(crate) async fn run_tui(").expect("run_tui");
         let body = &src[from..from + src[from..].find("'evloop: loop").expect("its loop")];
+        let flat: String = body.split_whitespace().collect();
         assert!(
-            body.contains("watch_tui_paths(tx, &repo, crate::cli::monitor::spawn_monitor)"),
+            flat.contains(
+                "watch_tui_paths(tx,&repo,&git_status,crate::cli::monitor::spawn_monitor)"
+            ),
             "the TUI keeps its monitor with the installed build's starter"
         );
     }
@@ -8968,7 +9143,7 @@ pub(crate) mod tests {
                 at: t0,
                 last: health(&snapshot.monitor),
             };
-            let mut last_sig = input_signature_with(p, health(&before)).ok();
+            let mut last_sig = input_signature_with(p, &Default::default(), health(&before)).ok();
             assert!(last_sig.is_some());
 
             let quiet = close_turn(&mut probe, t0 + every, every, false, || health(&before));
@@ -8979,7 +9154,7 @@ pub(crate) mod tests {
                 turn.refresh_pending,
                 "{before:?} -> {after:?}: the probe must ask for the rebuild"
             );
-            let sig = input_signature_with(p, health(&after)).ok();
+            let sig = input_signature_with(p, &Default::default(), health(&after)).ok();
             assert_ne!(
                 sig, last_sig,
                 "{before:?} -> {after:?}: the gate must keep the rebuild"
@@ -8998,36 +9173,28 @@ pub(crate) mod tests {
 
             let settled = close_turn(&mut probe, t0 + every * 3, every, false, || health(&after));
             assert!(!settled.refresh_pending, "{after:?}: it flips once");
-            assert_eq!(input_signature_with(p, health(&after)).ok(), last_sig);
+            assert_eq!(
+                input_signature_with(p, &Default::default(), health(&after)).ok(),
+                last_sig
+            );
         }
     }
 
     #[test]
     fn deferred_wait_caps_to_the_refresh_interval() {
         let min = Duration::from_secs(1);
-        let base = Duration::from_secs(60);
-        // No pending refresh → the base cadence, untouched.
-        assert_eq!(
-            deferred_wait(base, false, Duration::from_millis(10), min),
-            base
-        );
+        // No pending refresh → nothing owed.
+        assert_eq!(deferred_wait(false, Duration::from_millis(10), min), None);
         // Pending, interval not yet elapsed → wait the REMAINING time, so
         // the coalesced burst flushes within one interval (trailing edge).
         assert_eq!(
-            deferred_wait(base, true, Duration::from_millis(400), min),
-            Duration::from_millis(600)
+            deferred_wait(true, Duration::from_millis(400), min),
+            Some(Duration::from_millis(600))
         );
         // Pending, interval already elapsed → 0 (flush on the next tick).
         assert_eq!(
-            deferred_wait(base, true, Duration::from_secs(5), min),
-            Duration::ZERO
-        );
-        // Pending but a shorter base (a visible spinner) wins, so the
-        // spinner keeps ticking while the refresh waits its interval.
-        let spinner = Duration::from_millis(120);
-        assert_eq!(
-            deferred_wait(spinner, true, Duration::from_millis(100), min),
-            spinner
+            deferred_wait(true, Duration::from_secs(5), min),
+            Some(Duration::ZERO)
         );
     }
 

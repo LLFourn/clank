@@ -169,7 +169,7 @@ pub fn attach_cost(repo: &Path) -> Duration {
     *COST.get_or_init(|| {
         let (tx, _rx) = std::sync::mpsc::channel::<()>();
         let t = Instant::now();
-        let watcher = clank::repo_watch::RepoStateWatcher::attach(repo, true, tx)
+        let watcher = clank::repo_watch::RepoStateWatcher::attach(repo, tx)
             .expect("attach a watcher to the fixture repo");
         drop(watcher);
         t.elapsed()

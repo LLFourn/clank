@@ -255,14 +255,13 @@ pub(crate) fn status_payload(
 }
 
 /// How an instance is to run: the tunnel it comes up behind, if any;
-/// how often its panes are re-listed; how long its tasks are given to
-/// end; and what the TUI knew when the start was asked for. One thing,
+/// how long its tasks are given to end; and what the TUI knew when the
+/// start was asked for. One thing,
 /// because they are answered together at the one place that starts a
 /// remote — and eight positional arguments at that call site said
 /// less than these four names do (ruthless on 06e16bf).
 pub(crate) struct Startup {
     pub(crate) tunnel: Option<tunnel::Start>,
-    pub(crate) poll: std::time::Duration,
     pub(crate) grace: std::time::Duration,
     /// Published before the server can answer anyone; see `start`.
     pub(crate) seed: serde_json::Value,
@@ -480,6 +479,9 @@ fn subscribe_in(
                 feed.event_in(generation, ev);
             }
         }
+        // The subscription is over: its panes may be gone, and the
+        // supervisor looks at once rather than at its next event.
+        feed.relist();
     });
     Some(Subscription { child, reader })
 }
@@ -492,13 +494,20 @@ struct TailHandle {
     tool: clank_core::vocab::Tool,
     path: PathBuf,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes the tail, which otherwise waits for its file to change.
+    poke: std::sync::mpsc::Sender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TailHandle {
-    /// Stop the tail and wait for it: within one poll of the file.
-    fn stop_and_join(mut self) {
+    fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.poke.send(());
+    }
+
+    /// Stop the tail and wait for it.
+    fn stop_and_join(mut self) {
+        self.stop();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -507,7 +516,7 @@ impl TailHandle {
 
 impl Drop for TailHandle {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop();
     }
 }
 
@@ -598,7 +607,7 @@ fn retarget_tails(
         .collect();
     for label in gone {
         if let Some(h) = tails.remove(&label) {
-            h.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            h.stop();
             retired.push(h);
         }
         if !wanted.contains_key(&label) {
@@ -614,16 +623,27 @@ fn retarget_tails(
         let owner = *next_owner;
         feed.claim_turns(label, owner, Some(session));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (feed, label2, session2, tool2, path2, stop2) = (
+        let (poke, woken) = std::sync::mpsc::channel();
+        let (feed, label2, session2, tool2, path2, stop2, poke2) = (
             feed.clone(),
             label.clone(),
             session.clone(),
             *tool,
             path.clone(),
             stop.clone(),
+            poke.clone(),
         );
         let thread = std::thread::spawn(move || {
-            run_tail(feed, label2, owner, session2, tool2, path2, stop2)
+            run_tail(
+                feed,
+                label2,
+                owner,
+                session2,
+                tool2,
+                path2,
+                stop2,
+                (poke2, woken),
+            )
         });
         tails.insert(
             label.clone(),
@@ -632,6 +652,7 @@ fn retarget_tails(
                 tool: *tool,
                 path: path.clone(),
                 stop,
+                poke,
                 thread: Some(thread),
             },
         );
@@ -643,8 +664,53 @@ fn retarget_tails(
 /// The last window of a transcript, then only what is appended;
 /// bytes enough for the page's last few screens, never the history.
 const TAIL_WINDOW: u64 = 4 * 1024 * 1024;
-const TAIL_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Watch for `path` changing: appended to, replaced, or made, along
+/// with its directory, which may not exist yet either.
+fn watch_transcript(
+    path: &Path,
+    wake: std::sync::mpsc::Sender<()>,
+    fault: crate::fs_notice::Fault,
+) -> notify::Result<crate::proc_identity::tree_watch::KernelWatcher> {
+    use notify::Watcher as _;
+    let dir = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let followed = path.to_path_buf();
+    let mut watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
+        move |p| p == followed,
+        transcript_handler(path.to_path_buf(), wake, fault),
+    )?;
+    watcher.watch(&dir, notify::RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+
+/// [`watch_transcript`]'s callback, apart from any backend so a test can
+/// drive it with what one delivers. The directory appearing is a wake
+/// too: the file may have been made with it.
+fn transcript_handler(
+    path: PathBuf,
+    wake: std::sync::mpsc::Sender<()>,
+    fault: crate::fs_notice::Fault,
+) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+    move |res: notify::Result<notify::Event>| {
+        use crate::fs_notice::{Notice, notice};
+        let ours = match notice(&res) {
+            Notice::Read => false,
+            Notice::Rescan => true,
+            Notice::Changed(paths) => paths
+                .iter()
+                .any(|p| *p == path || Some(p.as_path()) == path.parent()),
+            Notice::Failed(why) => {
+                crate::fs_notice::record(&fault, why);
+                true
+            }
+        };
+        if ours {
+            let _ = wake.send(());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_tail(
     feed: Feed,
     agent: String,
@@ -653,8 +719,32 @@ fn run_tail(
     tool: clank_core::vocab::Tool,
     path: PathBuf,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    (poke, woken): (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
 ) {
     use std::sync::atomic::Ordering;
+    let fault = crate::fs_notice::Fault::default();
+    let failed = || match crate::fs_notice::read(&fault) {
+        Some(why) => {
+            eprintln!(
+                "clank: the watch on {agent}'s transcript {} failed: {why}; the remote no \
+                 longer follows it",
+                path.display()
+            );
+            true
+        }
+        None => false,
+    };
+    let watcher = match watch_transcript(&path, poke.clone(), fault.clone()) {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            eprintln!(
+                "clank: cannot watch {}'s transcript {}: {e}; the remote will not follow it",
+                agent,
+                path.display()
+            );
+            return;
+        }
+    };
     // The file may not exist yet: a session that has not spoken.
     let (mut tail, lines) = loop {
         if stop.load(Ordering::Relaxed) {
@@ -662,9 +752,18 @@ fn run_tail(
         }
         match transcript::Tail::open(&path, TAIL_WINDOW) {
             Ok(opened) => break opened,
-            Err(_) => std::thread::sleep(std::time::Duration::from_secs(2)),
+            Err(_) => {
+                if woken.recv().is_err() {
+                    return;
+                }
+                while woken.try_recv().is_ok() {}
+                if failed() {
+                    return;
+                }
+            }
         }
     };
+    let _watcher = watcher;
     let mut generation = 1u32;
     feed.turns_reset(
         &agent,
@@ -674,8 +773,11 @@ fn run_tail(
         window_turns(tool, &lines),
     );
     loop {
-        std::thread::sleep(TAIL_POLL);
-        if stop.load(Ordering::Relaxed) {
+        if woken.recv().is_err() {
+            return;
+        }
+        while woken.try_recv().is_ok() {}
+        if stop.load(Ordering::Relaxed) || failed() {
             return;
         }
         let Ok(polled) = tail.poll() else {
@@ -728,11 +830,6 @@ fn window_turns(
     turns
 }
 
-/// How often the pane set is re-listed. A status change is a hint,
-/// not the trigger: the TUI creates panes asynchronously after the
-/// change the watcher sees, and a resize changes nothing it watches.
-pub(crate) const PANE_POLL: std::time::Duration = std::time::Duration::from_secs(4);
-
 /// The first wait before a dead subscription is restarted; it doubles
 /// on each failed restart, up to [`RESTART_MAX`].
 const RESTART_MIN: std::time::Duration = std::time::Duration::from_secs(1);
@@ -758,19 +855,24 @@ fn resubscribe(
     }
 }
 
-/// The repo's pane supervisor. It re-lists the panes every
-/// [`PANE_POLL`], restarting the subscription when membership changes;
-/// restarts a subscription whose reader ended, with backoff; and runs
-/// the verification samples [`freshness::Freshness`] calls for,
-/// answering viewers' `verify` requests. Ends on the cancel signal, its
-/// subscription with it (`stop` ends that).
-#[allow(clippy::too_many_arguments)]
-async fn pane_poll(
+/// The repo's pane supervisor. Zellij announces no change to its
+/// layout, so the panes are listed again only when something says they
+/// may have changed ([`Feed::relist`]): a subscribed pane closing, a
+/// subscription ending, the TUI's own listing finding a different set
+/// of agents' panes or reopening one, the connector attaching again, and
+/// a viewer asking to verify a pane the table does not hold as open. A
+/// pane moved, renamed or opened by hand is seen at the next of those.
+///
+/// It also restarts a subscription whose reader ended, with backoff, and
+/// runs the verification samples [`freshness::Freshness`] calls for,
+/// answering viewers' `verify` requests; both wait on deadlines, not a
+/// clock. Ends on the cancel signal, its subscription with it (`stop`
+/// ends that).
+async fn pane_supervisor(
     panes: Arc<dyn Panes>,
     feed: Feed,
     subscription: Arc<Mutex<Option<Subscription>>>,
     mut cancelled: tokio::sync::watch::Receiver<bool>,
-    poll: std::time::Duration,
     blocking: Arc<Blocking>,
     mut verify: tokio::sync::mpsc::UnboundedReceiver<Verify>,
 ) {
@@ -779,18 +881,27 @@ async fn pane_poll(
     let clock = || tokio::time::Instant::now().into_std();
     let mut fresh = freshness::Freshness::default();
     let mut table = feed.table();
-    let mut listed = clock();
-    let mut tick = tokio::time::interval(poll.min(std::time::Duration::from_secs(1)));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     type Sample = Option<Option<std::collections::BTreeMap<String, Vec<String>>>>;
     let mut sampling: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Sample> + Send>>> =
         None;
     let mut backoff = RESTART_MIN;
     let mut restart_at: Option<Instant> = None;
     loop {
+        let due = [restart_at, fresh.next_due(&feed.freshness_view())]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(tokio::time::Instant::from_std);
         tokio::select! {
             _ = cancelled.changed() => return,
             Some(ask) = verify.recv() => {
+                let unknown = ask
+                    .panes
+                    .iter()
+                    .any(|id| !table.iter().any(|p| &p.id == id && !p.exited));
+                if unknown {
+                    feed.relist();
+                }
                 fresh.verify(
                     freshness::RequestId { tab: ask.tab, id: ask.id },
                     ask.panes.into_iter().collect(),
@@ -809,63 +920,61 @@ async fn pane_poll(
                     None => fresh.abandon(),
                 }
             }
-            _ = tick.tick() => {
+            _ = feed.relist_asked() => {
+                // The listing is waited for, not abandoned: a blocking
+                // call cannot be cancelled, so cancel is checked after it.
+                let listing = panes.clone();
+                let got = blocking.run(move || listing.table()).await;
                 if *cancelled.borrow() {
                     return;
                 }
-                let now = clock();
-                if now.duration_since(listed) >= poll {
-                    listed = now;
-                    // The listing is waited for, not abandoned: a blocking
-                    // call cannot be cancelled, so cancel is checked after it.
-                    let listing = panes.clone();
-                    let got = blocking.run(move || listing.table()).await;
-                    if *cancelled.borrow() {
-                        return;
-                    }
-                    if let Some(Some(listed_now)) = got {
-                        let change = feed.panes(listed_now.clone());
-                        table = listed_now;
-                        if change == TableChange::Membership {
-                            resubscribe(&*panes, &table, &feed, &subscription, None);
-                        }
-                    }
-                }
-                let dead = table.iter().any(|p| !p.exited)
-                    && subscription
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .is_none_or(|s| s.reader.is_finished());
-                match (dead, restart_at) {
-                    (false, _) => {
-                        restart_at = None;
-                        backoff = RESTART_MIN;
-                    }
-                    (true, None) => restart_at = Some(now + backoff),
-                    (true, Some(at)) if now >= at => {
+                if let Some(Some(listed_now)) = got {
+                    let change = feed.panes(listed_now.clone());
+                    table = listed_now;
+                    if change == TableChange::Membership {
                         resubscribe(&*panes, &table, &feed, &subscription, None);
-                        backoff = (backoff * 2).min(RESTART_MAX);
-                        restart_at = Some(now + backoff);
                     }
-                    (true, Some(_)) => {}
-                }
-                if fresh.timed_out(now) {
-                    sampling = None;
-                }
-                if sampling.is_none()
-                    && let Some(start) = fresh.tick(now, &feed.freshness_view())
-                {
-                    let sampler = panes.clone();
-                    let ids: Vec<String> = start.panes.into_iter().collect();
-                    let blocking = blocking.clone();
-                    sampling = Some(Box::pin(async move {
-                        blocking
-                            .run(move || sampler.sample(&ids, freshness::SAMPLE_TIMEOUT))
-                            .await
-                    }));
                 }
             }
+            _ = async { tokio::time::sleep_until(due.expect("guarded")).await }, if due.is_some() => {}
+        }
+        if *cancelled.borrow() {
+            return;
+        }
+        let now = clock();
+        let dead = table.iter().any(|p| !p.exited)
+            && subscription
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(|s| s.reader.is_finished());
+        match (dead, restart_at) {
+            (false, _) => {
+                restart_at = None;
+                backoff = RESTART_MIN;
+            }
+            (true, None) => restart_at = Some(now + backoff),
+            (true, Some(at)) if now >= at => {
+                resubscribe(&*panes, &table, &feed, &subscription, None);
+                backoff = (backoff * 2).min(RESTART_MAX);
+                restart_at = Some(now + backoff);
+            }
+            (true, Some(_)) => {}
+        }
+        if fresh.timed_out(now) {
+            sampling = None;
+        }
+        if sampling.is_none()
+            && let Some(start) = fresh.tick(now, &feed.freshness_view())
+        {
+            let sampler = panes.clone();
+            let ids: Vec<String> = start.panes.into_iter().collect();
+            let blocking = blocking.clone();
+            sampling = Some(Box::pin(async move {
+                blocking
+                    .run(move || sampler.sample(&ids, freshness::SAMPLE_TIMEOUT))
+                    .await
+            }));
         }
     }
 }
@@ -1408,6 +1517,108 @@ mod tests {
         );
     }
 
+    /// The tail reading its transcript is not a change to it, and a
+    /// failed watch is recorded for the tail to stop on.
+    #[test]
+    fn a_transcripts_reads_wake_nothing_and_its_failure_is_recorded() {
+        use crate::fs_notice::tests::{event, opened};
+        let path = std::path::Path::new("/projects/p/session.jsonl");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fault = crate::fs_notice::Fault::default();
+        let mut handle = transcript_handler(path.to_path_buf(), tx, fault.clone());
+        handle(opened(path));
+        assert!(rx.try_recv().is_err(), "its own read woke it");
+        handle(event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            path,
+        ));
+        assert!(rx.try_recv().is_ok(), "an append wakes it");
+        handle(Err(notify::Error::generic("the stream died")));
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(
+            crate::fs_notice::read(&fault).as_deref(),
+            Some("the stream died")
+        );
+    }
+
+    /// A transcript is followed by its directory's events: an append
+    /// wakes the tail, nothing else does, and a file whose directory
+    /// does not exist yet is heard when it is made.
+    #[test]
+    fn a_transcript_wakes_its_tail_only_when_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dunce::canonicalize(dir.path())
+            .unwrap()
+            .join("session.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _watch = watch_transcript(&path, tx, Default::default()).unwrap();
+        while rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok()
+        {}
+        std::fs::write(dir.path().join("other.jsonl"), "{}\n").unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).is_err(),
+            "another session's file"
+        );
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            b"{}\n",
+        )
+        .unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "an append"
+        );
+        while rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_ok()
+        {}
+        let replacement = path.with_extension("tmp");
+        std::fs::write(&replacement, "{}\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "a rename over it"
+        );
+        while rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_ok()
+        {}
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            b"{}\n",
+        )
+        .unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "an append to the file renamed in"
+        );
+
+        let later = dir.path().join("project/new.jsonl");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _watch = watch_transcript(&later, tx, Default::default()).unwrap();
+        while rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok()
+        {}
+        std::fs::create_dir_all(later.parent().unwrap()).unwrap();
+        std::fs::write(&later, "{}\n").unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "its creation"
+        );
+    }
+
     /// `painter` is on the roster and `💤 painter` is recorded as owned but
     /// off it, so a pane titled `💤 painter` may be either. It is not
     /// published as painter, and neither `say` nor `stop` will treat it as
@@ -1468,6 +1679,7 @@ mod tests {
             /// When each subscription was started, on the paused clock.
             subscribed: Mutex<Vec<tokio::time::Instant>>,
             sampled: AtomicUsize,
+            listed: AtomicUsize,
         }
 
         impl Scripted {
@@ -1477,6 +1689,7 @@ mod tests {
                     samples: Mutex::new(samples.iter().copied().collect()),
                     subscribed: Mutex::new(Vec::new()),
                     sampled: AtomicUsize::new(0),
+                    listed: AtomicUsize::new(0),
                 })
             }
 
@@ -1490,6 +1703,7 @@ mod tests {
                 "test"
             }
             fn table(&self) -> Option<Vec<PaneMeta>> {
+                self.listed.fetch_add(1, Ordering::SeqCst);
                 Some(table())
             }
             fn subscribe(&self, _: &[String]) -> Option<SubscribeChild> {
@@ -1557,12 +1771,11 @@ mod tests {
             frame(&feed, "a");
             let (cancel, cancelled) = tokio::sync::watch::channel(false);
             let (verify, rx) = tokio::sync::mpsc::unbounded_channel();
-            let task = tokio::spawn(pane_poll(
+            let task = tokio::spawn(pane_supervisor(
                 panes,
                 feed.clone(),
                 subscription.clone(),
                 cancelled,
-                Duration::from_secs(3600),
                 Arc::new(Blocking::default()),
                 rx,
             ));
@@ -1720,6 +1933,53 @@ mod tests {
                     "each wait doubles the one before: {gaps:?}"
                 );
             }
+            run.stop().await;
+        }
+
+        /// Zellij announces no layout change, and nothing here invents
+        /// one: an idle supervisor with a healthy subscription never
+        /// lists, however long it runs.
+        #[tokio::test(start_paused = true)]
+        async fn an_idle_supervisor_never_lists() {
+            let panes = Scripted::new(true, &[]);
+            let run = supervise(panes.clone());
+            pass(120).await;
+            assert_eq!(panes.listed.load(Ordering::SeqCst), 0);
+            run.stop().await;
+        }
+
+        /// Each thing that says the panes may have changed lists them
+        /// once: a subscribed pane closing, the TUI's word, and a viewer
+        /// asking after a pane the table does not hold as open. A viewer
+        /// asking after an open one does not.
+        #[tokio::test(start_paused = true)]
+        async fn each_announced_change_lists_once() {
+            let panes = Scripted::new(true, &[]);
+            let run = supervise(panes.clone());
+            let listed = || panes.listed.load(Ordering::SeqCst);
+            let closed: SubscribeEvent = serde_json::from_value(serde_json::json!({
+                "event": "pane_closed", "pane_id": "p",
+            }))
+            .unwrap();
+            run.feed
+                .event_in(run.feed.freshness_view().generation, closed);
+            pass(1).await;
+            assert_eq!(listed(), 1, "a pane closing");
+            run.feed.relist();
+            pass(1).await;
+            assert_eq!(listed(), 2, "the TUI's word");
+            run.ask("open");
+            pass(1).await;
+            assert_eq!(listed(), 2, "a viewer asking after an open pane");
+            run.verify
+                .send(Verify {
+                    tab: "t".into(),
+                    id: "gone".into(),
+                    panes: vec!["q".into()],
+                })
+                .unwrap();
+            pass(1).await;
+            assert_eq!(listed(), 3, "a viewer asking after a pane it does not hold");
             run.stop().await;
         }
 

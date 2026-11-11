@@ -245,7 +245,6 @@ impl BridgeInstance {
     ) -> anyhow::Result<Self> {
         let Startup {
             tunnel: _,
-            poll,
             grace,
             seed,
             reopen,
@@ -316,12 +315,11 @@ impl BridgeInstance {
         let (attached_tx, mut attached_rx) =
             watch::channel(clank_web::bridge::ConnectionStatus::Connecting);
         let connection_problem = attached_rx.clone();
-        tasks.spawn(super::pane_poll(
+        tasks.spawn(super::pane_supervisor(
             panes,
             feed.clone(),
             subscription.clone(),
             cancelled.clone(),
-            poll,
             blocking.clone(),
             verify_rx,
         ));
@@ -400,6 +398,12 @@ impl BridgeInstance {
                 anyhow::bail!("the web host started but the repo did not attach: {why}")
             }
         }
+    }
+
+    /// The panes may have changed: the TUI's own listing found a
+    /// different set, or it reopened one. The bridge lists them again.
+    pub(crate) fn panes_changed(&self) {
+        self.feed.relist();
     }
 
     pub(crate) fn observe(&self, snap: &crate::cli::status::StatusSnapshot) {
@@ -779,7 +783,6 @@ mod tests {
                     }),
                     Startup {
                         tunnel: None,
-                        poll: Duration::from_secs(3600),
                         grace: Duration::from_secs(2),
                         seed: serde_json::json!({"phase":"ready"}),
                         reopen: None,
@@ -874,7 +877,6 @@ mod tests {
             Arc::new(TestPanes { sent: sent.clone() }),
             Startup {
                 tunnel: None,
-                poll: Duration::from_secs(3600),
                 grace: Duration::from_secs(2),
                 seed: serde_json::json!({"phase":"existing"}),
                 reopen: None,
@@ -1004,7 +1006,6 @@ mod tests {
                 }),
                 Startup {
                     tunnel: None,
-                    poll: Duration::from_secs(3600),
                     grace: Duration::from_secs(2),
                     seed: serde_json::json!({"text":"x".repeat(5*1024*1024)}),
                     reopen: None,
@@ -1208,7 +1209,6 @@ mod tests {
             ));
             let startup = Startup {
                 tunnel: None,
-                poll: Duration::from_secs(3600),
                 grace: Duration::from_secs(2),
                 seed: serde_json::json!({"phase":"ready"}),
                 reopen: None,
@@ -1431,7 +1431,6 @@ mod tests {
             panes.clone(),
             Startup {
                 tunnel: None,
-                poll: Duration::from_secs(3600),
                 grace: Duration::from_secs(2),
                 seed: serde_json::json!({"phase":"ready"}),
                 reopen: None,

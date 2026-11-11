@@ -6,7 +6,7 @@
 //! fails and callers observe nothing.
 
 use super::ProcToken;
-use super::inspect::{Inspection, ProcessState};
+use super::inspect::Inspection;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -31,6 +31,9 @@ pub enum Wake<K> {
     Exited(K),
     /// An entry of the watched directory was added, removed or replaced.
     Dir,
+    /// The kernel wait failed: nothing more will be reported, so the
+    /// owner stops or recovers, saying so.
+    Failed(String),
 }
 
 /// One owned watcher thread. Dropping it stops and joins the thread.
@@ -55,7 +58,12 @@ impl<K: Clone + PartialEq + Send + 'static> ExitWatch<K> {
                 let sys = sys.clone();
                 let ledger = ledger.clone();
                 move || {
-                    while let Some(events) = sys.wait() {
+                    loop {
+                        let events = match sys.wait() {
+                            Ok(Some(events)) => events,
+                            Ok(None) => return,
+                            Err(e) => return sink(Wake::Failed(e.to_string())),
+                        };
                         for event in events {
                             match event {
                                 platform::Event::Exited(reg) => {
@@ -65,6 +73,7 @@ impl<K: Clone + PartialEq + Send + 'static> ExitWatch<K> {
                                     }
                                 }
                                 platform::Event::Dir => sink(Wake::Dir),
+                                platform::Event::Path(_) | platform::Event::Lost => {}
                             }
                         }
                     }
@@ -98,6 +107,12 @@ impl<K: Clone + PartialEq + Send + 'static> ExitWatch<K> {
             self.ledger.lock().unwrap().take(reg);
         }
         armed
+    }
+
+    /// Stand in for the kernel wait failing, as a test drives an owner.
+    #[cfg(test)]
+    pub fn fail_for_test(&self) {
+        self.sys.fail();
     }
 
     /// Stop watching under `key`. An exit already queued for it is
@@ -168,7 +183,7 @@ enum Seen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Registered {
+pub(in crate::proc_identity) enum Registered {
     Ok,
     Gone,
     Failed,
@@ -217,7 +232,7 @@ impl Seam for Native<'_> {
     fn seen(&mut self, pid: i32, birth: &ProcToken) -> Seen {
         match super::inspect::inspect(pid, birth) {
             Inspection::Verified(details)
-                if matches!(details.state, Ok(ProcessState::Zombie | ProcessState::Dead)) =>
+                if super::inspect::life_from(&details.state) == super::inspect::Life::Gone =>
             {
                 Seen::Gone
             }
@@ -234,20 +249,81 @@ impl Seam for Native<'_> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const STOPPING: u8 = 1;
+#[cfg(test)]
+const FAILING: u8 = 2;
+
+/// What a wait woken by its owner returns: nothing more once stopped,
+/// and in a test, the failure standing in for the kernel's.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ended<E>(ending: u8) -> Option<io::Result<Option<E>>> {
+    match ending {
+        0 => None,
+        STOPPING => Some(Ok(None)),
+        _ => Some(Err(io::Error::other("the kernel wait failed"))),
+    }
+}
+
+/// What one queued inotify record says of the watched paths.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathRecord {
+    Changed(u64),
+    /// The queue overflowed and records were dropped.
+    Lost,
+}
+
+/// inotify's `IN_Q_OVERFLOW`, spelled here so the decoder builds, and is
+/// tested, where inotify does not exist.
+const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+
+/// An overflow belongs to the whole instance and names no watch, so it is
+/// read before the descriptor is looked up.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn decode_path_record(
+    mask: u32,
+    wd: i32,
+    watches: &std::collections::HashMap<i32, u64>,
+) -> Option<PathRecord> {
+    if mask & IN_Q_OVERFLOW != 0 {
+        return Some(PathRecord::Lost);
+    }
+    watches.get(&wd).copied().map(PathRecord::Changed)
+}
+
 #[cfg(target_os = "macos")]
-mod platform {
+pub(in crate::proc_identity) mod platform {
     use super::Registered;
     use std::io;
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// A descriptor for watching `path` that does not keep its volume
+    /// from being unmounted, and reads and writes nothing.
+    fn open_to_watch(path: &Path) -> io::Result<OwnedFd> {
+        use std::os::unix::fs::OpenOptionsExt;
+        Ok(std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EVTONLY)
+            .open(path)?
+            .into())
+    }
 
     /// Field order is drop order: the queue closes before the directory
-    /// it watches, so the registered descriptor outlives the queue.
-    pub(super) struct Sys {
+    /// and paths it watches, so a registered descriptor outlives the
+    /// queue.
+    pub(in crate::proc_identity) struct Sys {
         kq: OwnedFd,
         _dir: Option<OwnedFd>,
-        stopping: AtomicBool,
+        /// The descriptor of each watched path, by registration. One is
+        /// closed only by its removal from here, which is also what
+        /// removes its registration.
+        paths: std::sync::Mutex<std::collections::HashMap<u64, OwnedFd>>,
+        /// [`STOPPING`] once stopped; in a test, [`FAILING`] to stand in
+        /// for a kernel wait that failed.
+        ending: AtomicU8,
     }
 
     const WAKE: usize = 0;
@@ -263,20 +339,29 @@ mod platform {
         }
     }
 
-    pub(super) enum Event {
+    pub(in crate::proc_identity) enum Event {
         Exited(u64),
         Dir,
+        /// A path watched under this registration changed.
+        Path(u64),
+        /// Path events were dropped: any watched path may have changed.
+        // kqueue keeps each registration's pending state on the
+        // registration itself, coalesced, so it has no queue to overflow.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        Lost,
     }
 
     impl Sys {
         /// Unsafe because `kevent` registers descriptors by number: each
-        /// must outlive the queue, which no type can say.
+        /// must outlive its registration, which no type can say.
         #[allow(unsafe_code)]
         fn apply(&self, ev: libc::kevent) -> io::Result<()> {
-            // SAFETY: one initialised change and no event buffer. The only
-            // descriptor ever registered is `_dir`, which `Sys` owns and
-            // drops after `kq`; the other filters name a pid or a user
-            // event, not a descriptor.
+            // SAFETY: one initialised change and no event buffer. The
+            // descriptors ever registered are `_dir` and those in `paths`,
+            // all owned by `Sys`: `_dir` and `paths` drop after `kq`, and a
+            // path's descriptor is closed only on its removal from
+            // `paths`, which removes its registration with it. The other
+            // filters name a pid or a user event, not a descriptor.
             let n = unsafe {
                 libc::kevent(
                     self.kq.as_raw_fd(),
@@ -294,22 +379,14 @@ mod platform {
             }
         }
 
-        pub(super) fn new(dir: Option<&Path>) -> io::Result<Self> {
-            use std::os::unix::fs::OpenOptionsExt;
+        pub(in crate::proc_identity) fn new(dir: Option<&Path>) -> io::Result<Self> {
             let kq = rustix::event::kqueue::kqueue()?;
-            let dir = dir
-                .map(|dir| {
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .custom_flags(libc::O_EVTONLY)
-                        .open(dir)
-                        .map(OwnedFd::from)
-                })
-                .transpose()?;
+            let dir = dir.map(open_to_watch).transpose()?;
             let sys = Self {
                 kq,
                 _dir: None,
-                stopping: AtomicBool::new(false),
+                paths: Default::default(),
+                ending: AtomicU8::new(0),
             };
             sys.apply(change(
                 WAKE,
@@ -329,7 +406,7 @@ mod platform {
         }
 
         /// `reg` rides in `udata` and comes back with the event.
-        pub(super) fn register(&self, reg: u64, pid: i32) -> Registered {
+        pub(in crate::proc_identity) fn register(&self, reg: u64, pid: i32) -> Registered {
             let mut ev = change(
                 pid as usize,
                 libc::EVFILT_PROC,
@@ -346,13 +423,58 @@ mod platform {
 
         /// kqueue holds one registration per pid; the ledger calls this
         /// only for the registration that still owns it.
-        pub(super) fn deregister(&self, _reg: u64, pid: i32) {
+        pub(in crate::proc_identity) fn deregister(&self, _reg: u64, pid: i32) {
             let _ = self.apply(change(pid as usize, libc::EVFILT_PROC, libc::EV_DELETE, 0));
         }
 
-        pub(super) fn stop(&self) {
-            self.stopping.store(true, Ordering::Release);
+        /// Watch `path`: a directory's entries, or with `content` a
+        /// file's writes as well. Opening is for events only, and the
+        /// filters below report no reads.
+        pub(in crate::proc_identity) fn register_path(
+            &self,
+            reg: u64,
+            path: &Path,
+            content: bool,
+        ) -> io::Result<()> {
+            let fd = open_to_watch(path)?;
+            let mut fflags = libc::NOTE_WRITE | libc::NOTE_DELETE | libc::NOTE_RENAME;
+            if content {
+                fflags |= libc::NOTE_EXTEND;
+            }
+            let mut ev = change(
+                fd.as_raw_fd() as usize,
+                libc::EVFILT_VNODE,
+                libc::EV_ADD | libc::EV_CLEAR,
+                fflags,
+            );
+            ev.udata = reg as usize as *mut libc::c_void;
+            let mut paths = self.paths.lock().unwrap();
+            self.apply(ev)?;
+            paths.insert(reg, fd);
+            Ok(())
+        }
+
+        /// Closing the descriptor removes its registration.
+        pub(in crate::proc_identity) fn deregister_path(&self, reg: u64) {
+            self.paths.lock().unwrap().remove(&reg);
+        }
+
+        pub(in crate::proc_identity) fn stop(&self) {
+            self.end(super::STOPPING);
+        }
+
+        #[cfg(test)]
+        pub(in crate::proc_identity) fn fail(&self) {
+            self.end(super::FAILING);
+        }
+
+        fn end(&self, how: u8) {
+            self.ending.store(how, Ordering::Release);
             let _ = self.apply(change(WAKE, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER));
+        }
+
+        fn ended(&self) -> Option<io::Result<Option<Vec<Event>>>> {
+            super::ended(self.ending.load(Ordering::Acquire))
         }
 
         /// Blocks until the kernel reports something; `None` once stopped.
@@ -360,7 +482,7 @@ mod platform {
         /// Unsafe for the same reason as [`Sys::apply`]: `kevent` has no
         /// safe form, even with no changes to register.
         #[allow(unsafe_code)]
-        pub(super) fn wait(&self) -> Option<Vec<Event>> {
+        pub(in crate::proc_identity) fn wait(&self) -> io::Result<Option<Vec<Event>>> {
             loop {
                 let mut out = [change(0, 0, 0, 0); 16];
                 // SAFETY: no changes are registered, and `out` is a valid
@@ -375,14 +497,15 @@ mod platform {
                         std::ptr::null(),
                     )
                 };
-                if self.stopping.load(Ordering::Acquire) {
-                    return None;
+                if let Some(ended) = self.ended() {
+                    return ended;
                 }
                 if n < 0 {
-                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
-                    return None;
+                    return Err(e);
                 }
                 let events: Vec<Event> = out[..n as usize]
                     .iter()
@@ -390,12 +513,13 @@ mod platform {
                         libc::EVFILT_PROC if ev.fflags & libc::NOTE_EXIT != 0 => {
                             Some(Event::Exited(ev.udata as usize as u64))
                         }
-                        libc::EVFILT_VNODE => Some(Event::Dir),
+                        libc::EVFILT_VNODE if ev.udata.is_null() => Some(Event::Dir),
+                        libc::EVFILT_VNODE => Some(Event::Path(ev.udata as usize as u64)),
                         _ => None,
                     })
                     .collect();
                 if !events.is_empty() {
-                    return Some(events);
+                    return Ok(Some(events));
                 }
             }
         }
@@ -403,7 +527,7 @@ mod platform {
 }
 
 #[cfg(target_os = "linux")]
-mod platform {
+pub(in crate::proc_identity) mod platform {
     use super::Registered;
     use rustix::event::epoll;
     use std::collections::HashMap;
@@ -411,23 +535,37 @@ mod platform {
     use std::os::fd::OwnedFd;
     use std::path::Path;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
 
-    pub(super) enum Event {
+    pub(in crate::proc_identity) enum Event {
         Exited(u64),
         Dir,
+        /// A path watched under this registration changed.
+        Path(u64),
+        /// Path events were dropped: any watched path may have changed.
+        // kqueue keeps each registration's pending state on the
+        // registration itself, coalesced, so it has no queue to overflow.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        Lost,
     }
 
-    pub(super) struct Sys {
+    pub(in crate::proc_identity) struct Sys {
         epoll: OwnedFd,
         wake: OwnedFd,
         dir: Option<OwnedFd>,
         pidfds: Mutex<HashMap<u64, OwnedFd>>,
-        stopping: AtomicBool,
+        /// One inotify instance for every watched path, and each watch's
+        /// registration by its descriptor.
+        paths: OwnedFd,
+        watches: Mutex<HashMap<i32, u64>>,
+        /// [`STOPPING`] once stopped; in a test, [`FAILING`] to stand in
+        /// for a kernel wait that failed.
+        ending: AtomicU8,
     }
 
     const WAKE: u64 = u64::MAX;
     const DIR: u64 = u64::MAX - 1;
+    const PATHS: u64 = u64::MAX - 2;
 
     impl Sys {
         fn add(&self, fd: &OwnedFd, data: u64) -> io::Result<()> {
@@ -440,7 +578,7 @@ mod platform {
             Ok(())
         }
 
-        pub(super) fn new(dir: Option<&Path>) -> io::Result<Self> {
+        pub(in crate::proc_identity) fn new(dir: Option<&Path>) -> io::Result<Self> {
             use rustix::event::{EventfdFlags, eventfd};
             use rustix::fs::inotify;
             let epoll = epoll::create(epoll::CreateFlags::CLOEXEC)?;
@@ -459,22 +597,96 @@ mod platform {
                     Ok(fd)
                 })
                 .transpose()?;
+            let paths =
+                inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;
             let sys = Self {
                 epoll,
                 wake,
                 dir,
                 pidfds: Mutex::default(),
-                stopping: AtomicBool::new(false),
+                paths,
+                watches: Mutex::default(),
+                ending: AtomicU8::new(0),
             };
             sys.add(&sys.wake, WAKE)?;
+            sys.add(&sys.paths, PATHS)?;
             if let Some(fd) = &sys.dir {
                 sys.add(fd, DIR)?;
             }
             Ok(sys)
         }
 
+        /// Watch `path`: a directory's entries, or with `content` a
+        /// file's writes as well. The mask reports no reads or opens.
+        pub(in crate::proc_identity) fn register_path(
+            &self,
+            reg: u64,
+            path: &Path,
+            content: bool,
+        ) -> io::Result<()> {
+            use rustix::fs::inotify::WatchFlags;
+            let mut mask = WatchFlags::CREATE
+                | WatchFlags::DELETE
+                | WatchFlags::MOVED_TO
+                | WatchFlags::MOVED_FROM
+                | WatchFlags::DELETE_SELF
+                | WatchFlags::MOVE_SELF;
+            if content {
+                mask |= WatchFlags::MODIFY | WatchFlags::CLOSE_WRITE;
+            }
+            let mut watches = self.watches.lock().unwrap();
+            let wd = rustix::fs::inotify::add_watch(&self.paths, path, mask)?;
+            watches.insert(wd, reg);
+            Ok(())
+        }
+
+        pub(in crate::proc_identity) fn deregister_path(&self, reg: u64) {
+            let mut watches = self.watches.lock().unwrap();
+            let wds: Vec<i32> = watches
+                .iter()
+                .filter(|(_, r)| **r == reg)
+                .map(|(wd, _)| *wd)
+                .collect();
+            for wd in wds {
+                watches.remove(&wd);
+                let _ = rustix::fs::inotify::remove_watch(&self.paths, wd);
+            }
+        }
+
+        /// What the queued path events say, each once.
+        fn path_events(&self) -> io::Result<Vec<Event>> {
+            let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+            let mut reader = rustix::fs::inotify::Reader::new(&self.paths, &mut buf);
+            let mut seen = Vec::new();
+            loop {
+                match reader.next() {
+                    Ok(event) => {
+                        let watches = self.watches.lock().unwrap();
+                        let decoded =
+                            super::decode_path_record(event.events().bits(), event.wd(), &watches);
+                        if let Some(decoded) = decoded
+                            && !seen.contains(&decoded)
+                        {
+                            seen.push(decoded);
+                        }
+                    }
+                    Err(rustix::io::Errno::AGAIN) => {
+                        return Ok(seen
+                            .into_iter()
+                            .map(|seen| match seen {
+                                super::PathRecord::Changed(reg) => Event::Path(reg),
+                                super::PathRecord::Lost => Event::Lost,
+                            })
+                            .collect());
+                    }
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
         /// `reg` is the epoll data and comes back with the event.
-        pub(super) fn register(&self, reg: u64, pid: i32) -> Registered {
+        pub(in crate::proc_identity) fn register(&self, reg: u64, pid: i32) -> Registered {
             use rustix::process::{Pid, PidfdFlags, pidfd_open};
             let Some(pid) = (pid > 0).then(|| Pid::from_raw(pid)).flatten() else {
                 return Registered::Failed;
@@ -492,13 +704,26 @@ mod platform {
         }
 
         /// Closing the pidfd removes it from the epoll set.
-        pub(super) fn deregister(&self, reg: u64, _pid: i32) {
+        pub(in crate::proc_identity) fn deregister(&self, reg: u64, _pid: i32) {
             self.pidfds.lock().unwrap().remove(&reg);
         }
 
-        pub(super) fn stop(&self) {
-            self.stopping.store(true, Ordering::Release);
+        pub(in crate::proc_identity) fn stop(&self) {
+            self.end(super::STOPPING);
+        }
+
+        #[cfg(test)]
+        pub(in crate::proc_identity) fn fail(&self) {
+            self.end(super::FAILING);
+        }
+
+        fn end(&self, how: u8) {
+            self.ending.store(how, Ordering::Release);
             let _ = rustix::io::write(&self.wake, &1u64.to_ne_bytes());
+        }
+
+        fn ended(&self) -> Option<io::Result<Option<Vec<Event>>>> {
+            super::ended(self.ending.load(Ordering::Acquire))
         }
 
         fn drain(fd: &OwnedFd) {
@@ -506,19 +731,19 @@ mod platform {
             while matches!(rustix::io::read(fd, &mut buf), Ok(n) if n > 0) {}
         }
 
-        pub(super) fn wait(&self) -> Option<Vec<Event>> {
+        pub(in crate::proc_identity) fn wait(&self) -> io::Result<Option<Vec<Event>>> {
             let mut out = Vec::with_capacity(16);
             loop {
                 out.clear();
                 let waited =
                     epoll::wait(&self.epoll, rustix::buffer::spare_capacity(&mut out), None);
-                if self.stopping.load(Ordering::Acquire) {
-                    return None;
+                if let Some(ended) = self.ended() {
+                    return ended;
                 }
                 match waited {
                     Ok(_) => {}
                     Err(rustix::io::Errno::INTR) => continue,
-                    Err(_) => return None,
+                    Err(e) => return Err(e.into()),
                 }
                 let mut events = Vec::new();
                 for ev in &out {
@@ -530,6 +755,7 @@ mod platform {
                             }
                             events.push(Event::Dir);
                         }
+                        PATHS => events.extend(self.path_events()?),
                         reg => {
                             // A pidfd stays readable after exit; drop it so it
                             // reports once.
@@ -539,7 +765,7 @@ mod platform {
                     }
                 }
                 if !events.is_empty() {
-                    return Some(events);
+                    return Ok(Some(events));
                 }
             }
         }
@@ -547,30 +773,44 @@ mod platform {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-mod platform {
+pub(in crate::proc_identity) mod platform {
     use super::Registered;
     use std::io;
     use std::path::Path;
 
-    pub(super) enum Event {
+    pub(in crate::proc_identity) enum Event {
         Exited(u64),
         Dir,
+        Path(u64),
+        #[allow(dead_code)]
+        Lost,
     }
 
-    pub(super) struct Sys;
+    pub(in crate::proc_identity) struct Sys;
 
     impl Sys {
-        pub(super) fn new(_dir: Option<&Path>) -> io::Result<Self> {
+        pub(in crate::proc_identity) fn new(_dir: Option<&Path>) -> io::Result<Self> {
             Err(io::ErrorKind::Unsupported.into())
         }
-        pub(super) fn register(&self, _reg: u64, _pid: i32) -> Registered {
+        pub(in crate::proc_identity) fn register(&self, _reg: u64, _pid: i32) -> Registered {
             Registered::Failed
         }
-        pub(super) fn deregister(&self, _reg: u64, _pid: i32) {}
-        pub(super) fn stop(&self) {}
-        pub(super) fn wait(&self) -> Option<Vec<Event>> {
-            None
+        pub(in crate::proc_identity) fn deregister(&self, _reg: u64, _pid: i32) {}
+        pub(in crate::proc_identity) fn register_path(
+            &self,
+            _reg: u64,
+            _path: &Path,
+            _content: bool,
+        ) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
         }
+        pub(in crate::proc_identity) fn deregister_path(&self, _reg: u64) {}
+        pub(in crate::proc_identity) fn stop(&self) {}
+        pub(in crate::proc_identity) fn wait(&self) -> io::Result<Option<Vec<Event>>> {
+            Ok(None)
+        }
+        #[cfg(test)]
+        pub(in crate::proc_identity) fn fail(&self) {}
     }
 }
 
@@ -579,6 +819,23 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn an_overflow_is_a_loss_whatever_descriptor_it_carries() {
+        let watches = std::collections::HashMap::from([(3, 30u64)]);
+        assert_eq!(
+            decode_path_record(0x100, 3, &watches),
+            Some(PathRecord::Changed(30))
+        );
+        assert_eq!(decode_path_record(0x100, 9, &watches), None);
+        for wd in [-1, 3, 9] {
+            assert_eq!(
+                decode_path_record(IN_Q_OVERFLOW, wd, &watches),
+                Some(PathRecord::Lost),
+                "wd {wd}"
+            );
+        }
+    }
 
     struct Script {
         seen: Vec<Seen>,

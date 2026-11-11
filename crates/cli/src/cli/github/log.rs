@@ -560,6 +560,39 @@ impl IngestLease {
         Self::taking(events_dir, source_key, clank_user_config::lease::take_now)
     }
 
+    /// Block until the lease is free, then take it: the kernel wakes
+    /// this when its holder lets go, by dropping it or by dying.
+    pub(crate) fn wait(events_dir: &Path, source_key: &str) -> std::io::Result<IngestLease> {
+        fn blocking(file: &std::fs::File) -> std::io::Result<bool> {
+            loop {
+                match rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive) {
+                    Ok(()) => return Ok(true),
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Self::taking(events_dir, source_key, blocking)?
+            .ok_or_else(|| std::io::Error::other("a blocking take returned untaken"))
+    }
+
+    /// [`Self::wait`] on a thread of its own, answering on the receiver.
+    /// A detached thread, not the runtime's blocking pool: a runtime
+    /// shutting down waits for its pool, and this can wait on a holder
+    /// for as long as the holder lives. A lease taken after the
+    /// receiver is gone is dropped, and so released, at once.
+    pub(crate) fn when_free(
+        events_dir: &Path,
+        source_key: &str,
+    ) -> tokio::sync::oneshot::Receiver<std::io::Result<IngestLease>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (dir, key) = (events_dir.to_path_buf(), source_key.to_string());
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::wait(&dir, &key));
+        });
+        rx
+    }
+
     fn taking(
         events_dir: &Path,
         source_key: &str,
@@ -575,6 +608,101 @@ impl IngestLease {
             .open(&path)?;
         Ok(take(&file)?.then_some(IngestLease { _file: file }))
     }
+}
+
+/// The moment between a follower's watch on `events_dir` registering and
+/// its read of the log: what a test does here is what a holder could do
+/// in that gap.
+#[cfg(not(test))]
+pub(crate) fn follow_gap(_events_dir: &Path) {}
+
+#[cfg(test)]
+pub(crate) fn follow_gap(events_dir: &Path) {
+    let hooks: Vec<_> = {
+        let mut gaps = FOLLOW_GAPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (ours, others) = std::mem::take(&mut *gaps)
+            .into_iter()
+            .partition(|(dir, _)| dir == events_dir);
+        *gaps = others;
+        ours
+    };
+    for (_, hook) in hooks {
+        hook();
+    }
+}
+
+/// What a test runs in [`follow_gap`], by events directory, once.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static FOLLOW_GAPS: std::sync::Mutex<
+    Vec<(std::path::PathBuf, Box<dyn FnOnce() + Send>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Changes to the entries of an events directory, as a follower waits
+/// on them: an appended row, a new log, a released lease's file.
+pub(crate) struct LogChanges {
+    _watcher: crate::proc_identity::tree_watch::KernelWatcher,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Result<(), String>>,
+}
+
+impl LogChanges {
+    pub(crate) fn watch(events_dir: &Path) -> std::io::Result<Self> {
+        use notify::Watcher as _;
+        std::fs::create_dir_all(events_dir)?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // A row is appended to its log in place.
+        let mut watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
+            |path| path.extension().is_some_and(|ext| ext == "jsonl"),
+            log_handler(tx),
+        )?;
+        watcher
+            .watch(events_dir, notify::RecursiveMode::NonRecursive)
+            .map_err(std::io::Error::other)?;
+        Ok(Self {
+            _watcher: watcher,
+            rx,
+        })
+    }
+
+    /// The next change, with any burst after it drained; or why the
+    /// watch failed, after which it reports nothing more.
+    pub(crate) async fn changed(&mut self) -> Result<(), String> {
+        next_change(&mut self.rx).await
+    }
+}
+
+/// What [`LogChanges`] hears: a change, or why its watch failed.
+type LogNotes = tokio::sync::mpsc::UnboundedReceiver<Result<(), String>>;
+
+/// [`LogChanges`]'s callback, apart from any backend so a test can
+/// drive it with what one delivers.
+fn log_handler(
+    tx: tokio::sync::mpsc::UnboundedSender<Result<(), String>>,
+) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+    use crate::fs_notice::{Notice, notice};
+    move |res: notify::Result<notify::Event>| match notice(&res) {
+        Notice::Read => {}
+        Notice::Changed(_) | Notice::Rescan => {
+            let _ = tx.send(Ok(()));
+        }
+        Notice::Failed(why) => {
+            let _ = tx.send(Err(why));
+        }
+    }
+}
+
+async fn next_change(rx: &mut LogNotes) -> Result<(), String> {
+    let first = rx
+        .recv()
+        .await
+        .unwrap_or_else(|| Err("its watcher stopped".to_string()));
+    first?;
+    while let Ok(next) = rx.try_recv() {
+        next?;
+    }
+    Ok(())
 }
 
 /// The ingest-side WAL handle shared between the poll loop and the
@@ -2276,6 +2404,60 @@ pub(crate) mod tests {
     }
 
     use super::*;
+
+    /// A follower reading its log is not a change to it; a failed watch
+    /// and a stopped one are failures the follower is told of, not
+    /// wakes and not silence.
+    #[tokio::test]
+    async fn a_followers_log_watch_ignores_reads_and_reports_failure() {
+        use crate::fs_notice::tests::{event, opened};
+        let log = std::path::Path::new("/events/src.jsonl");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handle = log_handler(tx);
+        handle(opened(log));
+        assert!(rx.try_recv().is_err(), "its own read woke it");
+        handle(event(
+            notify::EventKind::Create(notify::event::CreateKind::File),
+            log,
+        ));
+        assert_eq!(next_change(&mut rx).await, Ok(()));
+        handle(Err(notify::Error::generic("the stream died")));
+        assert_eq!(
+            next_change(&mut rx).await,
+            Err("the stream died".to_string())
+        );
+        drop(handle);
+        let stopped =
+            tokio::time::timeout(std::time::Duration::from_secs(5), next_change(&mut rx)).await;
+        assert!(
+            matches!(stopped, Ok(Err(_))),
+            "a stopped watcher is a failure, not silence: {stopped:?}"
+        );
+    }
+
+    /// A holder appends rows to the log a follower watches, in place:
+    /// the append is a change, and a new log beside it is one too.
+    #[tokio::test]
+    async fn an_append_to_a_followed_log_is_a_change() {
+        async fn heard(changes: &mut LogChanges) -> bool {
+            tokio::time::timeout(std::time::Duration::from_secs(5), changes.changed())
+                .await
+                .is_ok_and(|changed| changed.is_ok())
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let events = dunce::canonicalize(dir.path()).unwrap();
+        let log = events.join("src.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let mut changes = LogChanges::watch(&events).unwrap();
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            file.write_all(b"{}\n").unwrap();
+        }
+        assert!(heard(&mut changes).await, "an appended row was not heard");
+        std::fs::write(events.join("other.jsonl"), "").unwrap();
+        assert!(heard(&mut changes).await, "a new log was not heard");
+    }
 
     fn item(n: u64) -> WaitItem {
         WaitItem::GithubEvent {

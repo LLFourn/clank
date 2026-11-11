@@ -141,7 +141,12 @@ impl Lifetime {
         let (tx, exited) = tokio::sync::oneshot::channel();
         let mut tx = Some(tx);
         let Ok(watch) = ExitWatch::new(None, move |wake| {
-            if let (Wake::Exited(()), Some(tx)) = (wake, tx.take()) {
+            // A watch that failed can no longer say the owner lives, so
+            // the owner is taken as gone, which ends the hook's wait.
+            if let Wake::Failed(why) = &wake {
+                eprintln!("clank: the watch on this hook's owner failed: {why}");
+            }
+            if let (Wake::Exited(()) | Wake::Failed(_), Some(tx)) = (wake, tx.take()) {
                 let _ = tx.send(());
             }
         }) else {

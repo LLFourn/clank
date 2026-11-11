@@ -316,6 +316,9 @@ impl RepoSession {
 #[async_trait]
 impl Backend for RepoSession {
     async fn subscribe_with_snapshot(&self) -> (Snapshot, broadcast::Receiver<Update>) {
+        // Attached again after an absence: whatever changed meanwhile is
+        // listed, and reaches the viewers as an update.
+        self.feed.relist();
         self.feed.bridge_connect()
     }
 

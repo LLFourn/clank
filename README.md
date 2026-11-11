@@ -203,7 +203,10 @@ repair them on their own. `clank doctor` warns about a missing one.
 ### Upgrading
 
 - **Running agents see nothing.** An install needs no restart of anything
-  an agent is running. Within a few seconds of it:
+  an agent is running. Each long-lived clank process watches the directory
+  the binary is installed in (and the one a link to it points into), so
+  it learns of an install the moment the file is replaced; none of them
+  checks on a timer. Then:
   - a monitor finishes what it has already handed to a hook, retires, and
     its successor runs the new build;
   - a parked Stop hook, the wait under it, and a Grok or hand-armed
@@ -435,6 +438,13 @@ still running (`restart to update`), stopped, not running, or unknown.
 `clank status` always prints its `monitor:` line.
 
 `clank status --watch` gives a live non-fullscreen view; `-j` emits JSON.
+It and the TUI do work only when something happens: a file Git sees
+changes (including tracked files under `.clank/` and force-added ones in
+ignored directories), `.clank/` state changes, the monitor's fold moves,
+a shown process exits, clank is installed, you type, or a clock on screen
+is due to read differently. An idle repo costs them nothing, and the
+working tree is walked once per change, not once per look. A watcher that
+fails ends `status --watch` with an error; the TUI says so on screen.
 Status JSON carries `active_plan` and `last_finished` as objects or `null`;
 `last_finished` is shown only when no plan is active. A finished run carries
 `duration_secs`, from its accepted intro to finalize by Git author time (clock
@@ -1308,16 +1318,25 @@ arming or ingesting a future or overdue definition.
 
 The existing monitor owns one native deadline set per author; the local fallback
 owns one per wait. Each waits until its nearest deadline, with no timer subprocess,
-task per timer, clock polling, or additional permanent service. The monitor's existing
-repository watcher and heartbeat remain. Local/invocation config edits apply on the
+task per timer, clock polling, or additional permanent service. Local/invocation
+config edits apply on the
 next arm. With no monitor or armed wait, a timer cannot launch an agent at its due
 time: it catches up when Clank next arms. Clock movement backwards is rechecked before
 acceptance; a forward jump is observed at the currently armed monotonic deadline or
 next configuration rearm, without periodic clock checks.
 
-A timer does not install or start an agent provider. Native timer sleeps add no
-polling; the existing bounded repository watcher uses `notify::PollWatcher`, and its
-cadence is unchanged.
+A timer does not install or start an agent provider, and adds no polling.
+
+Nothing clank runs locally polls; only GitHub sources do, since GitHub has no
+push channel to a local process. The repository watcher uses the platform's
+native file events and fails with an error rather than falling back to
+polling. The monitor has no heartbeat: it does work when the repo changes, a
+client connects or leaves, a process it watches exits, clank is installed, or a
+deadline it holds (a timer, a check-in, recovery's next step, a retry after a
+failure) falls due. Its watchdog is armed only while it is handling something
+or retiring, and a waiting `clank wait` or hook learns the monitor is gone from
+its socket closing. A wait following another's command or GitHub source wakes
+when that source's log changes or its lease comes free.
 
 After upgrading clank, restart long-lived monitors, waits and TUIs: updating the
 binary does not update a process already running it. A newer client asks an older

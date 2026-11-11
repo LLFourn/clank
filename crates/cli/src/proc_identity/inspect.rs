@@ -36,6 +36,52 @@ impl From<io::Error> for Unavailable {
 
 pub type Field<T> = Result<T, Unavailable>;
 
+/// Whether a process is still running, apart from which process it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Life {
+    Running,
+    /// Exited, collected or not, or no such process.
+    Gone,
+    /// Its state cannot be read.
+    Unknown,
+}
+
+/// A state read as life. A process that has exited and is not yet
+/// collected keeps its pid, its group and, on Linux, a readable birth,
+/// so only its state says it is gone.
+pub(crate) fn life_from(state: &Field<ProcessState>) -> Life {
+    match state {
+        Ok(ProcessState::Zombie | ProcessState::Dead) => Life::Gone,
+        Ok(_) => Life::Running,
+        Err(Unavailable::Io(io::ErrorKind::NotFound)) => Life::Gone,
+        Err(_) => Life::Unknown,
+    }
+}
+
+/// `pid`'s life, from its state alone.
+pub fn life_of(pid: i32) -> Life {
+    if pid <= 0 {
+        return Life::Unknown;
+    }
+    life_from(&platform::fields(pid).state)
+}
+
+/// The state a Linux `/proc/<pid>/stat` records.
+#[cfg(any(target_os = "linux", test))]
+fn stat_state(stat: &super::linux::Stat) -> Field<ProcessState> {
+    stat.state.map(linux_state).ok_or(Unavailable::Malformed)
+}
+
+/// The life `/proc/<pid>/stat` text records, as [`life_of`] reads it.
+#[cfg(test)]
+fn stat_life(bytes: &[u8], pid: i32) -> Life {
+    life_from(
+        &super::linux::parse_stat(bytes, pid)
+            .ok_or(Unavailable::Malformed)
+            .and_then(|stat| stat_state(&stat)),
+    )
+}
+
 /// OS state, not a liveness probe. Runnable includes queued CPU work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
@@ -280,7 +326,7 @@ mod platform {
     pub(super) fn fields(pid: i32) -> Fields {
         match super::super::linux::read_stat(pid) {
             Ok(stat) => Fields {
-                state: stat.state.map(linux_state).ok_or(Unavailable::Malformed),
+                state: stat_state(&stat),
                 parent: stat.parent.ok_or(Unavailable::Malformed),
                 group: stat.group.ok_or(Unavailable::Malformed),
             },
@@ -715,6 +761,34 @@ mod tests {
         assert_eq!(
             mac_argv(&vec![0; MAX_ARG_BYTES + 5]),
             Err(Unavailable::TooLarge)
+        );
+    }
+
+    #[test]
+    fn a_readable_stat_in_zombie_or_dead_state_is_gone_and_an_unreadable_one_unknown() {
+        let stat = |state: &str| {
+            format!("42 (sh) {state} 7 8 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345 0 0\n").into_bytes()
+        };
+        for state in ["Z", "X", "x"] {
+            assert!(super::super::linux::parse_stat(&stat(state), 42).is_some());
+            assert_eq!(stat_life(&stat(state), 42), Life::Gone, "{state}");
+        }
+        for state in ["R", "S", "D", "T"] {
+            assert_eq!(stat_life(&stat(state), 42), Life::Running, "{state}");
+        }
+        assert_eq!(
+            stat_life(&stat("ZZ"), 42),
+            Life::Unknown,
+            "a malformed state"
+        );
+        assert_eq!(stat_life(b"42 (sh", 42), Life::Unknown, "a malformed stat");
+        assert_eq!(
+            life_from(&Err(Unavailable::Io(io::ErrorKind::PermissionDenied))),
+            Life::Unknown
+        );
+        assert_eq!(
+            life_from(&Err(Unavailable::Io(io::ErrorKind::NotFound))),
+            Life::Gone
         );
     }
 

@@ -649,6 +649,28 @@ impl StatusSnapshot {
         plan_arg: Option<&str>,
         watch_mode: bool,
     ) -> anyhow::Result<Self> {
+        Self::build_with(
+            repo,
+            basename,
+            home,
+            policy,
+            plan_arg,
+            watch_mode,
+            &GitStatus::default(),
+        )
+        .await
+    }
+
+    /// [`Self::build_async`], reading the Git status from `git_status`.
+    pub(crate) async fn build_with(
+        repo: &Path,
+        basename: &str,
+        home: Option<&Path>,
+        policy: crate::rebuild::CachePolicy,
+        plan_arg: Option<&str>,
+        watch_mode: bool,
+        git_status: &GitStatus,
+    ) -> anyhow::Result<Self> {
         let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
@@ -663,6 +685,7 @@ impl StatusSnapshot {
             log.rows,
             log.github_events,
             log.next,
+            git_status,
         )
     }
 
@@ -677,15 +700,17 @@ impl StatusSnapshot {
         log_rows: Vec<crate::cli::log::OnelineRow>,
         github_events: Vec<crate::cli::github::timeline::MergedEvent>,
         log_next: Option<crate::cli::log::HistoryCursor>,
+        git_status: &GitStatus,
     ) -> anyhow::Result<Self> {
         // One ODB handle for the whole snapshot: HEAD facts, the dirty
-        // walk, the commit-tag HEAD read, and every per-plan worktree
-        // diff share it (no per-read/per-plan re-open). Opaque
+        // walk when the cache is stale, the commit-tag HEAD read, and
+        // every per-plan worktree diff share it (no per-read/per-plan
+        // re-open). Opaque
         // `git_io::Repo` so this stays off the gix boundary
         // (gix-not-git-gate).
         let git = crate::git_io::open(repo)?;
         let (branch, head_sha, head_subject) = head_info(&git);
-        let dirty = git.working_tree_dirty()?;
+        let dirty = git_status.read(&git)?;
 
         // `status` is a read-only renderer (also reused by `clank html`), so
         // a config it cannot read becomes a failed config line over the
@@ -1114,14 +1139,52 @@ fn paint_stdout() -> bool {
 /// prior output to retain — a probe/build failure is FATAL, exactly
 /// like the one-shot path. AFTER one success, failures degrade to a
 /// stderr warning with the last output kept; the caller leaves the
-/// signature untouched, so the SAME state retries on the next event
-/// or the 60s backstop (recovery is the ordinary success path).
+/// signature untouched, so the SAME state retries on the next event or
+/// after [`watch_retry`]'s pause (recovery is the ordinary success
+/// path).
 fn watch_failure(bootstrapped: bool, stage: &str, e: impl std::fmt::Display) -> anyhow::Result<()> {
     if bootstrapped {
         eprintln!("status watch: {stage} failed ({e}); kept last output, retrying");
         Ok(())
     } else {
         Err(anyhow::anyhow!("status watch: {stage} failed: {e}"))
+    }
+}
+
+/// The pause before retrying after `failures` failed refreshes in a
+/// row: 1s, 2s, 4s … capped at 30s. A timer the loop sets itself after
+/// a failure, so a transient one recovers without waiting for an edit.
+fn watch_retry(failures: u32) -> Option<Duration> {
+    (failures > 0)
+        .then(|| Duration::from_secs(1u64 << (failures - 1).min(5)).min(Duration::from_secs(30)))
+}
+
+/// How long the watch loop may sleep before a timer of its own is due:
+/// a failed refresh's retry, or a failed replacement's. With neither,
+/// `None`: an idle repo costs nothing until an event.
+fn watch_wait(failures: u32, replacement_retry: Option<Duration>) -> Option<Duration> {
+    [watch_retry(failures), replacement_retry]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// Wait for an event on `rx`, or for `wait` to pass: `Ok(true)` for an
+/// event, `Ok(false)` for the timer.
+fn next_wake(
+    rx: &mpsc::Receiver<()>,
+    wait: Option<Duration>,
+) -> Result<bool, mpsc::RecvTimeoutError> {
+    match wait {
+        Some(wait) => match rx.recv_timeout(wait) {
+            Ok(()) => Ok(true),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(false),
+            Err(e) => Err(e),
+        },
+        None => rx
+            .recv()
+            .map(|()| true)
+            .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
     }
 }
 
@@ -1134,18 +1197,37 @@ async fn run_watch(
     plan_arg: Option<&str>,
 ) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<()>();
-    let _watcher = watch_status_paths(tx, &repo)?;
+    let git_status = GitStatus::default();
+    let watchers = watch_status_paths(tx.clone(), &repo, &git_status)?;
 
     let mut last_emitted: Option<String> = None;
     let mut last_sig: Option<InputSignature> = None;
+    let mut failures: u32 = 0;
     // A watch holds nothing a restart would lose: the installed build
     // prints the snapshot afresh.
     let mut replacing = crate::upgrade::Replacing::new(crate::upgrade::process().clone(), |_| {
         crate::upgrade::exec_installed_as_started()
     });
+    let mut exits = ProcessExits::new({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(());
+        }
+    });
+    let _installs = replacing.authority().subscribe(move || {
+        let _ = tx.send(());
+    });
     let mut said_stale = false;
 
     loop {
+        if let Some(why) = watchers
+            .git
+            .fault()
+            .or_else(|| watchers.core.fault())
+            .or_else(|| exits.fault())
+        {
+            anyhow::bail!("status watch: {why}");
+        }
         // Ahead of the nothing-changed gate, which an install never
         // moves: a watch on a quiet repo still finds out.
         let stale = replacing.pass(crate::upgrade::Hosting::Nothing).stale();
@@ -1154,26 +1236,29 @@ async fn run_watch(
         }
         said_stale = stale;
         // Nothing-changed gate (lloyd's invariant): only rebuild when an
-        // input the snapshot depends on actually changed. The signature
-        // probe is far cheaper than the fold + render it guards.
+        // input the snapshot depends on actually changed. The probe walks
+        // the tree only when an event made the Git status stale, and the
+        // build then reuses that walk.
         // Transient probe/rebuild failures must not kill a
         // BOOTSTRAPPED watch (see [`watch_failure`] — the first
         // snapshot stays fatal): keep the last output, do NOT
-        // advance the signature, and let the next event or the 60s
-        // backstop retry the SAME state.
-        match input_signature(&repo) {
+        // advance the signature, and let the next event or the retry
+        // pause retry the SAME state.
+        match input_signature(&repo, &git_status) {
             Ok(sig) if last_sig.as_ref() != Some(&sig) => {
-                match StatusSnapshot::build_async(
+                match StatusSnapshot::build_with(
                     &repo,
                     &basename,
                     home.as_deref(),
                     policy,
                     plan_arg,
                     true,
+                    &git_status,
                 )
                 .await
                 {
                     Ok(snapshot) => {
+                        failures = 0;
                         let output = if json {
                             snapshot.to_json_compact()
                         } else {
@@ -1191,24 +1276,25 @@ async fn run_watch(
                             last_emitted = Some(output);
                         }
                         last_sig = Some(sig);
+                        exits.track(&repo);
                     }
-                    Err(e) => watch_failure(last_sig.is_some(), "refresh", format!("{e:#}"))?,
+                    Err(e) => {
+                        failures += 1;
+                        watch_failure(last_sig.is_some(), "refresh", format!("{e:#}"))?
+                    }
                 }
             }
-            Ok(_) => {}
-            Err(e) => watch_failure(last_sig.is_some(), "input probe", format!("{e:#}"))?,
+            Ok(_) => failures = 0,
+            Err(e) => {
+                failures += 1;
+                watch_failure(last_sig.is_some(), "input probe", format!("{e:#}"))?
+            }
         }
 
-        // Event-driven: worktree edits, .clank writes, and git-dir
-        // changes all arrive as watcher events now, so no fast
-        // poll. The long timeout is a backstop against watcher
-        // pathologies the error channel doesn't surface.
-        match rx.recv_timeout(Duration::from_secs(60).min(replacing.due_in())) {
-            Ok(()) => while rx.recv_timeout(Duration::from_millis(200)).is_ok() {},
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("filesystem watcher disconnected")
-            }
+        match next_wake(&rx, watch_wait(failures, replacing.retry_in())) {
+            Ok(true) => while rx.recv_timeout(Duration::from_millis(200)).is_ok() {},
+            Ok(false) => {}
+            Err(_) => anyhow::bail!("status watch: the filesystem watcher disconnected"),
         }
     }
 }
@@ -1408,39 +1494,43 @@ async fn log_rows_page(
     }
 }
 
-/// Decides which filesystem events wake the status loops. This is an
-/// ALLOWLIST, not "anything under `.clank`" (status-tui-watch-cpu):
-/// wakes on
-/// - the workflow-state signal dirs under `.clank` ([`CLANK_WAKE_DIRS`]:
-///   plans/queue/blocks/agents/finished/config) — feedback/queue/agent
-///   state are load-bearing even though gitignored;
-/// - anything under the git dir (HEAD moves, ref updates);
-/// - any `.gitignore` change (which also refreshes the matcher);
-/// - any worktree path the gitignore rules do NOT match (keeps
-///   `dirty:` fresh on tracked edits).
+/// What one filesystem event says to a status loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Seen {
+    /// Nothing the panel shows: ignored churn, Git's object store, and
+    /// the `.clank/` state the core watcher already delivers.
+    Nothing,
+    /// Something the panel shows that Git's status does not depend on.
+    Shown,
+    /// Something Git's status depends on: the cached [`GitStatus`] is
+    /// stale.
+    GitInput,
+}
+
+/// Classifies the status loops' filesystem events by Git's own view of
+/// the repo, never by path prefix or ignore pattern alone.
 ///
-/// It deliberately does NOT wake on the rest of `.clank`: the derived
-/// fold `cache`, generated `html`, the `zellij` layout, and — the big
-/// one — nested worktrees under `.clank/worktrees/<name>/`, which are
-/// whole separate repos whose builds + caches would otherwise wake
-/// this pane. Gitignore-matched worktree paths (`target/`, `*.log`)
-/// are dropped too — a `cargo build`'s thousands of `target/` files
-/// say nothing about clank state or worktree dirt.
-///
-/// The ignore test is git-accurate ([`crate::git_io::PathIgnore`], gix's
-/// exclude stack): it honors NESTED `.gitignore` files (plus
-/// `.git/info/exclude` and `core.excludesFile`), so churn under a
-/// subproject's ignored dir (e.g. a Flutter `frostsnapp/build/`) is
-/// recognized as ignored and dropped — not stormed on. (A root-only
-/// matcher missed nested ignores and woke ~250×/s on such a tree.)
-/// TRACKED-but-gitignored files (`git add -f`) are dropped like
-/// any ignored path: their edits refresh `dirty:` on the 60s
-/// backstop, not instantly.
+/// A [`Seen::GitInput`] is a path the index holds (so a tracked plan
+/// under `.clank/` and a force-added file under an ignored directory
+/// both count), an untracked path that is not ignored, the index, HEAD
+/// and the refs, and whatever decides what Git sees: a `.gitignore`,
+/// `info/exclude`, the repo's config, and the files
+/// [`crate::git_io::status_inputs_elsewhere`] names. Ignored churn
+/// (`target/`, Git-ignored runtime state under `.clank/`) is
+/// [`Seen::Nothing`], honoring nested `.gitignore` files: a root-only
+/// matcher once woke ~250×/s on a subproject's ignored `build/`.
 pub(crate) struct WakeFilter {
     repo_root: PathBuf,
     git_dir: PathBuf,
+    common_dir: PathBuf,
     clank_root: PathBuf,
+    /// The files elsewhere as last read; the watch on them reads the set
+    /// again whenever one changes, and updates it here.
+    elsewhere: Known,
     ignore: crate::git_io::PathIgnore,
+    /// Raised by the watch on the files elsewhere, which runs on
+    /// another thread than the one this filter is driven on.
+    stale_ignore: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // The `.clank/` workflow-state signal dirs the snapshot depends on —
@@ -1449,8 +1539,9 @@ pub(crate) struct WakeFilter {
 use crate::repo_watch::{CLANK_STATUS_ONLY_DIRS, CLANK_WAKE_DIRS};
 
 /// A cheap fingerprint of everything a [`StatusSnapshot`] is derived
-/// from — the SAME inputs the [`WakeFilter`] wakes on: committed
-/// history (HEAD), the working tree (`dirty`), and the gitignored
+/// from — the SAME inputs the status loops wake on: committed history
+/// (HEAD), the working tree (`dirty`, from the [`GitStatus`] cache), and
+/// the gitignored
 /// `.clank` workflow dirs ([`CLANK_WAKE_DIRS`]). The watch loops reuse
 /// the previous snapshot while this is unchanged, so a wake that
 /// touched nothing the snapshot depends on costs only this probe, not
@@ -1490,20 +1581,25 @@ pub(crate) fn process_health(repo: &Path) -> ProcessHealth {
     }
 }
 
-/// Compute the current [`InputSignature`]. One ODB open (HEAD + the
-/// dirty walk); the `.clank` fingerprint is stat-only (no file reads).
-pub(crate) fn input_signature(repo: &Path) -> anyhow::Result<InputSignature> {
-    input_signature_with(repo, process_health(repo))
+/// Compute the current [`InputSignature`]. One ODB open for HEAD; the
+/// Git status comes from `git_status`, walked only if an event made it
+/// stale; the `.clank` fingerprint is stat-only (no file reads).
+pub(crate) fn input_signature(
+    repo: &Path,
+    git_status: &GitStatus,
+) -> anyhow::Result<InputSignature> {
+    input_signature_with(repo, git_status, process_health(repo))
 }
 
 /// [`input_signature`] with its [`ProcessHealth`] supplied.
 pub(crate) fn input_signature_with(
     repo: &Path,
+    git_status: &GitStatus,
     health: ProcessHealth,
 ) -> anyhow::Result<InputSignature> {
     let git = crate::git_io::open(repo)?;
     let head = git.head_sha()?.map(|s| s.as_str().to_string());
-    let dirty = git.working_tree_dirty()?;
+    let dirty = git_status.read(&git)?;
     Ok(InputSignature {
         head,
         dirty,
@@ -1511,6 +1607,149 @@ pub(crate) fn input_signature_with(
         health,
         sources: sources_fingerprint(repo),
     })
+}
+
+/// The working tree's Git status (`DirtyStats`, diff statistics
+/// included), walked once per change and shared by every reader in a
+/// process: the gate probe and the snapshot build.
+///
+/// It is fresh until [`GitStatus::invalidate`], which the status loops'
+/// Git watcher calls for exactly the events [`WakeFilter`] calls
+/// [`Seen::GitInput`]. A new one is stale, so a one-shot reader walks
+/// once. Clones share one cache.
+#[derive(Clone, Default)]
+pub(crate) struct GitStatus(std::sync::Arc<GitStatusCache>);
+
+#[derive(Default)]
+struct GitStatusCache {
+    fresh: std::sync::atomic::AtomicBool,
+    last: std::sync::Mutex<Option<Option<DirtyStats>>>,
+}
+
+impl GitStatus {
+    /// Something the status depends on changed: the next read walks.
+    pub(crate) fn invalidate(&self) {
+        self.0
+            .fresh
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The status, walking the tree only if it is stale.
+    pub(crate) fn read(
+        &self,
+        git: &crate::git_io::Repo,
+    ) -> Result<Option<DirtyStats>, crate::git_io::GitIoError> {
+        use std::sync::atomic::Ordering;
+        let mut last = self
+            .0
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Marked fresh before the walk, so an event landing during it
+        // marks it stale again and the next read walks.
+        if self.0.fresh.swap(true, Ordering::AcqRel)
+            && let Some(dirty) = *last
+        {
+            return Ok(dirty);
+        }
+        match git.working_tree_dirty() {
+            Ok(dirty) => {
+                *last = Some(dirty);
+                Ok(dirty)
+            }
+            Err(e) => {
+                self.invalidate();
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Exit watches on the processes a status panel shows as alive: each
+/// agent's attended processes and the repo's monitor. A process ending
+/// writes no file, so without these the panel would show it alive until
+/// some unrelated event.
+pub(crate) struct ProcessExits {
+    watch: Option<ProcExitWatch>,
+    armed: Vec<(i32, crate::proc_identity::ProcToken)>,
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    fault: crate::fs_notice::Fault,
+}
+
+type ProcExitWatch =
+    crate::proc_identity::exit_watch::ExitWatch<(i32, crate::proc_identity::ProcToken)>;
+
+impl ProcessExits {
+    /// `wake` is called when a watched process exits.
+    pub(crate) fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        let wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(wake);
+        let fault = crate::fs_notice::Fault::default();
+        let watch = ProcExitWatch::new(None, {
+            let (wake, fault) = (wake.clone(), fault.clone());
+            move |w| {
+                if let crate::proc_identity::exit_watch::Wake::Failed(why) = w {
+                    crate::fs_notice::record(&fault, format!("the process watch failed: {why}"));
+                }
+                wake()
+            }
+        });
+        if let Err(e) = &watch {
+            crate::fs_notice::record(&fault, format!("cannot watch for process exits: {e}"));
+        }
+        ProcessExits {
+            watch: watch.ok(),
+            armed: Vec::new(),
+            wake,
+            fault,
+        }
+    }
+
+    /// Why a shown process's exit can no longer be heard, once it can't:
+    /// from then on the panel would show it alive after it ended.
+    pub(crate) fn fault(&self) -> Option<String> {
+        crate::fs_notice::read(&self.fault)
+    }
+
+    /// Watch exactly the processes `repo` shows as alive now. One found
+    /// already gone wakes at once, and only the first time it is seen.
+    pub(crate) fn track(&mut self, repo: &Path) {
+        self.track_these(shown_processes(repo));
+    }
+
+    fn track_these(&mut self, shown: Vec<(i32, crate::proc_identity::ProcToken)>) {
+        use crate::proc_identity::exit_watch::Armed;
+        let Some(watch) = &self.watch else {
+            return;
+        };
+        for gone in self.armed.iter().filter(|key| !shown.contains(key)) {
+            watch.disarm(gone);
+        }
+        for key in shown.iter().filter(|key| !self.armed.contains(key)) {
+            if watch.arm(key.clone(), key.0, &key.1) == Armed::Ended {
+                (self.wake)();
+            }
+        }
+        self.armed = shown;
+    }
+}
+
+/// The processes the panel shows as alive, by pid and birth.
+fn shown_processes(repo: &Path) -> Vec<(i32, crate::proc_identity::ProcToken)> {
+    let agents = crate::agent_store::agents_root(repo);
+    let mut shown: Vec<_> = std::fs::read_dir(&agents)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| crate::cli::agent_state::load(&entry.path()))
+        .flat_map(|state| state.attending)
+        .filter_map(|attended| attended.pid.zip(attended.token))
+        .collect();
+    if let crate::cli::monitor::Liveness::Running { pid, .. } = crate::cli::monitor::liveness(repo)
+        && let Some(token) = crate::proc_identity::token_for(pid)
+    {
+        shown.push((pid, token));
+    }
+    shown
 }
 
 /// Hash of the sources account the monitor publishes, as the panel would
@@ -1605,176 +1844,486 @@ fn collect_fingerprint(path: &Path, out: &mut Vec<(PathBuf, Option<std::time::Sy
 }
 
 impl WakeFilter {
-    pub(crate) fn new(repo_root: &Path, git_dir: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn new(repo_root: &Path) -> anyhow::Result<Self> {
         // FSEvents delivers canonical paths (`/private/var/…`);
         // compare against canonical roots or every prefix check
         // misses on symlinked locations (e.g. macOS tempdirs).
         let repo_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-        let git_dir = dunce::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
-        let ignore = crate::git_io::open_ignore(&repo_root)?;
         Ok(Self {
+            git_dir: crate::repo_watch::git_state_dir(&repo_root)?,
+            common_dir: crate::repo_watch::git_common_state_dir(&repo_root)?,
+            elsewhere: Known::default(),
+            ignore: crate::git_io::open_ignore(&repo_root)?,
+            stale_ignore: Default::default(),
             clank_root: repo_root.join(".clank"),
-            ignore,
             repo_root,
-            git_dir,
         })
     }
 
-    /// True → the working-tree event at `path` should wake the DIFF
-    /// loop (refresh `dirty:`/diff).
-    pub(crate) fn wakes(&mut self, path: &Path) -> bool {
+    /// The git directories outside the worktree, each once: a linked
+    /// worktree's own gitdir lies inside the shared one.
+    fn git_dirs_outside(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for dir in [&self.common_dir, &self.git_dir] {
+            if !dir.starts_with(&self.repo_root) && !dirs.iter().any(|d| dir.starts_with(d)) {
+                dirs.push(dir.clone());
+            }
+        }
+        dirs
+    }
+
+    fn reopen_ignore(&mut self) {
+        // On an error the old stack stays, which errs toward waking.
+        if let Ok(ignore) = crate::git_io::open_ignore(&self.repo_root) {
+            self.ignore = ignore;
+        }
+    }
+
+    pub(crate) fn sees(&mut self, path: &Path) -> Seen {
+        if self
+            .stale_ignore
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.reopen_ignore();
+        }
         // Native FSEvents paths are canonical, but notify's polling
         // backend can report `/var/…` for a root canonicalized to
         // `/private/var/…`. Keep the filter's comparison in one path
         // namespace before treating a path as outside the repo.
         let canonical;
-        let path = if path.starts_with(&self.repo_root) {
+        let path = if [&self.repo_root, &self.git_dir, &self.common_dir]
+            .iter()
+            .any(|root| path.starts_with(root))
+        {
             path
         } else {
             canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             &canonical
         };
-        // Gate-state changes — the gitdir (commits/refs) AND anything
-        // under `.clank/` — are the CORE watcher's job
-        // (`repo_watch::is_core_wake`). The diff watcher refreshes
-        // dirty/diff from the WORKING TREE only, so it drops both: status
-        // runs both watchers on one channel, and dropping here keeps the
-        // diff side from double-waking on a gate change the core already
-        // delivered. The status-only dirs under `.clank/` are the
-        // exception: no gate reads them, so only this watcher delivers
-        // them.
-        if let Ok(rel) = path.strip_prefix(&self.clank_root) {
-            return rel
-                .components()
-                .next()
-                .and_then(|c| c.as_os_str().to_str())
-                .is_some_and(|head| CLANK_STATUS_ONLY_DIRS.contains(&head));
+        if self.elsewhere.lock().iter().any(|file| file == path) {
+            self.reopen_ignore();
+            return Seen::GitInput;
         }
-        if path.starts_with(&self.git_dir) {
-            return false;
-        }
-        // A `.gitignore` write changes what's ignored: rebuild the
-        // (nested-aware) exclude stack and wake. On a rebuild error keep
-        // the old stack — erring toward waking is safe.
-        if path.file_name().is_some_and(|n| n == ".gitignore") {
-            if let Ok(ig) = crate::git_io::open_ignore(&self.repo_root) {
-                self.ignore = ig;
+        // The shared dir holds every linked worktree's gitdir, so this
+        // worktree's own is asked first.
+        for dir in [self.git_dir.clone(), self.common_dir.clone()] {
+            if let Ok(rel) = path.strip_prefix(&dir) {
+                if !git_state_input(rel) {
+                    return Seen::Nothing;
+                }
+                if rel.starts_with("info") {
+                    self.reopen_ignore();
+                }
+                return Seen::GitInput;
             }
-            return true;
         }
-        // Paths outside the root shouldn't arrive; if one does, wake
-        // conservatively.
         let Ok(rela) = path.strip_prefix(&self.repo_root) else {
-            return true;
+            return Seen::GitInput;
         };
-        // Working-tree path: wake unless git-ignored — keeps `dirty:`
-        // fresh on tracked edits while dropping build artifacts, honoring
-        // NESTED `.gitignore`s (the storm fix). `is_dir` races with
-        // deletion; a vanished path reads as non-dir, only loosening
-        // toward a wake.
-        !self.ignore.is_ignored(rela, path.is_dir())
+        if rela.as_os_str().is_empty() {
+            return Seen::Nothing;
+        }
+        if path.file_name().is_some_and(|n| n == ".gitignore") {
+            self.reopen_ignore();
+            return Seen::GitInput;
+        }
+        if self.ignore.is_tracked(rela) {
+            return Seen::GitInput;
+        }
+        // `is_dir` races with deletion; a vanished path reads as
+        // non-dir, only loosening toward a wake.
+        if !self.ignore.is_ignored(rela, path.is_dir()) {
+            return Seen::GitInput;
+        }
+        let shown = path
+            .strip_prefix(&self.clank_root)
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .and_then(|c| c.as_os_str().to_str())
+            .is_some_and(|head| CLANK_STATUS_ONLY_DIRS.contains(&head));
+        match shown {
+            true => Seen::Shown,
+            false => Seen::Nothing,
+        }
     }
 }
 
-/// Watcher for the status loops: the repo root recursively (working
-/// tree, `.clank`, and `.git` when embedded) plus the git dir when
-/// it lives elsewhere (linked worktrees) — events filtered through
-/// [`WakeFilter`]. Watcher ERRORS also wake: notify signals queue
-/// overflow as an error event, and the right response is one cheap
-/// rebuild, not silent staleness.
+/// Whether a path inside a git directory is one a status walk reads:
+/// HEAD and the refs it may point through (`git reset --soft` moves
+/// only these), the index, and what decides what Git sees. Objects,
+/// logs and lock files are not.
+fn git_state_input(rel: &Path) -> bool {
+    if rel.extension().is_some_and(|ext| ext == "lock") {
+        return false;
+    }
+    match rel.components().next().and_then(|c| c.as_os_str().to_str()) {
+        Some("HEAD" | "index" | "packed-refs" | "refs" | "config" | "config.worktree") => true,
+        Some("info") => {
+            rel == Path::new("info")
+                || rel == Path::new("info/exclude")
+                || rel == Path::new("info/sparse-checkout")
+        }
+        _ => false,
+    }
+}
+
+/// The status loops' watchers: the core wakes (the monitor's, or a
+/// watcher of our own) and the Git watcher ([`watch_git`]), on one
+/// channel.
 pub(crate) fn watch_status_paths(
     tx: mpsc::Sender<()>,
     repo: &Path,
+    git_status: &GitStatus,
 ) -> anyhow::Result<StatusWatchers> {
     // Gate state comes from the repo's MONITOR when one is running —
     // one watcher and one fold for the whole repo, which is the point
     // of `a-repo-is-watched-once-not-once-per-waiter`: this panel used
     // to attach a watcher of its own alongside one per parked wait.
     // With no monitor it attaches that watcher itself, so the panel
-    // behaves the same either way. `status` is always native (no poll
-    // mode).
+    // behaves the same either way.
     let core = crate::cli::monitor::core_wakes(repo, tx.clone())?;
-    let diff = watch_diff_paths(tx, repo)?;
-    Ok(StatusWatchers {
-        _core: core,
-        _diff: diff,
-    })
+    let git = watch_git(tx, repo, git_status)?;
+    Ok(StatusWatchers { core, git })
 }
 
 /// The TUI's watchers: the keeper, which holds the repo's monitor
 /// subscription and brings a monitor back when it goes, and the same
-/// diff watcher as [`watch_status_paths`]. Plain `status --watch` stays
+/// Git watcher as [`watch_status_paths`]. Plain `status --watch` stays
 /// on [`watch_status_paths`], which never starts anything.
 pub(crate) fn watch_tui_paths(
     tx: mpsc::Sender<()>,
     repo: &Path,
+    git_status: &GitStatus,
     spawn: impl Fn(&Path) -> std::io::Result<Box<dyn crate::cli::monitor::Started>> + Send + 'static,
 ) -> anyhow::Result<TuiWatchers> {
     let keeper = crate::cli::monitor::keeper::MonitorKeeper::start(repo, tx.clone(), spawn);
-    let diff = watch_diff_paths(tx, repo)?;
-    Ok(TuiWatchers {
-        keeper,
-        _diff: diff,
-    })
+    let git = watch_git(tx, repo, git_status)?;
+    Ok(TuiWatchers { keeper, git })
 }
 
 /// What [`watch_tui_paths`] keeps alive. Dropping it stops the keeper
-/// and the diff watcher.
+/// and the Git watcher.
 pub(crate) struct TuiWatchers {
     pub(crate) keeper: crate::cli::monitor::keeper::MonitorKeeper,
-    _diff: RecommendedWatcher,
+    pub(crate) git: GitWatch,
 }
 
 /// The two watchers `status` keeps alive together. Dropping this stops
-/// both. The SHARED core watcher feeds gate state; the status-only diff
-/// watcher feeds dirty/diff. They send on one channel; the loop's
-/// nothing-changed gate ([`InputSignature`]) coalesces.
+/// both. They send on one channel; the loop's nothing-changed gate
+/// ([`InputSignature`]) coalesces.
 pub(crate) struct StatusWatchers {
     /// The shared fold, or a watcher of our own — see
     /// [`crate::cli::monitor::core_wakes`].
-    _core: crate::cli::monitor::CoreWakes,
+    pub(crate) core: crate::cli::monitor::CoreWakes,
     /// Kept local on purpose: the monitor has no reason to compute a
     /// diff, and nothing but this panel wants one.
-    _diff: RecommendedWatcher,
+    pub(crate) git: GitWatch,
 }
 
-/// The status-only DIFF watcher: the WHOLE working tree, recursively,
-/// waking on tracked-file edits to refresh `dirty:`/diff while dropping
-/// gitignored churn ([`WakeFilter`] holds the nested-aware
-/// `git_io::PathIgnore` — status-watch-nested-ignore). It is NEVER a
-/// source of gate state: it drops `.clank/` and the gitdir (the core
-/// watcher owns those). Watcher errors wake (one cheap rebuild beats
-/// silent staleness).
-fn watch_diff_paths(tx: mpsc::Sender<()>, repo: &Path) -> anyhow::Result<RecommendedWatcher> {
-    let mut watcher = notify::recommended_watcher(diff_wake_handler(tx, repo)?)?;
-    watcher
-        .watch(repo, RecursiveMode::Recursive)
-        .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", repo.display()))?;
-    Ok(watcher)
+/// The status loops' Git watcher, and what ends them when it fails.
+pub(crate) struct GitWatch {
+    _tree: RecommendedWatcher,
+    _elsewhere: Elsewhere,
+    fault: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// One filter for both the native production watcher and the polling
-/// test backend. The latter is necessary where the process can attach
-/// an FSEvents watcher but the sandbox never delivers its events.
-fn diff_wake_handler(
+impl GitWatch {
+    /// Why the watcher stopped being trustworthy, once it has. A loop
+    /// that reads this as `Some` must end, saying so: from then on it
+    /// would sit on a stale status with nothing to correct it.
+    pub(crate) fn fault(&self) -> Option<String> {
+        self.fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Watch everything [`WakeFilter`] can call a [`Seen::GitInput`]: the
+/// worktree and the git directories recursively, and the files elsewhere
+/// one by one, since a recursive watch of a home directory would hear
+/// everything under it. Each Git input invalidates `git_status` before
+/// it wakes `tx`.
+fn watch_git(
     tx: mpsc::Sender<()>,
     repo: &Path,
-) -> anyhow::Result<impl FnMut(notify::Result<notify::Event>) + Send + 'static> {
-    let git_dir = crate::repo_watch::git_state_dir(repo)?;
-    let mut filter = WakeFilter::new(repo, &git_dir)?;
-    Ok(move |res: notify::Result<notify::Event>| {
-        match res {
-            Ok(event) => {
-                // Path-less events (rescan notices) wake conservatively.
-                if event.paths.is_empty() || event.paths.iter().any(|p| filter.wakes(p)) {
-                    let _ = tx.send(());
-                }
-            }
-            Err(_) => {
+    git_status: &GitStatus,
+) -> anyhow::Result<GitWatch> {
+    let filter = WakeFilter::new(repo)?;
+    let roots: Vec<PathBuf> = std::iter::once(filter.repo_root.clone())
+        .chain(filter.git_dirs_outside())
+        .collect();
+    let known = filter.elsewhere.clone();
+    let stale_ignore = filter.stale_ignore.clone();
+    let fault = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut tree = notify::recommended_watcher(git_wake_handler(
+        tx.clone(),
+        filter,
+        git_status.clone(),
+        fault.clone(),
+    ))?;
+    let mut paths = tree.paths_mut();
+    for root in &roots {
+        paths
+            .add(root, RecursiveMode::Recursive)
+            .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", root.display()))?;
+    }
+    paths
+        .commit()
+        .map_err(|e| anyhow::anyhow!("cannot watch {}: {e}", repo.display()))?;
+    let repo = repo.to_path_buf();
+    let elsewhere = Elsewhere::start(
+        move || crate::git_io::status_inputs_elsewhere(&repo).map_err(|e| e.to_string()),
+        known,
+        {
+            let (git_status, tx) = (git_status.clone(), tx.clone());
+            move || {
+                stale_ignore.store(true, std::sync::atomic::Ordering::Release);
+                git_status.invalidate();
                 let _ = tx.send(());
             }
+        },
+        {
+            let fault = fault.clone();
+            move |why| {
+                crate::fs_notice::record(&fault, why);
+                let _ = tx.send(());
+            }
+        },
+    )?;
+    Ok(GitWatch {
+        _tree: tree,
+        _elsewhere: elsewhere,
+        fault,
+    })
+}
+
+/// The files elsewhere that decide what Git sees, as last read.
+#[derive(Clone, Default)]
+pub(crate) struct Known(std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>);
+
+impl Known {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The watch on the files elsewhere, through the kernel. Each file is
+/// watched by the logical path Git names, as an entry of its directory,
+/// so replacing it or retargeting a link there is heard, and by the file
+/// it resolves to, for its content and for being replaced. A change to
+/// any of them can name others — a config sets `core.excludesFile` or
+/// includes another file — so each one reads the set again and the watch
+/// follows it, a file not made yet included.
+struct Elsewhere {
+    rereads: mpsc::Sender<Reread>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+enum Reread {
+    Now,
+    Stop,
+}
+
+impl Elsewhere {
+    /// `read` names the files; `changed` is called once the watch covers
+    /// what a change named, and `failed` once the watch, or a read of the
+    /// set, fails.
+    fn start(
+        read: impl Fn() -> Result<Vec<PathBuf>, String> + Send + 'static,
+        known: Known,
+        changed: impl Fn() + Send + Sync + 'static,
+        failed: impl Fn(String) + Send + Sync + 'static,
+    ) -> anyhow::Result<Self> {
+        let (rereads, asked) = mpsc::channel();
+        let failed = std::sync::Arc::new(failed);
+        let mut watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
+            {
+                let known = known.clone();
+                move |path| known.lock().iter().any(|file| file == path)
+            },
+            {
+                let (rereads, failed, known) = (rereads.clone(), failed.clone(), known.clone());
+                move |res: notify::Result<notify::Event>| {
+                    use crate::fs_notice::{Notice, notice};
+                    let ours = match notice(&res) {
+                        Notice::Read => false,
+                        Notice::Rescan => true,
+                        // A directory that appears may already hold one.
+                        Notice::Changed(paths) => paths
+                            .iter()
+                            .any(|path| known.lock().iter().any(|file| file.starts_with(path))),
+                        Notice::Failed(why) => {
+                            failed(format!("the watch on Git's files elsewhere failed: {why}"));
+                            false
+                        }
+                    };
+                    if ours {
+                        let _ = rereads.send(Reread::Now);
+                    }
+                }
+            },
+        )?;
+        let mut following = Following::default();
+        if following.settle(&read, &mut watcher, &known)? {
+            changed();
+        }
+        let thread = std::thread::Builder::new()
+            .name("git-elsewhere".into())
+            .spawn(move || {
+                while let Ok(Reread::Now) = asked.recv() {
+                    while let Ok(next) = asked.try_recv() {
+                        if let Reread::Stop = next {
+                            return;
+                        }
+                    }
+                    if let Err(e) = following.settle(&read, &mut watcher, &known) {
+                        return failed(format!("cannot follow Git's files elsewhere: {e:#}"));
+                    }
+                    changed();
+                }
+            })?;
+        Ok(Self {
+            rereads,
+            thread: Some(thread),
+        })
+    }
+}
+
+/// What the watch is registered for: the files as Git names them, and
+/// the directories watched for them and for what they resolve to.
+#[derive(Default)]
+struct Following {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+}
+
+impl Following {
+    /// Register for the set `read` names, then read it again, until a
+    /// read finds what is registered: a change made between a read and
+    /// its registration names inputs no event would ever report. Whether
+    /// a read after the first found the set moved.
+    fn settle(
+        &mut self,
+        read: &impl Fn() -> Result<Vec<PathBuf>, String>,
+        watcher: &mut crate::proc_identity::tree_watch::KernelWatcher,
+        known: &Known,
+    ) -> anyhow::Result<bool> {
+        use notify::Watcher as _;
+        let mut moved = false;
+        let mut first = true;
+        loop {
+            let mut files = read().map_err(|e| anyhow::anyhow!("{e}"))?;
+            files.sort();
+            files.dedup();
+            let resolved: Vec<PathBuf> = files.iter().map(|f| canonical_file(f)).collect();
+            let mut followed: Vec<PathBuf> = files.iter().chain(&resolved).cloned().collect();
+            followed.sort();
+            followed.dedup();
+            let mut dirs: Vec<PathBuf> = followed
+                .iter()
+                .filter_map(|f| f.parent().map(Path::to_path_buf))
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            if files == self.files && dirs == self.dirs && followed == *known.lock() {
+                return Ok(moved);
+            }
+            moved |= !first;
+            first = false;
+            let newly: Vec<PathBuf> = followed
+                .iter()
+                .filter(|f| !known.lock().contains(f))
+                .cloned()
+                .collect();
+            *known.lock() = followed;
+            // A directory already watched chose its files' content when it
+            // was listed: it is listed again for a file newly followed in
+            // it. What changed meanwhile is covered by the caller's
+            // `changed` after the set settles.
+            let relisted: Vec<PathBuf> = self
+                .dirs
+                .iter()
+                .filter(|d| newly.iter().any(|f| f.parent() == Some(d.as_path())))
+                .cloned()
+                .collect();
+            for gone in self
+                .dirs
+                .iter()
+                .filter(|d| !dirs.contains(d) || relisted.contains(d))
+            {
+                let _ = watcher.unwatch(gone);
+            }
+            for dir in dirs
+                .iter()
+                .filter(|d| !self.dirs.contains(d) || relisted.contains(d))
+            {
+                watcher
+                    .watch(dir, RecursiveMode::NonRecursive)
+                    .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", dir.display()))?;
+            }
+            self.files = files;
+            self.dirs = dirs;
+        }
+    }
+}
+
+/// Where `path` resolves to; through its directory when it does not
+/// exist, as the directory's watch would name it.
+fn canonical_file(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).ok().unwrap_or_else(|| {
+        match (
+            path.parent().and_then(|d| dunce::canonicalize(d).ok()),
+            path.file_name(),
+        ) {
+            (Some(dir), Some(name)) => dir.join(name),
+            _ => path.to_path_buf(),
         }
     })
+}
+
+impl Drop for Elsewhere {
+    fn drop(&mut self) {
+        let _ = self.rereads.send(Reread::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The Git watcher's callback, apart from any backend so a test can
+/// drive it with the events a backend would deliver.
+fn git_wake_handler(
+    tx: mpsc::Sender<()>,
+    mut filter: WakeFilter,
+    git_status: GitStatus,
+    fault: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+    move |res: notify::Result<notify::Event>| {
+        use crate::fs_notice::{Notice, notice};
+        let seen = match notice(&res) {
+            Notice::Read => Seen::Nothing,
+            Notice::Rescan => Seen::GitInput,
+            Notice::Changed(paths) => paths
+                .iter()
+                .map(|p| filter.sees(p))
+                .max()
+                .unwrap_or(Seen::Nothing),
+            Notice::Failed(why) => {
+                crate::fs_notice::record(&fault, format!("the filesystem watcher failed: {why}"));
+                let _ = tx.send(());
+                return;
+            }
+        };
+        if seen == Seen::GitInput {
+            git_status.invalidate();
+        }
+        if seen != Seen::Nothing {
+            let _ = tx.send(());
+        }
+    }
 }
 
 /// Forward SIGWINCH into the wake channel so a terminal resize is
@@ -2007,7 +2556,7 @@ mod watch_failure_tests {
         assert!(err.to_string().contains("refresh"), "{err}");
         // After one success the watch degrades and keeps running;
         // the caller leaves last_sig untouched, so the next
-        // event/backstop retries the same state and an ordinary
+        // event or retry pause retries the same state and an ordinary
         // success is the recovery.
         assert!(watch_failure(true, "input probe", "boom").is_ok());
         assert!(watch_failure(true, "refresh", "boom").is_ok());
@@ -2299,59 +2848,692 @@ mod dirty_and_wake_tests {
         assert_eq!(s(12, 3, 2, 1), "+12 −3 · 2 binary · 1 untracked");
     }
 
+    /// A repo with every kind of path the filter tells apart: tracked
+    /// files in and out of `.clank/`, a file force-added under an ignored
+    /// directory, ignored runtime state under `.clank/`, and ignore
+    /// rules both at the root and nested.
+    fn classified_repo(root: &Path) {
+        git(root, &["init", "--quiet", "-b", "main"]);
+        git(root, &["config", "user.email", "t@t"]);
+        git(root, &["config", "user.name", "t"]);
+        for (path, body) in [
+            (".gitignore", "/target/\n*.log\n/build/\n"),
+            ("sub/.gitignore", "/build/\n.dart_tool/\n"),
+            ("sub/build/macos/App", "x"),
+            ("sub/.dart_tool/x", "x"),
+            (
+                ".clank/.gitignore",
+                "agents/\ncache/\nworktrees/\ndrafts/\n",
+            ),
+            (".clank/plans/foo.md", "# foo\n"),
+            (".clank/drafts/idea.md", "# idea\n"),
+            ("src/lib.rs", "fn a() {}\n"),
+            ("build/kept.bin", "kept\n"),
+        ] {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), body).unwrap();
+        }
+        git(root, &["add", "-A"]);
+        git(root, &["add", "-f", "build/kept.bin"]);
+        git(root, &["commit", "--quiet", "-m", "base"]);
+    }
+
+    /// What each kind of path says, asked of the index and Git's own
+    /// exclude stack: a tracked plan under `.clank/` and a force-added
+    /// file under an ignored directory are Git inputs; ignored churn,
+    /// nested ignores included, is nothing.
     #[test]
     fn wake_filter_matrix() {
-        // Real on-disk repo: the filter's ignore test is now gix's
-        // exclude stack, which reads `.gitignore` from disk and honors
-        // NESTED files — so the fixture writes a root AND a nested
-        // `.gitignore` and the queried paths exist where it matters.
+        use Seen::{GitInput, Nothing, Shown};
         let dir = tempfile::tempdir().unwrap();
         let root = dunce::canonicalize(dir.path()).unwrap();
-        git(&root, &["init", "--quiet", "-b", "main"]);
-        std::fs::write(root.join(".gitignore"), "/target/\n*.log\n").unwrap();
-        // A subproject that ignores its OWN build dir via a NESTED
-        // `.gitignore` — the storm case (Flutter `frostsnapp/build/`).
-        std::fs::create_dir_all(root.join("sub/build/macos")).unwrap();
-        std::fs::create_dir_all(root.join("sub/.dart_tool")).unwrap();
-        std::fs::write(root.join("sub/.gitignore"), "/build/\n.dart_tool/\n").unwrap();
-        std::fs::write(root.join("sub/build/macos/App"), "x").unwrap();
-        std::fs::write(root.join("sub/.dart_tool/x"), "x").unwrap();
-        let git_dir = root.join(".git");
-        let mut f = WakeFilter::new(&root, &git_dir).unwrap();
-        let p = |rel: &str| root.join(rel);
+        classified_repo(&root);
+        let mut f = WakeFilter::new(&root).unwrap();
+        for (rel, want) in [
+            (".clank/plans/foo.md", GitInput),
+            (".clank/plans/new.md", GitInput),
+            (".clank/.gitignore", GitInput),
+            (".clank/agents/codex/feedback/abc.md", Nothing),
+            (".clank/cache/repo-state/abc123.7.v10.bin", Nothing),
+            (".clank/worktrees/wt1/src/lib.rs", Nothing),
+            (".clank/drafts/idea.md", Shown),
+            (".clank/drafts", Shown),
+            ("build/kept.bin", GitInput),
+            ("build/other.o", Nothing),
+            ("target/debug/build/junk.o", Nothing),
+            ("build.log", Nothing),
+            ("src/lib.rs", GitInput),
+            ("src/new.rs", GitInput),
+            ("sub/build/macos/App", Nothing),
+            ("sub/.dart_tool/x", Nothing),
+            ("sub/main.rs", GitInput),
+            (".gitignore", GitInput),
+            ("sub/.gitignore", GitInput),
+            (".git/HEAD", GitInput),
+            (".git/index", GitInput),
+            (".git/refs/heads/main", GitInput),
+            (".git/packed-refs", GitInput),
+            (".git/config", GitInput),
+            (".git/info/exclude", GitInput),
+            (".git/objects/ab/cdef", Nothing),
+            (".git/index.lock", Nothing),
+            (".git/logs/HEAD", Nothing),
+            (".git/FETCH_HEAD", Nothing),
+        ] {
+            assert_eq!(f.sees(&root.join(rel)), want, "{rel}");
+        }
+    }
 
-        // The DIFF watcher refreshes dirty/diff from the WORKING TREE
-        // only. Gate-state changes — gitdir AND everything under
-        // `.clank/` — are the CORE watcher's job
-        // (`repo_watch::is_core_wake`), so the diff filter ignores both,
-        // no matter the subpath. (This avoids double-waking: status runs
-        // both watchers on one channel.)
-        assert!(!f.wakes(&p(".clank/agents/codex/feedback/abc.md")));
-        assert!(!f.wakes(&p(".clank/plans/foo.md")));
-        assert!(!f.wakes(&p(".clank/config.json")));
-        assert!(!f.wakes(&p(".clank/cache/repo-state/abc123.7.v10.bin")));
-        assert!(!f.wakes(&p(".clank/worktrees/wt1/src/lib.rs")));
-        assert!(!f.wakes(&p(".git/HEAD")));
-        // Drafts are the panel's alone: no core watcher delivers them.
-        assert!(f.wakes(&p(".clank/drafts/idea.md")));
-        assert!(f.wakes(&p(".clank/drafts")));
+    /// The walks a refresh costs, as the watch loops make one: the probe,
+    /// then the build when the probe moved.
+    async fn refresh(r: &Path, status: &GitStatus) -> (usize, InputSignature) {
+        let before = crate::git_io::DIRTY_WALKS.with(|c| c.get());
+        let sig = input_signature(r, status).unwrap();
+        StatusSnapshot::build_with(
+            r,
+            "repo",
+            None,
+            crate::rebuild::CachePolicy::Use,
+            None,
+            true,
+            status,
+        )
+        .await
+        .unwrap();
+        (crate::git_io::DIRTY_WALKS.with(|c| c.get()) - before, sig)
+    }
 
-        // Top-level working tree: root-gitignored → drop, tracked → wake.
-        assert!(!f.wakes(&p("target/debug/build/junk.o")));
-        assert!(!f.wakes(&p("build.log")));
-        assert!(f.wakes(&p("src/lib.rs")));
-        assert!(f.wakes(&p("Cargo.toml")));
+    fn event(r: &Path, paths: &[&str]) -> notify::Result<notify::Event> {
+        Ok(paths
+            .iter()
+            .fold(notify::Event::new(notify::EventKind::Any), |event, path| {
+                event.add_path(r.join(path))
+            }))
+    }
 
-        // THE FIX: churn ignored only by the NESTED `sub/.gitignore`
-        // must NOT wake (a root-only matcher missed these and stormed).
-        assert!(!f.wakes(&p("sub/build/macos/App")));
-        assert!(!f.wakes(&p("sub/.dart_tool/x")));
-        // ...but a tracked file in the same subproject still wakes.
-        assert!(f.wakes(&p("sub/main.rs")));
+    /// Drives the Git watcher's own callback with what a backend reports
+    /// for each change, then refreshes as the loops do. Every Git input
+    /// costs exactly one walk, shared by the probe and the snapshot, and
+    /// the status it shows is the tree's; nothing else costs a walk.
+    #[tokio::test]
+    async fn each_git_input_walks_once_and_nothing_else_walks() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dunce::canonicalize(dir.path()).unwrap();
+        classified_repo(&r);
+        let excludes = tempfile::tempdir().unwrap();
+        let excludes = dunce::canonicalize(excludes.path()).unwrap().join("ignore");
+        std::fs::write(&excludes, "*.tmp\n").unwrap();
+        git(
+            &r,
+            &["config", "core.excludesFile", excludes.to_str().unwrap()],
+        );
+        let status = GitStatus::default();
+        let (tx, rx) = mpsc::channel();
+        let mut handle = git_wake_handler(
+            tx,
+            WakeFilter::new(&r).unwrap(),
+            status.clone(),
+            Default::default(),
+        );
+        assert_eq!(refresh(&r, &status).await.0, 1, "a new cache walks once");
+        assert_eq!(refresh(&r, &status).await.0, 0, "and then not again");
 
-        // .gitignore changes always wake (and rebuild the exclude stack).
-        assert!(f.wakes(&p(".gitignore")));
-        assert!(f.wakes(&p("sub/.gitignore")));
+        let write = |path: &str, body: &str| {
+            let path = r.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        type Change<'a> = (&'a str, Box<dyn Fn() + 'a>, notify::Result<notify::Event>);
+        let walked: Vec<Change> = vec![
+            (
+                "a tracked edit",
+                Box::new(|| write("src/lib.rs", "fn b() {}\n")),
+                event(&r, &["src/lib.rs"]),
+            ),
+            (
+                "a tracked plan under .clank",
+                Box::new(|| write(".clank/plans/foo.md", "# foo\n\nmore\n")),
+                event(&r, &[".clank/plans/foo.md"]),
+            ),
+            (
+                "a force-added file under an ignored directory",
+                Box::new(|| write("build/kept.bin", "changed\n")),
+                event(&r, &["build/kept.bin"]),
+            ),
+            (
+                "a new untracked file",
+                Box::new(|| write("src/loose.rs", "\n")),
+                event(&r, &["src/loose.rs"]),
+            ),
+            (
+                "an untracked file moved into an ignored path",
+                Box::new(|| {
+                    std::fs::create_dir_all(r.join("target")).unwrap();
+                    std::fs::rename(r.join("src/loose.rs"), r.join("target/loose.rs")).unwrap()
+                }),
+                event(&r, &["src/loose.rs", "target/loose.rs"]),
+            ),
+            (
+                "an untracked file deleted",
+                Box::new(|| {
+                    write("src/gone.rs", "\n");
+                    std::fs::remove_file(r.join("src/gone.rs")).unwrap()
+                }),
+                event(&r, &["src/gone.rs"]),
+            ),
+            (
+                "staging",
+                Box::new(|| {
+                    write("src/staged.rs", "\n");
+                    git(&r, &["add", "src/staged.rs"])
+                }),
+                event(&r, &[".git/index"]),
+            ),
+            (
+                "a commit, then HEAD alone moved back over it",
+                Box::new(|| {
+                    git(&r, &["commit", "--quiet", "-am", "two"]);
+                    git(&r, &["reset", "--quiet", "--soft", "HEAD~1"])
+                }),
+                event(&r, &[".git/refs/heads/main", ".git/logs/HEAD"]),
+            ),
+            (
+                "a detached HEAD moved alone",
+                Box::new(|| {
+                    git(&r, &["commit", "--quiet", "-am", "three"]);
+                    git(&r, &["checkout", "--quiet", "--detach"]);
+                    git(&r, &["reset", "--quiet", "--soft", "HEAD~1"])
+                }),
+                event(&r, &[".git/HEAD"]),
+            ),
+            (
+                "a .gitignore change",
+                Box::new(|| write(".gitignore", "/target/\n*.log\n/build/\n/src/staged.rs\n")),
+                event(&r, &[".gitignore"]),
+            ),
+            (
+                "the global excludes file",
+                Box::new(|| std::fs::write(&excludes, "*.tmp\n*.rs\n").unwrap()),
+                Ok(notify::Event::new(notify::EventKind::Any).add_path(excludes.clone())),
+            ),
+            (
+                "a must-rescan",
+                Box::new(|| {}),
+                Ok(notify::Event::new(notify::EventKind::Any)
+                    .add_path(r.clone())
+                    .set_flag(notify::event::Flag::Rescan)),
+            ),
+            (
+                "a path-less event",
+                Box::new(|| {}),
+                Ok(notify::Event::new(notify::EventKind::Any)),
+            ),
+        ];
+        for (what, change, reported) in walked {
+            change();
+            handle(reported);
+            assert!(rx.try_recv().is_ok(), "{what} woke the loop");
+            let (walks, sig) = refresh(&r, &status).await;
+            assert_eq!(walks, 1, "{what}");
+            assert_eq!(
+                sig.dirty,
+                crate::git_io::working_tree_dirty_at(&r).unwrap(),
+                "{what}: the status shown is the tree's"
+            );
+        }
+
+        let unwalked: Vec<Change> = vec![
+            (
+                "an ignored build output",
+                Box::new(|| write("target/debug/out.o", "junk")),
+                event(&r, &["target/debug/out.o"]),
+            ),
+            (
+                "ignored runtime state under .clank",
+                Box::new(|| write(".clank/agents/codex/feedback/abc.md", "CONTINUE\n")),
+                event(&r, &[".clank/agents/codex/feedback/abc.md"]),
+            ),
+            (
+                "the object store",
+                Box::new(|| {}),
+                event(&r, &[".git/objects/ab/cdef", ".git/index.lock"]),
+            ),
+        ];
+        for (what, change, reported) in unwalked {
+            change();
+            handle(reported);
+            assert!(rx.try_recv().is_err(), "{what} woke the loop");
+            assert_eq!(refresh(&r, &status).await.0, 0, "{what}");
+        }
+        // A monitor's wake and an install's reach the loop by other
+        // senders and never touch the cache: the refresh they cause
+        // walks nothing.
+        assert_eq!(refresh(&r, &status).await.0, 0, "a monitor or install wake");
+    }
+
+    /// A process the panel shows as alive wakes it when it exits, which
+    /// no file write would; one found already gone wakes it once.
+    #[test]
+    fn an_exit_of_a_shown_process_wakes_the_panel() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let token = crate::proc_identity::token_for(pid).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut exits = ProcessExits::new(move || {
+            let _ = tx.send(());
+        });
+        exits.track_these(vec![(pid, token.clone())]);
+        exits.track_these(vec![(pid, token.clone())]);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "alive"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "its exit");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "once");
+
+        let (tx, rx) = mpsc::channel();
+        let mut later = ProcessExits::new(move || {
+            let _ = tx.send(());
+        });
+        later.track_these(vec![(pid, token.clone())]);
+        later.track_these(vec![(pid, token)]);
+        assert!(rx.try_recv().is_ok(), "already gone");
+        assert!(rx.try_recv().is_err(), "and said once");
+    }
+
+    /// The status walk reads the index and HEAD, and on Linux each open
+    /// is a notification: a read must neither wake the loop nor make the
+    /// cache stale, or every walk would schedule the next.
+    #[tokio::test]
+    async fn reading_what_the_status_reads_is_not_a_change() {
+        use crate::fs_notice::tests::opened;
+        let dir = tempfile::tempdir().unwrap();
+        let r = dunce::canonicalize(dir.path()).unwrap();
+        classified_repo(&r);
+        let status = GitStatus::default();
+        let (tx, rx) = mpsc::channel();
+        let mut handle = git_wake_handler(
+            tx,
+            WakeFilter::new(&r).unwrap(),
+            status.clone(),
+            Default::default(),
+        );
+        assert_eq!(refresh(&r, &status).await.0, 1);
+        for read in [
+            ".git/HEAD",
+            ".git/index",
+            "src/lib.rs",
+            ".clank/plans/foo.md",
+        ] {
+            handle(opened(&r.join(read)));
+        }
+        assert!(rx.try_recv().is_err(), "a read woke the loop");
+        assert_eq!(refresh(&r, &status).await.0, 0, "and made the cache stale");
+    }
+
+    /// A process watch whose kernel wait fails wakes the panel and says
+    /// why, so the loop ends rather than show exited processes as alive.
+    #[test]
+    fn a_failed_process_watch_is_the_panels_fault() {
+        let (tx, rx) = mpsc::channel();
+        let exits = ProcessExits::new(move || {
+            let _ = tx.send(());
+        });
+        assert_eq!(exits.fault(), None);
+        exits.watch.as_ref().unwrap().fail_for_test();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert!(exits.fault().is_some_and(|why| why.contains("failed")));
+    }
+
+    /// A watcher that fails ends the loop rather than leaving it on a
+    /// status nothing will correct: the fault is kept for the loop to
+    /// read, and the loop is woken to read it.
+    #[test]
+    fn a_failing_watcher_is_a_fault_the_loop_is_woken_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dunce::canonicalize(dir.path()).unwrap();
+        classified_repo(&r);
+        let fault = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (tx, rx) = mpsc::channel();
+        let mut handle = git_wake_handler(
+            tx,
+            WakeFilter::new(&r).unwrap(),
+            GitStatus::default(),
+            fault.clone(),
+        );
+        handle(Err(notify::Error::generic("the stream died")));
+        assert!(rx.try_recv().is_ok());
+        let said = fault.lock().unwrap().clone().expect("a fault");
+        assert!(said.contains("the stream died"), "{said}");
+    }
+
+    /// The files elsewhere, watched as `watch_git` watches them, with
+    /// each change counted.
+    fn elsewhere_of(repo: &Path) -> (Elsewhere, Known, mpsc::Receiver<()>) {
+        let (tx, rx) = mpsc::channel();
+        let known = Known::default();
+        let repo = repo.to_path_buf();
+        let watch = Elsewhere::start(
+            move || crate::git_io::status_inputs_elsewhere(&repo).map_err(|e| e.to_string()),
+            known.clone(),
+            move || {
+                let _ = tx.send(());
+            },
+            |why| panic!("{why}"),
+        )
+        .unwrap();
+        (watch, known, rx)
+    }
+
+    fn heard(rx: &mpsc::Receiver<()>) -> bool {
+        rx.recv_timeout(Duration::from_secs(5)).is_ok()
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    /// [`elsewhere_of`] with the set read by `read`, and every change
+    /// logged in `log` beside whatever `read` logs.
+    fn elsewhere_reading(
+        read: impl Fn() -> Result<Vec<PathBuf>, String> + Send + 'static,
+        log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> (Elsewhere, Known, mpsc::Receiver<()>) {
+        let (tx, rx) = mpsc::channel();
+        let known = Known::default();
+        let watch = Elsewhere::start(
+            read,
+            known.clone(),
+            move || {
+                log.lock().unwrap().push("changed");
+                let _ = tx.send(());
+            },
+            |why| panic!("{why}"),
+        )
+        .unwrap();
+        (watch, known, rx)
+    }
+
+    /// The set changes between the first read and its registration: the
+    /// file the config names by the time the watch is in place is the
+    /// one followed, and a later write to it is heard.
+    #[test]
+    fn a_dependency_selected_while_the_watch_is_set_up_is_followed() {
+        let repo = fixture_repo();
+        let ext = tempfile::tempdir().unwrap();
+        let dir = dunce::canonicalize(ext.path()).unwrap();
+        let (a, b) = (dir.join("a.ignore"), dir.join("b.ignore"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        git(
+            repo.path(),
+            &["config", "core.excludesFile", a.to_str().unwrap()],
+        );
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let (path, b_name) = (repo.path().to_path_buf(), b.clone());
+        let (_watch, _known, rx) = elsewhere_reading(
+            move || {
+                let set = crate::git_io::status_inputs_elsewhere(&path).map_err(|e| e.to_string());
+                if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    git(
+                        &path,
+                        &["config", "core.excludesFile", b_name.to_str().unwrap()],
+                    );
+                }
+                set
+            },
+            Default::default(),
+        );
+        settle(&rx);
+        append(&b, "*.log\n");
+        assert!(heard(&rx), "the file selected in the setup gap");
+    }
+
+    /// A file newly selected and written while the watch is still taking
+    /// it up: the change is said only after the watch covers it, so an
+    /// owner that reads on that word sees the write.
+    #[test]
+    fn a_write_during_reconfiguration_is_said_after_it() {
+        let repo = fixture_repo();
+        let ext = tempfile::tempdir().unwrap();
+        let b = dunce::canonicalize(ext.path()).unwrap().join("b.ignore");
+        std::fs::write(&b, "").unwrap();
+        let log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> = Default::default();
+        let (path, b_read, read_log) = (repo.path().to_path_buf(), b.clone(), log.clone());
+        let (_watch, _known, rx) = elsewhere_reading(
+            move || {
+                let set =
+                    crate::git_io::status_inputs_elsewhere(&path).map_err(|e| e.to_string())?;
+                if set.contains(&b_read) && !read_log.lock().unwrap().contains(&"written") {
+                    append(&b_read, "*.tmp\n");
+                    read_log.lock().unwrap().push("written");
+                }
+                Ok(set)
+            },
+            log.clone(),
+        );
+        settle(&rx);
+        log.lock().unwrap().clear();
+        git(
+            repo.path(),
+            &["config", "core.excludesFile", b.to_str().unwrap()],
+        );
+        assert!(heard(&rx));
+        settle(&rx);
+        let log = log.lock().unwrap().clone();
+        let written = log.iter().position(|e| *e == "written").expect("written");
+        assert!(
+            log[written..].contains(&"changed"),
+            "the change was said before the write it covers: {log:?}"
+        );
+    }
+
+    /// An included config that holds nothing yet is still one Git
+    /// consults: its first write is heard, and an unrelated entry beside
+    /// it is not.
+    #[test]
+    fn the_first_write_to_an_empty_included_config_is_heard() {
+        let repo = fixture_repo();
+        let ext = tempfile::tempdir().unwrap();
+        let empty = dunce::canonicalize(ext.path())
+            .unwrap()
+            .join("initially-empty.gitconfig");
+        std::fs::write(&empty, "").unwrap();
+        git(
+            repo.path(),
+            &["config", "include.path", empty.to_str().unwrap()],
+        );
+        let (_watch, known, rx) = elsewhere_of(repo.path());
+        assert!(known.lock().contains(&empty), "{:?}", known.lock());
+        settle(&rx);
+        std::fs::write(ext.path().join("unrelated"), "x").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(700)).is_err(),
+            "an unrelated entry"
+        );
+        append(&empty, "[core]\n\tautocrlf = false\n");
+        assert!(heard(&rx), "its first write");
+    }
+
+    /// An included config that does not exist yet, named relative to the
+    /// file that includes it: its creation is heard.
+    #[test]
+    fn creating_a_missing_included_config_is_heard() {
+        let repo = fixture_repo();
+        let ext = tempfile::tempdir().unwrap();
+        let dir = dunce::canonicalize(ext.path()).unwrap();
+        let outer = dir.join("outer.gitconfig");
+        std::fs::write(&outer, "[include]\n\tpath = later.gitconfig\n").unwrap();
+        git(
+            repo.path(),
+            &["config", "include.path", outer.to_str().unwrap()],
+        );
+        let later = dir.join("later.gitconfig");
+        let (_watch, known, rx) = elsewhere_of(repo.path());
+        assert!(known.lock().contains(&later), "{:?}", known.lock());
+        settle(&rx);
+        std::fs::write(dir.join("unrelated"), "x").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(700)).is_err(),
+            "an unrelated entry"
+        );
+        std::fs::write(&later, "[core]\n").unwrap();
+        assert!(heard(&rx), "its creation");
+    }
+
+    /// Git's section and key names are case-insensitive: a mixed-case
+    /// include, and a mixed-case conditional one, are followed to an
+    /// empty file and a missing one, each heard when written.
+    #[test]
+    fn mixed_case_includes_are_followed() {
+        let repo = fixture_repo();
+        let ext = tempfile::tempdir().unwrap();
+        let dir = dunce::canonicalize(ext.path()).unwrap();
+        let (empty, missing) = (dir.join("empty.gitconfig"), dir.join("missing.gitconfig"));
+        std::fs::write(&empty, "").unwrap();
+        append(
+            &repo.path().join(".git/config"),
+            &format!(
+                "[InClUdE]\n\tPaTh = {}\n[INCLUDEIF \"gitdir:/nowhere/\"]\n\tPATH = {}\n",
+                empty.display(),
+                missing.display()
+            ),
+        );
+        let (_watch, known, rx) = elsewhere_of(repo.path());
+        for file in [&empty, &missing] {
+            assert!(
+                known.lock().contains(file),
+                "{file:?} in {:?}",
+                known.lock()
+            );
+        }
+        settle(&rx);
+        append(&empty, "[core]\n");
+        assert!(heard(&rx), "the empty one written");
+        settle(&rx);
+        std::fs::write(&missing, "[core]\n").unwrap();
+        assert!(heard(&rx), "the missing one made");
+    }
+
+    /// A config reached through a link: retargeting the link is heard,
+    /// and so are writes to the new target and its replacement, with
+    /// no restart.
+    #[test]
+    fn a_linked_config_is_followed_across_a_retarget() {
+        let repo = fixture_repo();
+        let ext = tempfile::tempdir().unwrap();
+        let dir = dunce::canonicalize(ext.path()).unwrap();
+        let (a, b, link) = (
+            dir.join("a.gitconfig"),
+            dir.join("b.gitconfig"),
+            dir.join("link"),
+        );
+        std::fs::write(&a, "[core]\n").unwrap();
+        std::fs::write(&b, "[core]\n").unwrap();
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        git(
+            repo.path(),
+            &["config", "include.path", link.to_str().unwrap()],
+        );
+        let (_watch, known, rx) = elsewhere_of(repo.path());
+        assert!(known.lock().contains(&link), "{:?}", known.lock());
+        settle(&rx);
+
+        let fresh = dir.join("link.new");
+        std::os::unix::fs::symlink(&b, &fresh).unwrap();
+        std::fs::rename(&fresh, &link).unwrap();
+        assert!(heard(&rx), "the retarget");
+        settle(&rx);
+        append(&b, "\tautocrlf = false\n");
+        assert!(heard(&rx), "a write to the new target");
+        settle(&rx);
+        let replacement = dir.join("b.new");
+        std::fs::write(&replacement, "[core]\n\tbare = false\n").unwrap();
+        std::fs::rename(&replacement, &b).unwrap();
+        assert!(heard(&rx), "the new target replaced");
+    }
+
+    /// A config file elsewhere edited in place, as an editor that writes
+    /// through the file does, is heard; an unrelated entry beside it is
+    /// not, and neither is reading it.
+    #[test]
+    fn an_external_config_edited_in_place_is_heard() {
+        let repo = fixture_repo();
+        let ext = tempfile::tempdir().unwrap();
+        let extra = dunce::canonicalize(ext.path())
+            .unwrap()
+            .join("extra.gitconfig");
+        std::fs::write(&extra, "[core]\n").unwrap();
+        git(
+            repo.path(),
+            &["config", "include.path", extra.to_str().unwrap()],
+        );
+        let (_watch, known, rx) = elsewhere_of(repo.path());
+        assert!(known.lock().contains(&extra), "{:?}", known.lock());
+        settle(&rx);
+
+        std::fs::write(ext.path().join("unrelated"), "x").unwrap();
+        let _ = std::fs::read(&extra).unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(700)).is_err(),
+            "an unrelated entry, or a read"
+        );
+        append(&extra, "\tautocrlf = false\n");
+        assert!(heard(&rx), "the in-place edit");
+    }
+
+    /// `core.excludesFile` changed to a file elsewhere that does not exist
+    /// yet: the change of config is heard, the new file is followed from
+    /// then on, its creation and an in-place edit are heard, and nothing
+    /// is restarted.
+    #[test]
+    fn a_newly_selected_external_excludes_file_is_followed() {
+        let repo = fixture_repo();
+        let ext = tempfile::tempdir().unwrap();
+        let ignore = dunce::canonicalize(ext.path()).unwrap().join("git/ignore");
+        let (_watch, known, rx) = elsewhere_of(repo.path());
+        settle(&rx);
+
+        git(
+            repo.path(),
+            &["config", "core.excludesFile", ignore.to_str().unwrap()],
+        );
+        assert!(heard(&rx), "the config naming it");
+        let by = std::time::Instant::now() + Duration::from_secs(5);
+        while !known.lock().contains(&ignore) {
+            assert!(
+                std::time::Instant::now() < by,
+                "never followed: {:?}",
+                known.lock()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        settle(&rx);
+        // Its directory appearing is a look, since it may already hold
+        // the file; an unrelated entry in it is not.
+        std::fs::create_dir_all(ignore.parent().unwrap()).unwrap();
+        settle(&rx);
+        std::fs::write(ext.path().join("git/unrelated"), "x").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(700)).is_err(),
+            "an unrelated entry"
+        );
+        std::fs::write(&ignore, "*.log\n").unwrap();
+        assert!(heard(&rx), "its creation");
+        settle(&rx);
+        append(&ignore, "*.tmp\n");
+        assert!(heard(&rx), "its in-place edit");
     }
 
     fn git(repo: &Path, args: &[&str]) {
@@ -2746,7 +3928,7 @@ mod dirty_and_wake_tests {
         git(r, &["commit", "--quiet", "-m", "[foo] intro"]);
 
         crate::git_io::OPEN_COUNT.with(|c| c.set(0));
-        let _ = input_signature(r).unwrap();
+        let _ = input_signature(r, &GitStatus::default()).unwrap();
         assert_eq!(
             crate::git_io::OPEN_COUNT.with(|c| c.get()),
             1,
@@ -2764,7 +3946,7 @@ mod dirty_and_wake_tests {
         let socket = Path::new("/tmp/x.sock");
         let me = std::process::id() as i32;
         publish(r, &describe(r, me, socket)).unwrap();
-        let running = input_signature(r).unwrap();
+        let running = input_signature(r, &GitStatus::default()).unwrap();
         assert_eq!(process_health(r).monitor, liveness(r));
         assert!(matches!(
             process_health(r).monitor,
@@ -2772,11 +3954,15 @@ mod dirty_and_wake_tests {
         ));
 
         publish(r, &describe(r, i32::MAX, socket)).unwrap();
-        let gone = input_signature(r).unwrap();
+        let gone = input_signature(r, &GitStatus::default()).unwrap();
         assert_eq!(process_health(r).monitor, Liveness::Gone { pid: i32::MAX });
         assert_ne!(running, gone);
         let _ = std::fs::remove_file(runtime_path(r, "json"));
-        assert_ne!(gone, input_signature(r).unwrap(), "and so does its absence");
+        assert_ne!(
+            gone,
+            input_signature(r, &GitStatus::default()).unwrap(),
+            "and so does its absence"
+        );
     }
 
     /// Plain `status --watch` subscribes read-only and never reaches a
@@ -2793,7 +3979,7 @@ mod dirty_and_wake_tests {
         };
         let run_watch = span("async fn run_watch(", "let mut last_emitted");
         assert!(
-            run_watch.contains("watch_status_paths(tx, &repo)?"),
+            run_watch.contains("watch_status_paths(tx.clone(), &repo, &git_status)?"),
             "{run_watch}"
         );
         assert!(!run_watch.contains("watch_tui_paths"), "{run_watch}");
@@ -2816,28 +4002,82 @@ mod dirty_and_wake_tests {
     }
 
     /// The watch loop is not run here, so its order is read: it looks for
-    /// an install on every turn, ahead of the gate an install never moves,
-    /// and sleeps no longer than until the next look.
+    /// an install on every turn, ahead of the gate an install never moves;
+    /// it is woken by an install; a failed watcher ends it; and it sleeps
+    /// for nothing but [`watch_wait`]'s own timers.
     #[test]
     fn status_watch_looks_for_an_install_ahead_of_its_gate() {
         let src = include_str!("status.rs");
         let from = src.find("async fn run_watch(").expect("run_watch");
         let body = &src[from..from + src[from..].find("\n}\n").expect("its end")];
         let turn = body.find("    loop {").expect("the loop");
+        let fault = body
+            .find("if let Some(why) = watchers")
+            .expect("the fault check");
+        let flat: String = body[fault..].split_whitespace().collect();
+        assert!(
+            flat.starts_with(
+                "ifletSome(why)=watchers.git.fault().or_else(||watchers.core.fault()).or_else(||exits.fault()){anyhow::bail!"
+            ),
+            "every watch's failure ends the loop: {flat}"
+        );
         let pass = body
             .find("replacing.pass(crate::upgrade::Hosting::Nothing)")
             .expect("the pass");
-        let gate = body.find("match input_signature(&repo)").expect("the gate");
-        assert!(turn < pass && pass < gate, "{body}");
+        let gate = body
+            .find("match input_signature(&repo, &git_status)")
+            .expect("the gate");
+        assert!(turn < fault && fault < pass && pass < gate, "{body}");
         assert!(
             body.contains("crate::upgrade::process().clone()")
                 && body.contains("crate::upgrade::exec_installed_as_started()"),
             "this process's own authority, restarted as it was started"
         );
+        let subscribed = body
+            .find("replacing.authority().subscribe(")
+            .expect("woken by an install");
+        assert!(subscribed < turn, "subscribed before the first look");
         assert!(
-            body.contains("rx.recv_timeout(Duration::from_secs(60).min(replacing.due_in()))"),
+            body.contains("next_wake(&rx, watch_wait(failures, replacing.retry_in()))"),
             "{body}"
         );
+        for poll in ["recv_timeout(Duration::from_secs", "sleep("] {
+            assert!(!body.contains(poll), "{poll} in {body}");
+        }
+    }
+
+    /// An idle watch sleeps until an event: no timer of its own is due
+    /// unless a refresh or a replacement failed.
+    #[test]
+    fn an_idle_watch_has_no_timer() {
+        assert_eq!(watch_wait(0, None), None);
+        assert_eq!(watch_wait(1, None), Some(Duration::from_secs(1)));
+        assert_eq!(watch_wait(9, None), Some(Duration::from_secs(30)));
+        assert_eq!(
+            watch_wait(0, Some(Duration::from_millis(500))),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    /// With no timer the wait has no timeout: it returns for an event
+    /// however late, and says so when every sender is gone.
+    #[test]
+    fn next_wake_without_a_timer_waits_for_the_event() {
+        let (tx, rx) = mpsc::channel();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            tx.send(()).unwrap();
+        });
+        let began = std::time::Instant::now();
+        assert_eq!(next_wake(&rx, None), Ok(true));
+        assert!(began.elapsed() >= Duration::from_millis(300));
+        late.join().unwrap();
+        assert_eq!(
+            next_wake(&rx, None),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        let (_tx, rx) = mpsc::channel::<()>();
+        assert_eq!(next_wake(&rx, Some(Duration::from_millis(10))), Ok(false));
     }
 
     #[test]
@@ -2849,8 +4089,8 @@ mod dirty_and_wake_tests {
         git(r, &["add", "-A"]);
         git(r, &["commit", "--quiet", "-m", "[foo] intro"]);
         assert_eq!(
-            input_signature(r).unwrap(),
-            input_signature(r).unwrap(),
+            input_signature(r, &GitStatus::default()).unwrap(),
+            input_signature(r, &GitStatus::default()).unwrap(),
             "stable across calls when nothing changed — the gate reuses"
         );
     }
@@ -2891,9 +4131,12 @@ mod dirty_and_wake_tests {
         let before = snapshot(r, None).await.unwrap();
         assert_eq!(before.queue.len(), 1);
         assert!(before.drafts.is_empty());
-        let signature = input_signature(r).unwrap();
+        let signature = input_signature(r, &GitStatus::default()).unwrap();
         crate::cli::queue::unqueue(r, "idea").unwrap();
-        assert_ne!(signature, input_signature(r).unwrap());
+        assert_ne!(
+            signature,
+            input_signature(r, &GitStatus::default()).unwrap()
+        );
         let after = snapshot(r, None).await.unwrap();
         assert!(after.queue.is_empty());
         assert_eq!(
@@ -3012,9 +4255,12 @@ mod dirty_and_wake_tests {
     /// every `POLL_INTERVAL`, so a change can always be reported
     /// later; observing silence for longer than a cycle is the most a
     /// test can establish.
+    /// The polling backend's cadence, in the one test that drives the Git
+    /// watcher's callback through it.
+    const POLL: Duration = Duration::from_millis(500);
+
     fn settle(rx: &mpsc::Receiver<()>) {
-        const QUIET: Duration =
-            crate::repo_watch::POLL_INTERVAL.saturating_add(Duration::from_millis(200));
+        const QUIET: Duration = POLL.saturating_add(Duration::from_millis(200));
         // A channel that never goes quiet must FAIL, not hang: a
         // watcher waking forever is the bug this test would be there
         // to catch.
@@ -3061,8 +4307,13 @@ mod dirty_and_wake_tests {
         // the production callback with notify's polling backend so
         // this test measures our filter and wake behavior.
         let mut poll_watcher = notify::PollWatcher::new(
-            diff_wake_handler(tx, r).unwrap(),
-            notify::Config::default().with_poll_interval(crate::repo_watch::POLL_INTERVAL),
+            git_wake_handler(
+                tx,
+                WakeFilter::new(r).unwrap(),
+                GitStatus::default(),
+                Default::default(),
+            ),
+            notify::Config::default().with_poll_interval(POLL),
         )
         .unwrap();
         poll_watcher.watch(r, RecursiveMode::Recursive).unwrap();
@@ -3070,8 +4321,7 @@ mod dirty_and_wake_tests {
         // Root-ignored path: no wake. Give the poller a full cycle
         // plus slack after each write, so a broken filter cannot pass
         // merely because its event arrived after the assertion.
-        const NO_WAKE: Duration =
-            crate::repo_watch::POLL_INTERVAL.saturating_add(Duration::from_millis(200));
+        const NO_WAKE: Duration = POLL.saturating_add(Duration::from_millis(200));
         settle(&rx);
         std::fs::write(r.join("target/debug/out.o"), "junk").unwrap();
         assert!(

@@ -175,6 +175,27 @@ impl Freshness {
         Some(Start { panes })
     }
 
+    /// When [`Self::tick`] or [`Self::timed_out`] next has something to
+    /// do, if nothing else happens first: a running sample's timeout, a
+    /// mismatch's confirmation, or the spacing after which a waiting
+    /// request for a live pane may be sampled. `None` when only a new
+    /// request or a change of panes could give it work.
+    pub(crate) fn next_due(&self, retained: &Retained) -> Option<Instant> {
+        if let Some(sample) = &self.in_flight {
+            return Some(sample.started + SAMPLE_TIMEOUT);
+        }
+        if let Some((at, _, _)) = &self.confirm {
+            return Some(*at);
+        }
+        if self.waiting.is_empty() || !self.demanded().iter().any(|p| retained.live.contains(p)) {
+            return None;
+        }
+        match self.last_regular {
+            Some(last) => Some(last + SPACING),
+            None => self.waiting.iter().map(|w| w.arrived).min(),
+        }
+    }
+
     /// The running sample could not be taken. Its waiters wait on, for
     /// the next regular sample; a failed confirmation is not retried.
     pub(crate) fn abandon(&mut self) {

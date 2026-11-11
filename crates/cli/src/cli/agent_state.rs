@@ -491,6 +491,19 @@ impl Attended {
         })
     }
 
+    /// The unix second [`Self::age`] counts from.
+    pub(crate) fn age_from(&self) -> Option<i64> {
+        let from = match &self.expect {
+            Some(expect) => expect.since()?,
+            None => time::OffsetDateTime::parse(
+                &self.at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()?,
+        };
+        Some(from.unix_timestamp())
+    }
+
     /// The work's age against its bound — `3m/5m`, and `12m/5m` once
     /// overdue. Without an expectation it ages from `at`.
     pub(crate) fn age(&self, now: time::OffsetDateTime) -> Option<String> {
@@ -658,6 +671,56 @@ impl View {
                 delivery: owing.oldest.delivery,
             });
         View { state, stale, owed }
+    }
+
+    /// The unix second at which what this state says next changes with
+    /// no new record: an age it shows rolls over, or a threshold it is
+    /// judged by passes. `None` when nothing it says moves with the clock.
+    pub(crate) fn changes_at(&self, now: u64) -> Option<u64> {
+        use crate::cli::ledger::{Delivery, Since};
+        if self.stale.is_some() {
+            return None;
+        }
+        let state = &self.state;
+        let age =
+            |from: u64| now + crate::age::short_changes_in(now.saturating_sub(from) as i64) as u64;
+        let passes = |at: u64| (at > now).then_some(at);
+        let countdown = |at: u64| {
+            (at > now).then(|| now + crate::age::countdown_changes_in((at - now) as i64) as u64)
+        };
+        let mut due = vec![Some(age(state.since))];
+        if let Activity::Working(m) = &state.activity {
+            due.push(passes(m.until));
+        }
+        if let (Activity::Idle, Reachability::NoWaiter { since: Some(went) }) =
+            (&state.activity, &state.reachability)
+        {
+            let from = (*went).max(state.since);
+            due.push(passes(from.saturating_add(UNREACHABLE_AFTER)));
+            due.push(Some(age(from)));
+        }
+        if let Some(owing) = &state.owed
+            && let Some(item) = &owing.undelivered
+        {
+            if let Delivery::InFlight(until) = item.delivery {
+                due.push(passes(until));
+            }
+            due.push(passes(
+                item.since.no_later_than().saturating_add(owing.warn),
+            ));
+            if let Since::At(at) = item.since {
+                due.push(Some(age(at)));
+            }
+        }
+        match &state.nudge {
+            Nudge::At(at) => due.push(countdown(*at)),
+            Nudge::Silent { since, at } => {
+                due.push(Some(age(*since)));
+                due.push(at.and_then(countdown));
+            }
+            Nudge::Nothing | Nudge::InFlight | Nudge::WaitingForYou(_) => {}
+        }
+        due.into_iter().flatten().min()
     }
 
     /// The whole state in one line, with every reason it gives.

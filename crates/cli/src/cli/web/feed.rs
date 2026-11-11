@@ -277,6 +277,9 @@ pub(crate) struct Feed {
     state: Arc<Mutex<Retained>>,
     bridge_tx: broadcast::Sender<clank_web::bridge::Update>,
     bridge_sequence: Arc<AtomicU64>,
+    /// Asks the pane supervisor to list the panes again: zellij has no
+    /// layout event, so each thing that can change the set says so here.
+    relist: Arc<tokio::sync::Notify>,
 }
 
 impl Feed {
@@ -364,7 +367,18 @@ impl Feed {
             state: Arc::new(Mutex::new(Retained::default())),
             bridge_tx,
             bridge_sequence: Arc::new(AtomicU64::new(0)),
+            relist: Default::default(),
         }
+    }
+
+    /// The panes may have changed: the supervisor lists them again.
+    pub(crate) fn relist(&self) {
+        self.relist.notify_one();
+    }
+
+    /// Until something asks for a listing.
+    pub(crate) async fn relist_asked(&self) {
+        self.relist.notified().await;
     }
 
     /// Change the state and broadcast what changed, under one lock.
@@ -541,6 +555,7 @@ impl Feed {
                     s.closed.insert(id);
                     vec![browser_frame("panes", &panes_data(&s.panes, &s.closed))]
                 });
+                self.relist();
             }
             _ => {}
         }

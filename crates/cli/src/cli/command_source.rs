@@ -167,14 +167,6 @@ pub(crate) const FAILURES_BEFORE_SURFACING: u32 = 3;
 /// come back.
 pub(crate) const HEALTHY_RUN: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How often a non-holder re-reads the holder's log and re-tries the
-/// lease.
-///
-/// It bounds two things at once: how stale a follower's view of the
-/// inbox gets, and how long a takeover waits after the holder
-/// leaves. Cheap — a file read and a `flock` attempt, no process.
-pub(crate) const TAIL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// The kind clank gives its OWN failure reports. A producer cannot
 /// forge one: its lines are refused if they claim this kind, so
 /// "the source is broken" can never be something the source said.
@@ -1726,6 +1718,18 @@ pub(crate) trait Os {
     /// group: `None` when that cannot be told.
     fn working(&self, anchor: crate::signal::Pgid) -> Option<bool>;
     fn pause(&self, d: std::time::Duration);
+    /// Block until a member of `anchor`'s group other than the anchor
+    /// exits, or until `deadline`, read after the wait can be told it
+    /// moved.
+    fn until_a_member_exits(
+        &self,
+        _anchor: crate::signal::Pgid,
+        deadline: &dyn Fn() -> Option<std::time::Instant>,
+    ) {
+        if let Some(by) = deadline() {
+            self.pause(by.saturating_duration_since(self.now()))
+        }
+    }
     fn now(&self) -> std::time::Instant;
 }
 
@@ -1750,14 +1754,124 @@ impl Os for Native<'_> {
         }
     }
     fn working(&self, anchor: crate::signal::Pgid) -> Option<bool> {
-        crate::signal::group_members(anchor)
-            .map(|members| members.iter().any(|pid| *pid != anchor.get()))
+        at_work(anchor).map(|members| !members.is_empty())
     }
     fn pause(&self, d: std::time::Duration) {
         std::thread::sleep(d)
     }
+    fn until_a_member_exits(
+        &self,
+        anchor: crate::signal::Pgid,
+        deadline: &dyn Fn() -> Option<std::time::Instant>,
+    ) {
+        let (exited, exit) = std::sync::mpsc::channel();
+        DEADLINE_WAITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(exited.clone());
+        let Some(at_most) = deadline().map(|by| by.saturating_duration_since(self.now())) else {
+            return;
+        };
+        let Ok(watch) = crate::proc_identity::exit_watch::ExitWatch::<i32>::new(None, move |_| {
+            let _ = exited.send(());
+        }) else {
+            // Nothing can report an exit, so the grace is waited out.
+            return std::thread::sleep(at_most);
+        };
+        let watched = watch_members(anchor.get(), &mut || at_work(anchor), &mut |pid| {
+            use crate::proc_identity::{exit_watch::Armed, inspect::Life};
+            // Its exit was already reported, before this watch existed,
+            // and is not reported again when it is collected.
+            if crate::proc_identity::inspect::life_of(pid) == Life::Gone {
+                return Armed::Ended;
+            }
+            match crate::proc_identity::token_for(pid) {
+                Some(token) => watch.arm(pid, pid, &token),
+                None => Armed::Unknown,
+            }
+        });
+        if watched == Watched::Wait {
+            let _ = exit.recv_timeout(at_most);
+        }
+    }
     fn now(&self) -> std::time::Instant {
         std::time::Instant::now()
+    }
+}
+
+/// The members of `anchor`'s group, the anchor aside, that may still be
+/// at work: `None` when the group cannot be listed. One that has exited
+/// but is not yet collected still occupies the group and does nothing,
+/// and its exit was reported when it happened; one whose state cannot be
+/// read is counted.
+fn at_work(anchor: crate::signal::Pgid) -> Option<Vec<i32>> {
+    let members = crate::signal::group_members(anchor)?;
+    Some(
+        members
+            .into_iter()
+            .filter(|pid| *pid != anchor.get())
+            .filter(|pid| {
+                crate::proc_identity::inspect::life_of(*pid)
+                    != crate::proc_identity::inspect::Life::Gone
+            })
+            .collect(),
+    )
+}
+
+/// Whether a wait for a group's members has anything left to wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Watched {
+    /// No work is left, or some ended before it could be watched: the
+    /// caller looks again at once.
+    Settled,
+    /// Work is left and every member that can be is watched.
+    Wait,
+}
+
+/// Arm a watch on each member of `anchor`'s group but the anchor, then
+/// look at the group again. A member that ended between the caller's
+/// look and its arming leaves no exit to hear, so the second look is
+/// what stops a wait on work that is already over. A group or a member
+/// whose identity cannot be read is not taken as ended: the wait is then
+/// bounded by its deadline.
+pub(crate) fn watch_members(
+    anchor: i32,
+    members: &mut dyn FnMut() -> Option<Vec<i32>>,
+    arm: &mut dyn FnMut(i32) -> crate::proc_identity::exit_watch::Armed,
+) -> Watched {
+    use crate::proc_identity::exit_watch::Armed;
+    let Some(first) = members() else {
+        return Watched::Wait;
+    };
+    let others: Vec<i32> = first.into_iter().filter(|pid| *pid != anchor).collect();
+    if others.is_empty() {
+        return Watched::Settled;
+    }
+    for pid in others {
+        if arm(pid) == Armed::Ended {
+            return Watched::Settled;
+        }
+    }
+    match members() {
+        Some(now) if now.iter().all(|pid| *pid == anchor) => Watched::Settled,
+        _ => Watched::Wait,
+    }
+}
+
+/// Groups' waits for their members, to be woken when the deadline they
+/// wait towards may have moved.
+static DEADLINE_WAITERS: std::sync::Mutex<Vec<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A drain began or was cut short: every wait for a group's members
+/// reads its deadline again.
+pub(crate) fn deadlines_moved() {
+    for waiter in DEADLINE_WAITERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain(..)
+    {
+        let _ = waiter.send(());
     }
 }
 
@@ -1798,10 +1912,6 @@ pub(crate) fn stop_grace(
     Ok(grace)
 }
 
-/// How often a group asked to end is looked at again while its work
-/// may still be finishing.
-const WORK_LOOK: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// Wait for every member of `record`'s group but its anchor to end, or
 /// for `deadline`, which is read again on every look because a drain
 /// can bring it forward. `None` is a deadline already passed.
@@ -1819,7 +1929,10 @@ pub(crate) fn await_work(
         }
         let now = os.now();
         match deadline() {
-            Some(by) if now < by => os.pause(WORK_LOOK.min(by - now)),
+            Some(by) if now < by => match anchor {
+                Some(anchor) => os.until_a_member_exits(anchor, &deadline),
+                None => os.pause(by - now),
+            },
             _ => return Drained::KilledAtGrace,
         }
     }
@@ -2044,6 +2157,22 @@ pub(crate) fn reap_previous_producer(store_dir: &std::path::Path, key: &str) -> 
     reap_previous_producer_with(store_dir, key, &Native { children: &[] })
 }
 
+/// The group the producer recorded for `key` leads, if a usable record
+/// names one.
+pub(crate) fn recorded_group(
+    store_dir: &std::path::Path,
+    key: &str,
+) -> Option<crate::signal::Pgid> {
+    let body = std::fs::read(producer_path(store_dir, key)).ok()?;
+    let record = serde_json::from_slice::<Producer>(&body).ok()?;
+    crate::signal::Pgid::new(record.pgid())
+}
+
+/// The first pause before a deferred retirement is tried again with no
+/// exit to prompt it, and its cap.
+pub(crate) const DEFERRAL_FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const DEFERRAL_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// [`reap_previous_producer`] with the system calls supplied.
 pub(crate) fn reap_previous_producer_with(
     store_dir: &std::path::Path,
@@ -2081,6 +2210,196 @@ mod producer_tests {
     use std::time::Duration;
 
     const WHEN: &str = "Thu 1 Oct 16:58:08 2026";
+
+    /// The last worker ending between the caller's look and the watch's
+    /// arming leaves no exit to hear: the look taken after arming ends
+    /// the wait at once rather than at the grace. A group with no work
+    /// left is not waited on, and one that cannot be read is.
+    #[test]
+    fn work_that_ended_while_its_watch_was_armed_is_not_waited_on() {
+        use crate::proc_identity::exit_watch::Armed;
+        let anchor = 100;
+        let mut looks = vec![Some(vec![anchor]), Some(vec![anchor, 7])];
+        let mut armed = Vec::new();
+        assert_eq!(
+            watch_members(anchor, &mut || looks.pop().unwrap(), &mut |pid| {
+                armed.push(pid);
+                Armed::Watching
+            }),
+            Watched::Settled,
+            "the member armed had already gone"
+        );
+        assert_eq!(armed, [7]);
+
+        let mut nothing = || Some(vec![anchor]);
+        assert_eq!(
+            watch_members(anchor, &mut nothing, &mut |_| panic!("armed nothing")),
+            Watched::Settled
+        );
+        let mut still = || Some(vec![anchor, 7]);
+        assert_eq!(
+            watch_members(anchor, &mut still, &mut |_| Armed::Watching),
+            Watched::Wait
+        );
+        assert_eq!(
+            watch_members(anchor, &mut still, &mut |_| Armed::Ended),
+            Watched::Settled
+        );
+        assert_eq!(
+            watch_members(anchor, &mut still, &mut |_| Armed::Unknown),
+            Watched::Wait,
+            "an identity that cannot be read is not an exit"
+        );
+        assert_eq!(
+            watch_members(anchor, &mut || None, &mut |_| Armed::Watching),
+            Watched::Wait
+        );
+    }
+
+    /// The wait for a group's work is woken by a member exiting, not
+    /// by looking again: a member that ends after a second ends a wait
+    /// whose deadline is a minute off.
+    #[test]
+    fn a_member_exiting_ends_the_wait_for_the_group() {
+        let mut leader = std::process::Command::new("sh")
+            .args(["-c", "sleep 1 & sleep 4; wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let anchor = Pgid::new(leader.id() as i32).unwrap();
+        while crate::signal::group_members(anchor).is_none_or(|m| m.len() < 3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let began = std::time::Instant::now();
+        let by = began + Duration::from_secs(60);
+        Native { children: &[] }.until_a_member_exits(anchor, &|| Some(by));
+        let waited = began.elapsed();
+        let _ = leader.wait();
+        assert!(
+            waited >= Duration::from_millis(500) && waited < Duration::from_secs(3),
+            "it waited {waited:?}: until the member's exit, and no longer"
+        );
+    }
+
+    /// A member that has exited but is not yet collected still occupies
+    /// its group, and its exit has already been reported: the wait for
+    /// the group's work takes it as ended rather than waiting out the
+    /// deadline for an exit that will not come again.
+    #[test]
+    fn an_exited_member_not_yet_collected_does_not_hold_the_wait() {
+        let group = Uncollected::new();
+        let began = std::time::Instant::now();
+        let by = began + Duration::from_secs(60);
+        Native { children: &[] }.until_a_member_exits(group.anchor, &|| Some(by));
+        let waited = began.elapsed();
+        assert!(
+            waited < Duration::from_secs(3),
+            "it waited {waited:?} for a member that had already exited"
+        );
+    }
+
+    /// A live anchor leading a group whose one other member has exited
+    /// and is not collected: this test is its parent, and the owner under
+    /// test collects nothing.
+    struct Uncollected {
+        anchor_proc: std::process::Child,
+        member: std::process::Child,
+        anchor: Pgid,
+    }
+
+    impl Uncollected {
+        fn new() -> Self {
+            let anchor_proc = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let anchor = Pgid::new(anchor_proc.id() as i32).unwrap();
+            let member = std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .process_group(anchor.get())
+                .spawn()
+                .unwrap();
+            // Built before anything can fail, so its drop collects both.
+            let group = Self {
+                anchor_proc,
+                member,
+                anchor,
+            };
+            let pid = group.member.id() as i32;
+            let by = std::time::Instant::now() + Duration::from_secs(5);
+            while crate::proc_identity::inspect::life_of(pid)
+                != crate::proc_identity::inspect::Life::Gone
+            {
+                assert!(
+                    std::time::Instant::now() < by,
+                    "the member {pid} was not seen to exit within 5s"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                crate::signal::group_members(anchor).is_some_and(|m| m.contains(&pid)),
+                "the exited member still occupies its group until it is collected"
+            );
+            group
+        }
+
+        fn record(&self) -> Producer {
+            Producer::Anchored {
+                pgid: self.anchor.get(),
+                birth: crate::proc_identity::token_for(self.anchor.get()).unwrap(),
+            }
+        }
+    }
+
+    impl Drop for Uncollected {
+        // Both are this test's own unreaped children, so neither pid can
+        // have passed to another process when it is signalled.
+        fn drop(&mut self) {
+            for child in [&mut self.member, &mut self.anchor_proc] {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// The whole wait for a group's work, not only one look: a member that
+    /// has exited is no work, so the group's work is done within its grace.
+    #[test]
+    fn an_exited_member_not_yet_collected_is_no_work() {
+        let group = Uncollected::new();
+        let by = std::time::Instant::now() + Duration::from_secs(10);
+        let began = std::time::Instant::now();
+        let drained = await_work(&group.record(), &Native { children: &[] }, || Some(by));
+        assert_eq!(drained, crate::cli::source_group::Drained::WithinGrace);
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    #[test]
+    fn ending_a_group_whose_member_exited_uncollected_drains_within_grace() {
+        let group = Uncollected::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("producer.json");
+        let by = std::time::Instant::now() + Duration::from_secs(10);
+        let began = std::time::Instant::now();
+        let (_, drained) = end_by(
+            &path,
+            &group.record(),
+            &Native { children: &[] },
+            Whose::Own,
+            || Some(by),
+        );
+        assert_eq!(drained, crate::cli::source_group::Drained::WithinGrace);
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            began.elapsed()
+        );
+    }
 
     fn birth() -> crate::proc_identity::ProcToken {
         crate::proc_identity::ProcToken::MacStart { sec: 7, usec: 8 }
@@ -2633,6 +2952,22 @@ mod producer_tests {
         }
         fn pause(&self, d: Duration) {
             self.elapsed.set(self.elapsed.get() + d);
+        }
+        /// The work's end is the exit the wait is woken by.
+        fn until_a_member_exits(
+            &self,
+            _: crate::signal::Pgid,
+            deadline: &dyn Fn() -> Option<std::time::Instant>,
+        ) {
+            let Some(by) = deadline() else {
+                return;
+            };
+            let until = by.saturating_duration_since(self.started);
+            let woken = match self.ends_after {
+                Some(end) if end > self.elapsed.get() => end.min(until),
+                _ => until,
+            };
+            self.elapsed.set(woken.max(self.elapsed.get()));
         }
         fn now(&self) -> std::time::Instant {
             self.started + self.elapsed.get()

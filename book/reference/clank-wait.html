@@ -64,14 +64,6 @@
   <dd>
 <p>Skip the on-disk state cache</p>
   </dd>
-  <dt id="option-poll"><code>--poll</code></dt>
-  <dd>
-<p>Force polling mode for git changes (skip the native gitdir watch, refold on a 500ms tick). Use this when native <code>notify</code> events on the gitdir are unreliable — most notably inside the Codex tool sandbox.</p>
-<p>Default is <code>false</code>. Unset, the default flips to <code>true</code> when <code>CODEX_SANDBOX=seatbelt</code> is in the environment. Pass <code>--no-poll</code> to force the native path regardless of env.</p>
-  </dd>
-  <dt id="option-no_poll"><code>--no-poll</code></dt>
-  <dd>
-  </dd>
   <dt id="option-help"><code>-h, --help</code></dt>
   <dd>
 <p>Print help (see a summary with &#39;-h&#39;)</p>

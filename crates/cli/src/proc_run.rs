@@ -829,12 +829,18 @@ fn reaper() -> &'static Reaper {
                 }
             });
         let sink = tx.clone();
-        let watch = crate::proc_identity::exit_watch::ExitWatch::new(None, move |wake| {
-            if let crate::proc_identity::exit_watch::Wake::Exited(pid) = wake {
-                let _ = sink.send(pid);
-            }
-        })
-        .ok();
+        let watch =
+            crate::proc_identity::exit_watch::ExitWatch::new(None, move |wake| match wake {
+                crate::proc_identity::exit_watch::Wake::Exited(pid) => {
+                    let _ = sink.send(pid);
+                }
+                crate::proc_identity::exit_watch::Wake::Failed(why) => eprintln!(
+                    "clank: the watch that reaps exited children failed: {why}; they are reaped \
+                 only as their owners wait for them"
+                ),
+                crate::proc_identity::exit_watch::Wake::Dir => {}
+            })
+            .ok();
         Reaper {
             watch,
             exited: std::sync::Mutex::new(tx),

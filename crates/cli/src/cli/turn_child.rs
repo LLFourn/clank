@@ -389,7 +389,7 @@ async fn shared(
         Ok(socket) => socket,
         Err(e) => return Hand::Lost(e.to_string()),
     };
-    let mut notes = match super::wait::bridge_notes(conn, super::monitor::BEAT_GRACE) {
+    let mut notes = match super::wait::bridge_notes(conn) {
         Ok(notes) => notes,
         Err(e) => return Hand::Lost(e.to_string()),
     };
@@ -407,7 +407,7 @@ async fn shared(
                 if matches!(note, Some(Ok(_))) {
                     outage.answered();
                 }
-                // A beat proves the monitor alive, not that it answers:
+                // Any note proves the monitor there, not that it answers:
                 // only a verdict ends what the session was told of.
                 if matches!(note, Some(Ok(Note::Verdict(_))))
                     && !std::mem::replace(&mut heard, true)

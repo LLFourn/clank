@@ -147,8 +147,7 @@ async fn await_recovery(
     };
     tokio::task::spawn_blocking(move || {
         loop {
-            let deadline = std::time::Instant::now() + crate::cli::monitor::BEAT_GRACE;
-            match conn.note(deadline) {
+            match conn.next_note() {
                 Ok(Note::Recover {
                     opened_by,
                     n,
