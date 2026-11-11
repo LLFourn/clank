@@ -11,10 +11,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clank_core::turn_policy::{
-    AttendReply, AttendRequest, Attending, CheckIn, CheckInRef, Effect, Entry, Event, Facts,
-    Handoff, Liveness, Ms, Output, OwedItem, Persisted, Phase, Presence, PresentationId, Qualifies,
-    Quiet, ResultOutcome, SessionState, ShellProof, SilentWhy, TaskSnapshot, Unqualified,
-    Unwatched, Verdict, Withheld,
+    AttendReply, AttendRequest, Attending, CheckIn, Effect, Entry, Event, Facts, Handoff, Liveness,
+    Ms, Output, OwedItem, Persisted, Phase, Presence, PresentationId, Qualifies, Quiet,
+    ResultOutcome, SessionState, ShellProof, SilentWhy, TaskSnapshot, Unqualified, Unwatched,
+    Verdict,
 };
 use clank_core::{AgentLabel, AutoMode, Role, SessionId, SilentReason, Tool};
 
@@ -336,15 +336,6 @@ impl Commit {
     }
 }
 
-/// One check-in, for every entry that fell due together, to be typed
-/// through the agent's resume route.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CheckInDue {
-    pub(crate) author: AgentLabel,
-    pub(crate) session: SessionId,
-    pub(crate) check_ins: Vec<CheckInRef>,
-}
-
 struct Custody {
     state: SessionState,
     carried: Option<Carried>,
@@ -632,10 +623,11 @@ impl Turns {
                 let stepped = first
                     .then(|| self.step_under(author, g, Some(Tool::Grok), event, &permit))
                     .flatten();
-                return Some(frame_of(match stepped {
+                let verdict = match stepped {
                     Some(Output::Verdict(verdict)) => verdict,
                     _ => g.handoff_verdict(session, *continued),
-                }));
+                };
+                return Some(self.frame(author, conn, report, verdict, permit, g));
             }
             Report::Child { tool, seen, .. } => {
                 let recorded = first && self.child(author, g, *tool, seen, &permit);
@@ -648,9 +640,8 @@ impl Turns {
             }
             _ if g.owed.is_none() => return None,
             Report::TurnEnd { stop, .. } if first => Event::TurnEnd(stop.clone()),
-            Report::TurnEnd { stop, .. } | Report::Compacted { stop, .. } => {
-                Event::Parked(stop.clone())
-            }
+            Report::TurnEnd { stop, .. } => Event::Parked(stop.clone()),
+            Report::Compacted { stop, .. } => Event::Compacted(stop.clone()),
             Report::SessionStart { session, .. } => Event::SessionStart(session.clone()),
         };
         let tool = report.tool();
@@ -660,7 +651,22 @@ impl Turns {
                 why: SilentReason::StaleBinding,
             }));
         };
-        let frame = match verdict {
+        Some(self.frame(author, conn, report, verdict, permit, g))
+    }
+
+    /// `verdict` as `report`'s carrier on `conn` is told it. A presentation
+    /// is held as carried by `conn` under `permit` until its result.
+    fn frame(
+        &mut self,
+        author: &AgentLabel,
+        conn: u64,
+        report: &Report,
+        verdict: Verdict,
+        permit: crate::upgrade::Permit,
+        g: &Gathered,
+    ) -> Frame {
+        let tool = report.tool();
+        match verdict {
             Verdict::Deliver {
                 presentation,
                 identities,
@@ -725,8 +731,7 @@ impl Turns {
                 Frame::text(WireVerdict::Deliver { presentation }, text)
             }
             other => frame_of(other),
-        };
-        Some(frame)
+        }
     }
 
     /// The terminal verdict a parked report gets at its hook's deadline.
@@ -907,8 +912,9 @@ impl Turns {
             };
             format!(
                 "{verb} {what} {ends}. Work you have already been shown stays quiet and new work \
-                 still wakes you; if it is still going after {} you are checked in on once. \
-                 Anything else you attend is unchanged.",
+                 still wakes you; if it is still going after {} you are checked in on once, \
+                 through your wait when your turn has ended. Anything else you attend is \
+                 unchanged.",
                 super::attend::duration_arg(expect / 1000),
             )
         };
@@ -1018,57 +1024,10 @@ impl Turns {
             .collect()
     }
 
-    /// Step `author`'s check-ins at their deadline: the one check-in to
-    /// type for every entry due, if any is owed and the gates let it
-    /// through.
-    pub(crate) fn check_in(&mut self, author: &AgentLabel, g: &Gathered) -> Option<CheckInDue> {
-        self.custody(author, g)?;
-        let Some(Output::Effects(effects)) = self.step(author, g, None, Event::CheckInDue) else {
-            return None;
-        };
-        let session = self.agents.get(author)?.state.binding.clone();
-        effects.into_iter().find_map(|e| match e {
-            Effect::CheckIn(lines) => Some(CheckInDue {
-                author: author.clone(),
-                session: session.clone(),
-                check_ins: lines.into_iter().map(|l| l.check_in).collect(),
-            }),
-            _ => None,
-        })
-    }
-
-    /// The check-in fired for `check_ins` could not be typed, and why.
-    pub(crate) fn check_in_failed(
-        &mut self,
-        author: &AgentLabel,
-        check_ins: Vec<CheckInRef>,
-        why: String,
-        g: &Gathered,
-    ) {
-        self.step(
-            author,
-            g,
-            None,
-            Event::CheckInUndeliverable { check_ins, why },
-        );
-    }
-
-    /// The last look before the check-in fired for `check_ins` is typed,
-    /// against `author`'s custody and gates as they are now: the text for
-    /// the entries still owed it.
-    pub(crate) fn may_type_check_in(
-        &mut self,
-        author: &AgentLabel,
-        check_ins: &[CheckInRef],
-        g: &Gathered,
-    ) -> Result<String, String> {
-        let custody = self
-            .custody(author, g)
-            .ok_or("the session no longer holds the label")?;
-        custody
-            .state
-            .may_type_check_in(check_ins, &facts(g, None, &[], &Process))
-            .map(|lines| super::wake_render::check_in_text(&lines))
+    /// Step `author` at a check-in's deadline: every entry it passed is
+    /// owed its check-in from now, which the agent's next park presents.
+    pub(crate) fn fall_due(&mut self, author: &AgentLabel, g: &Gathered) {
+        self.step(author, g, None, Event::CheckInDue);
     }
 
     /// The facts changed: an owed-work change ends the repeat episode.
@@ -1182,27 +1141,18 @@ fn attended(entry: &Entry, qualifies: &Qualifies) -> super::agent_state::Attende
     super::agent_state::Attended {
         task: entry.name().to_string(),
         expect: Some(super::agent_state::Expectation {
-            since: rfc3339(entry.since),
-            secs: entry.expect / 1000,
+            since: rfc3339(entry.window.since),
+            secs: entry.window.expect / 1000,
         }),
         desc: Some(entry.desc.clone()),
         pid: shell.map(|p| p.pid),
         token: shell.and_then(|p| serde_json::from_str(&p.token).ok()),
-        at: rfc3339(entry.since),
+        at: rfc3339(entry.window.since),
         declared: matches!(entry.work, Attending::Declared { .. }),
-        check_in: match &entry.check_in {
+        check_in: match &entry.window.check_in {
             CheckIn::Armed => None,
+            CheckIn::Due => Some("check-in due".into()),
             CheckIn::Fired => Some("checked in".into()),
-            CheckIn::Withheld(why) => Some(format!(
-                "check-in withheld: {}",
-                match why {
-                    Withheld::AutoOff => "auto off",
-                    Withheld::Asking => "a question was pending",
-                    Withheld::Blocked => "a block was pending",
-                }
-            )),
-            CheckIn::Undeliverable(why) => Some(format!("check-in undeliverable: {why}")),
-            CheckIn::ProcessGone => None,
         },
         unqualified: match qualifies {
             Qualifies::Yes => None,

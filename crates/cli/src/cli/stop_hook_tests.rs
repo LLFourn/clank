@@ -2152,3 +2152,47 @@ async fn a_subagents_hook_exits_zero_and_silent_within_its_budget() {
         );
     }
 }
+
+/// A once-answered report's presentation is answered by how its writing
+/// went: delivered only by a write that succeeded, failed by one that
+/// failed or never happened, and a frame with no presentation is answered
+/// with no result.
+#[test]
+fn a_once_answered_presentation_is_delivered_only_by_its_write() {
+    let id = clank_core::turn_policy::PresentationId {
+        session: clank_core::SessionId::parse("session-one").unwrap(),
+        seq: 1,
+    };
+    let frame = Frame::text(
+        WireVerdict::Deliver {
+            presentation: id.clone(),
+        },
+        "clank check-in: x".into(),
+    );
+    assert_eq!(
+        result_of(&frame, Some(Ok(())), "unwritten"),
+        Some(TurnResult::Delivered {
+            presentation: id.clone()
+        })
+    );
+    assert_eq!(
+        result_of(
+            &frame,
+            Some(Err(std::io::Error::other("closed"))),
+            "unwritten"
+        ),
+        Some(TurnResult::EmitFailed {
+            presentation: id.clone(),
+            why: "closed".into()
+        })
+    );
+    assert_eq!(
+        result_of(&frame, None, "unwritten"),
+        Some(TurnResult::EmitFailed {
+            presentation: id,
+            why: "unwritten".into()
+        })
+    );
+    let notice = Frame::text(WireVerdict::Notify, "arm".into());
+    assert_eq!(result_of(&notice, Some(Ok(())), "unwritten"), None);
+}

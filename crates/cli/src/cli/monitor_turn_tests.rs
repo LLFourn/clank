@@ -8,9 +8,6 @@ use crate::cli::turn_wire::{Frame, Report, TurnResult, WireVerdict};
 
 const SESSION: &str = "session-handshake";
 
-/// A Claude pane whose input line is empty.
-const EMPTY_INPUT: &str = "────────────────\n❯ \n────────────────\n";
-
 /// A timer event no log keeps: the monitor holds it for its author until
 /// a presentation of it is delivered.
 fn transient(author: &AgentLabel) -> Vec<(AgentLabel, WaitItem)> {
@@ -281,6 +278,41 @@ async fn an_unbinding_seen_by_a_fold_retires_the_check_in_it_owed() {
     );
 }
 
+/// The loop's step at a deadline with no waiter to serve presents
+/// nothing, and leaves the check-in owed, shown so, and not due again: the
+/// loop cannot spin on a deadline only a park can discharge.
+#[tokio::test]
+async fn a_deadline_with_no_waiter_owes_its_check_in_and_is_not_due_again() {
+    let (repo, author, state) = owed_repo().await;
+    let then = crate::cli::turn_custody::now_ms() - 120_000;
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    attend_sleeper(
+        &mut turns,
+        &author,
+        &gathered(repo.path(), &author, &state).at(then),
+    );
+    let due = turns.next_deadline().expect("armed");
+    let mut clients = Vec::new();
+    let mut recovery =
+        crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
+    let leaving = deadline_round(
+        repo.path(),
+        &mut clients,
+        Some(&state),
+        &[],
+        &Default::default(),
+        &mut turns,
+        &mut recovery,
+        due,
+    );
+    assert!(leaving.is_empty());
+    assert!(turns.due_authors(u64::MAX).is_empty(), "not due again");
+    assert!(!turns.presenting(&author), "nothing presented");
+    let g = gathered(repo.path(), &author, &state);
+    let shown = turns.projection(&author, &g).attended;
+    assert_eq!(shown[0].check_in.as_deref(), Some("check-in due"));
+}
+
 /// The loop's step at a due deadline leaves nothing due behind it, even
 /// for an agent unbound since its check-in was armed: the next deadline
 /// is never one already passed, so the loop cannot spin on it.
@@ -294,13 +326,9 @@ async fn a_due_check_in_of_an_unbound_agent_is_not_due_again() {
         &clank_core::SessionId::parse(SESSION).unwrap(),
     )
     .unwrap();
-    let stepped = due_check_ins(&mut turns, due_at, |author| {
+    due_check_ins(&mut turns, due_at, |author| {
         gathered(repo.path(), author, &state).at(due_at)
     });
-    assert!(
-        stepped.iter().all(|(_, _, due)| due.is_none()),
-        "nothing typed"
-    );
     assert!(turns.next_deadline().is_none_or(|at| at > due_at));
     assert!(turns.due_authors(due_at).is_empty());
 }
@@ -409,219 +437,6 @@ fn attend_named(
         .unwrap();
 }
 
-fn ask_for(due: &crate::cli::turn_custody::CheckInDue) -> CheckInAsk {
-    let (reply, _answer) = tokio::sync::oneshot::channel();
-    CheckInAsk {
-        author: due.author.clone(),
-        session: due.session.clone(),
-        check_ins: due.check_ins.clone(),
-        screen: (clank_core::Tool::Claude, Some(EMPTY_INPUT.into())),
-        reply,
-    }
-}
-
-/// The last look reads the custody and the gates as they are when it is
-/// asked, not as they were when the check-in fired: auto turned off, a
-/// question or a block opened, the attendance cleared or renewed, each
-/// refuses the typing that would otherwise go ahead. Attending something
-/// else beside it does not.
-#[tokio::test]
-async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
-    let (repo, author, state) = owed_repo().await;
-    let recovery = recovering(repo.path(), &author);
-    let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
-    let now = || {
-        gather(
-            repo.path(),
-            Some(&state),
-            &author,
-            &Default::default(),
-            &mut Default::default(),
-            &[],
-        )
-    };
-    let cases: [(&str, Option<&str>); 7] = [
-        ("nothing", None),
-        ("another entry beside it", None),
-        ("auto off", Some("auto turned off")),
-        ("question", Some("a question is pending")),
-        ("block", Some("a block is pending")),
-        (
-            "clear",
-            Some("the attendance it was for was cleared or renewed"),
-        ),
-        (
-            "renew",
-            Some("the attendance it was for was cleared or renewed"),
-        ),
-    ];
-    for (change, refused) in cases {
-        let (mut turns, due_at) = attended(repo.path(), &author, &state);
-        let due = turns
-            .check_in(&author, &now().at(due_at))
-            .expect("it fires");
-        match change {
-            "auto off" => {
-                crate::agent_store::set_auto_mode(repo.path(), &author, clank_core::AutoMode::Off)
-                    .unwrap()
-            }
-            "question" => crate::cli::question_state::observe(
-                &dir,
-                [crate::cli::question_state::Observation::Asked {
-                    key: crate::cli::question_state::Key {
-                        session: SESSION.into(),
-                        prompt: "p".into(),
-                        tool_use: "t".into(),
-                    },
-                    header: "which one".into(),
-                    input: "h".into(),
-                }],
-            ),
-            "block" => {
-                std::fs::create_dir_all(dir.join("blocks")).unwrap();
-                std::fs::write(dir.join("blocks/decide.md"), "which one?").unwrap();
-            }
-            "clear" => {
-                turns
-                    .attend(
-                        &author,
-                        clank_core::turn_policy::AttendRequest::Clear {
-                            session: clank_core::SessionId::parse(SESSION).unwrap(),
-                            which: clank_core::turn_policy::Clearing::All,
-                        },
-                        &now(),
-                    )
-                    .unwrap();
-            }
-            "another entry beside it" => {
-                attend_named(&mut turns, &author, "other helper", &now().at(due_at + 1))
-            }
-            "renew" => attend_sleeper(&mut turns, &author, &now().at(due_at + 1)),
-            _ => {}
-        }
-        let looked = may_check_in_now(repo.path(), &recovery, &mut turns, &now(), &ask_for(&due));
-        assert_eq!(
-            looked.map(|text| text.contains("\"sleeper\" has been going")),
-            refused.map_or(Ok(true), |why| Err(why.to_string())),
-            "{change}"
-        );
-        crate::agent_store::set_auto_mode(repo.path(), &author, clank_core::AutoMode::On).unwrap();
-        let _ = std::fs::remove_file(crate::cli::question_state::path(&dir));
-        let _ = std::fs::remove_dir_all(dir.join("blocks"));
-    }
-}
-
-/// A check-in whose attendance is replaced while it is being typed is
-/// refused at its last look, types nothing, and its loss is not recorded
-/// against the replacement, which keeps its own check-in.
-#[tokio::test]
-async fn a_check_in_overtaken_during_dispatch_leaves_its_replacement_alone() {
-    let (repo, author, state) = owed_repo().await;
-    let recovery = recovering(repo.path(), &author);
-    let (mut turns, due_at) = attended(repo.path(), &author, &state);
-    let now = |at: u64| {
-        gather(
-            repo.path(),
-            Some(&state),
-            &author,
-            &Default::default(),
-            &mut Default::default(),
-            &[],
-        )
-        .at(at)
-    };
-    let old = turns.check_in(&author, &now(due_at)).expect("it fires");
-    attend_sleeper(&mut turns, &author, &now(due_at + 1));
-    let replacement = turns.projection(&author, &now(due_at + 2));
-    let typist = std::sync::Arc::new(Recorded {
-        typed: Default::default(),
-        lost: false,
-    });
-    let g = now(due_at + 3);
-    let done = check_in_through(repo.path(), old, typist.clone(), |ask| {
-        may_check_in_now(repo.path(), &recovery, &mut turns, &g, ask)
-    })
-    .await;
-    assert!(typist.typed.lock().unwrap().is_empty(), "nothing is typed");
-    let why = done.outcome.expect_err("refused at its last look");
-    assert!(why.contains("cleared or renewed"), "{why}");
-    turns.check_in_failed(&author, done.check_ins, why, &g);
-    assert_eq!(
-        turns.projection(&author, &g),
-        replacement,
-        "the replacement keeps its own check-in"
-    );
-    assert!(turns.next_deadline().is_some_and(|at| at > due_at));
-}
-
-/// Two entries fall due together; one is renewed or cleared while the
-/// check-in is being typed. What is typed is the other's line alone: the
-/// stale one is not sent, and the one still owed is not lost with it.
-#[tokio::test]
-async fn a_grouped_check_in_types_only_the_entries_still_owed_it() {
-    let (repo, author, state) = owed_repo().await;
-    let recovery = recovering(repo.path(), &author);
-    let now = |at: u64| {
-        gather(
-            repo.path(),
-            Some(&state),
-            &author,
-            &Default::default(),
-            &mut Default::default(),
-            &[],
-        )
-        .at(at)
-    };
-    for change in ["renew", "clear"] {
-        let _ = std::fs::remove_file(
-            crate::agent_store::agents_root(repo.path())
-                .join(author.as_str())
-                .join("turn.json"),
-        );
-        let mut turns = Turns::new(repo.path().to_path_buf());
-        let start = crate::cli::turn_custody::now_ms();
-        attend_sleeper(&mut turns, &author, &now(start));
-        attend_named(&mut turns, &author, "helper", &now(start));
-        let due_at = turns.next_deadline().expect("both armed");
-        let due = turns.check_in(&author, &now(due_at)).expect("it fires");
-        assert_eq!(due.check_ins.len(), 2, "one check-in for both");
-        match change {
-            "renew" => attend_sleeper(&mut turns, &author, &now(due_at + 1)),
-            _ => {
-                turns
-                    .attend(
-                        &author,
-                        clank_core::turn_policy::AttendRequest::Clear {
-                            session: clank_core::SessionId::parse(SESSION).unwrap(),
-                            which: clank_core::turn_policy::Clearing::Named("sleeper".into()),
-                        },
-                        &now(due_at + 1),
-                    )
-                    .unwrap();
-            }
-        }
-        let typist = std::sync::Arc::new(Recorded {
-            typed: Default::default(),
-            lost: false,
-        });
-        let g = now(due_at + 2);
-        let done = check_in_through(repo.path(), due, typist.clone(), |ask| {
-            may_check_in_now(repo.path(), &recovery, &mut turns, &g, ask)
-        })
-        .await;
-        assert!(done.outcome.is_ok(), "{change}: {:?}", done.outcome);
-        let typed = typist.typed.lock().unwrap().clone();
-        let [text] = typed.as_slice() else {
-            panic!("{change}: typed once: {typed:?}");
-        };
-        assert!(
-            text.contains("\"helper\" has been going"),
-            "{change}: {text}"
-        );
-        assert!(!text.contains("sleeper"), "{change}: {text}");
-    }
-}
-
 /// A repo whose master `claude` is bound to [`SESSION`] and owed one timer
 /// event, folded.
 async fn owed_repo() -> (TempRepo, AgentLabel, crate::repo_state::RepoState) {
@@ -705,6 +520,21 @@ fn log_timer_occurrence(
             },
         )
         .unwrap();
+}
+
+/// [`stop_report`] as a current hook reports it, with its start time.
+fn hooked_stop(started: u64) -> Report {
+    Report::TurnEnd {
+        stop: clank_core::turn_policy::TurnEndReport {
+            tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            hook_started: Some(started),
+            tool: clank_core::Tool::Claude,
+            session: clank_core::SessionId::parse(SESSION).unwrap(),
+            place: Default::default(),
+        },
+        deadline: u64::MAX,
+        questions: Vec::new(),
+    }
 }
 
 fn stop_report() -> Report {
@@ -1477,207 +1307,130 @@ async fn a_result_on_a_foreign_connection_is_never_credited() {
     );
 }
 
-/// A typist that records what it was asked to type, or cannot find the
-/// pane at all.
-struct Recorded {
-    typed: std::sync::Mutex<Vec<String>>,
-    lost: bool,
-}
-
-impl Typist for Recorded {
-    fn locate(
-        &self,
-        _repo: std::path::PathBuf,
-        _author: AgentLabel,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Located, String>> + Send>> {
-        let lost = self.lost;
-        Box::pin(async move {
-            if lost {
-                return Err("its pane was not found".into());
-            }
-            Ok((
-                crate::cli::pane_target::Target {
-                    session: "test".into(),
-                    pane: "terminal_1".into(),
-                    tool: clank_core::Tool::Claude,
-                    repo: "/test".into(),
-                    label: AgentLabel::parse("test").unwrap(),
-                },
-                Some(EMPTY_INPUT.into()),
-            ))
-        })
-    }
-
-    fn submit(
-        &self,
-        _target: crate::cli::pane_target::Target,
-        text: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::cli::monitor::Submitted> + Send>>
-    {
-        self.typed.lock().unwrap().push(text);
-        Box::pin(async { Ok(crate::cli::pane_input::Delivered::Whole) })
-    }
-}
-
-/// Deliver `due` through `typist`, answering the last look with `look`.
-async fn check_in_through(
-    repo: &std::path::Path,
-    due: crate::cli::turn_custody::CheckInDue,
-    typist: std::sync::Arc<Recorded>,
-    look: impl FnOnce(&CheckInAsk) -> Result<String, String>,
-) -> CheckedIn {
-    let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel();
-    let (done, mut finished) = tokio::sync::mpsc::unbounded_channel();
-    let delivering = tokio::spawn(deliver_check_in(
-        repo.to_path_buf(),
-        due,
-        typist,
-        asks,
-        done,
-    ));
-    if let Some(ask) = asked.recv().await {
-        let looked = look(&ask);
-        let _ = ask.reply.send(looked);
-    }
-    delivering.await.unwrap();
-    finished.recv().await.unwrap()
-}
-
-/// A declaration owes one typed check-in at its deadline; with the route
-/// lost by then, the check-in is recorded undeliverable and recovery takes
-/// the agent back.
+/// The incident of 2026-11-11 at the monitor's custody: six declarations
+/// fall due at different times while the agent's hook stays parked. Each
+/// re-step of that park at a deadline is handed the check-in of what fell
+/// due, in the check-in's own words, and the result on the carrying
+/// connection spends it; the park that follows holds until the next
+/// deadline, and two due at one moment share one.
 #[tokio::test]
-async fn a_declaration_is_checked_in_on_by_typing_once() {
-    let (repo, author, state) = owed_repo().await;
+async fn attendances_falling_due_while_parked_are_checked_in_through_the_park() {
+    let (repo, author, _) = timer_repo();
+    let state = folded(repo.path()).await.unwrap();
+    let start = crate::cli::turn_custody::now_ms() - 3_600_000;
+    let at = |t: u64| gathered(repo.path(), &author, &state).at(t);
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gather(
-        repo.path(),
-        Some(&state),
-        &author,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
-    );
-    attend_sleeper(&mut turns, &author, &g);
-    let listed = stop_report();
-    let frame = turns.answer(&author, 1, &listed, true, &g).unwrap();
-    assert!(
-        frame.presentation().is_some(),
-        "owed work it never received is delivered, attending or not: {frame:?}"
-    );
-    let due_at = turns.next_deadline().expect("a check-in is owed");
-
-    for lost in [false, true] {
-        let mut turns = Turns::new(repo.path().to_path_buf());
-        let at_due = gather(
-            repo.path(),
-            Some(&state),
+    for (i, offset) in [0, 10, 20, 30, 50, 50].into_iter().enumerate() {
+        attend_named(
+            &mut turns,
             &author,
-            &Default::default(),
-            &mut Default::default(),
-            &[],
-        )
-        .at(due_at);
-        let due = turns.check_in(&author, &at_due).expect("due");
-        let typist = std::sync::Arc::new(Recorded {
-            typed: Default::default(),
-            lost,
+            &format!("review {i}"),
+            &at(start + offset * 1000),
+        );
+    }
+    let mut conn = 1;
+    let mut held_report = hooked_stop(start + 55_000);
+    let first = turns.answer(&author, conn, &held_report, true, &at(start + 55_000));
+    assert_eq!(first.unwrap().verdict, WireVerdict::Park);
+    let mut shown = Vec::new();
+    while let Some(due) = turns.next_deadline() {
+        let held = turns.answer(&author, conn, &held_report, false, &at(due - 1));
+        assert_eq!(held.unwrap().verdict, WireVerdict::Park);
+        turns.fall_due(&author, &at(due));
+        let frame = turns
+            .answer(&author, conn, &held_report, false, &at(due))
+            .unwrap();
+        let presentation = frame.presentation().expect("handed to the park").clone();
+        let text = frame.rendered.unwrap_or_default();
+        assert!(text.starts_with("clank check-in: "), "{text}");
+        shown.push(
+            (0..6)
+                .filter(|i| text.contains(&format!("\"review {i}\"")))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            turns
+                .result(
+                    &author,
+                    conn,
+                    TurnResult::Delivered { presentation },
+                    &at(due)
+                )
+                .unwrap()
+                .is_some()
+        );
+        conn += 1;
+        held_report = hooked_stop(due + 1);
+        let next = turns.answer(&author, conn, &held_report, true, &at(due + 1));
+        assert_eq!(next.unwrap().verdict, WireVerdict::Park, "once each");
+    }
+    assert_eq!(shown, [vec![0], vec![1], vec![2], vec![3], vec![4, 5]]);
+}
+
+/// A check-in reaches the agent only as the frame its parked hook prints,
+/// and only that hook's result spends it. Until the result the row says it
+/// is owed; a failed emit leaves it owed for the next park, and a delivery
+/// says it was checked in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_in_reaches_the_parked_hook_and_only_its_result_spends_it() {
+    for ending in ["emit failed", "delivered"] {
+        let (repo, author, _) = timer_repo();
+        let state = folded(repo.path()).await.unwrap();
+        let then = crate::cli::turn_custody::now_ms() - 120_000;
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        attend_sleeper(
+            &mut turns,
+            &author,
+            &gathered(repo.path(), &author, &state).at(then),
+        );
+        let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut hook = Hook::carrying(repo.path(), &author, &stop_report(), ours);
+        let client = admitted(theirs, repo.path(), &heard_tx).await;
+        let mut clients = vec![client];
+        let leaving = serve(repo.path(), &mut clients, &state, &mut turns);
+        let (frame, mut hook) = tokio::task::spawn_blocking(move || (hook.frame(), hook))
+            .await
+            .unwrap();
+        let presentation = frame.presentation().expect("a presentation").clone();
+        let text = frame.rendered.clone().unwrap_or_default();
+        assert!(
+            text.starts_with("clank check-in: declared work \"sleeper\" has been going"),
+            "{ending}: {text}"
+        );
+        let g = gathered(repo.path(), &author, &state);
+        let row = |turns: &mut Turns| turns.projection(&author, &g).attended[0].check_in.clone();
+        assert_eq!(row(&mut turns).as_deref(), Some("check-in due"), "{ending}");
+        hook.answer(&match ending {
+            "emit failed" => TurnResult::EmitFailed {
+                presentation,
+                why: "write failed".into(),
+            },
+            _ => TurnResult::Delivered { presentation },
         });
-        let done = check_in_through(repo.path(), due.clone(), typist.clone(), |_| {
-            Ok("clank check-in: as the last look says".into())
-        })
-        .await;
-        let typed = typist.typed.lock().unwrap().clone();
-        match lost {
-            false => {
-                assert!(done.outcome.is_ok());
-                assert_eq!(
-                    typed,
-                    vec!["clank check-in: as the last look says".to_string()],
-                    "typed once, as the last look answered"
-                );
-            }
-            true => {
-                assert!(typed.is_empty());
-                let why = done.outcome.expect_err("undeliverable");
-                turns.check_in_failed(&author, done.check_ins, why, &at_due);
-                let shown = turns.projection(&author, &at_due).attended;
-                assert!(
-                    matches!(shown.as_slice(), [a] if a.check_in.as_deref().is_some_and(|c| c.starts_with("check-in undeliverable"))),
-                    "{shown:?}"
-                );
-                assert_eq!(
-                    turns.recovery_quiet(&author, &at_due),
-                    None,
-                    "recovery takes over"
-                );
-            }
+        let (from, Heard::Line(line)) = next_heard(&mut heard).await else {
+            panic!("{ending}: expected a result");
+        };
+        let _ = turns.result(&author, from, serde_json::from_str(&line).unwrap(), &g);
+        drop(hook.stdin);
+        hook.child.join().unwrap();
+        for writer in leaving {
+            let _ = writer.await;
         }
-        // The next run of this loop restarts from the persisted attendance,
-        // whose check-in is still armed: rewind it.
-        if !lost {
-            let path = crate::agent_store::agents_root(repo.path()).join("claude/turn.json");
-            let mut p: clank_core::turn_policy::Persisted =
-                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            for entry in &mut p.attendances {
-                entry.check_in = clank_core::turn_policy::CheckIn::Armed;
+        match ending {
+            "emit failed" => {
+                assert_eq!(row(&mut turns).as_deref(), Some("check-in due"));
+                assert!(presented_next(&mut turns, &author, &g).starts_with("clank check-in: "));
             }
-            std::fs::write(&path, serde_json::to_vec(&p).unwrap()).unwrap();
+            _ => {
+                assert_eq!(row(&mut turns).as_deref(), Some("checked in"));
+                let next = turns
+                    .answer(&author, 999, &stop_report(), true, &g)
+                    .unwrap();
+                assert_eq!(next.verdict, WireVerdict::Park, "once");
+            }
         }
     }
-}
-
-/// A check-in refused at its last look is not typed.
-#[tokio::test]
-async fn a_check_in_its_last_look_refuses_is_not_typed() {
-    let repo = TempRepo::new();
-    let typist = std::sync::Arc::new(Recorded {
-        typed: Default::default(),
-        lost: false,
-    });
-    let due = crate::cli::turn_custody::CheckInDue {
-        author: AgentLabel::parse("claude").unwrap(),
-        session: clank_core::SessionId::parse(SESSION).unwrap(),
-        check_ins: vec![clank_core::turn_policy::CheckInRef {
-            key: clank_core::turn_policy::EntryKey::Name("sleeper".into()),
-            since: 0,
-        }],
-    };
-    let done = check_in_through(repo.path(), due, typist.clone(), |_| Err("refused".into())).await;
-    assert!(done.outcome.is_err());
-    assert!(typist.typed.lock().unwrap().is_empty());
-}
-
-/// The last look needs recovery to hold the agent as resumed by typing: an
-/// agent recovery does not hold is never typed into.
-#[test]
-fn the_last_look_needs_a_harness_resumed_by_typing() {
-    let repo = TempRepo::new();
-    let driver =
-        crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
-    let (reply, _answer) = tokio::sync::oneshot::channel();
-    let author = AgentLabel::parse("claude").unwrap();
-    let ask = CheckInAsk {
-        author: author.clone(),
-        session: clank_core::SessionId::parse(SESSION).unwrap(),
-        check_ins: vec![clank_core::turn_policy::CheckInRef {
-            key: clank_core::turn_policy::EntryKey::Name("sleeper".into()),
-            since: 0,
-        }],
-        screen: (clank_core::Tool::Claude, Some(String::new())),
-        reply,
-    };
-    let g = crate::cli::turn_custody::Gathered::of(repo.path(), &author, None);
-    assert!(
-        may_check_in_now(
-            repo.path(),
-            &driver,
-            &mut Turns::new(repo.path().to_path_buf()),
-            &g,
-            &ask
-        )
-        .is_err()
-    );
 }
 
 /// Recovery's transport rides the monitor's connection: a turn the harness
@@ -1822,10 +1575,9 @@ async fn attend_and_clear_requests_are_scoped_to_their_entry() {
 }
 
 /// The loop's step at an attendance deadline serves the agent's parked
-/// wait again, with no repo change and no typed route: the work it had
-/// received and the attendance quieted is presented once the deadline
-/// passes. The check-in is still owed beside it, and the work comes back
-/// without it ever being typed.
+/// wait again, with no repo change: the work it had received and the
+/// attendance quieted is presented once the deadline passes, with the
+/// check-in that deadline owes beside it, in the one presentation.
 #[tokio::test]
 async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline() {
     let (repo, author, state) = owed_repo().await;
@@ -1842,7 +1594,7 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
     );
     attend_sleeper(&mut turns, &author, &g);
     let parked = turns
-        .answer(&author, 2, &stop_report(), true, &g.at(then + 1))
+        .answer(&author, 2, &hooked_stop(then + 1), true, &g.at(then + 1))
         .unwrap();
     assert_eq!(parked.verdict, WireVerdict::Park, "received work is quiet");
     let deadline = turns.next_deadline().expect("the quiet arms a check-in");
@@ -1861,7 +1613,7 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
         conn: 2,
         admitted: Default::default(),
         report: Some(Box::new(Reporting {
-            report: stop_report(),
+            report: hooked_stop(then + 1),
             stepped: true,
             reader: None,
         })),
@@ -1881,16 +1633,16 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
         )
     };
 
-    let (dues, _) = round(&mut clients, &mut turns, deadline - 1);
-    assert!(dues.is_empty());
+    round(&mut clients, &mut turns, deadline - 1);
     assert!(queue.try_recv().is_err(), "nothing before the deadline");
     assert_eq!(clients.len(), 1);
 
-    let (dues, _) = round(&mut clients, &mut turns, deadline);
-    assert_eq!(dues.len(), 1, "the check-in is still owed");
+    round(&mut clients, &mut turns, deadline);
     let note = queue.try_recv().expect("the parked wait was served");
     assert!(
-        note.contains("deliver") && note.contains("scheduled work"),
+        note.contains("deliver")
+            && note.contains("scheduled work")
+            && note.contains("clank check-in: declared work \\\"sleeper\\\""),
         "{note}"
     );
     assert!(clients.is_empty(), "a delivery retires the parked report");
@@ -2430,42 +2182,6 @@ async fn the_loop_gives_up_a_presentation_its_carrier_never_answered_for() {
         Gate::Go,
         "the agent moves to recovery"
     );
-}
-
-/// A check-in that falls due on a monitor of a replaced build is not
-/// typed: the pane is not looked for, no last look is asked, and it is
-/// recorded undelivered with the reason.
-#[tokio::test]
-async fn a_stale_monitor_types_no_check_in() {
-    use crate::upgrade::tests::{AsProcess, Installed};
-    let repo = tempfile::tempdir().unwrap();
-    let installed = Installed::current();
-    let authority = installed.authority();
-    let _as = AsProcess::of(&authority);
-    installed.replace(1);
-    let typist = std::sync::Arc::new(Recorded {
-        typed: Default::default(),
-        lost: false,
-    });
-    let asked = std::cell::Cell::new(false);
-    let done = check_in_through(
-        repo.path(),
-        crate::cli::turn_custody::CheckInDue {
-            author: AgentLabel::parse("test").unwrap(),
-            session: clank_core::SessionId::parse("session-one").unwrap(),
-            check_ins: Vec::new(),
-        },
-        typist.clone(),
-        |_| {
-            asked.set(true);
-            Ok("still going?".into())
-        },
-    )
-    .await;
-    let why = done.outcome.expect_err("typed by a stale monitor");
-    assert!(why.contains(crate::upgrade::STALE_BADGE), "{why}");
-    assert!(!asked.get());
-    assert!(typist.typed.lock().unwrap().is_empty());
 }
 
 /// A payload recorded under `core/tests/fixtures/stop_hook/`, as Claude

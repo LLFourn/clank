@@ -326,9 +326,9 @@ fn the_wire_frames_what_the_monitor_said() {
 
 /// A request for the wait that was in transit while the label was rebound
 /// reaches the old session as nothing: the binding is checked again once
-/// the monitor's answer, and its child's collection, are done.
-#[tokio::test]
-async fn an_answer_overtaken_by_a_rebind_reaches_the_old_session_as_nothing() {
+/// the monitor's answer is in, as it is written out.
+#[test]
+fn an_answer_overtaken_by_a_rebind_reaches_the_old_session_as_nothing() {
     let (_temp, repo, label, session, env) = fixture();
     handle(
         &input(&repo, &session, "session_start", json!([])),
@@ -336,30 +336,36 @@ async fn an_answer_overtaken_by_a_rebind_reaches_the_old_session_as_nothing() {
         &env,
     )
     .unwrap();
-    let (release, held) = tokio::sync::oneshot::channel::<()>();
-    let asked = async {
-        held.await.unwrap();
-        Frame::text(WireVerdict::Notify, ARM.to_string())
-    };
+    let asked = || Frame::text(WireVerdict::Notify, ARM.to_string());
     let successor = SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap();
-    let rebind_then_release = async {
-        crate::agent_store::bind_session_to_agent(&repo, &label, Tool::Grok, &successor).unwrap();
-        release.send(()).unwrap();
-    };
-    let (frame, ()) = tokio::join!(
-        still_bound(&repo, &label, session.as_str(), asked),
-        rebind_then_release
-    );
+    crate::agent_store::bind_session_to_agent(&repo, &label, Tool::Grok, &successor).unwrap();
+    let frame = still_bound(&repo, &label, session.as_str(), asked());
     assert_eq!(wire(&frame), (None, None), "no block, no arm: {frame:?}");
-
-    let answered = still_bound(&repo, &label, successor.as_str(), async {
-        Frame::text(WireVerdict::Notify, ARM.to_string())
-    })
-    .await;
+    let answered = still_bound(&repo, &label, successor.as_str(), asked());
     assert!(
         wire(&answered).0.is_some(),
         "the session holding the label is answered"
     );
+}
+
+/// A check-in handed to Grok's Stop blocks it with its text, as a request
+/// for the wait does.
+#[test]
+fn a_check_in_blocks_groks_stop_with_its_text() {
+    let frame = Frame::text(
+        WireVerdict::Deliver {
+            presentation: clank_core::turn_policy::PresentationId {
+                session: SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap(),
+                seq: 1,
+            },
+        },
+        "clank check-in: declared work".to_string(),
+    );
+    let (out, err) = wire(&frame);
+    assert_eq!(err, None);
+    let block: serde_json::Value = serde_json::from_str(&out.expect("a decision")).unwrap();
+    assert_eq!(block["decision"], "block");
+    assert_eq!(block["reason"], "clank check-in: declared work");
 }
 
 /// The notices a child with no monitor prints for Grok's Stop block it

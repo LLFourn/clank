@@ -1,5 +1,5 @@
-//! Provider-aware terminal input shared by nudges, events, recovery, check-ins,
-//! the web bridge and user commands: the one boundary every pane write crosses.
+//! Provider-aware terminal input shared by nudges, events, recovery, the web
+//! bridge and user commands: the one boundary every pane write crosses.
 //! Callers resolve target identity; accepted terminal bytes do not prove a stopped turn.
 //!
 //! Four rules hold here and nowhere else:
@@ -1239,7 +1239,7 @@ mod tests {
     /// The writer paths that type a prompt into a Claude or Codex pane.
     #[derive(Debug, Clone, Copy)]
     enum Path {
-        /// Recovery's typed sends and check-ins.
+        /// Recovery's typed sends.
         Submit,
         /// Event wakes.
         Wake,
@@ -2115,9 +2115,9 @@ mod tests {
         );
     }
 
-    /// The monitor's own writers, recovery's typed sends and check-ins
-    /// (`submit_async`) and event wakes (`wake_for_events_async`), give way
-    /// to a pane another writer holds, typing nothing, rather than wait.
+    /// The monitor's own writers, recovery's typed sends (`submit_async`)
+    /// and event wakes (`wake_for_events_async`), give way to a pane
+    /// another writer holds, typing nothing, rather than wait.
     /// Driven through those entry points with the real runtime lock held on
     /// a test-only pane, so they return before any terminal is reached.
     #[test]

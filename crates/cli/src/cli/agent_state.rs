@@ -350,7 +350,7 @@ pub(crate) struct Attended {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub(crate) declared: bool,
-    /// What became of its check-in, once it was due.
+    /// Where its check-in stands once due: owed, or delivered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) check_in: Option<String>,
     /// Why it covers nothing now, while it does not.
@@ -1643,7 +1643,7 @@ mod tests {
             token: None,
             at: "2026-08-20T14:51:09Z".into(),
             declared: true,
-            check_in: Some("check-in undeliverable: no pane".into()),
+            check_in: Some("check-in due".into()),
             unqualified: None,
             rests_on: None,
         };
@@ -1651,10 +1651,7 @@ mod tests {
             rec.marker_fields(now).map(|f| f.subject),
             Some("capture-probe sleeper")
         );
-        assert!(
-            rec.summary(now)
-                .ends_with("check-in undeliverable: no pane")
-        );
+        assert!(rec.summary(now).ends_with("check-in due"));
         rec.declared = false;
         assert!(rec.marker_fields(now).is_none());
     }

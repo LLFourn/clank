@@ -210,11 +210,35 @@ fn clear_all() -> Event {
     })
 }
 
-fn check_ins(fx: Vec<Effect>) -> Vec<CheckInRef> {
-    match fx.as_slice() {
-        [Effect::CheckIn(lines)] => lines.iter().map(|l| l.check_in.clone()).collect(),
-        other => panic!("not one check-in: {other:?}"),
+/// The check-in `v` carries, if it carries one.
+fn check_in_of(v: &Verdict) -> Option<&[CheckInLine]> {
+    match v {
+        Verdict::Deliver { notices, .. } => notices.iter().find_map(|n| match n {
+            Notice::CheckIn(lines) => Some(lines.as_slice()),
+            _ => None,
+        }),
+        _ => None,
     }
+}
+
+/// The presentation carrying `v`'s check-in, and the names it is for.
+fn checked_in(v: Verdict) -> (PresentationId, Vec<String>) {
+    let names = check_in_of(&v)
+        .unwrap_or_else(|| panic!("no check-in: {v:?}"))
+        .iter()
+        .map(|l| l.name.clone())
+        .collect();
+    (presented(v).0, names)
+}
+
+/// The report a park holds, stepped again.
+fn parked() -> Event {
+    Event::Parked(report(Tool::Claude))
+}
+
+/// A compaction's report: a new report of the park, unplaced.
+fn compacted() -> Event {
+    Event::Compacted(report(Tool::Claude))
 }
 
 fn owed(identity: &str, receipt: &str) -> [OwedItem; 1] {
@@ -285,7 +309,7 @@ fn a_declaration_takes_effect_at_once_for_every_tool() {
     let a = owed("event:a", "read:a");
     for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
         let st = received_then(&s, &a, declare(SUBAGENT_NAME));
-        assert_eq!(entry(&st).check_in, CheckIn::Armed);
+        assert_eq!(entry(&st).window.check_in, CheckIn::Armed);
         assert_eq!(st.next_deadline(), Some(T0 + 10 * MINUTE));
         assert_eq!(
             st.recovery_quiet(&facts(T0 + MINUTE, &s, &a)),
@@ -411,7 +435,11 @@ fn a_declaration_is_its_task_not_its_description() {
         &facts(T0 + 2 * MINUTE, &s, &a),
     );
     assert_eq!(bound_to(&st), [Some("first")], "same task: merged");
-    assert_eq!(entry(&st).since, T0 + MINUTE, "on the renewal's clock");
+    assert_eq!(
+        entry(&st).window.since,
+        T0 + MINUTE,
+        "on the renewal's clock"
+    );
     st.step(declare(SUBAGENT_NAME), &facts(T0 + 3 * MINUTE, &s, &a));
     assert_eq!(
         verdict(st.step(
@@ -551,11 +579,11 @@ fn without_a_listing_only_a_clear_ends_a_declaration() {
     assert_eq!(names(&st), ["reviewer"], "a delivered message ends nothing");
 
     let due = st.next_deadline().unwrap();
-    assert_eq!(
-        check_ins(effects(st.step(Event::CheckInDue, &facts(due, &s, &ab)))).len(),
-        1
-    );
-    assert!(effects(st.step(Event::CheckInDue, &facts(due + MINUTE, &s, &ab))).is_empty());
+    let (p, checked) = checked_in(verdict(st.step(codex(), &facts(due, &s, &ab))));
+    assert_eq!(checked, ["reviewer"]);
+    committed(st.step(Event::Delivered(p), &facts(due, &s, &ab)));
+    let again = verdict(st.step(codex(), &facts(due + MINUTE, &s, &ab)));
+    assert_eq!(check_in_of(&again), None, "once");
     assert_eq!(names(&st), ["reviewer"], "a check-in is not an end");
 
     let cleared = Event::Attend(AttendRequest::Clear {
@@ -875,36 +903,368 @@ fn a_killed_run_ends_like_any_other() {
     assert_eq!(names(&st), ["build"], "the other run is untouched");
 }
 
-/// A declaration is checked in on once at `--expect` if it still stands.
+/// A declaration still standing at `--expect` is owed one check-in. Its
+/// parked hook is handed it as a notice with no work beside it, and only
+/// that notice's delivery spends it.
 #[test]
 fn a_declaration_is_checked_in_on_once_at_its_expectation() {
     let s = session();
     let mut st = standing(&s);
     let due = st.next_deadline().unwrap();
     assert_eq!(due, T0 + 10 * MINUTE);
-    assert!(effects(st.step(Event::CheckInDue, &facts(due - 1, &s, &[]))).is_empty());
-    let fired = effects(st.step(Event::CheckInDue, &facts(due, &s, &[])));
-    let [Effect::CheckIn(lines)] = fired.as_slice() else {
-        panic!("{fired:?}");
-    };
+    assert_eq!(
+        verdict(st.step(stop(), &facts(due - 1, &s, &[]))),
+        Verdict::Park
+    );
+    assert_eq!(entry(&st).window.check_in, CheckIn::Armed);
+    let v = verdict(st.step(parked(), &facts(due, &s, &[])));
+    let lines = check_in_of(&v).expect("checked in at the park").to_vec();
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].name, SUBAGENT_NAME);
     assert!(!lines[0].run);
-    assert!(effects(st.step(Event::CheckInDue, &facts(due + 1, &s, &[]))).is_empty());
+    let (p, identities) = presented(v);
+    assert!(identities.is_empty(), "a check-in is not work");
+    assert_eq!(
+        entry(&st).window.check_in,
+        CheckIn::Due,
+        "presented is not delivered"
+    );
     assert_eq!(st.next_deadline(), None);
+    committed(st.step(Event::Delivered(p), &facts(due + 1, &s, &[])));
+    assert_eq!(entry(&st).window.check_in, CheckIn::Fired);
+    assert_eq!(
+        verdict(st.step(stop(), &facts(due + 2, &s, &[]))),
+        Verdict::Park,
+        "once"
+    );
 }
 
-/// A run due for its check-in after its process went owes no check-in:
-/// its end is the wake.
+/// A check-in whose presentation fails, dies with its monitor, or
+/// outlives its result's bound is still owed: the next park presents it
+/// again, and only a delivery spends it.
+#[test]
+fn a_check_in_not_delivered_stays_owed() {
+    let s = session();
+    for ending in ["emit failed", "restart", "overdue"] {
+        let mut st = standing(&s);
+        let due = st.next_deadline().unwrap();
+        let (p, _) = checked_in(verdict(st.step(stop(), &facts(due, &s, &[]))));
+        let mut st = match ending {
+            "emit failed" => {
+                settled(st.step(Event::EmitFailed(p), &facts(due, &s, &[])));
+                st
+            }
+            "restart" => restore(&serde_json::to_string(&st.persisted()).unwrap()),
+            _ => {
+                let late = facts(due + DELIVERY_RESULT_WITHIN, &s, &[]);
+                settled(st.step(Event::ResultOverdue, &late));
+                st
+            }
+        };
+        assert_eq!(entry(&st).window.check_in, CheckIn::Due, "{ending}");
+        let later = due + 2 * DELIVERY_RESULT_WITHIN;
+        let (p, names) = checked_in(verdict(st.step(stop(), &facts(later, &s, &[]))));
+        assert_eq!(names, [SUBAGENT_NAME], "{ending}");
+        committed(st.step(Event::Delivered(p), &facts(later, &s, &[])));
+        assert_eq!(entry(&st).window.check_in, CheckIn::Fired, "{ending}");
+    }
+}
+
+/// The incident of 2026-11-11: six `clank run`s fall due at different
+/// times while the agent's hook stays parked. Each is handed to that park
+/// as soon as it falls due, and the park that follows waits for the next;
+/// two due at one moment share one check-in.
+#[test]
+fn runs_falling_due_while_parked_are_each_checked_in_through_the_park() {
+    let s = session();
+    let mut st = SessionState::new(s.clone());
+    for (i, at) in [0, 1, 2, 3, 5, 5].into_iter().enumerate() {
+        st.step(
+            run(&format!("review {i}"), 7001 + i as i32),
+            &facts(T0 + at * MINUTE, &s, &[]),
+        );
+    }
+    assert_eq!(
+        verdict(st.step(stop(), &facts(T0 + 6 * MINUTE, &s, &[]))),
+        Verdict::Park
+    );
+    let mut shown = Vec::new();
+    while let Some(due) = st.next_deadline() {
+        assert_eq!(
+            verdict(st.step(parked(), &facts(due - 1, &s, &[]))),
+            Verdict::Park
+        );
+        assert!(effects(st.step(Event::CheckInDue, &facts(due, &s, &[]))).is_empty());
+        let (p, names) = checked_in(verdict(st.step(parked(), &facts(due, &s, &[]))));
+        committed(st.step(Event::Delivered(p), &facts(due, &s, &[])));
+        shown.push(names);
+        assert_eq!(
+            verdict(st.step(stop(), &facts(due + 1, &s, &[]))),
+            Verdict::Park,
+            "the next park waits for the next"
+        );
+    }
+    assert_eq!(
+        shown,
+        [
+            vec!["review 0"],
+            vec!["review 1"],
+            vec!["review 2"],
+            vec!["review 3"],
+            vec!["review 4", "review 5"],
+        ]
+    );
+    assert!(
+        st.attendances
+            .iter()
+            .all(|e| e.window.check_in == CheckIn::Fired)
+    );
+}
+
+/// Entries falling due while the agent works are owed and nothing
+/// presents them: not a compaction in the turn a delivery started, and not
+/// a session start. The next Stop carries
+/// every one owed in one check-in.
+#[test]
+fn check_ins_falling_due_mid_turn_wait_for_the_next_park() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = SessionState::new(s.clone());
+    st.step(declare("reviewer"), &facts(T0, &s, &[]));
+    st.step(run("test run", 7001), &facts(T0 + MINUTE, &s, &[]));
+    let (p, _) = deliver(&mut st, &facts(T0 + 2 * MINUTE, &s, &a));
+    committed(st.step(Event::Delivered(p), &facts(T0 + 2 * MINUTE, &s, &a)));
+    for due in [T0 + 10 * MINUTE, T0 + 11 * MINUTE] {
+        assert!(effects(st.step(Event::CheckInDue, &facts(due, &s, &[]))).is_empty());
+    }
+    assert!(
+        st.attendances
+            .iter()
+            .all(|e| e.window.check_in == CheckIn::Due)
+    );
+    let late = facts(T0 + 20 * MINUTE, &s, &[]);
+    assert_eq!(
+        verdict(st.step(compacted(), &late)),
+        Verdict::Park,
+        "no Stop stands: the turn is not over"
+    );
+    assert_eq!(
+        verdict(st.step(Event::SessionStart(s.clone()), &late)),
+        Verdict::Park
+    );
+    let (_, names) = checked_in(verdict(st.step(stop(), &late)));
+    assert_eq!(names, ["reviewer", "test run"]);
+}
+
+/// Every harness is checked in on at its turn end: through the park of
+/// every hook that parks, and through Grok's native Stop, beside the
+/// request for its wait when it asks for one.
+#[test]
+fn a_check_in_rides_every_harness_turn_end() {
+    let s = session();
+    for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+        let mut st = standing(&s);
+        let due = st.next_deadline().unwrap();
+        let (_, names) = checked_in(verdict(
+            st.step(Event::TurnEnd(report(tool)), &facts(due, &s, &[])),
+        ));
+        assert_eq!(names, [SUBAGENT_NAME], "{tool:?}");
+    }
+    for registered in [false, true] {
+        let mut st = standing(&s);
+        let due = st.next_deadline().unwrap();
+        let v = verdict(st.step(
+            native(&s, registered, TaskSnapshot::Unavailable),
+            &facts(due, &s, &[]),
+        ));
+        let Verdict::Deliver { notices, .. } = &v else {
+            panic!("{v:?}");
+        };
+        assert_eq!(
+            notices.contains(&Notice::ArmWait),
+            !registered,
+            "only a Stop with no wait asks for one: {v:?}"
+        );
+        let (_, names) = checked_in(v);
+        assert_eq!(names, [SUBAGENT_NAME], "registered {registered}");
+    }
+}
+
+/// Grok's native Stop delivers its check-in with the same receipt as any
+/// presentation: spent only by a delivery, left owed by a failed emit or a
+/// result that never came, and presented again at the next native Stop. A
+/// renewal while one is in flight keeps its own. With nothing owed, or for
+/// another session, the Stop is answered as before.
+#[test]
+fn groks_native_stop_carries_its_check_in_with_a_receipt() {
+    let s = session();
+    let grok = |registered| native(&s, registered, TaskSnapshot::Unavailable);
+    let mut st = standing(&s);
+    assert_eq!(
+        verdict(st.step(grok(true), &facts(T0 + MINUTE, &s, &[]))),
+        Verdict::Silent(SilentWhy::WaitArmed),
+        "nothing owed yet"
+    );
+    let due = st.next_deadline().unwrap();
+    assert_eq!(
+        verdict(st.step(
+            native(&other_session(), true, TaskSnapshot::Unavailable),
+            &facts(due, &s, &[])
+        )),
+        Verdict::Silent(SilentWhy::StaleBinding)
+    );
+    for ending in ["emit failed", "overdue"] {
+        let (p, _) = checked_in(verdict(st.step(grok(true), &facts(due, &s, &[]))));
+        assert_eq!(entry(&st).window.check_in, CheckIn::Due, "{ending}");
+        match ending {
+            "emit failed" => settled(st.step(Event::EmitFailed(p), &facts(due, &s, &[]))),
+            _ => settled(st.step(
+                Event::ResultOverdue,
+                &facts(due + DELIVERY_RESULT_WITHIN, &s, &[]),
+            )),
+        };
+        assert_eq!(entry(&st).window.check_in, CheckIn::Due, "{ending}");
+    }
+    let later = due + 2 * DELIVERY_RESULT_WITHIN;
+    let (p, _) = checked_in(verdict(st.step(grok(true), &facts(later, &s, &[]))));
+    committed(st.step(Event::Delivered(p), &facts(later, &s, &[])));
+    assert_eq!(entry(&st).window.check_in, CheckIn::Fired);
+    assert_eq!(
+        verdict(st.step(grok(true), &facts(later + 1, &s, &[]))),
+        Verdict::Silent(SilentWhy::WaitArmed),
+        "once"
+    );
+
+    let mut st = standing(&s);
+    let due = st.next_deadline().unwrap();
+    let (p, _) = checked_in(verdict(st.step(grok(true), &facts(due, &s, &[]))));
+    st.step(declare(SUBAGENT_NAME), &facts(due + 1, &s, &[]));
+    committed(st.step(Event::Delivered(p), &facts(due + 2, &s, &[])));
+    assert_eq!(
+        entry(&st).window.check_in,
+        CheckIn::Armed,
+        "the renewal keeps its own"
+    );
+    let next = st.next_deadline().unwrap();
+    let (_, names) = checked_in(verdict(st.step(grok(true), &facts(next, &s, &[]))));
+    assert_eq!(names, [SUBAGENT_NAME]);
+}
+
+/// A wake carrying work carries the check-in owed beside it, and its one
+/// delivery commits the work's receipts and spends the check-in.
+#[test]
+fn a_wake_carrying_work_carries_the_check_in_beside_it() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = standing(&s);
+    let due = st.next_deadline().unwrap();
+    let v = verdict(st.step(stop(), &facts(due, &s, &a)));
+    assert_eq!(check_in_of(&v).map(<[_]>::len), Some(1));
+    let (p, identities) = presented(v);
+    assert_eq!(identities, ["event:a"]);
+    let fx = committed(st.step(Event::Delivered(p), &facts(due, &s, &a)));
+    assert!(
+        fx.contains(&Effect::CommitReceipts(vec!["read:a".into()])),
+        "{fx:?}"
+    );
+    assert_eq!(entry(&st).window.check_in, CheckIn::Fired);
+}
+
+/// A run gone by its check-in is presented none: its end is the wake.
 #[test]
 fn a_run_gone_by_its_check_in_owes_none() {
     let s = session();
     let mut st = SessionState::new(s.clone());
     st.step(run("test run", 7001), &facts(T0, &s, &[]));
     let due = st.next_deadline().unwrap();
-    assert!(effects(st.step(Event::CheckInDue, &dead(due, &s, &[]))).is_empty());
-    assert_eq!(entry(&st).check_in, CheckIn::ProcessGone);
+    assert_eq!(verdict(st.step(stop(), &dead(due, &s, &[]))), Verdict::Park);
     assert_eq!(st.next_deadline(), None, "never due again");
+}
+
+/// A renewal arms one more check-in, for its new expectation. Renewed
+/// after a delivery, the next is presented at the new deadline; renewed
+/// before one, the old window's is never presented; renewed while one is
+/// in flight, that delivery spends only the entries still owed what it
+/// carried, so the renewed one stays armed and is checked in on again.
+#[test]
+fn a_renewal_arms_a_new_check_in_and_no_old_presentation_spends_it() {
+    let s = session();
+    let mut st = standing(&s);
+    let due = st.next_deadline().unwrap();
+    let (p, _) = checked_in(verdict(st.step(stop(), &facts(due, &s, &[]))));
+    committed(st.step(Event::Delivered(p), &facts(due, &s, &[])));
+    st.step(declare(SUBAGENT_NAME), &facts(due + 1, &s, &[]));
+    assert_eq!(entry(&st).window.check_in, CheckIn::Armed);
+    let next = st.next_deadline().unwrap();
+    assert_eq!(next, due + 1 + 10 * MINUTE);
+    assert_eq!(
+        verdict(st.step(stop(), &facts(next - 1, &s, &[]))),
+        Verdict::Park
+    );
+    let (_, names) = checked_in(verdict(st.step(parked(), &facts(next, &s, &[]))));
+    assert_eq!(names, [SUBAGENT_NAME], "renewed after: checked in again");
+
+    let mut st = standing(&s);
+    let due = st.next_deadline().unwrap();
+    st.step(Event::CheckInDue, &facts(due, &s, &[]));
+    st.step(declare(SUBAGENT_NAME), &facts(due + 1, &s, &[]));
+    assert_eq!(
+        entry(&st).window.check_in,
+        CheckIn::Armed,
+        "renewed before: unfired"
+    );
+    assert_eq!(
+        verdict(st.step(stop(), &facts(due + 2, &s, &[]))),
+        Verdict::Park
+    );
+
+    let mut st = standing(&s);
+    st.step(run("test run", 7001), &facts(T0, &s, &[]));
+    let due = st.next_deadline().unwrap();
+    let (p, names) = checked_in(verdict(st.step(stop(), &facts(due, &s, &[]))));
+    assert_eq!(names, [SUBAGENT_NAME, "test run"]);
+    st.step(declare(SUBAGENT_NAME), &facts(due + 1, &s, &[]));
+    committed(st.step(Event::Delivered(p), &facts(due + 2, &s, &[])));
+    assert_eq!(
+        [
+            &st.attendances[0].window.check_in,
+            &st.attendances[1].window.check_in
+        ],
+        [&CheckIn::Armed, &CheckIn::Fired],
+        "renewed in flight: the delivery spends only the run's"
+    );
+    let next = st.next_deadline().unwrap();
+    assert_eq!(next, due + 1 + 10 * MINUTE);
+    assert_eq!(
+        verdict(st.step(stop(), &facts(next - 1, &s, &[]))),
+        Verdict::Park
+    );
+    let (_, names) = checked_in(verdict(st.step(parked(), &facts(next, &s, &[]))));
+    assert_eq!(names, [SUBAGENT_NAME]);
+}
+
+/// With no waiter nothing presents an owed check-in. It survives a monitor
+/// restart, holds nothing off recovery past its deadline, and the next
+/// park presents it once.
+#[test]
+fn an_owed_check_in_waits_for_a_park_across_a_restart_and_is_delivered_once() {
+    let s = session();
+    let mut st = standing(&s);
+    let due = st.next_deadline().unwrap();
+    assert!(effects(st.step(Event::CheckInDue, &facts(due, &s, &[]))).is_empty());
+    assert_eq!(st.recovery_quiet(&facts(due + 1, &s, &[])), None);
+    let mut st = restore(&serde_json::to_string(&st.persisted()).unwrap());
+    assert_eq!(entry(&st).window.check_in, CheckIn::Due);
+    assert_eq!(st.next_deadline(), None, "nothing to wake the monitor for");
+    let (p, names) = checked_in(verdict(st.step(stop(), &facts(due + MINUTE, &s, &[]))));
+    assert_eq!(names, [SUBAGENT_NAME]);
+    committed(st.step(Event::Delivered(p), &facts(due + MINUTE, &s, &[])));
+    let mut st = restore(&serde_json::to_string(&st.persisted()).unwrap());
+    assert_eq!(
+        verdict(st.step(stop(), &facts(due + 2 * MINUTE, &s, &[]))),
+        Verdict::Park,
+        "delivered once"
+    );
 }
 
 /// `clank attend <desc>` renews the run that `--desc` names, as its check-in
@@ -923,8 +1283,8 @@ fn a_run_is_renewed_and_cleared_by_its_desc() {
     );
     let renewed = &st.attendances[0];
     assert_eq!(renewed.proof(), Some(&proof_of(7001)));
-    assert_eq!((renewed.started, renewed.since), (T0, due + 1));
-    assert_eq!(renewed.check_in, CheckIn::Armed);
+    assert_eq!((renewed.started, renewed.window.since), (T0, due + 1));
+    assert_eq!(renewed.window.check_in, CheckIn::Armed);
     assert_eq!(
         st.attendances.len(),
         2,
@@ -1041,9 +1401,9 @@ fn recovery_is_quiet_only_while_attendance_quiets_everything_owed() {
     );
 }
 
-/// Past its deadline an entry quiets nothing, its check-in lost or not.
+/// Past its deadline an entry quiets nothing, its check-in owed or not.
 #[test]
-fn received_work_is_quiet_until_the_deadline_even_when_the_check_in_is_lost() {
+fn received_work_is_quiet_until_the_deadline_even_while_its_check_in_is_owed() {
     let s = session();
     let a = owed("event:a", "read:a");
     let mut st = received_then(&s, &a, run("test run", 7001));
@@ -1055,14 +1415,8 @@ fn received_work_is_quiet_until_the_deadline_even_when_the_check_in_is_lost() {
         Verdict::Park
     );
     let at = facts(deadline, &s, &a);
-    let check_ins = check_ins(effects(st.step(Event::CheckInDue, &at)));
-    st.step(
-        Event::CheckInUndeliverable {
-            check_ins,
-            why: "its pane was not found".into(),
-        },
-        &at,
-    );
+    st.step(Event::CheckInDue, &at);
+    assert_eq!(entry(&st).window.check_in, CheckIn::Due);
     assert_eq!(st.recovery_quiet(&at), None);
     let (_, identities) = presented(verdict(st.step(Event::Parked(report(Tool::Claude)), &at)));
     assert_eq!(identities, ["event:a"]);
@@ -1148,85 +1502,6 @@ fn quieted_work_is_neither_presented_nor_counted() {
     assert_eq!(st.repeat, None, "a quieted episode is over");
 }
 
-#[test]
-fn entries_due_together_share_one_check_in_and_a_stale_result_is_discarded() {
-    let s = session();
-    let mut st = SessionState::new(s.clone());
-    st.step(run("test run", 7001), &facts(T0, &s, &[]));
-    st.step(declare(SUBAGENT_NAME), &facts(T0, &s, &[]));
-    let due = st.next_deadline().unwrap();
-    let fired = check_ins(effects(st.step(Event::CheckInDue, &facts(due, &s, &[]))));
-    assert_eq!(fired.len(), 2);
-    st.step(declare(SUBAGENT_NAME), &facts(due + 1, &s, &[]));
-    let lines = st
-        .may_type_check_in(&fired, &facts(due + 1, &s, &[]))
-        .unwrap();
-    assert_eq!(lines.len(), 1, "the renewed one dropped out");
-    assert!(lines[0].run);
-    st.step(
-        Event::CheckInUndeliverable {
-            check_ins: fired,
-            why: "no pane".into(),
-        },
-        &facts(due + 2, &s, &[]),
-    );
-    assert_eq!(
-        st.attendances[0].check_in,
-        CheckIn::Undeliverable("no pane".into())
-    );
-    assert_eq!(
-        st.attendances[1].check_in,
-        CheckIn::Armed,
-        "the renewal keeps its own"
-    );
-}
-
-#[test]
-fn the_last_look_refuses_a_check_in_whose_attendance_or_gates_changed() {
-    let s = session();
-    let mut st = standing(&s);
-    let due = st.next_deadline().unwrap();
-    let ours = fired(&mut st, due);
-    let now = facts(due, &s, &[]);
-    let ours = [ours];
-    assert!(
-        matches!(st.may_type_check_in(&ours, &now).as_deref(), Ok([line]) if line.check_in == ours[0])
-    );
-    let off = Facts {
-        auto: Ok(AutoMode::Off),
-        ..facts(due, &s, &[])
-    };
-    let asking = Facts {
-        asking: true,
-        ..facts(due, &s, &[])
-    };
-    let blocked = Facts {
-        blocked: true,
-        ..facts(due, &s, &[])
-    };
-    let other = other_session();
-    let rebound = facts(due, &other, &[]);
-    for (gate, why) in [
-        (&off, "auto turned off"),
-        (&asking, "a question is pending"),
-        (&blocked, "a block is pending"),
-        (&rebound, "the session no longer holds the label"),
-    ] {
-        assert_eq!(st.may_type_check_in(&ours, gate), Err(why.to_string()));
-    }
-
-    let mut cleared = st.clone();
-    cleared.step(clear_all(), &now);
-    let mut renewed = st.clone();
-    renewed.step(declare(SUBAGENT_NAME), &facts(due + 1, &s, &[]));
-    for st in [cleared, renewed] {
-        assert_eq!(
-            st.may_type_check_in(&ours, &facts(due + 1, &s, &[])),
-            Err("the attendance it was for was cleared or renewed".to_string())
-        );
-    }
-}
-
 /// Grok's waiter evidence is the monitor's registration of it. A Stop
 /// that continues the turn asked to arm one treats a wait not yet
 /// registered as pending, so it is never asked for twice.
@@ -1285,6 +1560,8 @@ mod old_bytes {
     /// Declarations as the build that ended them at the next turn start
     /// wrote them, one with its turn already ended.
     pub const TURN_SCOPED: &str = r#"{"binding":"00000000-0000-0000-0000-000000000000","attendances":[{"work":{"Declared":{"name":"capture-probe sleeper","seen_turn_end":true}},"desc":"capture-probe sleeper","started":1000000,"since":1000000,"expect":600000,"check_in":"Armed"},{"work":{"Declared":{"name":"reviewer","seen_turn_end":false}},"desc":"reviewer","started":1000000,"since":1000000,"expect":600000,"check_in":"Fired"}],"repeat":null,"outstanding":null,"outstanding_episode_broken":false,"resolved":null,"next_seq":3,"received":["event:a"],"unwatched":null}"#;
+    /// Each check-in state a build that typed check-ins could save.
+    pub const TYPED_CHECK_INS: &str = r#"{"binding":"00000000-0000-0000-0000-000000000000","attendances":[{"work":{"Declared":{"name":"lost"}},"desc":"lost","started":1000000,"since":1000000,"expect":600000,"check_in":{"Undeliverable":"its pane was not found"}},{"work":{"Run":{"pid":7001,"token":"mac1:7001:1"}},"desc":"gone","started":1000000,"since":1000000,"expect":600000,"check_in":"ProcessGone"},{"work":{"Declared":{"name":"held"}},"desc":"held","started":1000000,"since":1000000,"expect":600000,"check_in":{"Withheld":"Asking"}},{"work":{"Declared":{"name":"typed"}},"desc":"typed","started":1000000,"since":1000000,"expect":600000,"check_in":"Fired"},{"work":{"Declared":{"name":"armed"}},"desc":"armed","started":1000000,"since":1000000,"expect":1200000,"check_in":"Armed"}],"repeat":null,"outstanding":null,"outstanding_episode_broken":false,"resolved":null,"next_seq":3,"received":[],"unwatched":null}"#;
     pub const LISTED: &str = r#"{"binding":"00000000-0000-0000-0000-000000000000","attendances":[{"selector":{"Name":"capture-probe sleeper"},"resolved":{"task_id":"a25eee2eef81caf3e","kind":"Subagent"},"desc":"capture-probe sleeper","since":1000000,"expect":600000,"shell":null,"check_in":"Armed"},{"selector":{"RunDesc":"test run"},"resolved":null,"desc":"test run","since":1060000,"expect":600000,"shell":{"pid":7001,"token":"mac1:7001:1"},"check_in":"Unarmed"},{"selector":{"Name":"watcher"},"resolved":{"task_id":"m1","kind":{"Unknown":"monitor"}},"desc":null,"since":1000000,"expect":600000,"shell":null,"check_in":{"Withheld":"AutoOff"}}],"repeat":null,"outstanding":null,"outstanding_episode_broken":false,"resolved":null,"next_seq":3,"received":["event:a"],"unwatched":null}"#;
 }
 
@@ -1298,7 +1575,13 @@ fn restore(bytes: &str) -> SessionState {
 #[test]
 fn every_older_saved_shape_loads_with_its_runs_registered() {
     let s = session();
-    let bound = |name: &str, task: &str, since, expect, check_in| Entry {
+    let window = |id, since, expect, check_in| Window {
+        id,
+        since,
+        expect,
+        check_in,
+    };
+    let bound = |name: &str, task: &str, since, expect, check_in, id| Entry {
         work: Attending::Declared {
             name: name.into(),
             task: Some(task.into()),
@@ -1308,55 +1591,58 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
         },
         desc: name.into(),
         started: since,
-        since,
-        expect,
-        check_in,
+        window: window(id, since, expect, check_in),
     };
-    let declared = |name: &str, since, expect, check_in| Entry {
+    let declared = |name: &str, since, expect, check_in, id| Entry {
         work: Attending::declared(name.into()),
         desc: name.into(),
         started: since,
-        since,
-        expect,
-        check_in,
+        window: window(id, since, expect, check_in),
     };
-    let test_run = |since, expect| Entry {
+    let test_run = |since, expect, id| Entry {
         work: Attending::Run(proof_of(7001)),
         desc: "test run".into(),
         started: since,
-        since,
-        expect,
-        check_in: CheckIn::Armed,
+        window: window(id, since, expect, CheckIn::Armed),
     };
     assert!(restore(old_bytes::NONE).attendances.is_empty());
     assert_eq!(restore(old_bytes::NONE).next_seq, 3);
     assert_eq!(
         restore(old_bytes::INTENT).attendances,
-        [test_run(T0, 10 * MINUTE)]
+        [test_run(T0, 10 * MINUTE, 1)]
     );
     assert_eq!(
         restore(old_bytes::OTHER_RENEWAL).attendances,
         [
-            bound(SUBAGENT_NAME, SUBAGENT_ID, T0, 10 * MINUTE, CheckIn::Armed),
-            test_run(T0 + 2 * MINUTE, 20 * MINUTE),
+            bound(
+                SUBAGENT_NAME,
+                SUBAGENT_ID,
+                T0,
+                10 * MINUTE,
+                CheckIn::Armed,
+                1
+            ),
+            test_run(T0 + 2 * MINUTE, 20 * MINUTE, 2),
         ]
     );
     let listed = restore(old_bytes::LISTED);
     assert_eq!(
         listed.attendances,
         [
-            bound(SUBAGENT_NAME, SUBAGENT_ID, T0, 10 * MINUTE, CheckIn::Armed),
-            test_run(T0 + MINUTE, 10 * MINUTE),
             bound(
-                "watcher",
-                "m1",
+                SUBAGENT_NAME,
+                SUBAGENT_ID,
                 T0,
                 10 * MINUTE,
-                CheckIn::Withheld(Withheld::AutoOff)
+                CheckIn::Armed,
+                1
             ),
+            test_run(T0 + MINUTE, 10 * MINUTE, 2),
+            bound("watcher", "m1", T0, 10 * MINUTE, CheckIn::Due, 3),
         ]
     );
     assert_eq!(listed.ended_runs(&DEAD, T0 + 2 * MINUTE).len(), 1);
+    assert_eq!(listed.next_window, 3, "a new window is not an old one");
 
     let mut st = restore(old_bytes::LISTED);
     st.step(stop(), &facts(T0 + 2 * MINUTE, &s, &[]));
@@ -1375,8 +1661,8 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
     assert_eq!(
         turn_scoped.attendances,
         [
-            declared(SUBAGENT_NAME, T0, 10 * MINUTE, CheckIn::Armed),
-            declared("reviewer", T0, 10 * MINUTE, CheckIn::Fired),
+            declared(SUBAGENT_NAME, T0, 10 * MINUTE, CheckIn::Armed, 1),
+            declared("reviewer", T0, 10 * MINUTE, CheckIn::Fired, 2),
         ]
     );
     let mut st = turn_scoped.clone();
@@ -1392,6 +1678,29 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
         back.attendances, listed.attendances,
         "the new shape round-trips"
     );
+}
+
+/// A check-in an older build left without reaching the model (lost to a
+/// missing pane, withheld by a gate, or skipped for a gone run) loads as
+/// owed, and the next park presents it; one it typed loads as spent.
+#[test]
+fn check_ins_saved_by_a_typing_build_load_as_owed_or_spent() {
+    let s = session();
+    let mut st = restore(old_bytes::TYPED_CHECK_INS);
+    let states: Vec<&CheckIn> = st.attendances.iter().map(|e| &e.window.check_in).collect();
+    assert_eq!(
+        states,
+        [
+            &CheckIn::Due,
+            &CheckIn::Due,
+            &CheckIn::Due,
+            &CheckIn::Fired,
+            &CheckIn::Armed
+        ]
+    );
+    assert_eq!(st.next_deadline(), Some(T0 + 20 * MINUTE));
+    let (_, names) = checked_in(verdict(st.step(stop(), &facts(T0 + 11 * MINUTE, &s, &[]))));
+    assert_eq!(names, ["lost", "gone", "held"]);
 }
 
 #[test]
@@ -1446,16 +1755,6 @@ fn repeated_deliveries_count_and_a_human_turn_resets() {
 }
 
 #[test]
-fn a_check_in_respects_the_current_auto_mode() {
-    let s = session();
-    let mut st = standing(&s);
-    let due = st.next_deadline().unwrap();
-    let mut off = facts(due, &s, &[]);
-    off.auto = Ok(AutoMode::Off);
-    assert!(effects(st.step(Event::CheckInDue, &off)).is_empty());
-}
-
-#[test]
 fn a_later_report_does_not_erase_an_emitted_presentations_receipt() {
     let s = session();
     let a = [OwedItem {
@@ -1503,46 +1802,76 @@ fn an_empty_owed_fold_forgets_the_previous_repeat_episode() {
     );
 }
 
+/// A check-in with no work beside it waits while clank may not wake the
+/// agent for anything but work, or may not wake it at all, at a Stop and
+/// at Grok's native Stop alike, and the turn end after the gate lifts
+/// presents it.
 #[test]
-fn a_check_in_held_back_by_a_gate_is_spent_and_never_rescheduled() {
+fn a_check_in_held_by_a_gate_waits_for_it_to_lift() {
     let s = session();
-    for (gate, why) in [
-        ("auto off", Withheld::AutoOff),
-        ("asking", Withheld::Asking),
-        ("blocked", Withheld::Blocked),
-    ] {
-        let mut st = standing(&s);
-        let due = st.next_deadline().unwrap();
-        let mut f = facts(due, &s, &[]);
-        match gate {
-            "auto off" => f.auto = Ok(AutoMode::Off),
-            "asking" => f.asking = true,
-            _ => f.blocked = true,
+    type TurnEnd = fn(&SessionId) -> Event;
+    let carriers: [(&str, TurnEnd); 2] = [
+        ("Stop", |_| stop()),
+        ("Grok's native Stop", |s| {
+            native(s, true, TaskSnapshot::Unavailable)
+        }),
+    ];
+    for (carrier, turn_end) in carriers {
+        for gate in [
+            "auto off",
+            "asking",
+            "blocked",
+            "user command",
+            "bad config",
+            "bad role",
+        ] {
+            let mut st = standing(&s);
+            let due = st.next_deadline().unwrap();
+            let mut f = facts(due, &s, &[]);
+            match gate {
+                "auto off" => f.auto = Ok(AutoMode::Off),
+                "asking" => f.asking = true,
+                "blocked" => f.blocked = true,
+                "user command" => f.user_command = true,
+                "bad config" => f.auto = Err("bad config".into()),
+                _ => f.role = Err("no role".into()),
+            }
+            let held = verdict(st.step(turn_end(&s), &f));
+            assert_eq!(check_in_of(&held), None, "{carrier}, {gate}: {held:?}");
+            assert_eq!(
+                entry(&st).window.check_in,
+                CheckIn::Due,
+                "{carrier}, {gate}"
+            );
+            let lifted = facts(due + 1, &s, &[]);
+            let (_, names) = checked_in(verdict(st.step(turn_end(&s), &lifted)));
+            assert_eq!(names, [SUBAGENT_NAME], "{carrier}, {gate}");
         }
-        assert!(effects(st.step(Event::CheckInDue, &f)).is_empty(), "{gate}");
-        assert!(entry(&st).check_in == CheckIn::Withheld(why), "{gate}");
-        assert_eq!(st.next_deadline(), None, "{gate}");
-        assert!(
-            effects(st.step(Event::CheckInDue, &facts(due + 1, &s, &[]))).is_empty(),
-            "{gate}: the gate lifting does not re-arm it"
-        );
     }
 }
 
+/// A renewal made while a presentation is in flight, whose new expectation
+/// has passed too before that presentation is delivered, keeps the new
+/// window's check-in owed: the old delivery spends only the window it was
+/// presented for.
 #[test]
-fn an_unreadable_config_or_role_lets_the_check_in_through() {
+fn an_old_delivery_never_spends_a_renewed_window_already_due() {
     let s = session();
-    for broken in ["config", "role"] {
-        let mut st = standing(&s);
-        let due = st.next_deadline().unwrap();
-        let mut f = facts(due, &s, &[]);
-        if broken == "config" {
-            f.auto = Err("bad config".into());
-        } else {
-            f.role = Err("no role".into());
-        }
-        assert_eq!(effects(st.step(Event::CheckInDue, &f)).len(), 1, "{broken}");
-    }
+    let mut st = standing(&s);
+    let due = st.next_deadline().unwrap();
+    let (p, _) = checked_in(verdict(st.step(stop(), &facts(due, &s, &[]))));
+    st.step(declare(SUBAGENT_NAME), &facts(due + 1, &s, &[]));
+    let renewed = st.next_deadline().unwrap();
+    st.step(Event::CheckInDue, &facts(renewed, &s, &[]));
+    assert_eq!(entry(&st).window.check_in, CheckIn::Due);
+    committed(st.step(Event::Delivered(p), &facts(renewed + 1, &s, &[])));
+    assert_eq!(
+        entry(&st).window.check_in,
+        CheckIn::Due,
+        "the old window's delivery leaves the new one owed"
+    );
+    let (_, names) = checked_in(verdict(st.step(stop(), &facts(renewed + 2, &s, &[]))));
+    assert_eq!(names, [SUBAGENT_NAME]);
 }
 
 #[test]
@@ -1867,27 +2196,6 @@ fn an_unbroken_live_result_keeps_counting() {
 }
 
 #[test]
-fn an_undeliverable_check_in_is_recorded_and_recovery_takes_over() {
-    let s = session();
-    let mut st = standing(&s);
-    let due = st.next_deadline().unwrap();
-    let check_in = fired(&mut st, due);
-    st.step(
-        Event::CheckInUndeliverable {
-            check_ins: vec![check_in],
-            why: "no pane was found".into(),
-        },
-        &facts(due, &s, &[]),
-    );
-    assert_eq!(
-        entry(&st).check_in,
-        CheckIn::Undeliverable("no pane was found".into())
-    );
-    assert_eq!(st.next_deadline(), None);
-    assert_eq!(st.recovery_quiet(&facts(due + 1, &s, &[])), None);
-}
-
-#[test]
 fn a_session_start_presents_once_and_counts_nothing() {
     let s = session();
     let a = owed("event:a", "read:a");
@@ -1991,15 +2299,6 @@ fn only_a_known_persons_newer_turn_resets() {
         prev = Some(next);
     }
     assert_eq!(stated, [1, 2, 1, 2]);
-}
-
-/// Fire `st`'s check-in at `due`, and say which attendance it was for.
-fn fired(st: &mut SessionState, due: Ms) -> CheckInRef {
-    let s = st.binding.clone();
-    match check_ins(effects(st.step(Event::CheckInDue, &facts(due, &s, &[])))).as_slice() {
-        [one] => one.clone(),
-        other => panic!("not one entry checked in on: {other:?}"),
-    }
 }
 
 /// A Stop that would park ends silently while a verified user command
@@ -2159,14 +2458,18 @@ fn an_unseen_run_is_kept_and_never_ended() {
     };
     assert_eq!(st.recovery_quiet(&unseen), None);
     let due = st.next_deadline().unwrap();
-    let fired = effects(st.step(
-        Event::CheckInDue,
+    let (_, checked) = checked_in(verdict(st.step(
+        stop(),
         &Facts {
             liveness: &UNSEEN,
             ..facts(due, &s, &a)
         },
-    ));
-    assert_eq!(fired.len(), 1, "it may still be running: checked in on");
+    )));
+    assert_eq!(
+        checked,
+        ["test run"],
+        "it may still be running: checked in on"
+    );
     assert_eq!(names(&st), ["test run"]);
     assert_eq!(
         st.ended_runs(&DEAD, due + 1).len(),
@@ -2491,4 +2794,300 @@ fn state_saved_before_stops_were_kept_reports_none() {
     ] {
         assert_eq!(restore(old).stopped, None);
     }
+}
+
+/// A person starts a turn with no clank presentation, so the Stop of the
+/// turn before stays recorded. A compaction in the new turn is stepped as
+/// a park, but its record has moved past that Stop: it carries no
+/// check-in, which stays owed for the next Stop, while a park still at the
+/// recorded Stop is handed it.
+#[test]
+fn review_old_stop_cannot_authorize_a_check_in_at_a_new_turns_compaction() {
+    let s = session();
+    let mut st = SessionState::new(s.clone());
+    st.step(declare("reviewer"), &facts(T0, &s, &[]));
+    assert_eq!(
+        verdict(st.step(Event::TurnEnd(placed_stop("t1", 40)), &facts(T0, &s, &[]))),
+        Verdict::Park
+    );
+    let due = st.next_deadline().unwrap();
+    let compacting = placed_stop("t2", 200);
+    assert!(!st.stopped.as_ref().unwrap().stands_in(&compacting.place));
+    let v = verdict(st.step(Event::Compacted(compacting), &facts(due, &s, &[])));
+    assert!(
+        check_in_of(&v).is_none(),
+        "a Stop from t1 does not show t2 is over: {v:?}"
+    );
+    assert_eq!(entry(&st).window.check_in, CheckIn::Due);
+    let (p, names) = checked_in(verdict(
+        st.step(Event::Parked(placed_stop("t1", 40)), &facts(due, &s, &[])),
+    ));
+    assert_eq!(
+        names,
+        ["reviewer"],
+        "the park at t1's own Stop still is one"
+    );
+    settled(st.step(Event::EmitFailed(p), &facts(due, &s, &[])));
+    let (_, names) = checked_in(verdict(st.step(
+        Event::TurnEnd(placed_stop("t2", 220)),
+        &facts(due + 1, &s, &[]),
+    )));
+    assert_eq!(names, ["reviewer"], "t2's own Stop delivers it");
+}
+
+#[test]
+fn review_empty_placement_is_not_identity_of_the_parked_stop() {
+    let s = session();
+    let mut st = SessionState::new(s.clone());
+    st.step(declare("reviewer"), &facts(T0, &s, &[]));
+    let mut old_stop = report(Tool::Claude);
+    old_stop.place = TurnPlace::default();
+    old_stop.hook_started = Some(T0);
+    assert_eq!(
+        verdict(st.step(Event::TurnEnd(old_stop), &facts(T0, &s, &[]))),
+        Verdict::Park
+    );
+    let due = st.next_deadline().unwrap();
+    let mut later_compaction = report(Tool::Claude);
+    later_compaction.place = TurnPlace::default();
+    later_compaction.hook_started = Some(due);
+    let v = verdict(st.step(Event::Compacted(later_compaction), &facts(due, &s, &[])));
+    assert!(
+        check_in_of(&v).is_none(),
+        "equal missing placement is not evidence this compaction holds the old Stop: {v:?}"
+    );
+}
+
+/// A report other than the one that recorded the Stop holds it only by
+/// placement both sides read and that has not moved. A compaction whose
+/// record could not be read, one naming the Stop's turn with no boundary,
+/// or a Stop that itself was placed by name alone, is no such evidence:
+/// the check-in stays owed for the next Stop.
+#[test]
+fn a_park_without_placement_evidence_carries_no_check_in() {
+    let s = session();
+    let named = |turn: &str| TurnPlace {
+        turn: Some(turn.into()),
+        ..TurnPlace::default()
+    };
+    let read = |len| TurnPlace {
+        read_to: Some(ReadTo { file: 7, len }),
+        ..TurnPlace::default()
+    };
+    for (case, stopped, compacting) in [
+        ("unreadable compaction", read(100), TurnPlace::default()),
+        ("unread Stop", TurnPlace::default(), read(100)),
+        ("named but unplaced", named("t1"), named("t1")),
+    ] {
+        let mut st = standing(&s);
+        let due = st.next_deadline().unwrap();
+        let first = TurnEndReport {
+            place: stopped,
+            ..report(Tool::Claude)
+        };
+        st.step(Event::TurnEnd(first), &facts(due - 1, &s, &[]));
+        let compaction = TurnEndReport {
+            place: compacting,
+            ..report(Tool::Claude)
+        };
+        let v = verdict(st.step(Event::Compacted(compaction), &facts(due, &s, &[])));
+        assert_eq!(check_in_of(&v), None, "{case}: {v:?}");
+        assert_eq!(entry(&st).window.check_in, CheckIn::Due, "{case}");
+        let (_, names) = checked_in(verdict(st.step(stop(), &facts(due + 1, &s, &[]))));
+        assert_eq!(names, [SUBAGENT_NAME], "{case}: the next Stop delivers it");
+    }
+}
+
+/// A parked Stop that reads no record, as OpenCode's, or whose hook from
+/// an older build gave no start time, is re-served at its check-in's
+/// deadline as the very report the park holds, and is handed the check-in.
+#[test]
+fn a_re_served_unplaced_park_is_handed_its_check_in() {
+    let s = session();
+    let st = standing(&s);
+    let due = st.next_deadline().unwrap();
+    for hook_started in [later(), None] {
+        let mut st = st.clone();
+        let held = TurnEndReport {
+            hook_started,
+            ..report(Tool::OpenCode)
+        };
+        assert_eq!(
+            verdict(st.step(Event::TurnEnd(held.clone()), &facts(due - 1, &s, &[]))),
+            Verdict::Park
+        );
+        let (_, names) = checked_in(verdict(st.step(Event::Parked(held), &facts(due, &s, &[]))));
+        assert_eq!(names, [SUBAGENT_NAME], "{hook_started:?}");
+    }
+}
+
+/// Equal clock readings are not identity: a compaction at a later turn
+/// whose hook clock reads the same as the old Stop's carries nothing.
+#[test]
+fn review_equal_hook_clock_cannot_override_a_different_turn() {
+    let s = session();
+    let mut st = SessionState::new(s.clone());
+    st.step(declare("reviewer"), &facts(T0, &s, &[]));
+    let mut old = placed_stop("t1", 40);
+    old.tool = Tool::Claude;
+    old.hook_started = Some(T0);
+    assert_eq!(
+        verdict(st.step(Event::TurnEnd(old), &facts(T0, &s, &[]))),
+        Verdict::Park
+    );
+    let due = st.next_deadline().unwrap();
+    let mut compacted = placed_stop("t2", 200);
+    compacted.tool = Tool::Claude;
+    compacted.hook_started = Some(T0);
+    assert!(!st.stopped.as_ref().unwrap().stands_in(&compacted.place));
+    let v = verdict(st.step(Event::Compacted(compacted), &facts(due, &s, &[])));
+    assert!(
+        check_in_of(&v).is_none(),
+        "a matching clock cannot turn t2 into the old t1 Stop: {v:?}"
+    );
+}
+
+/// The listing that binds a pending declaration to its subagent, from the
+/// subagent's own stop.
+fn binding_report(s: &SessionId, at: Ms) -> ChildReport {
+    ChildReport {
+        session: s.clone(),
+        child: "other-child".into(),
+        hook_started: Some(at),
+        seen: ChildSeen::Stopped {
+            tasks: listing(&[(SUBAGENT_ID, SUBAGENT_NAME)]),
+            agent: TurnPlace::default(),
+        },
+    }
+}
+
+#[test]
+fn review_binding_a_declaration_does_not_change_its_check_in_window() {
+    let s = session();
+    let mut st = standing(&s);
+    let due = st.next_deadline().unwrap();
+    let (p, _) = checked_in(verdict(st.step(stop(), &facts(due, &s, &[]))));
+    assert!(matches!(entry(&st).key(), EntryKey::Name(_)));
+    assert!(st.child(&binding_report(&s, due + 1), &facts(due + 1, &s, &[])));
+    assert_eq!(entry(&st).task(), Some(SUBAGENT_ID));
+    let window = entry(&st).window.since;
+    committed(st.step(Event::Delivered(p), &facts(due + 2, &s, &[])));
+    let v = verdict(st.step(stop(), &facts(due + 3, &s, &[])));
+    assert!(
+        check_in_of(&v).is_none(),
+        "binding renewed nothing at since={window}, but the delivered check-in is repeated: {v:?}"
+    );
+}
+
+/// A presentation in flight across a binding is saved under the bound key.
+/// Restored, it died with its monitor, so its check-in is presented once
+/// more, and that delivery spends the bound entry's window.
+#[test]
+fn a_check_in_in_flight_across_a_binding_survives_a_restart_bound() {
+    let s = session();
+    let mut st = standing(&s);
+    let due = st.next_deadline().unwrap();
+    let (lost, _) = checked_in(verdict(st.step(stop(), &facts(due, &s, &[]))));
+    assert!(st.child(&binding_report(&s, due + 1), &facts(due + 1, &s, &[])));
+    let saved: Persisted =
+        serde_json::from_str(&serde_json::to_string(&st.persisted()).unwrap()).unwrap();
+    assert_eq!(
+        saved.outstanding.as_ref().map(|p| p.check_ins.clone()),
+        Some(vec![CheckInRef {
+            window: entry(&st).window.id,
+        }])
+    );
+    let mut st = SessionState::restored(saved);
+    assert!(matches!(
+        settled(st.step(Event::Delivered(lost), &facts(due + 2, &s, &[]))),
+        ResultOutcome::ProtocolViolation(_)
+    ));
+    assert_eq!(entry(&st).window.check_in, CheckIn::Due);
+    let (p, names) = checked_in(verdict(st.step(stop(), &facts(due + 3, &s, &[]))));
+    assert_eq!(names, [SUBAGENT_NAME]);
+    committed(st.step(Event::Delivered(p), &facts(due + 4, &s, &[])));
+    assert_eq!(entry(&st).window.check_in, CheckIn::Fired);
+}
+
+/// A declaration renewed while the first is bound to its subagent, its
+/// window presented, then merged into the bound one by a later listing.
+/// Returns the state just before the merge, the presentation carrying the
+/// pending window, and that window's deadline.
+fn presented_then_pending(s: &SessionId) -> (SessionState, PresentationId, Ms) {
+    let mut st = standing(s);
+    assert!(st.child(&binding_report(s, T0 + 1), &facts(T0 + 1, s, &[])));
+    let old_due = st.next_deadline().unwrap();
+    let (old, _) = checked_in(verdict(st.step(stop(), &facts(old_due, s, &[]))));
+    committed(st.step(Event::Delivered(old), &facts(old_due, s, &[])));
+    st.step(declare(SUBAGENT_NAME), &facts(old_due + 1, s, &[]));
+    assert_eq!(st.attendances.len(), 2);
+    let due = st.next_deadline().unwrap();
+    let parked_report = TurnEndReport {
+        tasks: TaskSnapshot::Known(vec![BackgroundTask::from(serde_json::json!({
+            "id":"work", "type":"shell", "status":"running", "description":"long work"
+        }))]),
+        hook_started: Some(old_due + 2),
+        ..report(Tool::Claude)
+    };
+    assert_eq!(
+        verdict(st.step(
+            Event::TurnEnd(parked_report.clone()),
+            &facts(old_due + 2, s, &[])
+        )),
+        Verdict::Park
+    );
+    let (p, names) = checked_in(verdict(
+        st.step(Event::Parked(parked_report), &facts(due, s, &[])),
+    ));
+    assert_eq!(names, [SUBAGENT_NAME]);
+    (st, p, due)
+}
+
+#[test]
+fn review_merging_a_pending_window_preserves_its_check_in_delivery() {
+    let s = session();
+    for delivered_before_merge in [false, true] {
+        let (mut st, p, due) = presented_then_pending(&s);
+        let window = st.attendances[1].window.clone();
+        if delivered_before_merge {
+            committed(st.step(Event::Delivered(p.clone()), &facts(due + 1, &s, &[])));
+        }
+        assert!(st.child(&binding_report(&s, due + 2), &facts(due + 2, &s, &[])));
+        assert_eq!(st.attendances.len(), 1);
+        assert_eq!(
+            (entry(&st).window.id, entry(&st).window.since),
+            (window.id, window.since),
+            "the merge moves the pending window"
+        );
+        if !delivered_before_merge {
+            committed(st.step(Event::Delivered(p), &facts(due + 3, &s, &[])));
+        }
+        assert_eq!(entry(&st).window.check_in, CheckIn::Fired);
+        let v = verdict(st.step(stop(), &facts(due + 4, &s, &[])));
+        assert!(
+            check_in_of(&v).is_none(),
+            "delivered before merge={delivered_before_merge}: {v:?}"
+        );
+    }
+}
+
+/// A merge while the pending window's presentation is in flight, then a
+/// restart: the presentation died with its monitor, so the moved window is
+/// still owed, presented once more, and spent by that delivery.
+#[test]
+fn a_window_merged_in_flight_survives_a_restart_owed() {
+    let s = session();
+    let (mut st, lost, due) = presented_then_pending(&s);
+    assert!(st.child(&binding_report(&s, due + 1), &facts(due + 1, &s, &[])));
+    let mut st = restore(&serde_json::to_string(&st.persisted()).unwrap());
+    assert!(matches!(
+        settled(st.step(Event::Delivered(lost), &facts(due + 2, &s, &[]))),
+        ResultOutcome::ProtocolViolation(_)
+    ));
+    assert_eq!(entry(&st).window.check_in, CheckIn::Due);
+    let (p, names) = checked_in(verdict(st.step(stop(), &facts(due + 3, &s, &[]))));
+    assert_eq!(names, [SUBAGENT_NAME]);
+    committed(st.step(Event::Delivered(p), &facts(due + 4, &s, &[])));
+    assert_eq!(entry(&st).window.check_in, CheckIn::Fired);
+    assert!(check_in_of(&verdict(st.step(stop(), &facts(due + 5, &s, &[])))).is_none());
 }

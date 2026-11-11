@@ -407,6 +407,59 @@ fn a_hook_handoff_reads_as_what_the_parked_hook_held() {
     );
 }
 
+/// A check-in presentation in flight when its monitor stopped: the owed
+/// window and the window the presentation carries read back as written,
+/// and a monitor restored from them takes the presentation as failed, so
+/// the check-in is still owed.
+#[test]
+fn turn_state_with_a_check_in_in_flight_reads_and_round_trips() {
+    use clank_core::turn_policy::{CheckIn, CheckInRef, Resolution, SessionState};
+    let dir = tempfile::tempdir().unwrap();
+    let path = place(
+        &dir.path().join("turn.json"),
+        fixture!("turn-check-in-in-flight.json"),
+    );
+    let stored = crate::cli::turn_custody::load_stored(dir.path()).unwrap();
+    let carried = stored.outstanding.as_ref().expect("in flight");
+    assert_eq!(carried.check_ins, [CheckInRef { window: 4 }]);
+    assert!(carried.identities.is_empty());
+    assert_eq!(stored.attendances[0].window.id, 4);
+    assert_eq!(stored.attendances[0].window.check_in, CheckIn::Due);
+    assert_eq!(serde_json::to_value(&stored).unwrap(), raw(&path));
+    let restored = SessionState::restored(stored.clone());
+    assert_eq!(restored.outstanding, None);
+    assert_eq!(
+        restored.resolved,
+        Some((carried.id.clone(), Resolution::Failed))
+    );
+    assert_eq!(restored.attendances[0].window.check_in, CheckIn::Due);
+}
+
+/// The same, as the build before windows had identities wrote it: the
+/// entry is given one on loading, and the reference, keyed by selector and
+/// clock, names no window, so nothing a dead presentation carried is spent
+/// by it; the check-in stays owed.
+#[test]
+fn a_check_in_in_flight_from_before_windows_loads_owed() {
+    use clank_core::turn_policy::{CheckIn, CheckInRef, Resolution, SessionState};
+    let dir = tempfile::tempdir().unwrap();
+    place(
+        &dir.path().join("turn.json"),
+        fixture!("turn-check-in-in-flight-keyed.json"),
+    );
+    let stored = crate::cli::turn_custody::load_stored(dir.path()).unwrap();
+    let carried = stored.outstanding.as_ref().expect("in flight");
+    assert_eq!(carried.check_ins, [CheckInRef { window: 0 }]);
+    assert_eq!(stored.attendances[0].window.id, 1);
+    assert_eq!(stored.next_window, 1);
+    let restored = SessionState::restored(stored.clone());
+    assert_eq!(
+        restored.resolved,
+        Some((carried.id.clone(), Resolution::Failed))
+    );
+    assert_eq!(restored.attendances[0].window.check_in, CheckIn::Due);
+}
+
 /// The entries the build that ended a declaration at the next turn start
 /// wrote: the declaration reads as one not yet resolved to a listed task,
 /// whose `seen_turn_end` no longer means anything, and the run keeps its
@@ -423,6 +476,9 @@ fn turn_state_with_turn_scoped_declarations_reads_and_round_trips() {
         .as_object_mut()
         .unwrap()
         .remove("seen_turn_end");
+    for (i, entry) in expected.as_array_mut().unwrap().iter_mut().enumerate() {
+        entry["window"] = json!(i + 1);
+    }
     assert_eq!(serde_json::to_value(&stored.attendances).unwrap(), expected);
     assert_eq!(stored.attendances.len(), 2);
     crate::cli::turn_custody::write_stored(
@@ -457,6 +513,7 @@ fn turn_state_with_listed_attendances_reads_as_declared_work() {
                 "work": {"Declared": {"name": "Implement the example plan", "task": "a0000000000000001"}},
                 "desc": "Implement the example plan",
                 "started": 1793845190330u64,
+                "window": 1,
                 "since": 1793845190330u64,
                 "expect": 7200000,
                 "check_in": "Armed"
@@ -465,6 +522,7 @@ fn turn_state_with_listed_attendances_reads_as_declared_work() {
                 "work": {"Run": {"pid": 7001, "token": "mac1:7001:1"}},
                 "desc": "test run",
                 "started": 1793845200000u64,
+                "window": 2,
                 "since": 1793845200000u64,
                 "expect": 600000,
                 "check_in": "Armed"
@@ -498,6 +556,7 @@ fn turn_state_with_one_old_attendance_reads_as_its_entries() {
                 "work": {"Declared": {"name": "capture-probe sleeper", "task": "a0000000000000002"}},
                 "desc": "capture-probe sleeper",
                 "started": 1000000,
+                "window": 1,
                 "since": 1000000,
                 "expect": 600000,
                 "check_in": "Armed"
@@ -506,6 +565,7 @@ fn turn_state_with_one_old_attendance_reads_as_its_entries() {
                 "work": {"Run": {"pid": 7001, "token": "mac1:7001:1"}},
                 "desc": "test run",
                 "started": 1120000,
+                "window": 2,
                 "since": 1120000,
                 "expect": 1200000,
                 "check_in": "Armed"

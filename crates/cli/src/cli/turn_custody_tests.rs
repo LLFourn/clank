@@ -15,7 +15,7 @@ fn unbinding_an_attended_agent_removes_its_due_timer() {
     let due = turns.next_deadline().expect("armed");
     crate::agent_store::release_binding(repo.path(), &author, &sid("session-one")).unwrap();
     let unbound = gathered(repo.path(), "claude", &[]).at(due);
-    assert!(turns.check_in(&author, &unbound).is_none());
+    turns.fall_due(&author, &unbound);
     assert_eq!(
         turns.next_deadline(),
         None,
@@ -689,47 +689,252 @@ fn a_closed_carrier_fails_its_presentation_and_the_work_is_presented_fresh() {
     );
 }
 
-/// An agent no recovery has identified, so with no typed route, is
-/// quieted by its first qualifying Stop, which arms the check-in; one that
-/// cannot be typed is recorded undeliverable, which is shown, and recovery
-/// treats the agent as any other past the deadline.
+/// A check-in needs no route into the agent's pane, for any harness whose
+/// hook parks. With no waiter at its deadline nothing presents it: it is
+/// shown owed, holds nothing off recovery, and the next park is handed it
+/// with its renewal recipe.
 #[test]
-fn a_silence_needs_no_route_and_a_lost_check_in_is_recorded() {
-    let repo = repo_with("claude", Tool::Claude, "session-one");
+fn a_check_in_with_no_waiter_waits_for_the_next_park() {
+    for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+        let repo = repo_with("agent", tool, "session-one");
+        let author = label("agent");
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let g = gathered(repo.path(), "agent", &[]);
+        attend_name(&mut turns, "agent", "session-one", &g);
+        let report = stop(tool, "session-one", None);
+        let frame = turns.answer(&author, 1, &report, true, &g).unwrap();
+        assert_eq!(frame.verdict, WireVerdict::Park, "{tool:?}");
+        turns.lost(&author, 1, &g);
+        let due = turns.next_deadline().expect("armed");
+        let at_due = gathered(repo.path(), "agent", &[]).at(due);
+        turns.fall_due(&author, &at_due);
+        let shown = turns.projection(&author, &at_due).attended;
+        assert_eq!(
+            shown.first().and_then(|a| a.check_in.as_deref()),
+            Some("check-in due"),
+            "{tool:?}"
+        );
+        assert_eq!(turns.recovery_quiet(&author, &at_due), None, "{tool:?}");
+        assert_eq!(turns.next_deadline(), None, "{tool:?}: not due again");
+        let next = turns.answer(&author, 2, &report, true, &at_due).unwrap();
+        assert!(next.presentation().is_some(), "{tool:?}: {next:?}");
+        let text = next.rendered.unwrap_or_default();
+        assert!(text.starts_with("clank check-in: "), "{tool:?}: {text}");
+        assert!(
+            text.contains(&format!("clank attend '{SUBAGENT}' --expect 20m")),
+            "{tool:?}: {text}"
+        );
+    }
+}
+
+/// Claude's compaction is stepped as a park. After an idle compaction its
+/// report still reads the record the Stop saw, so it carries the check-in
+/// owed; after a person started a turn the record has grown past that
+/// Stop, so it carries nothing and the check-in waits, owed, for the next
+/// Stop.
+#[test]
+fn a_compaction_carries_a_check_in_only_while_the_stop_still_holds() {
+    for (case, grown) in [("idle compaction", 0), ("a person's turn", 512)] {
+        let repo = repo_with("claude", Tool::Claude, "session-one");
+        let author = label("claude");
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let g = gathered(repo.path(), "claude", &[]);
+        attend_name(&mut turns, "claude", "session-one", &g);
+        let at = |len: u64| TurnEndReport {
+            tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            hook_started: later(),
+            tool: Tool::Claude,
+            session: sid("session-one"),
+            place: TurnPlace {
+                turn: None,
+                position: None,
+                human_turn: false,
+                read_to: Some(clank_core::turn_policy::ReadTo { file: 7, len }),
+            },
+        };
+        let stopped = Report::TurnEnd {
+            stop: at(1000),
+            deadline: u64::MAX,
+            questions: Vec::new(),
+        };
+        let frame = turns.answer(&author, 1, &stopped, true, &g).unwrap();
+        assert_eq!(frame.verdict, WireVerdict::Park, "{case}");
+        turns.lost(&author, 1, &g);
+        let due = turns.next_deadline().expect("armed");
+        let at_due = gathered(repo.path(), "claude", &[]).at(due);
+        let compacted = Report::Compacted {
+            stop: at(1000 + grown),
+            deadline: u64::MAX,
+        };
+        let frame = turns.answer(&author, 2, &compacted, true, &at_due).unwrap();
+        let shown = turns.projection(&author, &at_due).attended;
+        match grown {
+            0 => {
+                assert!(frame.presentation().is_some(), "{case}: {frame:?}");
+                assert!(
+                    frame
+                        .rendered
+                        .unwrap_or_default()
+                        .starts_with("clank check-in: "),
+                    "{case}"
+                );
+            }
+            _ => {
+                assert_eq!(frame.verdict, WireVerdict::Park, "{case}");
+                assert_eq!(shown[0].check_in.as_deref(), Some("check-in due"), "{case}");
+                let next = turns
+                    .answer(
+                        &author,
+                        3,
+                        &Report::TurnEnd {
+                            stop: at(1000 + grown + 64),
+                            deadline: u64::MAX,
+                            questions: Vec::new(),
+                        },
+                        true,
+                        &at_due,
+                    )
+                    .unwrap();
+                assert!(
+                    next.presentation().is_some(),
+                    "{case}: the next Stop delivers it"
+                );
+            }
+        }
+    }
+}
+
+/// A compaction that could read no record is no evidence the agent is
+/// still at its Stop, which read none either: it carries nothing and the
+/// check-in stays owed. The Stop's own report, re-served as its park at
+/// the deadline with nothing placed (as OpenCode's is), is the report its
+/// park holds, and is handed it.
+#[test]
+fn an_unplaced_park_carries_a_check_in_only_as_the_stops_own_report() {
+    for (case, tool) in [
+        ("compaction", Tool::Claude),
+        ("re-served park", Tool::OpenCode),
+    ] {
+        let repo = repo_with("agent", tool, "session-one");
+        let author = label("agent");
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let g = gathered(repo.path(), "agent", &[]);
+        attend_name(&mut turns, "agent", "session-one", &g);
+        let held = stop(tool, "session-one", None);
+        let frame = turns.answer(&author, 1, &held, true, &g).unwrap();
+        assert_eq!(frame.verdict, WireVerdict::Park, "{case}");
+        let due = turns.next_deadline().expect("armed");
+        let at_due = gathered(repo.path(), "agent", &[]).at(due);
+        let again = match case {
+            "compaction" => {
+                let Report::TurnEnd { stop: first, .. } = stop(tool, "session-one", None) else {
+                    panic!("a stop")
+                };
+                turns.answer(
+                    &author,
+                    2,
+                    &Report::Compacted {
+                        stop: first,
+                        deadline: u64::MAX,
+                    },
+                    true,
+                    &at_due,
+                )
+            }
+            _ => turns.answer(&author, 1, &held, false, &at_due),
+        }
+        .unwrap();
+        let shown = turns.projection(&author, &at_due).attended;
+        match case {
+            "compaction" => {
+                assert_eq!(again.verdict, WireVerdict::Park, "{case}");
+                assert_eq!(shown[0].check_in.as_deref(), Some("check-in due"), "{case}");
+            }
+            _ => assert!(
+                again
+                    .rendered
+                    .unwrap_or_default()
+                    .starts_with("clank check-in: "),
+                "{case}"
+            ),
+        }
+    }
+}
+
+/// A compaction is never taken for the Stop it follows, however its hook's
+/// clock reads: one whose clock matches the Stop's carries nothing when
+/// its placement names a later turn or is missing, and the check-in stays
+/// owed. The Stop's held report, from a hook too old to say when it
+/// started, is still handed it when re-served.
+#[test]
+fn a_compaction_with_the_stops_clock_is_not_its_report() {
+    let session = "session-one";
+    let report = |turn: Option<&str>, position: Option<u64>, started: Option<u64>| TurnEndReport {
+        tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+        hook_started: started,
+        tool: Tool::Claude,
+        session: sid(session),
+        place: TurnPlace {
+            turn: turn.map(str::to_string),
+            position,
+            human_turn: false,
+            read_to: None,
+        },
+    };
+    for (case, compacted) in [
+        ("a later turn", report(Some("t2"), Some(200), Some(7))),
+        ("no placement", report(None, None, Some(7))),
+    ] {
+        let repo = repo_with("claude", Tool::Claude, session);
+        let author = label("claude");
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let g = gathered(repo.path(), "claude", &[]);
+        attend_name(&mut turns, "claude", session, &g);
+        let stopped = Report::TurnEnd {
+            stop: report(Some("t1"), Some(40), Some(7)),
+            deadline: u64::MAX,
+            questions: Vec::new(),
+        };
+        let parked = turns.answer(&author, 1, &stopped, true, &g).unwrap();
+        assert_eq!(parked.verdict, WireVerdict::Park, "{case}");
+        turns.lost(&author, 1, &g);
+        let due = turns.next_deadline().expect("armed");
+        let at_due = gathered(repo.path(), "claude", &[]).at(due);
+        let compaction = Report::Compacted {
+            stop: compacted,
+            deadline: u64::MAX,
+        };
+        let frame = turns
+            .answer(&author, 2, &compaction, true, &at_due)
+            .unwrap();
+        assert_eq!(frame.verdict, WireVerdict::Park, "{case}: {frame:?}");
+        let shown = turns.projection(&author, &at_due).attended;
+        assert_eq!(shown[0].check_in.as_deref(), Some("check-in due"), "{case}");
+    }
+
+    let repo = repo_with("claude", Tool::Claude, session);
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "claude", &[]);
-    attend_name(&mut turns, "claude", "session-one", &g);
-    let report = stop(Tool::Claude, "session-one", None);
-    let frame = turns.answer(&author, 1, &report, true, &g).unwrap();
-    assert_eq!(frame.verdict, WireVerdict::Park);
-    let due = turns.next_deadline().expect("armed by the first Stop");
-    let at_due = gathered(repo.path(), "claude", &[]).at(due);
-    let check_in = turns.check_in(&author, &at_due).expect("owed");
-    assert_eq!(check_in.session, sid("session-one"));
-    let text = turns
-        .may_type_check_in(&author, &check_in.check_ins, &at_due)
-        .expect("the last look lets it through");
-    assert!(text.contains("check-in"), "{text}");
-    assert!(
-        text.contains(&format!("clank attend '{SUBAGENT}' --expect 20m")),
-        "{text}"
-    );
-    turns.check_in_failed(
-        &author,
-        check_in.check_ins.clone(),
-        "no pane was found".into(),
-        &at_due,
-    );
-    let shown = turns.projection(&author, &at_due).attended;
+    attend_name(&mut turns, "claude", session, &g);
+    let held = Report::TurnEnd {
+        stop: report(None, None, None),
+        deadline: u64::MAX,
+        questions: Vec::new(),
+    };
     assert_eq!(
-        shown.first().and_then(|a| a.check_in.as_deref()),
-        Some("check-in undeliverable: no pane was found")
+        turns.answer(&author, 1, &held, true, &g).unwrap().verdict,
+        WireVerdict::Park
     );
-    assert_eq!(turns.recovery_quiet(&author, &at_due), None);
+    let due = turns.next_deadline().expect("armed");
+    let at_due = gathered(repo.path(), "claude", &[]).at(due);
+    let again = turns.answer(&author, 1, &held, false, &at_due).unwrap();
     assert!(
-        turns.check_in(&author, &at_due).is_none(),
-        "spent, not retried"
+        again
+            .rendered
+            .unwrap_or_default()
+            .starts_with("clank check-in: "),
+        "the held Stop of a hook too old to say when it started"
     );
 }
 

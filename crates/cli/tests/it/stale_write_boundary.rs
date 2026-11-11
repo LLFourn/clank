@@ -437,7 +437,7 @@ fn the_scan_sees_a_write_and_what_excuses_it() {
 
 /// The seams through which a long-lived process changes something
 /// outside itself without writing a file: typing into a pane, a native
-/// harness call, a recovery or check-in dispatch, an interrupt, driving
+/// harness call, a recovery dispatch, an interrupt, driving
 /// panes, a git mutation. As (path under `crates/cli/src/`, function).
 ///
 /// Named, not discovered, and that is the limit of this half of the
@@ -461,7 +461,6 @@ const ACTION_SEAMS: &[(&str, &str)] = &[
     ("cli/codex_interrupt.rs", "start_if_failed"),
     ("cli/event_interrupt.rs", "dispatch"),
     ("cli/monitor.rs", "typed_send"),
-    ("cli/monitor.rs", "deliver_check_in"),
     ("cli/monitor.rs", "act_on_recovery"),
     ("cli/status_tui/zellij.rs", "handle_with"),
     ("git_plumbing.rs", "output"),

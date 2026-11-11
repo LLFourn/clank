@@ -1430,7 +1430,8 @@ mod old_bytes {
 }
 
 /// State saved before any of this was kept loads, and is written back
-/// byte for byte while nothing new is known: its declaration is a task
+/// byte for byte while nothing new is known, but for the window identity
+/// loading gives its declaration: its declaration is a task
 /// running with no baseline, nothing has been seen, and its Stop has no
 /// hook time or listing. It carries no kind, so it keeps the rule it was
 /// bound under: the agent's next Stop without the task ends it, whatever
@@ -1443,6 +1444,8 @@ fn state_saved_before_listings_were_remembered_loads() {
     assert_eq!(
         serde_json::to_string(&st.persisted()).unwrap(),
         old_bytes::BOUND
+            .replace(r#""started":1000000,"#, r#""started":1000000,"window":1,"#)
+            .replace(r#""next_seq":3,"#, r#""next_seq":3,"next_window":1,"#)
     );
     assert_eq!(*tracked(&st), Tracked::default());
     assert_eq!(phase(&st), Phase::Live);

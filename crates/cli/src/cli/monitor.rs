@@ -3488,9 +3488,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let mut turns = crate::cli::turn_custody::Turns::new(repo.as_ref().clone());
     let serving_since = std::time::Instant::now();
     let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel::<(u64, Heard)>();
-    let (check_in_asks, mut check_in_authorizations) =
-        tokio::sync::mpsc::unbounded_channel::<CheckInAsk>();
-    let (check_in_done, mut checked_in) = tokio::sync::mpsc::unbounded_channel::<CheckedIn>();
     let user_home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -3570,8 +3567,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             _ = crate::cli::timer_source::deadline(recovery_due) => Wake::RecoveryDue,
             _ = crate::cli::timer_source::deadline(turns_due) => Wake::TurnsDue,
             Some((conn, said)) = heard.recv() => Wake::Heard(conn, said),
-            Some(ask) = check_in_authorizations.recv() => Wake::AuthorizeCheckIn(ask),
-            Some(done) = checked_in.recv() => Wake::CheckedIn(done),
             Some(a) = authorizations.recv() => Wake::Authorize(a),
             Some(answer) = answered.recv() => Wake::Answered(answer),
             Some(event) = changed_records.recv() => {
@@ -3717,7 +3712,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         &mut recovery,
                         now,
                     ));
-                    let (dues, served) = deadline_round(
+                    leaving.extend(deadline_round(
                         &repo,
                         &mut clients,
                         folded_state.as_ref(),
@@ -3726,17 +3721,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         &mut turns,
                         &mut recovery,
                         now,
-                    );
-                    leaving.extend(served);
-                    for due in dues {
-                        owned.departing.push(tokio::spawn(deliver_check_in(
-                            repo.as_ref().clone(),
-                            due,
-                            std::sync::Arc::new(Panes),
-                            check_in_asks.clone(),
-                            check_in_done.clone(),
-                        )));
-                    }
+                    ));
                 }
             }
             Wake::Heard(conn, said) => {
@@ -3815,40 +3800,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         &mut turns,
                         &mut recovery,
                     )),
-                }
-            }
-            Wake::AuthorizeCheckIn(ask) => {
-                let allowed = if owner {
-                    let g = gather(
-                        &repo,
-                        folded_state.as_ref(),
-                        &ask.author,
-                        &hosted,
-                        &mut Default::default(),
-                        &pending,
-                    );
-                    may_check_in_now(&repo, &recovery, &mut turns, &g, &ask)
-                } else {
-                    Err("this monitor no longer holds the repo's lease".into())
-                };
-                let _ = ask.reply.send(allowed);
-            }
-            Wake::CheckedIn(done) => {
-                if let Err(why) = done.outcome {
-                    eprintln!(
-                        "monitor: `{}`'s check-in was not delivered: {why}",
-                        done.author
-                    );
-                    let g = gather(
-                        &repo,
-                        folded_state.as_ref(),
-                        &done.author,
-                        &hosted,
-                        &mut Default::default(),
-                        &pending,
-                    );
-                    turns.check_in_failed(&done.author, done.check_ins, why, &g);
-                    project(&mut recovery, &mut turns, &done.author, &g);
                 }
             }
             Wake::Answered((author, attempt, answer)) => {
@@ -4360,8 +4311,6 @@ enum Wake {
     TurnsDue,
     /// A reporting connection said something, or closed.
     Heard(u64, Heard),
-    AuthorizeCheckIn(CheckInAsk),
-    CheckedIn(CheckedIn),
     /// A task this loop owned has ended.
     Collected,
     /// Whether the watcher is still there.
@@ -5026,30 +4975,10 @@ fn last_look(
     Some((gate, owed))
 }
 
-/// A check-in's typing, prepared off the loop, asking the loop whether it
-/// may type now.
-struct CheckInAsk {
-    author: AgentLabel,
-    session: clank_core::SessionId,
-    /// The entries the check-in was fired for.
-    check_ins: Vec<clank_core::turn_policy::CheckInRef>,
-    /// The tool the roster gave the pane, and its screen as just read.
-    screen: (clank_core::Tool, Option<String>),
-    /// The text to type, for the entries still owed it, or why none is.
-    reply: tokio::sync::oneshot::Sender<Result<String, String>>,
-}
-
-/// How a check-in's one typing went.
-struct CheckedIn {
-    author: AgentLabel,
-    check_ins: Vec<clank_core::turn_policy::CheckInRef>,
-    outcome: Result<(), String>,
-}
-
 /// An agent's pane, and its screen as read when it was found.
 pub(crate) type Located = (crate::cli::pane_target::Target, Option<String>);
 
-/// Where recovery's typed sends and check-ins are typed: the agent's pane.
+/// Where recovery's typed sends are typed: the agent's pane.
 pub(crate) trait Typist: Send + Sync + 'static {
     /// The agent's pane, and its screen as read now.
     fn locate(
@@ -5131,82 +5060,6 @@ async fn typed_send(
     }
 }
 
-/// Type one check-in through the agent's resume route: find its pane,
-/// ask the loop for its last look, then submit. Any failure is reported,
-/// never retried: the check-in is spent either way.
-async fn deliver_check_in(
-    repo: std::path::PathBuf,
-    due: crate::cli::turn_custody::CheckInDue,
-    typist: std::sync::Arc<dyn Typist>,
-    asks: tokio::sync::mpsc::UnboundedSender<CheckInAsk>,
-    done: tokio::sync::mpsc::UnboundedSender<CheckedIn>,
-) {
-    let outcome = async {
-        let _permit = crate::upgrade::writing().map_err(|stale| stale.to_string())?;
-        let (target, screen) = typist.locate(repo, due.author.clone()).await?;
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        asks.send(CheckInAsk {
-            author: due.author.clone(),
-            session: due.session.clone(),
-            check_ins: due.check_ins.clone(),
-            screen: (target.tool, screen),
-            reply,
-        })
-        .map_err(|_| "the monitor is gone".to_string())?;
-        match answer.await {
-            Ok(Ok(text)) => typist
-                .submit(target, text)
-                .await
-                .map(|_| ())
-                .map_err(|e| match e {
-                    crate::cli::open_zellij::PaneWrite::NotStarted(why) => {
-                        format!("typing it did not start: {why}")
-                    }
-                    crate::cli::open_zellij::PaneWrite::Unknown(why) => {
-                        format!("typing it may not have finished: {why}")
-                    }
-                }),
-            Ok(Err(why)) => Err(format!("its last look refused it: {why}")),
-            Err(_) => Err("the monitor is gone".to_string()),
-        }
-    }
-    .await;
-    let _ = done.send(CheckedIn {
-        author: due.author,
-        check_ins: due.check_ins,
-        outcome,
-    });
-}
-
-/// The last look before a check-in is typed: the session still bound to the
-/// tool the roster gave the pane, that harness resumed by typing, its input
-/// line empty, and, by `g` as gathered now, every wake gate open. The text
-/// it answers with is for the entries still owed the check-in, as they
-/// stand now.
-fn may_check_in_now(
-    repo: &std::path::Path,
-    recovery: &crate::cli::recovery::Driver,
-    turns: &mut crate::cli::turn_custody::Turns,
-    g: &crate::cli::turn_custody::Gathered,
-    ask: &CheckInAsk,
-) -> Result<String, String> {
-    let (tool, screen) = &ask.screen;
-    if !crate::agent_store::binding_matches(repo, &ask.author, *tool, ask.session.as_str()) {
-        return Err("the session no longer holds the label".into());
-    }
-    if !recovery.may_type_check_in(&ask.author) {
-        return Err("its harness is not resumed by typing".into());
-    }
-    if screen
-        .as_deref()
-        .map(|s| crate::cli::composer::composer(*tool, s))
-        != Some(crate::cli::composer::Composer::Empty)
-    {
-        return Err("its input line is not empty".into());
-    }
-    turns.may_type_check_in(&ask.author, &ask.check_ins, g)
-}
-
 /// Record the end of every bound agent's `clank run` whose process is
 /// gone. Each beat asks, so a run ends within one beat of its process,
 /// and the first beat after a restart ends those that went while no
@@ -5218,39 +5071,33 @@ fn end_gone_runs(repo: &std::path::Path, turns: &mut crate::cli::turn_custody::T
     }
 }
 
-/// Step every check-in due by `now`, gathering each agent as it is
-/// evaluated: what was gathered, and the check-in to type, if one is owed.
-/// Each due attendance resolves, or is retired with its binding, so none
-/// is due again.
+/// Step every agent with a check-in due by `now`, gathering each as it is
+/// evaluated: what was gathered. Each due entry is then owed its check-in,
+/// or is retired with its binding, so none is due again.
 fn due_check_ins(
     turns: &mut crate::cli::turn_custody::Turns,
     now: u64,
     mut gathered: impl FnMut(&AgentLabel) -> crate::cli::turn_custody::Gathered,
-) -> Vec<(
-    AgentLabel,
-    crate::cli::turn_custody::Gathered,
-    Option<crate::cli::turn_custody::CheckInDue>,
-)> {
+) -> Vec<(AgentLabel, crate::cli::turn_custody::Gathered)> {
     turns
         .due_authors(now)
         .into_iter()
         .map(|author| {
             let g = gathered(&author);
-            let due = turns.check_in(&author, &g);
-            (author, g, due)
+            turns.fall_due(&author, &g);
+            (author, g)
         })
         .collect()
 }
 
 /// The loop's step when attendance deadlines fall due: each due check-in
-/// is stepped, and each of those agents' parked waits is served again with
-/// its facts as they are now. Returns the check-ins to type, and the
-/// writers of the reports it retired.
+/// is owed, and each of those agents' parked waits is served again with its
+/// facts as they are now, which is what presents the check-in to a park.
+/// Returns the writers of the reports it retired.
 ///
-/// No repo change marks a deadline, so without this re-serve a park whose
-/// work the attendance quieted would hold it until something else changed;
-/// the typed check-in cannot stand in, since a session may have no route
-/// for one.
+/// No repo change marks a deadline, so without this re-serve a parked
+/// agent would be checked in on, and shown the work its attendance
+/// quieted, only when something else changed.
 #[allow(clippy::too_many_arguments)]
 fn deadline_round(
     repo: &std::path::Path,
@@ -5261,10 +5108,7 @@ fn deadline_round(
     turns: &mut crate::cli::turn_custody::Turns,
     recovery: &mut crate::cli::recovery::Driver,
     now: u64,
-) -> (
-    Vec<crate::cli::turn_custody::CheckInDue>,
-    Vec<tokio::task::JoinHandle<Wrote>>,
-) {
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
     let stepped = due_check_ins(turns, now, |author| {
         gather(
             repo,
@@ -5275,10 +5119,8 @@ fn deadline_round(
             pending,
         )
     });
-    let mut dues = Vec::new();
     let mut leaving = Vec::new();
-    for (author, g, due) in stepped {
-        dues.extend(due);
+    for (author, g) in stepped {
         project(recovery, turns, &author, &g);
         leaving.extend(serve_reports(
             repo,
@@ -5291,7 +5133,7 @@ fn deadline_round(
             turns,
         ));
     }
-    (dues, leaving)
+    leaving
 }
 
 /// Fail every presentation whose carrier has had its time and not
