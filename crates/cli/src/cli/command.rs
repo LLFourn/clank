@@ -143,7 +143,9 @@ Examples:
   clank status
   # keep re-printing as things change
   clank status --watch
-  clank status -j";
+  clank status -j
+  # one JSON line per repo per change; +PATH / -PATH on stdin
+  clank status --watch -j --repos-from -";
 
 const FINISH_EXAMPLES: &str = "\
 Examples:

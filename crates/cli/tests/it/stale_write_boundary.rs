@@ -124,7 +124,7 @@ const UNGATED: &[(&str, &str, &str)] = &[
     (
         "cli/hook_handoff.rs",
         "*",
-        "OWN: the hook's handoff to the build it becomes",
+        "OWN: a hook's or a status watch's handoff to the build it becomes",
     ),
     (
         "cli/html.rs",
@@ -210,6 +210,11 @@ const UNGATED: &[(&str, &str, &str)] = &[
     ("cli/rewire.rs", "*", "ONE-SHOT: the post-rewrite hook"),
     ("cli/setup.rs", "*", "ONE-SHOT: `clank setup`"),
     ("cli/stash.rs", "*", "ONE-SHOT: `clank stash`"),
+    (
+        "cli/status_watch.rs",
+        "take",
+        "OWN: removes the handoff this watch was resumed from",
+    ),
     (
         "cli/status_tui/lease.rs",
         "*",

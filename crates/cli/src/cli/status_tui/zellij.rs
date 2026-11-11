@@ -4536,14 +4536,14 @@ mod tests {
     /// reopen request in the same directory reaches the loop.
     #[test]
     fn only_a_reopen_request_in_the_runtime_directory_reaches_the_loop() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let repo = std::path::Path::new("/w/proj");
         let (tx, requests) = std::sync::mpsc::channel();
-        let woken = std::sync::Arc::new(AtomicUsize::new(0));
-        let wakes = woken.clone();
+        let (woke, wakes) = std::sync::mpsc::channel();
+        // The loop reads requests when it is woken, so each wake looks
+        // for the request it is for at the moment it is made.
         let watch = RuntimeWatch::start_in(repo, Ok(dir.path().to_path_buf()), tx, move || {
-            wakes.fetch_add(1, Ordering::SeqCst);
+            let _ = woke.send(requests.try_recv());
         });
         assert_eq!(watch.unavailable, None);
         let tag = crate::cli::monitor::runtime_path_in(dir.path(), repo, "")
@@ -4553,19 +4553,18 @@ mod tests {
             .into_owned();
         std::fs::write(dir.path().join(format!("{tag}pane-launch-x.json")), "{}").unwrap();
         assert!(
-            requests
+            wakes
                 .recv_timeout(std::time::Duration::from_millis(300))
                 .is_err(),
             "a launch file is nobody's request"
         );
-        assert_eq!(woken.load(Ordering::SeqCst), 0);
         let request = crate::cli::remote_control::request_path(repo, "r1");
         std::fs::write(dir.path().join(request.file_name().unwrap()), "{}").unwrap();
         assert_eq!(
-            requests.recv_timeout(std::time::Duration::from_secs(5)),
-            Ok("r1".to_string())
+            wakes.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(Ok("r1".to_string()))
         );
-        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        assert!(wakes.try_recv().is_err(), "woken once");
         drop(watch);
     }
 }

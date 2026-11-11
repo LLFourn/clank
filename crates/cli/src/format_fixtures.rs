@@ -407,6 +407,42 @@ fn a_hook_handoff_reads_as_what_the_parked_hook_held() {
     );
 }
 
+/// What a multi-repo status watch of the build before this one handed
+/// the installed build it became: the repo set as it stood, and stdin
+/// still open with the start of a line read before the exec. Written
+/// again, it is the same bytes.
+#[test]
+fn a_status_watch_handoff_reads_as_the_set_it_held() {
+    use crate::cli::status_watch::{HandedStdin, Handoff};
+    let bytes = fixture!("status-watch-handoff.json");
+    let handoff = Handoff::parse(bytes.as_bytes()).unwrap();
+    assert_eq!(
+        handoff,
+        Handoff::new(
+            vec!["/w/example".into(), "/w/example-2".into()],
+            HandedStdin::Open {
+                partial: b"+/w/next".to_vec()
+            }
+        )
+    );
+    assert_eq!(
+        serde_json::to_string(&handoff).unwrap(),
+        bytes.trim_end(),
+        "a handoff written by this build is the same format"
+    );
+    for (stdin, state) in [
+        (HandedStdin::Unread, "unread"),
+        (HandedStdin::Ended, "ended"),
+    ] {
+        let json = serde_json::to_value(Handoff::new(vec![], stdin.clone())).unwrap();
+        assert_eq!(json["stdin"], json!({"state": state}));
+        assert_eq!(
+            Handoff::parse(json.to_string().as_bytes()).unwrap(),
+            Handoff::new(vec![], stdin)
+        );
+    }
+}
+
 /// A check-in presentation in flight when its monitor stopped: the owed
 /// window and the window the presentation carries read back as written,
 /// and a monitor restored from them takes the presentation as failed, so

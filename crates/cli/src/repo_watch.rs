@@ -190,22 +190,28 @@ impl RepoStateWatcher {
         timer_dirty: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         event_dirty: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<Self> {
-        Self::attach_reporting(repo, tx, timer_dirty, event_dirty, Default::default())
+        Self::attach_reporting(
+            repo,
+            tx.into(),
+            timer_dirty,
+            event_dirty,
+            Default::default(),
+        )
     }
 
     /// [`Self::attach`], recording a failure in `fault`, for an owner
     /// that reads it without holding the watcher.
-    pub(crate) fn attach_reporting_to(
+    pub(crate) fn attach_reporting_to<M: Clone + Send + Sync + 'static>(
         repo: &Path,
-        tx: Sender<()>,
+        tx: impl Into<crate::fs_notice::Wake<M>>,
         fault: crate::fs_notice::Fault,
     ) -> anyhow::Result<Self> {
-        Self::attach_reporting(repo, tx, None, None, fault)
+        Self::attach_reporting(repo, tx.into(), None, None, fault)
     }
 
-    fn attach_reporting(
+    fn attach_reporting<M: Clone + Send + Sync + 'static>(
         repo: &Path,
-        tx: Sender<()>,
+        tx: crate::fs_notice::Wake<M>,
         timer_dirty: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         event_dirty: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         fault: crate::fs_notice::Fault,
@@ -267,8 +273,8 @@ impl RepoStateWatcher {
 }
 
 /// The watcher's callback, apart from the backend so a test can drive it.
-fn handler(
-    tx: Sender<()>,
+fn handler<M: Clone + Send + Sync + 'static>(
+    tx: crate::fs_notice::Wake<M>,
     cr: PathBuf,
     gd: PathBuf,
     cd: PathBuf,
@@ -292,7 +298,7 @@ fn handler(
             Notice::Rescan => {
                 dirty(&event_dirty);
                 dirty(&timer_dirty);
-                let _ = wake.send(());
+                wake.ring();
             }
             Notice::Changed(paths) => {
                 if paths.iter().any(|path| is_event_invalidation(path, &cr)) {
@@ -302,7 +308,7 @@ fn handler(
                     dirty(&timer_dirty);
                 }
                 if paths.iter().any(|p| is_core_wake(p, &gd, &cd, &cr)) {
-                    let _ = wake.send(());
+                    wake.ring();
                 }
             }
             // The owner is woken once more and the channel is closed:
@@ -310,7 +316,7 @@ fn handler(
             // alone on it sees it close. Either way the fault says why.
             Notice::Failed(why) => {
                 crate::fs_notice::record(&fault, why);
-                let _ = wake.send(());
+                wake.ring();
                 tx = None;
             }
         }
@@ -565,7 +571,7 @@ mod tests {
         let events = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fault = crate::fs_notice::Fault::default();
         let mut handle = handler(
-            tx,
+            tx.into(),
             clank.clone(),
             git_dir.clone(),
             git_dir.clone(),

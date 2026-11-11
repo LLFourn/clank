@@ -2,10 +2,8 @@
 //! state. Folds the repo, projects per-plan via `clank-core::plan_view`,
 //! then renders. Never blocks.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -1079,15 +1077,9 @@ impl StatusSnapshot {
 
         out.trim_end_matches('\n').to_string()
     }
-
-    fn to_json_compact(&self) -> String {
-        serde_json::to_string(&self.to_json()).unwrap_or_default()
-    }
 }
 
 pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
-    let repo = resolve_repo(args.repo.as_deref())?;
-    let basename = repo_basename(&repo)?;
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
     } else {
@@ -1097,16 +1089,19 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
 
     if args.watch {
-        return run_watch(
-            repo,
-            basename,
+        let panel = super::status_watch::StatusPanel {
+            watches: Watches::default(),
             home,
             policy,
-            args.json,
-            args.plan.as_deref(),
-        )
-        .await;
+            plan: args.plan.clone(),
+        };
+        return super::status_watch::run(args, panel).await;
     }
+    if args.repo.len() > 1 {
+        anyhow::bail!("several repos are shown only by `status --watch -j`");
+    }
+    let repo = resolve_repo(args.repo.first().map(PathBuf::as_path))?;
+    let basename = repo_basename(&repo)?;
 
     let snapshot = StatusSnapshot::build_async(
         &repo,
@@ -1129,174 +1124,9 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
 
 /// Whether human output may carry colour: stdout is a terminal and
 /// `NO_COLOR` is unset.
-fn paint_stdout() -> bool {
+pub(crate) fn paint_stdout() -> bool {
     use std::io::IsTerminal as _;
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-}
-
-/// The watch loop's failure policy (tui-transient-refresh-resilience,
-/// codex 697cdb1): BEFORE the first successful snapshot there is no
-/// prior output to retain — a probe/build failure is FATAL, exactly
-/// like the one-shot path. AFTER one success, failures degrade to a
-/// stderr warning with the last output kept; the caller leaves the
-/// signature untouched, so the SAME state retries on the next event or
-/// after [`watch_retry`]'s pause (recovery is the ordinary success
-/// path).
-fn watch_failure(bootstrapped: bool, stage: &str, e: impl std::fmt::Display) -> anyhow::Result<()> {
-    if bootstrapped {
-        eprintln!("status watch: {stage} failed ({e}); kept last output, retrying");
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("status watch: {stage} failed: {e}"))
-    }
-}
-
-/// The pause before retrying after `failures` failed refreshes in a
-/// row: 1s, 2s, 4s … capped at 30s. A timer the loop sets itself after
-/// a failure, so a transient one recovers without waiting for an edit.
-fn watch_retry(failures: u32) -> Option<Duration> {
-    (failures > 0)
-        .then(|| Duration::from_secs(1u64 << (failures - 1).min(5)).min(Duration::from_secs(30)))
-}
-
-/// How long the watch loop may sleep before a timer of its own is due:
-/// a failed refresh's retry, or a failed replacement's. With neither,
-/// `None`: an idle repo costs nothing until an event.
-fn watch_wait(failures: u32, replacement_retry: Option<Duration>) -> Option<Duration> {
-    [watch_retry(failures), replacement_retry]
-        .into_iter()
-        .flatten()
-        .min()
-}
-
-/// Wait for an event on `rx`, or for `wait` to pass: `Ok(true)` for an
-/// event, `Ok(false)` for the timer.
-fn next_wake(
-    rx: &mpsc::Receiver<()>,
-    wait: Option<Duration>,
-) -> Result<bool, mpsc::RecvTimeoutError> {
-    match wait {
-        Some(wait) => match rx.recv_timeout(wait) {
-            Ok(()) => Ok(true),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(false),
-            Err(e) => Err(e),
-        },
-        None => rx
-            .recv()
-            .map(|()| true)
-            .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-    }
-}
-
-async fn run_watch(
-    repo: std::path::PathBuf,
-    basename: String,
-    home: Option<std::path::PathBuf>,
-    policy: crate::rebuild::CachePolicy,
-    json: bool,
-    plan_arg: Option<&str>,
-) -> anyhow::Result<()> {
-    let (tx, rx) = mpsc::channel::<()>();
-    let git_status = GitStatus::default();
-    let watchers = watch_status_paths(tx.clone(), &repo, &git_status)?;
-
-    let mut last_emitted: Option<String> = None;
-    let mut last_sig: Option<InputSignature> = None;
-    let mut failures: u32 = 0;
-    // A watch holds nothing a restart would lose: the installed build
-    // prints the snapshot afresh.
-    let mut replacing = crate::upgrade::Replacing::new(crate::upgrade::process().clone(), |_| {
-        crate::upgrade::exec_installed_as_started()
-    });
-    let mut exits = ProcessExits::new({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(());
-        }
-    });
-    let _installs = replacing.authority().subscribe(move || {
-        let _ = tx.send(());
-    });
-    let mut said_stale = false;
-
-    loop {
-        if let Some(why) = watchers
-            .git
-            .fault()
-            .or_else(|| watchers.core.fault())
-            .or_else(|| exits.fault())
-        {
-            anyhow::bail!("status watch: {why}");
-        }
-        // Ahead of the nothing-changed gate, which an install never
-        // moves: a watch on a quiet repo still finds out.
-        let stale = replacing.pass(crate::upgrade::Hosting::Nothing).stale();
-        if stale && !said_stale {
-            eprintln!("status watch: {}", crate::upgrade::STALE_BADGE);
-        }
-        said_stale = stale;
-        // Nothing-changed gate (lloyd's invariant): only rebuild when an
-        // input the snapshot depends on actually changed. The probe walks
-        // the tree only when an event made the Git status stale, and the
-        // build then reuses that walk.
-        // Transient probe/rebuild failures must not kill a
-        // BOOTSTRAPPED watch (see [`watch_failure`] — the first
-        // snapshot stays fatal): keep the last output, do NOT
-        // advance the signature, and let the next event or the retry
-        // pause retry the SAME state.
-        match input_signature(&repo, &git_status) {
-            Ok(sig) if last_sig.as_ref() != Some(&sig) => {
-                match StatusSnapshot::build_with(
-                    &repo,
-                    &basename,
-                    home.as_deref(),
-                    policy,
-                    plan_arg,
-                    true,
-                    &git_status,
-                )
-                .await
-                {
-                    Ok(snapshot) => {
-                        failures = 0;
-                        let output = if json {
-                            snapshot.to_json_compact()
-                        } else {
-                            snapshot.human(paint_stdout())
-                        };
-
-                        if last_emitted.as_deref() != Some(&output) {
-                            let stdout = std::io::stdout();
-                            let mut out = stdout.lock();
-                            if last_emitted.is_some() {
-                                writeln!(out)?;
-                            }
-                            writeln!(out, "{output}")?;
-                            out.flush()?;
-                            last_emitted = Some(output);
-                        }
-                        last_sig = Some(sig);
-                        exits.track(&repo);
-                    }
-                    Err(e) => {
-                        failures += 1;
-                        watch_failure(last_sig.is_some(), "refresh", format!("{e:#}"))?
-                    }
-                }
-            }
-            Ok(_) => failures = 0,
-            Err(e) => {
-                failures += 1;
-                watch_failure(last_sig.is_some(), "input probe", format!("{e:#}"))?
-            }
-        }
-
-        match next_wake(&rx, watch_wait(failures, replacing.retry_in())) {
-            Ok(true) => while rx.recv_timeout(Duration::from_millis(200)).is_ok() {},
-            Ok(false) => {}
-            Err(_) => anyhow::bail!("status watch: the filesystem watcher disconnected"),
-        }
-    }
 }
 
 /// Recent activity for the TUI's log pane: a bounded range-fold
@@ -1969,12 +1799,14 @@ fn git_state_input(rel: &Path) -> bool {
 
 /// The status loops' watchers: the core wakes (the monitor's, or a
 /// watcher of our own) and the Git watcher ([`watch_git`]), on one
-/// channel.
-pub(crate) fn watch_status_paths(
-    tx: mpsc::Sender<()>,
+/// channel. The worktree is heard once `watches` is next committed.
+pub(crate) fn watch_status_paths<M: Clone + Send + Sync + 'static>(
+    tx: impl Into<crate::fs_notice::Wake<M>>,
     repo: &Path,
     git_status: &GitStatus,
+    watches: &Watches,
 ) -> anyhow::Result<StatusWatchers> {
+    let tx = tx.into();
     // Gate state comes from the repo's MONITOR when one is running —
     // one watcher and one fold for the whole repo, which is the point
     // of `a-repo-is-watched-once-not-once-per-waiter`: this panel used
@@ -1982,7 +1814,7 @@ pub(crate) fn watch_status_paths(
     // With no monitor it attaches that watcher itself, so the panel
     // behaves the same either way.
     let core = crate::cli::monitor::core_wakes(repo, tx.clone())?;
-    let git = watch_git(tx, repo, git_status)?;
+    let git = watch_git(tx, repo, git_status, watches)?;
     Ok(StatusWatchers { core, git })
 }
 
@@ -1997,7 +1829,12 @@ pub(crate) fn watch_tui_paths(
     spawn: impl Fn(&Path) -> std::io::Result<Box<dyn crate::cli::monitor::Started>> + Send + 'static,
 ) -> anyhow::Result<TuiWatchers> {
     let keeper = crate::cli::monitor::keeper::MonitorKeeper::start(repo, tx.clone(), spawn);
-    let git = watch_git(tx, repo, git_status)?;
+    let watches = Watches::default();
+    let git = watch_git(tx, repo, git_status, &watches)?;
+    watches.commit()?;
+    if let Some(why) = git.fault() {
+        anyhow::bail!("{why}");
+    }
     Ok(TuiWatchers { keeper, git })
 }
 
@@ -2022,8 +1859,9 @@ pub(crate) struct StatusWatchers {
 
 /// The status loops' Git watcher, and what ends them when it fails.
 pub(crate) struct GitWatch {
-    _tree: RecommendedWatcher,
-    _elsewhere: Elsewhere,
+    _tree: Route,
+    _elsewhere: Follow,
+    _watches: Watches,
     fault: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -2040,15 +1878,18 @@ impl GitWatch {
 }
 
 /// Watch everything [`WakeFilter`] can call a [`Seen::GitInput`]: the
-/// worktree and the git directories recursively, and the files elsewhere
-/// one by one, since a recursive watch of a home directory would hear
-/// everything under it. Each Git input invalidates `git_status` before
-/// it wakes `tx`.
-fn watch_git(
-    tx: mpsc::Sender<()>,
+/// worktree and the git directories recursively, through the process's
+/// one worktree stream, and the files elsewhere one by one, through its
+/// one kernel watch of them, since a recursive watch of a home directory
+/// would hear everything under it. Each Git input invalidates
+/// `git_status` before it wakes `tx`.
+fn watch_git<M: Clone + Send + Sync + 'static>(
+    tx: impl Into<crate::fs_notice::Wake<M>>,
     repo: &Path,
     git_status: &GitStatus,
+    watches: &Watches,
 ) -> anyhow::Result<GitWatch> {
+    let tx = tx.into();
     let filter = WakeFilter::new(repo)?;
     let roots: Vec<PathBuf> = std::iter::once(filter.repo_root.clone())
         .chain(filter.git_dirs_outside())
@@ -2056,46 +1897,271 @@ fn watch_git(
     let known = filter.elsewhere.clone();
     let stale_ignore = filter.stale_ignore.clone();
     let fault = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let mut tree = notify::recommended_watcher(git_wake_handler(
-        tx.clone(),
-        filter,
-        git_status.clone(),
-        fault.clone(),
-    ))?;
-    let mut paths = tree.paths_mut();
-    for root in &roots {
-        paths
-            .add(root, RecursiveMode::Recursive)
-            .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", root.display()))?;
-    }
-    paths
-        .commit()
-        .map_err(|e| anyhow::anyhow!("cannot watch {}: {e}", repo.display()))?;
+    let tree = watches.worktrees.route(
+        roots,
+        Box::new(git_wake_handler(
+            tx.clone(),
+            filter,
+            git_status.clone(),
+            fault.clone(),
+        )),
+    );
     let repo = repo.to_path_buf();
-    let elsewhere = Elsewhere::start(
-        move || crate::git_io::status_inputs_elsewhere(&repo).map_err(|e| e.to_string()),
+    let elsewhere = watches.elsewhere.follow(
+        Box::new(move || crate::git_io::status_inputs_elsewhere(&repo).map_err(|e| e.to_string())),
         known,
         {
             let (git_status, tx) = (git_status.clone(), tx.clone());
-            move || {
+            std::sync::Arc::new(move || {
                 stale_ignore.store(true, std::sync::atomic::Ordering::Release);
                 git_status.invalidate();
-                let _ = tx.send(());
-            }
+                tx.ring();
+            })
         },
         {
             let fault = fault.clone();
-            move |why| {
+            std::sync::Arc::new(move |why| {
                 crate::fs_notice::record(&fault, why);
-                let _ = tx.send(());
-            }
+                tx.ring();
+            })
         },
     )?;
     Ok(GitWatch {
         _tree: tree,
         _elsewhere: elsewhere,
+        _watches: watches.clone(),
         fault,
     })
+}
+
+/// The watches every status loop in a process shares: one platform
+/// stream over every worktree it watches, and one kernel watch of the
+/// Git inputs outside them, which repos share (the global and XDG
+/// config, an excludes file). Clones share them.
+#[derive(Clone, Default)]
+pub(crate) struct Watches {
+    worktrees: Worktrees,
+    elsewhere: ElsewhereHub,
+}
+
+impl Watches {
+    /// Bring the worktree stream in line with the Git watchers alive now:
+    /// one restart however many came or went since the last commit.
+    /// Whether it restarted, in which case what changed in a worktree
+    /// already watched while it was stopped went unheard.
+    pub(crate) fn commit(&self) -> anyhow::Result<bool> {
+        self.worktrees.commit()
+    }
+
+    /// How many platform streams were made.
+    #[cfg(test)]
+    pub(crate) fn streams(&self) -> usize {
+        self.worktrees
+            .0
+            .streams
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many kernel watches of the files elsewhere were made.
+    #[cfg(test)]
+    pub(crate) fn elsewhere_watches(&self) -> usize {
+        self.elsewhere.made()
+    }
+}
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+type TreeHandler = Box<dyn FnMut(notify::Result<notify::Event>) + Send>;
+
+/// One platform stream over every worktree a process watches. FSEvents
+/// costs about a second to start, and a stream per repo made a watch of
+/// many repos wait that long for each.
+#[derive(Clone, Default)]
+struct Worktrees(std::sync::Arc<WorktreesInner>);
+
+#[derive(Default)]
+struct WorktreesInner {
+    stream: std::sync::Mutex<Option<RecommendedWatcher>>,
+    routes: std::sync::Arc<std::sync::Mutex<Routes>>,
+    /// The stream reported a failure: the next commit makes it afresh.
+    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    streams: std::sync::atomic::AtomicUsize,
+}
+
+/// Which handler hears which part of the stream.
+#[derive(Default)]
+struct Routes {
+    next: u64,
+    list: Vec<RouteEntry>,
+    /// The roots the stream holds.
+    watched: Vec<PathBuf>,
+    /// A route came or went since the stream was last committed.
+    dirty: bool,
+}
+
+struct RouteEntry {
+    id: u64,
+    roots: Vec<PathBuf>,
+    handler: TreeHandler,
+}
+
+/// A handler's share of the stream, until dropped.
+struct Route {
+    id: u64,
+    routes: std::sync::Arc<std::sync::Mutex<Routes>>,
+}
+
+impl Drop for Route {
+    fn drop(&mut self) {
+        let mut routes = lock(&self.routes);
+        routes.list.retain(|entry| entry.id != self.id);
+        routes.dirty = true;
+    }
+}
+
+impl Routes {
+    /// Hand each path to every route whose roots hold it, and what
+    /// concerns the whole stream to every route.
+    fn dispatch(&mut self, res: notify::Result<notify::Event>) {
+        let event = match res {
+            Err(e) => {
+                let why = e.to_string();
+                for entry in &mut self.list {
+                    (entry.handler)(Err(notify::Error::generic(&why)));
+                }
+                return;
+            }
+            Ok(event) if event.need_rescan() || event.paths.is_empty() => {
+                for entry in &mut self.list {
+                    (entry.handler)(Ok(event.clone()));
+                }
+                return;
+            }
+            Ok(event) => event,
+        };
+        let mut shares: Vec<Vec<PathBuf>> = vec![Vec::new(); self.list.len()];
+        for path in &event.paths {
+            for owner in self.owners(path) {
+                shares[owner].push(path.clone());
+            }
+        }
+        for (entry, paths) in self.list.iter_mut().zip(shares) {
+            if !paths.is_empty() {
+                let mut share = event.clone();
+                share.paths = paths;
+                (entry.handler)(Ok(share));
+            }
+        }
+    }
+
+    /// Every route with a root holding `path`. Routes subscribe to
+    /// trees, not own them: a linked worktree watches the main
+    /// checkout's git directory, which lies inside the main checkout's
+    /// own root, and both depend on what changes there. Each route's
+    /// filter decides whether a path is one of its repo's inputs.
+    fn owners(&self, path: &Path) -> Vec<usize> {
+        let holding = |path: &Path| -> Vec<usize> {
+            (0..self.list.len())
+                .filter(|&i| self.list[i].roots.iter().any(|root| path.starts_with(root)))
+                .collect()
+        };
+        let owners = holding(path);
+        match (owners.is_empty(), dunce::canonicalize(path)) {
+            (true, Ok(canonical)) => holding(&canonical),
+            _ => owners,
+        }
+    }
+}
+
+impl Worktrees {
+    /// Route the events under `roots` to `handler` from the next commit.
+    fn route(&self, roots: Vec<PathBuf>, handler: TreeHandler) -> Route {
+        let mut routes = lock(&self.0.routes);
+        routes.next += 1;
+        let id = routes.next;
+        routes.list.push(RouteEntry { id, roots, handler });
+        routes.dirty = true;
+        Route {
+            id,
+            routes: self.0.routes.clone(),
+        }
+    }
+
+    fn commit(&self) -> anyhow::Result<bool> {
+        use std::sync::atomic::Ordering;
+        let inner = &*self.0;
+        let mut stream = lock(&inner.stream);
+        let rebuild = inner.broken.swap(false, Ordering::AcqRel);
+        let (want, have) = {
+            let mut routes = lock(&inner.routes);
+            if !routes.dirty && !rebuild {
+                return Ok(false);
+            }
+            routes.dirty = false;
+            let mut want: Vec<PathBuf> = routes
+                .list
+                .iter()
+                .flat_map(|entry| entry.roots.iter().cloned())
+                .collect();
+            want.sort();
+            want.dedup();
+            let have = match rebuild {
+                true => Vec::new(),
+                false => routes.watched.clone(),
+            };
+            (want, have)
+        };
+        if stream.is_none() && want.is_empty() {
+            return Ok(false);
+        }
+        if rebuild || stream.is_none() {
+            *stream = None;
+            let (routes, broken) = (inner.routes.clone(), inner.broken.clone());
+            // The routes' lock is never held across a commit, which stops
+            // the stream and waits for the thread this runs on.
+            *stream = Some(notify::recommended_watcher(
+                move |res: notify::Result<notify::Event>| {
+                    if res.is_err() {
+                        broken.store(true, Ordering::Release);
+                    }
+                    lock(&routes).dispatch(res);
+                },
+            )?);
+            inner.streams.fetch_add(1, Ordering::SeqCst);
+        }
+        let Some(watcher) = stream.as_mut() else {
+            return Ok(false);
+        };
+        let mut failed = Vec::new();
+        {
+            let mut paths = watcher.paths_mut();
+            for gone in have.iter().filter(|root| !want.contains(root)) {
+                let _ = paths.remove(gone);
+            }
+            for root in want.iter().filter(|root| !have.contains(root)) {
+                if let Err(e) = paths.add(root, RecursiveMode::Recursive) {
+                    failed.push((root.clone(), e.to_string()));
+                }
+            }
+            paths.commit()?;
+        }
+        let mut routes = lock(&inner.routes);
+        routes.watched = want
+            .into_iter()
+            .filter(|root| !failed.iter().any(|(f, _)| f == root))
+            .collect();
+        for (root, why) in &failed {
+            let why = format!("watch `{}` failed: {why}", root.display());
+            for entry in routes.list.iter_mut().filter(|e| e.roots.contains(root)) {
+                (entry.handler)(Err(notify::Error::generic(&why)));
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// The files elsewhere that decide what Git sees, as last read.
@@ -2104,96 +2170,350 @@ pub(crate) struct Known(std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>);
 
 impl Known {
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock(&self.0)
     }
 }
 
-/// The watch on the files elsewhere, through the kernel. Each file is
-/// watched by the logical path Git names, as an entry of its directory,
-/// so replacing it or retargeting a link there is heard, and by the file
-/// it resolves to, for its content and for being replaced. A change to
-/// any of them can name others — a config sets `core.excludesFile` or
-/// includes another file — so each one reads the set again and the watch
-/// follows it, a file not made yet included.
-struct Elsewhere {
+type ReadSet = Box<dyn Fn() -> Result<Vec<PathBuf>, String> + Send>;
+type Changed = std::sync::Arc<dyn Fn() + Send + Sync>;
+type Failed = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+
+/// The watch on the files elsewhere, through the kernel, one per process
+/// however many repos read them. Each file is watched by the logical
+/// path Git names, as an entry of its directory, so replacing it or
+/// retargeting a link there is heard, and by the file it resolves to, for
+/// its content and for being replaced. A change to any of them can name
+/// others — a config sets `core.excludesFile` or includes another file —
+/// so each repo that follows it reads its set again and the watch follows
+/// that, a file not made yet included. A watch that failed is replaced
+/// for the next repo to follow.
+#[derive(Clone, Default)]
+struct ElsewhereHub(std::sync::Arc<HubSlot>);
+
+#[derive(Default)]
+struct HubSlot {
+    current: std::sync::Mutex<Option<std::sync::Arc<Followed>>>,
+    made: std::sync::atomic::AtomicUsize,
+}
+
+/// One kernel watch and the thread that rereads for it.
+struct Followed {
+    shared: std::sync::Arc<FollowShared>,
     rereads: mpsc::Sender<Reread>,
     thread: Option<std::thread::JoinHandle<()>>,
+    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct FollowShared {
+    state: std::sync::Mutex<FollowState>,
+    knowns: std::sync::Arc<std::sync::Mutex<Vec<(u64, Known)>>>,
+}
+
+struct FollowState {
+    registry: Registry,
+    followers: Vec<Follower>,
+    next: u64,
+}
+
+struct Follower {
+    id: u64,
+    read: ReadSet,
+    known: Known,
+    following: Following,
+    changed: Changed,
+    failed: Failed,
 }
 
 enum Reread {
-    Now,
+    Of(Vec<u64>),
+    All,
+    Failed(String),
     Stop,
 }
 
-impl Elsewhere {
-    /// `read` names the files; `changed` is called once the watch covers
-    /// what a change named, and `failed` once the watch, or a read of the
-    /// set, fails.
-    fn start(
-        read: impl Fn() -> Result<Vec<PathBuf>, String> + Send + 'static,
+/// One repo's share of the watch on the files elsewhere, until dropped.
+pub(crate) struct Follow {
+    followed: std::sync::Arc<Followed>,
+    id: u64,
+}
+
+impl ElsewhereHub {
+    /// Follow the files `read` names for one repo: `changed` is called
+    /// once the watch covers what a change named, and `failed` once the
+    /// watch, or a read of the set, fails.
+    fn follow(
+        &self,
+        read: ReadSet,
         known: Known,
-        changed: impl Fn() + Send + Sync + 'static,
-        failed: impl Fn(String) + Send + Sync + 'static,
-    ) -> anyhow::Result<Self> {
-        let (rereads, asked) = mpsc::channel();
-        let failed = std::sync::Arc::new(failed);
-        let mut watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
-            {
-                let known = known.clone();
-                move |path| known.lock().iter().any(|file| file == path)
-            },
-            {
-                let (rereads, failed, known) = (rereads.clone(), failed.clone(), known.clone());
-                move |res: notify::Result<notify::Event>| {
-                    use crate::fs_notice::{Notice, notice};
-                    let ours = match notice(&res) {
-                        Notice::Read => false,
-                        Notice::Rescan => true,
-                        // A directory that appears may already hold one.
-                        Notice::Changed(paths) => paths
-                            .iter()
-                            .any(|path| known.lock().iter().any(|file| file.starts_with(path))),
-                        Notice::Failed(why) => {
-                            failed(format!("the watch on Git's files elsewhere failed: {why}"));
-                            false
-                        }
-                    };
-                    if ours {
-                        let _ = rereads.send(Reread::Now);
-                    }
+        changed: Changed,
+        failed: Failed,
+    ) -> anyhow::Result<Follow> {
+        let followed = {
+            let mut current = lock(&self.0.current);
+            match &*current {
+                Some(followed) if !followed.dead.load(std::sync::atomic::Ordering::Acquire) => {
+                    followed.clone()
                 }
-            },
-        )?;
-        let mut following = Following::default();
-        if following.settle(&read, &mut watcher, &known)? {
-            changed();
-        }
-        let thread = std::thread::Builder::new()
-            .name("git-elsewhere".into())
-            .spawn(move || {
-                while let Ok(Reread::Now) = asked.recv() {
-                    while let Ok(next) = asked.try_recv() {
-                        if let Reread::Stop = next {
-                            return;
-                        }
-                    }
-                    if let Err(e) = following.settle(&read, &mut watcher, &known) {
-                        return failed(format!("cannot follow Git's files elsewhere: {e:#}"));
-                    }
-                    changed();
+                _ => {
+                    let followed = std::sync::Arc::new(Followed::start()?);
+                    self.0
+                        .made
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    *current = Some(followed.clone());
+                    followed
                 }
-            })?;
-        Ok(Self {
-            rereads,
-            thread: Some(thread),
-        })
+            }
+        };
+        followed.add(read, known, changed, failed)
+    }
+
+    #[cfg(test)]
+    fn made(&self) -> usize {
+        self.0.made.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
-/// What the watch is registered for: the files as Git names them, and
-/// the directories watched for them and for what they resolve to.
+impl Followed {
+    fn start() -> anyhow::Result<Self> {
+        let (rereads, asked) = mpsc::channel();
+        let knowns: std::sync::Arc<std::sync::Mutex<Vec<(u64, Known)>>> = Default::default();
+        let dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
+            {
+                let knowns = knowns.clone();
+                move |path| {
+                    lock(&knowns)
+                        .iter()
+                        .any(|(_, known)| known.lock().iter().any(|file| file == path))
+                }
+            },
+            {
+                let (rereads, knowns, dead) = (rereads.clone(), knowns.clone(), dead.clone());
+                move |res: notify::Result<notify::Event>| {
+                    use crate::fs_notice::{Notice, notice};
+                    let ask = match notice(&res) {
+                        Notice::Read => return,
+                        Notice::Rescan => Reread::All,
+                        // A directory that appears may already hold one.
+                        Notice::Changed(paths) => {
+                            let ids: Vec<u64> = lock(&knowns)
+                                .iter()
+                                .filter(|(_, known)| {
+                                    paths.iter().any(|path| {
+                                        known.lock().iter().any(|file| file.starts_with(path))
+                                    })
+                                })
+                                .map(|(id, _)| *id)
+                                .collect();
+                            if ids.is_empty() {
+                                return;
+                            }
+                            Reread::Of(ids)
+                        }
+                        Notice::Failed(why) => {
+                            dead.store(true, std::sync::atomic::Ordering::Release);
+                            Reread::Failed(why)
+                        }
+                    };
+                    let _ = rereads.send(ask);
+                }
+            },
+        )?;
+        let shared = std::sync::Arc::new(FollowShared {
+            state: std::sync::Mutex::new(FollowState {
+                registry: Registry {
+                    watcher,
+                    counts: Default::default(),
+                },
+                followers: Vec::new(),
+                next: 0,
+            }),
+            knowns,
+        });
+        let thread = std::thread::Builder::new()
+            .name("git-elsewhere".into())
+            .spawn({
+                let shared = shared.clone();
+                move || reread_on_ask(&shared, &asked)
+            })?;
+        Ok(Followed {
+            shared,
+            rereads,
+            thread: Some(thread),
+            dead,
+        })
+    }
+
+    fn add(
+        self: &std::sync::Arc<Self>,
+        read: ReadSet,
+        known: Known,
+        changed: Changed,
+        failed: Failed,
+    ) -> anyhow::Result<Follow> {
+        let mut state = lock(&self.shared.state);
+        state.next += 1;
+        let id = state.next;
+        lock(&self.shared.knowns).push((id, known.clone()));
+        let mut follower = Follower {
+            id,
+            read,
+            known,
+            following: Following::default(),
+            changed,
+            failed,
+        };
+        let FollowState {
+            registry,
+            followers,
+            ..
+        } = &mut *state;
+        match follower
+            .following
+            .settle(&follower.read, registry, &follower.known)
+        {
+            Ok((moved, relisted)) => {
+                if moved {
+                    (follower.changed)();
+                }
+                tell_relisted(followers, id, &relisted);
+                followers.push(follower);
+                Ok(Follow {
+                    followed: self.clone(),
+                    id,
+                })
+            }
+            Err(e) => {
+                follower.following.release(registry);
+                lock(&self.shared.knowns).retain(|(other, _)| *other != id);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Read again the sets a change named, until asked to stop.
+fn reread_on_ask(shared: &FollowShared, asked: &mpsc::Receiver<Reread>) {
+    while let Ok(first) = asked.recv() {
+        let mut ids = Vec::new();
+        let mut all = false;
+        let mut failure = None;
+        for ask in std::iter::once(first).chain(asked.try_iter()) {
+            match ask {
+                Reread::Stop => return,
+                Reread::All => all = true,
+                Reread::Of(of) => ids.extend(of),
+                Reread::Failed(why) => failure = Some(why),
+            }
+        }
+        let mut state = lock(&shared.state);
+        let FollowState {
+            registry,
+            followers,
+            ..
+        } = &mut *state;
+        if let Some(why) = failure {
+            for follower in followers.iter() {
+                (follower.failed)(format!("the watch on Git's files elsewhere failed: {why}"));
+            }
+            continue;
+        }
+        let mut relisted = Vec::new();
+        for follower in followers.iter_mut().filter(|f| all || ids.contains(&f.id)) {
+            match follower
+                .following
+                .settle(&follower.read, registry, &follower.known)
+            {
+                Ok((_, dirs)) => {
+                    (follower.changed)();
+                    relisted.extend(dirs.into_iter().map(|dir| (follower.id, dir)));
+                }
+                Err(e) => (follower.failed)(format!("cannot follow Git's files elsewhere: {e:#}")),
+            }
+        }
+        for (by, dir) in relisted {
+            tell_relisted(followers, by, std::slice::from_ref(&dir));
+        }
+    }
+}
+
+/// A directory listed again for one repo could have missed a change for
+/// the others that follow files in it: they read their sets again too.
+fn tell_relisted(followers: &[Follower], by: u64, relisted: &[PathBuf]) {
+    for follower in followers
+        .iter()
+        .filter(|f| f.id != by && relisted.iter().any(|dir| f.following.dirs.contains(dir)))
+    {
+        (follower.changed)();
+    }
+}
+
+impl Drop for Follow {
+    fn drop(&mut self) {
+        let shared = &self.followed.shared;
+        let mut state = lock(&shared.state);
+        let FollowState {
+            registry,
+            followers,
+            ..
+        } = &mut *state;
+        if let Some(at) = followers.iter().position(|f| f.id == self.id) {
+            followers.remove(at).following.release(registry);
+        }
+        lock(&shared.knowns).retain(|(id, _)| *id != self.id);
+    }
+}
+
+impl Drop for Followed {
+    fn drop(&mut self) {
+        let _ = self.rereads.send(Reread::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The directories the kernel watch holds, each once however many repos
+/// follow files in it.
+struct Registry {
+    watcher: crate::proc_identity::tree_watch::KernelWatcher,
+    counts: std::collections::BTreeMap<PathBuf, usize>,
+}
+
+impl Registry {
+    fn acquire(&mut self, dir: &Path) -> anyhow::Result<()> {
+        use notify::Watcher as _;
+        if !self.counts.contains_key(dir) {
+            self.watcher
+                .watch(dir, RecursiveMode::NonRecursive)
+                .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", dir.display()))?;
+        }
+        *self.counts.entry(dir.to_path_buf()).or_default() += 1;
+        Ok(())
+    }
+
+    fn release(&mut self, dir: &Path) {
+        use notify::Watcher as _;
+        if let Some(count) = self.counts.get_mut(dir) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(dir);
+                let _ = self.watcher.unwatch(dir);
+            }
+        }
+    }
+
+    fn relist(&mut self, dir: &Path) -> anyhow::Result<()> {
+        use notify::Watcher as _;
+        let _ = self.watcher.unwatch(dir);
+        self.watcher
+            .watch(dir, RecursiveMode::NonRecursive)
+            .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", dir.display()))
+    }
+}
+
+/// What one repo's set is registered for: the files as Git names them,
+/// and the directories watched for them and for what they resolve to.
 #[derive(Default)]
 struct Following {
     files: Vec<PathBuf>,
@@ -2204,16 +2524,17 @@ impl Following {
     /// Register for the set `read` names, then read it again, until a
     /// read finds what is registered: a change made between a read and
     /// its registration names inputs no event would ever report. Whether
-    /// a read after the first found the set moved.
+    /// a read after the first found the set moved, and the directories
+    /// already watched that were listed again.
     fn settle(
         &mut self,
-        read: &impl Fn() -> Result<Vec<PathBuf>, String>,
-        watcher: &mut crate::proc_identity::tree_watch::KernelWatcher,
+        read: &ReadSet,
+        registry: &mut Registry,
         known: &Known,
-    ) -> anyhow::Result<bool> {
-        use notify::Watcher as _;
+    ) -> anyhow::Result<(bool, Vec<PathBuf>)> {
         let mut moved = false;
         let mut first = true;
+        let mut relisted_all = Vec::new();
         loop {
             let mut files = read().map_err(|e| anyhow::anyhow!("{e}"))?;
             files.sort();
@@ -2229,7 +2550,7 @@ impl Following {
             dirs.sort();
             dirs.dedup();
             if files == self.files && dirs == self.dirs && followed == *known.lock() {
-                return Ok(moved);
+                return Ok((moved, relisted_all));
             }
             moved |= !first;
             first = false;
@@ -2246,26 +2567,32 @@ impl Following {
             let relisted: Vec<PathBuf> = self
                 .dirs
                 .iter()
+                .filter(|d| dirs.contains(d))
                 .filter(|d| newly.iter().any(|f| f.parent() == Some(d.as_path())))
                 .cloned()
                 .collect();
-            for gone in self
-                .dirs
-                .iter()
-                .filter(|d| !dirs.contains(d) || relisted.contains(d))
-            {
-                let _ = watcher.unwatch(gone);
+            for gone in self.dirs.iter().filter(|d| !dirs.contains(d)) {
+                registry.release(gone);
             }
-            for dir in dirs
-                .iter()
-                .filter(|d| !self.dirs.contains(d) || relisted.contains(d))
-            {
-                watcher
-                    .watch(dir, RecursiveMode::NonRecursive)
-                    .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", dir.display()))?;
+            self.dirs.retain(|d| dirs.contains(d));
+            for dir in &relisted {
+                registry.relist(dir)?;
             }
+            for dir in &dirs {
+                if !self.dirs.contains(dir) {
+                    registry.acquire(dir)?;
+                    self.dirs.push(dir.clone());
+                }
+            }
+            relisted_all.extend(relisted);
             self.files = files;
             self.dirs = dirs;
+        }
+    }
+
+    fn release(&mut self, registry: &mut Registry) {
+        for dir in self.dirs.drain(..) {
+            registry.release(&dir);
         }
     }
 }
@@ -2284,23 +2611,15 @@ fn canonical_file(path: &Path) -> PathBuf {
     })
 }
 
-impl Drop for Elsewhere {
-    fn drop(&mut self) {
-        let _ = self.rereads.send(Reread::Stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 /// The Git watcher's callback, apart from any backend so a test can
 /// drive it with the events a backend would deliver.
-fn git_wake_handler(
-    tx: mpsc::Sender<()>,
+fn git_wake_handler<M: Clone + Send + Sync + 'static>(
+    tx: impl Into<crate::fs_notice::Wake<M>>,
     mut filter: WakeFilter,
     git_status: GitStatus,
     fault: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+    let tx = tx.into();
     move |res: notify::Result<notify::Event>| {
         use crate::fs_notice::{Notice, notice};
         let seen = match notice(&res) {
@@ -2313,7 +2632,7 @@ fn git_wake_handler(
                 .unwrap_or(Seen::Nothing),
             Notice::Failed(why) => {
                 crate::fs_notice::record(&fault, format!("the filesystem watcher failed: {why}"));
-                let _ = tx.send(());
+                tx.ring();
                 return;
             }
         };
@@ -2321,7 +2640,7 @@ fn git_wake_handler(
             git_status.invalidate();
         }
         if seen != Seen::Nothing {
-            let _ = tx.send(());
+            tx.ring();
         }
     }
 }
@@ -2543,28 +2862,7 @@ pub(crate) fn dirty_summary(d: &DirtyStats) -> String {
 }
 
 #[cfg(test)]
-mod watch_failure_tests {
-    use super::watch_failure;
-
-    #[test]
-    fn initial_failure_is_fatal_post_success_degrades() {
-        // codex 697cdb1: before the first successful snapshot there
-        // is nothing to retain — fail loud, like the one-shot path.
-        let err = watch_failure(false, "input probe", "boom").unwrap_err();
-        assert!(err.to_string().contains("input probe"), "{err}");
-        let err = watch_failure(false, "refresh", "boom").unwrap_err();
-        assert!(err.to_string().contains("refresh"), "{err}");
-        // After one success the watch degrades and keeps running;
-        // the caller leaves last_sig untouched, so the next
-        // event or retry pause retries the same state and an ordinary
-        // success is the recovery.
-        assert!(watch_failure(true, "input probe", "boom").is_ok());
-        assert!(watch_failure(true, "refresh", "boom").is_ok());
-    }
-}
-
-#[cfg(test)]
-mod dirty_and_wake_tests {
+pub(crate) mod dirty_and_wake_tests {
 
     /// The refresh read collapses what the first read collapsed.
     ///
@@ -2754,6 +3052,7 @@ mod dirty_and_wake_tests {
     }
     use super::*;
     use std::process::Command;
+    use std::time::Duration;
 
     #[test]
     fn dirty_stats_unborn_head_degrades_lines_to_zero() {
@@ -3214,19 +3513,27 @@ mod dirty_and_wake_tests {
 
     /// The files elsewhere, watched as `watch_git` watches them, with
     /// each change counted.
-    fn elsewhere_of(repo: &Path) -> (Elsewhere, Known, mpsc::Receiver<()>) {
+    fn elsewhere_of(repo: &Path) -> (Follow, Known, mpsc::Receiver<()>) {
+        elsewhere_in(&ElsewhereHub::default(), repo)
+    }
+
+    /// [`elsewhere_of`], on the watch `hub` holds.
+    fn elsewhere_in(hub: &ElsewhereHub, repo: &Path) -> (Follow, Known, mpsc::Receiver<()>) {
         let (tx, rx) = mpsc::channel();
         let known = Known::default();
         let repo = repo.to_path_buf();
-        let watch = Elsewhere::start(
-            move || crate::git_io::status_inputs_elsewhere(&repo).map_err(|e| e.to_string()),
-            known.clone(),
-            move || {
-                let _ = tx.send(());
-            },
-            |why| panic!("{why}"),
-        )
-        .unwrap();
+        let watch = hub
+            .follow(
+                Box::new(move || {
+                    crate::git_io::status_inputs_elsewhere(&repo).map_err(|e| e.to_string())
+                }),
+                known.clone(),
+                std::sync::Arc::new(move || {
+                    let _ = tx.send(());
+                }),
+                std::sync::Arc::new(|why| panic!("{why}")),
+            )
+            .unwrap();
         (watch, known, rx)
     }
 
@@ -3249,19 +3556,20 @@ mod dirty_and_wake_tests {
     fn elsewhere_reading(
         read: impl Fn() -> Result<Vec<PathBuf>, String> + Send + 'static,
         log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
-    ) -> (Elsewhere, Known, mpsc::Receiver<()>) {
+    ) -> (Follow, Known, mpsc::Receiver<()>) {
         let (tx, rx) = mpsc::channel();
         let known = Known::default();
-        let watch = Elsewhere::start(
-            read,
-            known.clone(),
-            move || {
-                log.lock().unwrap().push("changed");
-                let _ = tx.send(());
-            },
-            |why| panic!("{why}"),
-        )
-        .unwrap();
+        let watch = ElsewhereHub::default()
+            .follow(
+                Box::new(read),
+                known.clone(),
+                std::sync::Arc::new(move || {
+                    log.lock().unwrap().push("changed");
+                    let _ = tx.send(());
+                }),
+                std::sync::Arc::new(|why| panic!("{why}")),
+            )
+            .unwrap();
         (watch, known, rx)
     }
 
@@ -3491,6 +3799,168 @@ mod dirty_and_wake_tests {
         );
         append(&extra, "\tautocrlf = false\n");
         assert!(heard(&rx), "the in-place edit");
+    }
+
+    /// Every repo's Git watch goes through one worktree stream and one
+    /// kernel watch of the files elsewhere: adding several repos, or
+    /// dropping one, restarts that one stream once, and never makes
+    /// another.
+    #[test]
+    fn one_stream_and_one_elsewhere_watch_serve_every_repo() {
+        let repos = [fixture_repo(), fixture_repo(), fixture_repo()];
+        let watches = Watches::default();
+        let (tx, _rx) = mpsc::channel::<()>();
+        let mut held: Vec<StatusWatchers> = repos
+            .iter()
+            .map(|repo| {
+                watch_status_paths(tx.clone(), repo.path(), &GitStatus::default(), &watches)
+                    .unwrap()
+            })
+            .collect();
+        assert!(watches.commit().unwrap(), "the stream started");
+        assert!(!watches.commit().unwrap(), "nothing came or went");
+        held.pop();
+        assert!(watches.commit().unwrap(), "a repo went");
+        assert_eq!(watches.streams(), 1);
+        assert_eq!(watches.elsewhere_watches(), 1);
+        assert!(held.iter().all(|w| w.git.fault().is_none()));
+    }
+
+    /// A main checkout and its linked worktree, routed as `watch_git`
+    /// routes them: the main checkout's root holds its `.git`, and the
+    /// linked worktree watches that `.git` as well. A change in the main
+    /// index, a shared ref, or one worktree's files reaches every repo
+    /// that depends on it, invalidates exactly those whose filters call
+    /// it an input, and shows in their status.
+    #[tokio::test]
+    async fn a_main_checkout_and_its_linked_worktree_each_hear_their_inputs() {
+        let dir = fixture_repo();
+        let main = dunce::canonicalize(dir.path()).unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let linked = dunce::canonicalize(ext.path()).unwrap().join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let worktrees = Worktrees::default();
+        let mut wakes = Vec::new();
+        let mut routes = Vec::new();
+        let statuses = [GitStatus::default(), GitStatus::default()];
+        for (repo, status) in [&main, &linked].into_iter().zip(&statuses) {
+            let filter = WakeFilter::new(repo).unwrap();
+            let roots: Vec<PathBuf> = std::iter::once(filter.repo_root.clone())
+                .chain(filter.git_dirs_outside())
+                .collect();
+            let (tx, rx) = mpsc::channel();
+            wakes.push(rx);
+            routes.push(worktrees.route(
+                roots,
+                Box::new(git_wake_handler(
+                    tx,
+                    filter,
+                    status.clone(),
+                    Default::default(),
+                )),
+            ));
+        }
+        assert_eq!(
+            routes.len(),
+            2,
+            "the linked worktree also watches {}",
+            main.join(".git").display()
+        );
+        let mut seen = Vec::new();
+        for (repo, status) in [&main, &linked].into_iter().zip(&statuses) {
+            // Twice: the first build makes the repo's untracked `.clank/`,
+            // which the first walk did not see.
+            refresh(repo, status).await;
+            status.invalidate();
+            seen.push(refresh(repo, status).await.1);
+        }
+        // What each change walks, and whose status it moves.
+        let mut heard = async |paths: Vec<PathBuf>| {
+            let mut event = notify::Event::new(notify::EventKind::Any);
+            event.paths = paths;
+            lock(&worktrees.0.routes).dispatch(Ok(event));
+            let mut out = Vec::new();
+            for (i, (repo, status)) in [&main, &linked].into_iter().zip(&statuses).enumerate() {
+                let woken = wakes[i].try_recv().is_ok();
+                while wakes[i].try_recv().is_ok() {}
+                let (walks, sig) = refresh(repo, status).await;
+                out.push((
+                    woken,
+                    walks,
+                    sig.dirty != seen[i].dirty || sig.head != seen[i].head,
+                ));
+                seen[i] = sig;
+            }
+            out
+        };
+
+        std::fs::write(main.join("staged.txt"), "new\n").unwrap();
+        git(&main, &["add", "staged.txt"]);
+        assert_eq!(
+            heard(vec![main.join(".git/index")]).await,
+            [(true, 1, true), (true, 1, false)],
+            "the main index: the main checkout walks and shows the staged file; \
+             the linked worktree's filter calls the shared directory's index an input"
+        );
+
+        git(&main, &["commit", "-q", "-m", "staged"]);
+        assert_eq!(
+            heard(vec![main.join(".git/refs/heads/main")]).await,
+            [(true, 1, true), (true, 1, false)],
+            "a shared ref: both depend on it, and the main checkout's HEAD moved"
+        );
+
+        std::fs::write(linked.join("a.txt"), "edited\n").unwrap();
+        assert_eq!(
+            heard(vec![linked.join("a.txt")]).await,
+            [(false, 0, false), (true, 1, true)],
+            "a file of the linked worktree alone"
+        );
+
+        std::fs::write(main.join("a.txt"), "edited\n").unwrap();
+        assert_eq!(
+            heard(vec![main.join("a.txt")]).await,
+            [(true, 1, true), (false, 0, false)],
+            "a file of the main checkout alone"
+        );
+    }
+
+    /// One file elsewhere that two repos read, as one watch of many repos
+    /// holds them: it is watched once, and an edit to it is heard for
+    /// each.
+    #[test]
+    fn a_shared_external_input_is_heard_for_every_repo_that_reads_it() {
+        let (one, two) = (fixture_repo(), fixture_repo());
+        let ext = tempfile::tempdir().unwrap();
+        let shared = dunce::canonicalize(ext.path())
+            .unwrap()
+            .join("shared.ignore");
+        std::fs::write(&shared, "").unwrap();
+        for repo in [&one, &two] {
+            git(
+                repo.path(),
+                &["config", "core.excludesFile", shared.to_str().unwrap()],
+            );
+        }
+        let hub = ElsewhereHub::default();
+        let (_one_watch, _, one_rx) = elsewhere_in(&hub, one.path());
+        let (_two_watch, _, two_rx) = elsewhere_in(&hub, two.path());
+        assert_eq!(hub.made(), 1, "one kernel watch for both");
+        settle(&one_rx);
+        settle(&two_rx);
+        append(&shared, "*.log\n");
+        assert!(heard(&one_rx), "the first repo");
+        assert!(heard(&two_rx), "the second repo");
     }
 
     /// `core.excludesFile` changed to a file elsewhere that does not exist
@@ -3963,121 +4433,6 @@ mod dirty_and_wake_tests {
             input_signature(r, &GitStatus::default()).unwrap(),
             "and so does its absence"
         );
-    }
-
-    /// Plain `status --watch` subscribes read-only and never reaches a
-    /// starter. Starting a monitor is banned in this suite, so the
-    /// wiring is read: the watch loop takes [`watch_status_paths`], which
-    /// takes `core_wakes`, which only subscribes.
-    #[test]
-    fn status_watch_never_reaches_a_starter() {
-        let src = include_str!("status.rs");
-        let span = |start: &str, end: &str| {
-            let from = src.find(start).unwrap_or_else(|| panic!("{start}"));
-            let to = src[from..].find(end).unwrap_or_else(|| panic!("{end}"));
-            &src[from..from + to]
-        };
-        let run_watch = span("async fn run_watch(", "let mut last_emitted");
-        assert!(
-            run_watch.contains("watch_status_paths(tx.clone(), &repo, &git_status)?"),
-            "{run_watch}"
-        );
-        assert!(!run_watch.contains("watch_tui_paths"), "{run_watch}");
-        let paths = span("pub(crate) fn watch_status_paths(", "\n}\n");
-        assert!(paths.contains("monitor::core_wakes(repo"), "{paths}");
-        for starting in ["keeper", "spawn", "attempt", "attach_or_spawn"] {
-            assert!(!paths.contains(starting), "{starting} in {paths}");
-        }
-
-        let monitor = include_str!("monitor.rs");
-        let from = monitor
-            .find("pub(crate) fn core_wakes(")
-            .expect("core_wakes");
-        let to = monitor[from..].find("\n}\n").expect("its end");
-        let core = &monitor[from..from + to];
-        assert!(core.contains("match subscribe(repo)"), "{core}");
-        for starting in ["spawn", "attempt", "keeper"] {
-            assert!(!core.contains(starting), "{starting} in {core}");
-        }
-    }
-
-    /// The watch loop is not run here, so its order is read: it looks for
-    /// an install on every turn, ahead of the gate an install never moves;
-    /// it is woken by an install; a failed watcher ends it; and it sleeps
-    /// for nothing but [`watch_wait`]'s own timers.
-    #[test]
-    fn status_watch_looks_for_an_install_ahead_of_its_gate() {
-        let src = include_str!("status.rs");
-        let from = src.find("async fn run_watch(").expect("run_watch");
-        let body = &src[from..from + src[from..].find("\n}\n").expect("its end")];
-        let turn = body.find("    loop {").expect("the loop");
-        let fault = body
-            .find("if let Some(why) = watchers")
-            .expect("the fault check");
-        let flat: String = body[fault..].split_whitespace().collect();
-        assert!(
-            flat.starts_with(
-                "ifletSome(why)=watchers.git.fault().or_else(||watchers.core.fault()).or_else(||exits.fault()){anyhow::bail!"
-            ),
-            "every watch's failure ends the loop: {flat}"
-        );
-        let pass = body
-            .find("replacing.pass(crate::upgrade::Hosting::Nothing)")
-            .expect("the pass");
-        let gate = body
-            .find("match input_signature(&repo, &git_status)")
-            .expect("the gate");
-        assert!(turn < fault && fault < pass && pass < gate, "{body}");
-        assert!(
-            body.contains("crate::upgrade::process().clone()")
-                && body.contains("crate::upgrade::exec_installed_as_started()"),
-            "this process's own authority, restarted as it was started"
-        );
-        let subscribed = body
-            .find("replacing.authority().subscribe(")
-            .expect("woken by an install");
-        assert!(subscribed < turn, "subscribed before the first look");
-        assert!(
-            body.contains("next_wake(&rx, watch_wait(failures, replacing.retry_in()))"),
-            "{body}"
-        );
-        for poll in ["recv_timeout(Duration::from_secs", "sleep("] {
-            assert!(!body.contains(poll), "{poll} in {body}");
-        }
-    }
-
-    /// An idle watch sleeps until an event: no timer of its own is due
-    /// unless a refresh or a replacement failed.
-    #[test]
-    fn an_idle_watch_has_no_timer() {
-        assert_eq!(watch_wait(0, None), None);
-        assert_eq!(watch_wait(1, None), Some(Duration::from_secs(1)));
-        assert_eq!(watch_wait(9, None), Some(Duration::from_secs(30)));
-        assert_eq!(
-            watch_wait(0, Some(Duration::from_millis(500))),
-            Some(Duration::from_millis(500))
-        );
-    }
-
-    /// With no timer the wait has no timeout: it returns for an event
-    /// however late, and says so when every sender is gone.
-    #[test]
-    fn next_wake_without_a_timer_waits_for_the_event() {
-        let (tx, rx) = mpsc::channel();
-        let late = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            tx.send(()).unwrap();
-        });
-        let began = std::time::Instant::now();
-        assert_eq!(next_wake(&rx, None), Ok(true));
-        assert!(began.elapsed() >= Duration::from_millis(300));
-        late.join().unwrap();
-        assert_eq!(
-            next_wake(&rx, None),
-            Err(mpsc::RecvTimeoutError::Disconnected)
-        );
-        let (_tx, rx) = mpsc::channel::<()>();
-        assert_eq!(next_wake(&rx, Some(Duration::from_millis(10))), Ok(false));
     }
 
     #[test]
@@ -4918,7 +5273,7 @@ mod dirty_and_wake_tests {
         );
     }
 
-    fn minimal_snapshot() -> StatusSnapshot {
+    pub(crate) fn minimal_snapshot() -> StatusSnapshot {
         StatusSnapshot {
             forks: Vec::new(),
             repo_path: PathBuf::from("/repo"),

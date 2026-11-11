@@ -1,0 +1,29 @@
+repo:   /repo
+branch: main
+head:   abcd123
+monitor: none
+dirty:  no
+
+plan: foo
+  latest reviewable: 0123456
+  gate:              unreviewed
+  waiting on:        master
+  reason:            gate continued (not FINISHED) — continue work or ask a reviewer to mark FINISHED
+
+blocks:
+  BLOCKED (codex): why?
+
+repo:   /repo
+branch: main
+head:   ef01234
+monitor: none
+dirty:  no
+
+plan: foo
+  latest reviewable: 0123456
+  gate:              unreviewed
+  waiting on:        master
+  reason:            gate continued (not FINISHED) — continue work or ask a reviewer to mark FINISHED
+
+blocks:
+  BLOCKED (codex): why?
