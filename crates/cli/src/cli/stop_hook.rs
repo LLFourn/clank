@@ -49,6 +49,12 @@
 //! newest wait for a session is its park, so this one, an older one and
 //! a later Stop's converge on one.
 //!
+//! # A SubagentStop or SubagentStart (`--subagent`)
+//!
+//! Claude runs these for a subagent of the session, not for the agent. The
+//! hook reports what it saw, hears that it was recorded and exits 0 having
+//! written nothing: it never parks, and what it reports ends no turn.
+//!
 //! # A SessionStart (`--session-start`)
 //!
 //! Bind the session clank launched to its label, or identify one it did
@@ -72,7 +78,9 @@ use super::turn_wire::{Frame, Report, TurnResult, WireVerdict};
 use super::{StopHookArgs, resolve_cwd_repo, resolve_repo};
 use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
 use crate::lifecycle::AgentLabel;
-use clank_core::turn_policy::{PresentationId, TaskSnapshot, TurnEndReport, TurnPlace};
+use clank_core::turn_policy::{
+    ChildReport, ChildSeen, Ms, PresentationId, TaskSnapshot, TurnEndReport, TurnPlace,
+};
 use clank_core::{
     CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
     SilentReason, Tool,
@@ -97,10 +105,19 @@ pub(crate) async fn run(args: StopHookArgs, host: &mut impl Host) -> anyhow::Res
     // The runner's ceiling clock starts HERE, at process spawn — so the
     // wait's deadline must be measured from here too.
     let started = std::time::Instant::now();
+    // Read before anything else this process does: the only evidence of
+    // where this report sits among its session's others.
+    let hook_started = host.now_ms();
     let tool: Tool = args.tool.into();
+    if let Some(event) = args.subagent {
+        run_subagent(tool, args.repo.as_deref(), event, hook_started, host).await;
+        return Ok(());
+    }
     let arrived = match args.handoff.as_deref() {
         Some(path) => super::hook_handoff::Handoff::take(path).and_then(Arrived::resumed),
-        None => host.input().and_then(|raw| Arrived::fresh(raw, started)),
+        None => host
+            .input()
+            .and_then(|raw| Arrived::fresh(raw, started, hook_started)),
     };
     let turn = match arrived {
         Ok(arrived) => {
@@ -117,6 +134,8 @@ pub(crate) async fn run(args: StopHookArgs, host: &mut impl Host) -> anyhow::Res
 
 /// What a Stop or PostCompact reads, starts, writes and ends with.
 pub(crate) trait Host {
+    /// The host clock now, in unix milliseconds.
+    fn now_ms(&self) -> Ms;
     /// The hook input, as the harness wrote it.
     fn input(&mut self) -> Result<String, String>;
     fn spawner(&self) -> &dyn Spawn;
@@ -138,15 +157,19 @@ struct Arrived {
     resumed: Option<Report>,
     /// When the hook can no longer hold its wait.
     poll_deadline: std::time::Instant,
+    /// When this hook started, by the host clock. `None` for a resumed
+    /// one, whose report already carries the time its hook started at.
+    hook_started: Option<Ms>,
 }
 
 impl Arrived {
-    fn fresh(raw: String, started: std::time::Instant) -> Result<Self, String> {
+    fn fresh(raw: String, started: std::time::Instant, hook_started: Ms) -> Result<Self, String> {
         Ok(Arrived {
             input: parse_input(&raw)?,
             raw,
             resumed: None,
             poll_deadline: poll_deadline(started),
+            hook_started: Some(hook_started),
         })
     }
 
@@ -167,6 +190,7 @@ impl Arrived {
             raw: handoff.input,
             poll_deadline: now.checked_add(left).map_or(ceiling, |by| by.min(ceiling)),
             resumed: Some(handoff.report),
+            hook_started: None,
         })
     }
 }
@@ -199,6 +223,9 @@ impl ProcessHost {
 }
 
 impl Host for ProcessHost {
+    fn now_ms(&self) -> Ms {
+        super::turn_custody::now_ms()
+    }
     fn input(&mut self) -> Result<String, String> {
         read_stdin()
     }
@@ -269,6 +296,7 @@ async fn stop(
         input,
         resumed,
         poll_deadline,
+        hook_started,
     } = arrived;
     // Read now, before any waiting: where in the agent's record this Stop
     // came from, not wherever the record has got to by delivery. A
@@ -316,6 +344,7 @@ async fn stop(
                 session: input.session_id.clone(),
                 place,
                 tasks: TaskSnapshot::of(&input),
+                hook_started,
             };
             let deadline = unix_ms(poll_deadline);
             // A compaction ends no turn, so it is no evidence about questions.
@@ -402,6 +431,109 @@ fn question_evidence(
             older: super::question_state::prompts_behind(Path::new(transcript), turn),
         },
     ]
+}
+
+/// How long a subagent's hook waits to hear its report was recorded. The
+/// subagent's stop, or its start, is held for no longer.
+const SUBAGENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a subagent's hook reports of `raw`, started at `hook_started`:
+/// nothing when the payload names no subagent. A stop carries the
+/// session's listing and where the agent's own record stood; a start
+/// carries neither. Nothing is read of the subagent's own transcript.
+fn subagent_report(
+    tool: Tool,
+    event: super::SubagentArg,
+    raw: &str,
+    hook_started: Ms,
+) -> Result<Option<(HookInput, ChildReport)>, String> {
+    let input = parse_input(raw)?;
+    let Some(child) = input.agent_id.clone() else {
+        return Ok(None);
+    };
+    let seen = match event {
+        super::SubagentArg::Start => ChildSeen::Started,
+        super::SubagentArg::Stop => ChildSeen::Stopped {
+            tasks: TaskSnapshot::of(&input),
+            agent: super::wake_repeat::place(
+                tool,
+                input.transcript_path.as_deref().map(Path::new),
+                input.turn_id.as_deref(),
+            ),
+        },
+    };
+    let report = ChildReport {
+        session: input.session_id.clone(),
+        child,
+        hook_started: Some(hook_started),
+        seen,
+    };
+    Ok(Some((input, report)))
+}
+
+/// SubagentStop or SubagentStart: report it, and exit 0 with nothing on
+/// stdout. Only a diagnostic is ever written, to stderr.
+async fn run_subagent(
+    tool: Tool,
+    repo_override: Option<&Path>,
+    event: super::SubagentArg,
+    hook_started: Ms,
+    host: &mut impl Host,
+) {
+    let said = match host.input() {
+        Ok(raw) => subagent(tool, repo_override, event, &raw, hook_started, &*host).await,
+        Err(e) => Some(e),
+    };
+    if let Some(message) = said {
+        let (_, stderr) = host.streams();
+        let _ = writeln!(stderr, "{message}");
+    }
+    host.exit(HOOK_OK_EXIT);
+}
+
+/// Carry a subagent's report under its session's label, and return the
+/// diagnostic to print, if any. Whether that session still holds the
+/// label is the monitor's to judge.
+async fn subagent(
+    tool: Tool,
+    repo_override: Option<&Path>,
+    event: super::SubagentArg,
+    raw: &str,
+    hook_started: Ms,
+    host: &impl Host,
+) -> Option<String> {
+    let (input, seen) = match subagent_report(tool, event, raw, hook_started) {
+        Ok(Some(reported)) => reported,
+        Ok(None) => return None,
+        Err(e) => return Some(e),
+    };
+    let repo = match resolve_hook_repo(repo_override, &input) {
+        Ok(repo) => repo,
+        Err(e) => return Some(e),
+    };
+    let label = match resolve_identity_for_hook_in(&repo, tool, &input.session_id) {
+        Ok(label) => label,
+        Err(e) => return Some(format!("{e:#}")),
+    };
+    let session = input.session_id.as_str();
+    let report = Report::Child {
+        tool,
+        seen,
+        deadline: super::turn_custody::now_ms() + SUBAGENT_BUDGET.as_millis() as u64,
+    };
+    let frame = answer_with(
+        host.spawner(),
+        &repo,
+        &label,
+        session,
+        report,
+        SUBAGENT_BUDGET,
+    )
+    .await;
+    match frame.verdict {
+        WireVerdict::Diagnostic { message } => Some(message),
+        _ => None,
+    }
 }
 
 /// The SessionStart payload both tools send: claude documents it, codex
@@ -551,6 +683,17 @@ pub(super) async fn answer_once(
     report: Report,
     budget: std::time::Duration,
 ) -> Frame {
+    answer_with(&Spawner, repo, label, session, report, budget).await
+}
+
+async fn answer_with(
+    spawner: &dyn Spawn,
+    repo: &Path,
+    label: &AgentLabel,
+    session: &str,
+    report: Report,
+    budget: std::time::Duration,
+) -> Frame {
     let tool = report.tool();
     let carried = await_verdict_under_deadline(
         std::time::Instant::now() + budget,
@@ -558,7 +701,7 @@ pub(super) async fn answer_once(
         false,
         &mut super::hook_owner::Lifetime::Unbound,
         &mut crate::upgrade::Replacing::never(),
-        || Spawner.spawn(repo, label, session, tool, &report),
+        || spawner.spawn(repo, label, session, tool, &report),
     )
     .await;
     match carried {

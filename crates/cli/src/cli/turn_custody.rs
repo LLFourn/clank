@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use clank_core::turn_policy::{
     AttendReply, AttendRequest, Attending, CheckIn, CheckInRef, Effect, Entry, Event, Facts,
-    Handoff, Liveness, Ms, Output, OwedItem, Persisted, Presence, PresentationId, Qualifies, Quiet,
-    ResultOutcome, SessionState, ShellProof, SilentWhy, TaskSnapshot, Unqualified, Unwatched,
-    Verdict, Withheld,
+    Handoff, Liveness, Ms, Output, OwedItem, Persisted, Phase, Presence, PresentationId, Qualifies,
+    Quiet, ResultOutcome, SessionState, ShellProof, SilentWhy, TaskSnapshot, Unqualified,
+    Unwatched, Verdict, Withheld,
 };
 use clank_core::{AgentLabel, AutoMode, Role, SessionId, SilentReason, Tool};
 
@@ -115,17 +115,24 @@ impl Gathered {
     /// before its listing is applied to any declaration.
     pub(crate) fn handoff_verdict(&self, session: &SessionId, continued: bool) -> Verdict {
         clank_core::turn_policy::handoff_verdict(
-            &self.handoff(session, continued, TaskSnapshot::Unavailable),
+            &self.handoff(session, continued, TaskSnapshot::Unavailable, None),
             &facts(self, Some(Tool::Grok), &[], &Process),
         )
     }
 
-    fn handoff(&self, session: &SessionId, continued: bool, tasks: TaskSnapshot) -> Handoff {
+    fn handoff(
+        &self,
+        session: &SessionId,
+        continued: bool,
+        tasks: TaskSnapshot,
+        hook_started: Option<Ms>,
+    ) -> Handoff {
         Handoff {
             session: session.clone(),
             wait_registered: self.waiter,
             continued,
             tasks,
+            hook_started,
         }
     }
 
@@ -551,6 +558,26 @@ impl Turns {
         ))
     }
 
+    /// Apply a subagent's report to what `author` attends, and say whether
+    /// it was its bound session's. Needs no fold: it presents nothing.
+    fn child(
+        &mut self,
+        author: &AgentLabel,
+        g: &Gathered,
+        tool: Tool,
+        seen: &clank_core::turn_policy::ChildReport,
+        permit: &crate::upgrade::Permit,
+    ) -> bool {
+        let Some(custody) = self.custody(author, g) else {
+            return false;
+        };
+        let recorded = custody
+            .state
+            .child(seen, &facts(g, Some(tool), &[], &Process));
+        self.persist(author, Some(permit));
+        recorded
+    }
+
     /// The agents whose next Stop, or parked report, ends rather than parks
     /// because a verified user command waits for them. Replaces the last set.
     pub(crate) fn set_user_commands(&mut self, waiting: std::collections::BTreeSet<AgentLabel>) {
@@ -593,15 +620,30 @@ impl Turns {
                 session,
                 continued,
                 tasks,
+                hook_started,
                 ..
             } => {
-                let event = Event::NativeTurnEnd(g.handoff(session, *continued, tasks.clone()));
+                let event = Event::NativeTurnEnd(g.handoff(
+                    session,
+                    *continued,
+                    tasks.clone(),
+                    *hook_started,
+                ));
                 let stepped = first
                     .then(|| self.step_under(author, g, Some(Tool::Grok), event, &permit))
                     .flatten();
                 return Some(frame_of(match stepped {
                     Some(Output::Verdict(verdict)) => verdict,
                     _ => g.handoff_verdict(session, *continued),
+                }));
+            }
+            Report::Child { tool, seen, .. } => {
+                let recorded = first && self.child(author, g, *tool, seen, &permit);
+                return Some(Frame::bare(match recorded {
+                    true => WireVerdict::Recorded,
+                    false => WireVerdict::Silent {
+                        why: SilentReason::StaleBinding,
+                    },
                 }));
             }
             _ if g.owed.is_none() => return None,
@@ -855,7 +897,8 @@ impl Turns {
             let ends = match (run, listed) {
                 (true, _) => "until its process ends, which wakes you once",
                 (false, true) => {
-                    "until your harness stops listing the task with that exact description"
+                    "until your harness stops listing the task with that exact description and \
+                     any background work it left running"
                 }
                 (false, false) => {
                     "until you clear it with `clank attend --clear` once your harness reports it \
@@ -1165,6 +1208,34 @@ fn attended(entry: &Entry, qualifies: &Qualifies) -> super::agent_state::Attende
             Qualifies::Yes => None,
             Qualifies::No(why) => Some(unqualified_text(why).into()),
         },
+        rests_on: entry.phase().and_then(rests_on),
+    }
+}
+
+/// What a declared subagent that is not running is attended for, as a
+/// status row says it. An unsure park says the work may be the agent's
+/// own: that is all the evidence could establish.
+fn rests_on(phase: &Phase) -> Option<String> {
+    match phase {
+        Phase::Live | Phase::Ended => None,
+        Phase::Unsettled { .. } => Some("may be running again".into()),
+        Phase::Parked { on, sure } => {
+            let tasks: Vec<String> = on
+                .iter()
+                .map(|task| {
+                    let kind = task.kind.as_deref().unwrap_or("task");
+                    match &task.description {
+                        Some(description) => format!("{kind} \"{description}\""),
+                        None => format!("{kind} {}", task.id),
+                    }
+                })
+                .collect();
+            let unsure = match sure {
+                true => "",
+                false => " (may be yours)",
+            };
+            Some(format!("waiting on {}{unsure}", tasks.join(", ")))
+        }
     }
 }
 

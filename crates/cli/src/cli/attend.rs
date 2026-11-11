@@ -4,8 +4,8 @@
 //!
 //! A declaration takes effect at once. Where the harness's Stop lists its
 //! background tasks (Claude, Grok) it resolves to the one live task whose
-//! description is the name, and ends when a listing no longer has that
-//! task. Elsewhere it stands until `--clear`. No turn start ends it, and
+//! description is the name, and ends when a listing has neither that task
+//! nor work it may have started. Elsewhere it stands until `--clear`. No turn start ends it, and
 //! clank never reports the work finished. At `--expect`, a declaration
 //! still standing is checked in on once.
 //!

@@ -196,7 +196,8 @@ pub(crate) enum Control {
         proof: clank_core::turn_policy::ShellProof,
     },
     /// A `clank attend` declaration, standing until the harness's listing
-    /// no longer has its task or `author` clears it.
+    /// has neither its task nor work that task may have started, or
+    /// `author` clears it.
     Attend {
         author: String,
         session: clank_core::SessionId,
@@ -4096,6 +4097,10 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     (Served::Agent { author }, Some(_)) => Some(author.clone()),
                     _ => None,
                 };
+                let child = client
+                    .report
+                    .as_ref()
+                    .is_some_and(|r| !r.report.reaches_agent());
                 leaving.extend(admit_into(
                     &repo,
                     &mut clients,
@@ -4107,15 +4112,19 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 if let Some(author) = reporting {
                     // Read afresh, as a newcomer's items are: the cached
                     // backlog may still hold a row acknowledged since.
-                    leaving.extend(serve_reports(
-                        &repo,
+                    let serving = Serving {
+                        repo: &repo,
+                        state: folded_state.as_ref(),
+                        pending: &pending,
+                        hosted: &hosted,
+                    };
+                    leaving.extend(serve_newcomer(
+                        &serving,
                         &mut clients,
-                        folded_state.as_ref(),
-                        Some(&author),
-                        &pending,
-                        &mut Default::default(),
-                        &hosted,
+                        &author,
+                        child,
                         &mut turns,
+                        &mut recovery,
                     ));
                 }
             }
@@ -8004,6 +8013,55 @@ fn ended(
     leaving
 }
 
+/// What the loop serves a newcomer's reports against.
+struct Serving<'a> {
+    repo: &'a std::path::Path,
+    state: Option<&'a crate::repo_state::RepoState>,
+    pending: &'a [(AgentLabel, WaitItem)],
+    hosted: &'a std::collections::BTreeMap<AgentLabel, Hosted>,
+}
+
+/// Serve `author`'s reports on the arrival of one. A child's report
+/// changes what status shows of an attendance and no fold follows it, so
+/// that is published here.
+fn serve_newcomer(
+    at: &Serving<'_>,
+    clients: &mut Vec<Client>,
+    author: &AgentLabel,
+    child: bool,
+    turns: &mut crate::cli::turn_custody::Turns,
+    recovery: &mut crate::cli::recovery::Driver,
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
+    let Serving {
+        repo,
+        state,
+        pending,
+        hosted,
+    } = *at;
+    let leaving = serve_reports(
+        repo,
+        clients,
+        state,
+        Some(author),
+        pending,
+        &mut Default::default(),
+        hosted,
+        turns,
+    );
+    if child {
+        let g = gather(
+            repo,
+            state,
+            author,
+            hosted,
+            &mut Default::default(),
+            pending,
+        );
+        project(recovery, turns, author, &g);
+    }
+    leaving
+}
+
 /// Step each held report — every author's, or `only`'s — and answer the
 /// ones whose verdict is terminal, retiring them. A parked report is told
 /// so once and then kept alive with beats.
@@ -8024,6 +8082,10 @@ fn serve_reports(
         .filter_map(registered_waiter)
         .map(|(author, session)| (author.clone(), session.to_string()))
         .collect();
+    // A child's report is applied before the park it may release: what
+    // it ends is then handed to that park in this same pass, with no Stop
+    // of the agent's to wait for.
+    clients.sort_by_key(|c| c.report.as_ref().is_none_or(|r| r.report.reaches_agent()));
     let mut keep = Vec::with_capacity(clients.len());
     for mut client in clients.drain(..) {
         let (Served::Agent { author }, Some(reporting)) = (&client.who, client.report.as_mut())
@@ -9386,6 +9448,7 @@ mod recovery_tests {
             let report = crate::cli::turn_wire::Report::TurnEnd {
                 stop: clank_core::turn_policy::TurnEndReport {
                     tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+                    hook_started: None,
                     tool: clank_core::Tool::Codex,
                     session: clank_core::SessionId::parse(session).unwrap(),
                     place: clank_core::turn_policy::TurnPlace {
@@ -9440,6 +9503,7 @@ mod recovery_tests {
         let stop = crate::cli::turn_wire::Report::TurnEnd {
             stop: clank_core::turn_policy::TurnEndReport {
                 tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+                hook_started: None,
                 tool: clank_core::Tool::Codex,
                 session: clank_core::SessionId::parse("session-one").unwrap(),
                 place: Default::default(),
@@ -18481,6 +18545,7 @@ mod user_command_tests {
                 report: crate::cli::turn_wire::Report::TurnEnd {
                     stop: clank_core::turn_policy::TurnEndReport {
                         tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+                        hook_started: None,
                         tool: clank_core::Tool::Claude,
                         session: clank_core::SessionId::parse(session).unwrap(),
                         place: Default::default(),

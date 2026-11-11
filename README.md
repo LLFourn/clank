@@ -154,7 +154,8 @@ clank doctor      # verify
 slash command for claude, the clank opencode plugin
 (`~/.config/opencode/plugin/clank.js` — session binding + work loop),
 and merges its hooks into claude's `settings.json` (Stop, SessionStart,
-PostCompact for the async loop, and the `AskUserQuestion` question hook)
+PostCompact, SubagentStop and SubagentStart for the async loop, and the
+`AskUserQuestion` question hook)
 and codex's `hooks.json` (Stop, SessionStart), replacing clank's own
 entries and keeping yours. Codex also gets a `clank` allow rule in
 `rules/default.rules`. Setup sets `finish.autosquash` to true in
@@ -879,13 +880,48 @@ it again while the work runs; new work still wakes it.
 - `clank attend "<name>"` declares other work, such as a subagent. It
   takes effect at once. Where the harness's Stop lists its own background
   tasks (Claude's `background_tasks`, Grok's `backgroundTasks`), the name
-  is matched to the one live task with that description and the
-  declaration ends when a listing no longer has that task; the listing
+  is matched to the one live task with that description; the listing
   never creates attendance, and a task nobody declared is ignored. A name
   that matches several tasks, or none within two Stops, is dropped with a
   notice saying what the harness lists. Where there is no listing (Codex,
   OpenCode) the declaration stands until the agent clears it. A person's
   message never ends one, and clank never says the named work finished.
+
+A declaration bound to any task but a subagent ends when the listing no
+longer has that task. A declared subagent stays attended through work
+it may have started. A subagent that backgrounds a long command and ends its turn to wait for
+it leaves the harness's listing, and comes back under the same id when
+the command exits, so its absence alone does not end the declaration.
+Nothing in a listing says who started a task, so this is inferred:
+
+- When the subagent stops (Claude's SubagentStop hook), every task in
+  the listing that no earlier listing showed, other than subagents and
+  the agent's own `clank wait`, may be its work. With any, the
+  declaration is parked on them; with none it ends. Without that hook (Grok, or a hook that was lost) the same is
+  read from the first Stop of the agent's that no longer lists the
+  subagent.
+- A parked declaration becomes live again when the subagent starts
+  again (SubagentStart) or a listing shows it, and ends when a later
+  listing has neither the subagent nor any task it was parked on. What
+  it quieted is then handed to the agent's waiting hook at once.
+- Reports are ordered by when each hook started, never by when they
+  arrive. One that cannot be ordered never ends or parks anything. A
+  start that cannot be ordered leaves the declaration standing: when it
+  carries the same time as the report before it, a report from strictly
+  later settles it; when its time is missing or earlier, which may be a
+  clock that went back, no report can, and it stands until
+  `clank attend --clear` or its `--expect` check-in.
+
+What this does not promise: a task that existed before the subagent
+never holds its declaration, but one the agent itself started while the
+subagent was running cannot be told from the subagent's, and holds it
+until that task ends or `--expect` passes. Status and `clank tui` say
+which case it is: `waiting on shell "Run the tests"` when the agent was
+stopped throughout and so cannot have started it, and the same with
+`(may be yours)` when it could have. A subagent declared before the
+session's first Stop has a long-running task of the session's own, such
+as Claude's artifact monitor, held as its work too, because no earlier
+listing showed that task.
 
 An agent attends several things at once. Each `attend` or `run` adds one
 entry, or renews what already stands under that name or process, and
@@ -927,7 +963,7 @@ committed. Everything else is per-user state.
 ~/.grok/skills/{clank-master,clank-reviewer,clank-standby,clank-github}/
 ~/.config/opencode/skills/{clank-master,clank-reviewer,clank-standby,clank-github}/
 ~/.config/opencode/plugin/clank.js  # opencode binding + work-loop plugin
-~/.claude/settings.json             # claude Stop, SessionStart, PostCompact + question hooks
+~/.claude/settings.json             # claude Stop, SessionStart, PostCompact, Subagent{Stop,Start} + question hooks
 ~/.codex/hooks.json                 # codex Stop + SessionStart hooks merged in
 ~/.codex/rules/default.rules        # codex allow rule for `clank`
 ~/.grok/hooks/clank.json            # grok SessionStart, Stop, SessionEnd adapter
@@ -951,7 +987,10 @@ auto-mode drives it:
   task manager can't reap what doesn't exist) and work WAKES the
   session as a system reminder. A PostCompact companion (also
   `asyncRewake`) parks the wait again after a compaction, which
-  otherwise ends it. A SessionStart companion, installed in either
+  otherwise ends it. SubagentStop and SubagentStart companions report
+  a subagent's stops and starts and return at once, which is what keeps
+  a declared subagent attended while it waits on work of its own (see
+  Background work). A SessionStart companion, installed in either
   mode, binds the session clank launched and delivers pending work as
   context after restarts and `/clear`. On older Claude Code the Stop
   hook parks the same wait synchronously, holding the turn open, and
@@ -1754,6 +1793,8 @@ a real run):
   OK   claude claude: …/.claude/skills/clank-master/SKILL.md: matches embedded content
   OK   claude claude: …/.claude/settings.json: claude Stop hook installed
   OK   claude claude: …/.claude/settings.json PostCompact: claude PostCompact hook installed
+  OK   claude claude: …/.claude/settings.json SubagentStop: claude SubagentStop hook installed
+  OK   claude claude: …/.claude/settings.json SubagentStart: claude SubagentStart hook installed
   OK   codex codex: …/.codex/hooks.json: codex Stop hook installed
 
 [session]

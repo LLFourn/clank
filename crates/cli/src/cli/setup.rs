@@ -205,7 +205,7 @@ pub(crate) fn declared_ends(tool: Tool) -> &'static str {
     match tool {
         Tool::Claude | Tool::Grok => {
             "A declaration ends when your harness stops\n  listing that work (named by its \
-             exact description)."
+             exact description) and any background work it\n  left running."
         }
         Tool::Codex | Tool::OpenCode => {
             "Clear a declaration with `clank attend\n  --clear \"<name>\"` once done."
@@ -903,6 +903,8 @@ pub(super) fn inspect_provider(
                 Box::new(PostCompactHook {
                     async_mode: claude_async,
                 }),
+                Box::new(SubagentHook::stop(claude_async)),
+                Box::new(SubagentHook::start(claude_async)),
                 Box::new(ClaudeQuestionHook("PreToolUse")),
                 Box::new(ClaudeQuestionHook("PermissionRequest")),
                 Box::new(ClaudeQuestionHook("PostToolUse")),
@@ -1554,6 +1556,8 @@ fn install_claude_hooks(
     merge_hook_into_settings(path, ClaudeHook { async_mode }, dry_run, summary)?;
     merge_hook_into_settings(path, SessionStartHook, dry_run, summary)?;
     merge_hook_into_settings(path, PostCompactHook { async_mode }, dry_run, summary)?;
+    merge_hook_into_settings(path, SubagentHook::stop(async_mode), dry_run, summary)?;
+    merge_hook_into_settings(path, SubagentHook::start(async_mode), dry_run, summary)?;
     for event in [
         "PreToolUse",
         "PermissionRequest",
@@ -1625,6 +1629,52 @@ impl HookKind for PostCompactHook {
     }
     fn async_rewake(&self) -> bool {
         true
+    }
+    fn installed(&self) -> bool {
+        self.async_mode
+    }
+}
+
+/// A subagent of the session stopped or started: evidence that keeps a
+/// declared subagent attended while it waits on work it started. It is an
+/// ordinary blocking entry with a short timeout, never `asyncRewake`: the
+/// hook reports and returns, and wakes nothing. Only beside the
+/// asyncrewake Stop entry, for a Claude new enough to have that also
+/// sends the task listing these reports are read against and knows both
+/// events; an older one would gain nothing from them.
+struct SubagentHook {
+    event: &'static str,
+    command: &'static str,
+    async_mode: bool,
+}
+impl SubagentHook {
+    fn stop(async_mode: bool) -> Self {
+        SubagentHook {
+            event: "SubagentStop",
+            command: "clank stop-hook --tool claude --subagent stop",
+            async_mode,
+        }
+    }
+    fn start(async_mode: bool) -> Self {
+        SubagentHook {
+            event: "SubagentStart",
+            command: "clank stop-hook --tool claude --subagent start",
+            async_mode,
+        }
+    }
+}
+impl HookKind for SubagentHook {
+    fn command(&self) -> &'static str {
+        self.command
+    }
+    fn tool_name(&self) -> &'static str {
+        "claude"
+    }
+    fn event(&self) -> &'static str {
+        self.event
+    }
+    fn timeout(&self) -> u64 {
+        15
     }
     fn installed(&self) -> bool {
         self.async_mode
@@ -3885,6 +3935,110 @@ mod tests {
         assert_eq!(clank_hook_entries(&v, "SessionStart").len(), 1);
     }
 
+    /// Setup registers SubagentStop and SubagentStart for Claude beside
+    /// the asyncrewake Stop entry, so an install made before them gains
+    /// both on its next setup. Each runs `stop-hook --subagent` for its
+    /// own event under a short timeout and is never an `asyncRewake`
+    /// entry: it cannot park or wake. A user's hook on the same event
+    /// stays, a legacy setup takes clank's out again, and Codex gets
+    /// neither.
+    #[test]
+    fn claude_gets_both_subagent_hooks_and_neither_can_park() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        let read = || std::fs::read_to_string(&path).unwrap();
+        let parsed = || serde_json::from_str::<serde_json::Value>(&read()).unwrap();
+        let theirs = serde_json::json!({"hooks": [{"type": "command", "command": "/my/stopped"}]});
+        write_file(
+            &path,
+            &serde_json::json!({"hooks": {
+                "Stop": [{"hooks": [{"type": "command", "timeout": HOOK_TIMEOUT_SECS,
+                    "command": "clank stop-hook --tool claude --loop asyncrewake",
+                    "asyncRewake": true}]}],
+                "SubagentStop": [theirs],
+            }})
+            .to_string(),
+        );
+
+        let mut summary = Vec::new();
+        install_claude_hooks(&path, true, false, &mut summary).unwrap();
+        let installed = read();
+        install_claude_hooks(&path, true, false, &mut Vec::new()).unwrap();
+        assert_eq!(read(), installed, "idempotent");
+        let v = parsed();
+        for (event, flag) in [
+            ("SubagentStop", crate::cli::SubagentArg::Stop),
+            ("SubagentStart", crate::cli::SubagentArg::Start),
+        ] {
+            assert!(
+                summary
+                    .iter()
+                    .any(|l| l.contains("add") && l.contains(&format!("{event} hook"))),
+                "{summary:?}"
+            );
+            let [ours] = clank_hook_entries(&v, event)[..] else {
+                panic!("one clank {event} entry: {v}");
+            };
+            assert!(ours.get("asyncRewake").is_none(), "{ours}");
+            assert_eq!(ours["timeout"], 15, "{ours}");
+            let argv = std::iter::once("clank".to_string())
+                .chain(std::iter::once("stop-hook".to_string()))
+                .chain(clank_hook_args(ours).expect("it runs stop-hook"));
+            let crate::cli::command::Command::StopHook(args) =
+                <crate::cli::command::Cli as clap::Parser>::try_parse_from(argv)
+                    .unwrap()
+                    .command
+            else {
+                panic!("stop-hook");
+            };
+            assert_eq!(args.subagent, Some(flag), "{event}");
+            assert!(!args.session_start && !args.post_compact && args.loop_mode.is_none());
+        }
+        assert_eq!(v["hooks"]["SubagentStop"][0], theirs, "the user's stays");
+
+        install_claude_hooks(&path, false, false, &mut Vec::new()).unwrap();
+        let v = parsed();
+        assert_eq!(v["hooks"]["SubagentStop"], serde_json::json!([theirs]));
+        assert!(v["hooks"].get("SubagentStart").is_none(), "{v}");
+
+        let codex = tmp.path().join("hooks.json");
+        install_codex_hooks(&codex, false, &mut Vec::new()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&codex).unwrap()).unwrap();
+        for event in ["SubagentStop", "SubagentStart"] {
+            assert!(v["hooks"].get(event).is_none(), "{event}: {v}");
+        }
+    }
+
+    /// A profile set up before the subagent hooks existed is not ready,
+    /// so the next setup writes it, and that adds both.
+    #[test]
+    fn a_profile_set_up_before_the_subagent_hooks_gains_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".claude");
+        install_provider(&home, Tool::Claude, &root, true, false, false, &mut vec![]).unwrap();
+        assert!(inspect_provider(&home, Tool::Claude, &root, true).unwrap());
+        let path = root.join("settings.json");
+        let mut older: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for event in ["SubagentStop", "SubagentStart"] {
+            older["hooks"].as_object_mut().unwrap().remove(event);
+            write_file(&path, &older.to_string());
+            assert!(
+                !inspect_provider(&home, Tool::Claude, &root, true).unwrap(),
+                "without {event}"
+            );
+        }
+        install_provider(&home, Tool::Claude, &root, true, false, false, &mut vec![]).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for event in ["SubagentStop", "SubagentStart"] {
+            assert_eq!(clank_hook_entries(&v, event).len(), 1, "{event}: {v}");
+        }
+        assert!(inspect_provider(&home, Tool::Claude, &root, true).unwrap());
+    }
+
     #[test]
     fn question_hooks_are_owned_idempotent_and_leave_other_provider_hooks_in_place() {
         let temp = tempfile::tempdir().unwrap();
@@ -3983,7 +4137,7 @@ mod tests {
             );
             assert_eq!(v["hooks"][event].as_array().unwrap().len(), 2, "{v}");
         }
-        assert_eq!(summary.len(), 7, "{summary:?}");
+        assert_eq!(summary.len(), 9, "{summary:?}");
         assert!(
             summary[..2].iter().all(|l| l.contains("merge")),
             "{summary:?}"

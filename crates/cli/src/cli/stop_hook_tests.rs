@@ -26,6 +26,9 @@ fn hook_input(session: &str) -> HookInput {
     .unwrap()
 }
 
+/// When the hooks these tests run say they started.
+const HOOK_STARTED: u64 = 1_794_355_246_100;
+
 /// `input`, as read from a harness just now.
 fn arrived(input: HookInput) -> Arrived {
     Arrived {
@@ -33,6 +36,7 @@ fn arrived(input: HookInput) -> Arrived {
         input,
         resumed: None,
         poll_deadline: poll_deadline(std::time::Instant::now()),
+        hook_started: Some(HOOK_STARTED),
     }
 }
 
@@ -40,6 +44,9 @@ fn arrived(input: HookInput) -> Arrived {
 struct Spawns<'a>(&'a dyn Spawn);
 
 impl Host for Spawns<'_> {
+    fn now_ms(&self) -> Ms {
+        HOOK_STARTED
+    }
     fn input(&mut self) -> Result<String, String> {
         unreachable!("the input is supplied")
     }
@@ -511,6 +518,7 @@ fn stop_report() -> Report {
     Report::TurnEnd {
         stop: TurnEndReport {
             tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            hook_started: None,
             tool: Tool::Claude,
             session: clank_core::SessionId::parse("sess-handshake").unwrap(),
             place: Default::default(),
@@ -1009,6 +1017,11 @@ async fn the_report_carries_the_stops_evidence() {
         assert_eq!(reported.tool, Tool::Claude);
         assert_eq!(reported.session.as_str(), "sess-evidence");
         assert_eq!(reported.tasks, tasks);
+        assert_eq!(
+            reported.hook_started,
+            Some(HOOK_STARTED),
+            "when its hook started"
+        );
         assert!(*deadline > before, "the deadline is ahead of the Stop");
     }
 }
@@ -1671,6 +1684,9 @@ impl Spawn for Replaced {
 }
 
 impl Host for Replaced {
+    fn now_ms(&self) -> Ms {
+        HOOK_STARTED
+    }
     fn input(&mut self) -> Result<String, String> {
         unreachable!("the input is supplied")
     }
@@ -1719,7 +1735,7 @@ async fn a_stale_parked_stop_hands_over_its_input_and_report_and_survives_failur
         carriers: Default::default(),
         handoffs: Default::default(),
     };
-    let arrived = Arrived::fresh(raw.clone(), std::time::Instant::now()).unwrap();
+    let arrived = Arrived::fresh(raw.clone(), std::time::Instant::now(), HOOK_STARTED).unwrap();
     let presents = async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let line = serde_json::to_string(&delivered()).unwrap();
@@ -1779,6 +1795,7 @@ async fn a_resumed_stop_carries_the_report_it_was_handed() {
                 read_to: None,
             },
             tasks: TaskSnapshot::Unavailable,
+            hook_started: None,
         },
         deadline: super::super::turn_custody::now_ms() + left.as_millis() as u64,
         questions: Vec::new(),
@@ -1818,4 +1835,320 @@ async fn a_resumed_stop_carries_the_report_it_was_handed() {
         arrived.poll_deadline <= poll_deadline(std::time::Instant::now()),
         "a handoff cannot keep a hook past the runner's ceiling"
     );
+}
+
+/// A payload recorded under `core/tests/fixtures/stop_hook/`, as Claude
+/// would send it for `session` working in `repo`.
+fn recorded(fixture: &str, repo: &Path, session: &str) -> serde_json::Value {
+    let path = format!(
+        "{}/../core/tests/fixtures/stop_hook/{fixture}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    payload["session_id"] = session.into();
+    payload["cwd"] = repo.to_str().unwrap().into();
+    payload
+}
+
+/// Claude's documented `SubagentStart` payload: the common fields plus
+/// `agent_id` and `agent_type`. None was recorded.
+fn documented_start(repo: &Path, session: &str, child: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session,
+        "transcript_path": "/REDACTED/transcript.jsonl",
+        "cwd": repo,
+        "hook_event_name": "SubagentStart",
+        "agent_id": child,
+        "agent_type": "general-purpose",
+    })
+}
+
+const RECORDED_A: &str = "a2185a1add00531a0";
+
+/// A subagent's stop reports the session's listing as Claude sent it, the
+/// agent's own record as the hook read it, and when the hook started; its
+/// start reports only that. Either is a report that does not park, holds
+/// nothing for its session and is given seconds, not a park's ceiling. The
+/// agent's own Stop sent this way reports nothing, and neither does a
+/// session that no longer holds the label, which is told why on stderr as
+/// its Stop would be.
+#[tokio::test]
+async fn a_subagents_hook_reports_what_it_saw_and_never_parks() {
+    use super::super::SubagentArg;
+    let dir = init_repo();
+    let repo = dunce::canonicalize(dir.path()).unwrap();
+    bind_tool(&repo, "claude", "sess-child", Tool::Claude);
+    let transcript = repo.join("agent.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"promptId\":\"prompt-1\",\"message\":{\"content\":\"go\"}}\n",
+    )
+    .unwrap();
+    let mut stops = recorded("subagent_stop_a_parks.json", &repo, "sess-child");
+    stops["transcript_path"] = transcript.to_str().unwrap().into();
+    let listed: Vec<clank_core::BackgroundTask> =
+        serde_json::from_value(stops["background_tasks"].clone()).unwrap();
+    assert_eq!(listed.len(), 4);
+    let agent = super::super::wake_repeat::place(Tool::Claude, Some(&transcript), None);
+    assert_eq!(agent.turn.as_deref(), Some("prompt-1"));
+
+    for (event, payload, seen) in [
+        (
+            SubagentArg::Stop,
+            stops,
+            ChildSeen::Stopped {
+                tasks: TaskSnapshot::Known(listed),
+                agent,
+            },
+        ),
+        (
+            SubagentArg::Start,
+            documented_start(&repo, "sess-child", RECORDED_A),
+            ChildSeen::Started,
+        ),
+    ] {
+        let recorder = Recorder::default();
+        let before = super::super::turn_custody::now_ms();
+        let said = subagent(
+            Tool::Claude,
+            Some(&repo),
+            event,
+            &payload.to_string(),
+            HOOK_STARTED,
+            &Spawns(&recorder),
+        )
+        .await;
+        assert_eq!(said.as_deref(), Some("recorded"));
+        let carried = recorder.0.borrow();
+        let [(at, who, report)] = carried.as_slice() else {
+            panic!("one report: {carried:?}");
+        };
+        assert_eq!((at, who.as_str()), (&repo, "claude"));
+        assert!(!report.parks() && !report.holds_session() && !report.reaches_agent());
+        let left = report.deadline().saturating_sub(before);
+        assert!(
+            left > 0 && left <= SUBAGENT_BUDGET.as_millis() as u64 + 1000,
+            "{left}ms"
+        );
+        assert_eq!(
+            report,
+            &Report::Child {
+                tool: Tool::Claude,
+                seen: ChildReport {
+                    session: clank_core::SessionId::parse("sess-child").unwrap(),
+                    child: RECORDED_A.into(),
+                    hook_started: Some(HOOK_STARTED),
+                    seen,
+                },
+                deadline: report.deadline(),
+            }
+        );
+    }
+
+    let agents_own = recorded("stop_a_parked_b_running.json", &repo, "sess-child");
+    let said = subagent(
+        Tool::Claude,
+        Some(&repo),
+        SubagentArg::Stop,
+        &agents_own.to_string(),
+        HOOK_STARTED,
+        &Spawns(&Unreachable),
+    )
+    .await;
+    assert_eq!(said, None, "it names no subagent");
+
+    bind_tool(&repo, "claude", "sess-newer", Tool::Claude);
+    let stale = recorded("subagent_stop_a_final.json", &repo, "sess-child");
+    let said = subagent(
+        Tool::Claude,
+        Some(&repo),
+        SubagentArg::Stop,
+        &stale.to_string(),
+        HOOK_STARTED,
+        &Spawns(&Unreachable),
+    )
+    .await;
+    assert!(
+        said.as_deref()
+            .is_some_and(|why| why.contains("no agent set up")),
+        "another session holds the label: {said:?}"
+    );
+}
+
+/// Nothing a subagent's hook reports is read from the subagent's own
+/// transcript: missing, written, replaced by another file or truncated,
+/// the report is the same.
+#[test]
+fn a_subagents_report_reads_nothing_of_its_own_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let own = dir.path().join("agent-a.jsonl");
+    let mut payload = recorded("subagent_stop_a_parks.json", dir.path(), "sess-child");
+    payload["agent_transcript_path"] = own.to_str().unwrap().into();
+    let report = |payload: &serde_json::Value| {
+        subagent_report(
+            Tool::Claude,
+            super::super::SubagentArg::Stop,
+            &payload.to_string(),
+            HOOK_STARTED,
+        )
+        .unwrap()
+        .expect("it names a subagent")
+        .1
+    };
+    let missing = report(&payload);
+    std::fs::write(&own, "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n").unwrap();
+    assert_eq!(report(&payload), missing, "written");
+    std::fs::write(&own, "").unwrap();
+    assert_eq!(report(&payload), missing, "truncated");
+    payload["agent_transcript_path"] = "/elsewhere/agent-b.jsonl".into();
+    assert_eq!(report(&payload), missing, "replaced");
+}
+
+/// A host fed one payload, whose carrier answers with `frames` and then
+/// stays silent with its pipe open.
+struct Fed {
+    stdin: String,
+    answers: Vec<Frame>,
+    carried: std::cell::RefCell<Vec<Report>>,
+    held: std::cell::RefCell<Vec<tokio::io::DuplexStream>>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit: Option<i32>,
+}
+
+impl Fed {
+    fn new(stdin: String, answers: Vec<Frame>) -> Self {
+        Fed {
+            stdin,
+            answers,
+            carried: Default::default(),
+            held: Default::default(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit: None,
+        }
+    }
+}
+
+impl Spawn for Fed {
+    fn spawn(
+        &self,
+        _: &Path,
+        _: &AgentLabel,
+        _: &str,
+        _: Tool,
+        report: &Report,
+    ) -> Result<OwnedWait, String> {
+        self.carried.borrow_mut().push(report.clone());
+        let said: String = self
+            .answers
+            .iter()
+            .map(|frame| format!("{}\n", serde_json::to_string(frame).unwrap()))
+            .collect();
+        let (silence, open) = tokio::io::duplex(64);
+        self.held.borrow_mut().push(silence);
+        OwnedWait::over(
+            None,
+            Box::new(tokio::io::sink()),
+            Box::new(tokio::io::AsyncReadExt::chain(
+                std::io::Cursor::new(said.into_bytes()),
+                open,
+            )),
+            None,
+            report,
+        )
+    }
+}
+
+impl Host for Fed {
+    fn now_ms(&self) -> Ms {
+        HOOK_STARTED
+    }
+    fn input(&mut self) -> Result<String, String> {
+        Ok(self.stdin.clone())
+    }
+    fn spawner(&self) -> &dyn Spawn {
+        self
+    }
+    fn streams(&mut self) -> (&mut dyn std::io::Write, &mut dyn std::io::Write) {
+        (&mut self.stdout, &mut self.stderr)
+    }
+    fn exit(&mut self, code: i32) {
+        self.exit = Some(code);
+    }
+    fn authority(&self) -> crate::upgrade::Authority {
+        crate::upgrade::Authority::unwatched()
+    }
+    fn become_installed(&self, _: &Path) -> std::io::Error {
+        panic!("a subagent's hook is never replaced: it does not park")
+    }
+}
+
+/// The whole `--subagent` hook, from its argv: acknowledged, it exits 0
+/// at once having written nothing. Left unanswered by a carrier that
+/// stays connected, or told to park, it is still gone within its budget,
+/// exit 0 and silent: it cannot hold a subagent's stop. Only a diagnostic
+/// is written, to stderr, and that exits 0 too.
+#[tokio::test(start_paused = true)]
+async fn a_subagents_hook_exits_zero_and_silent_within_its_budget() {
+    let dir = init_repo();
+    let repo = dunce::canonicalize(dir.path()).unwrap();
+    bind_tool(&repo, "claude", "sess-child", Tool::Claude);
+    let args = |event: &str| {
+        let argv = [
+            "clank",
+            "stop-hook",
+            "--tool",
+            "claude",
+            "--subagent",
+            event,
+        ];
+        let crate::cli::command::Command::StopHook(args) =
+            <crate::cli::command::Cli as clap::Parser>::try_parse_from(argv)
+                .unwrap()
+                .command
+        else {
+            panic!("stop-hook");
+        };
+        args
+    };
+    let stop = recorded("subagent_stop_a_parks.json", &repo, "sess-child").to_string();
+    let start = documented_start(&repo, "sess-child", RECORDED_A).to_string();
+    let recorded_frame = || Frame::bare(WireVerdict::Recorded);
+    for (event, stdin, answers, within, stderr) in [
+        ("stop", &stop, vec![recorded_frame()], 0, ""),
+        ("start", &start, vec![recorded_frame()], 0, ""),
+        ("stop", &stop, vec![], SUBAGENT_BUDGET.as_secs(), ""),
+        ("stop", &stop, vec![Frame::bare(WireVerdict::Park)], 0, ""),
+        (
+            "start",
+            &start,
+            vec![Frame::bare(WireVerdict::Diagnostic {
+                message: "hook: clank still has no monitor".into(),
+            })],
+            0,
+            "hook: clank still has no monitor\n",
+        ),
+    ] {
+        let mut host = Fed::new(stdin.clone(), answers);
+        let began = tokio::time::Instant::now();
+        run(args(event), &mut host).await.unwrap();
+        let took = began.elapsed();
+        assert!(
+            took <= std::time::Duration::from_secs(within + 1),
+            "{event}: held for {took:?}"
+        );
+        assert_eq!(host.exit, Some(HOOK_OK_EXIT), "{event}");
+        assert!(host.stdout.is_empty(), "{event}: {:?}", host.stdout);
+        assert_eq!(String::from_utf8_lossy(&host.stderr), stderr, "{event}");
+        let carried = host.carried.borrow();
+        assert!(
+            matches!(
+                carried.as_slice(),
+                [Report::Child { seen, .. }] if seen.hook_started == Some(HOOK_STARTED)
+            ),
+            "{event}: {carried:?}"
+        );
+    }
 }

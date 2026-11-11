@@ -1,5 +1,7 @@
 use super::*;
 
+mod subagents;
+
 const MINUTE: Ms = 60_000;
 const T0: Ms = 1_000_000;
 const SUBAGENT_NAME: &str = "capture-probe sleeper";
@@ -43,12 +45,20 @@ fn dead<'a>(now: Ms, binding: &'a SessionId, owed: &'a [OwedItem]) -> Facts<'a> 
     }
 }
 
+/// A hook time later than every one handed out before it: each report a
+/// test builds is its session's latest unless the test says otherwise.
+fn later() -> Option<Ms> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(T0);
+    Some(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 fn report(tool: Tool) -> TurnEndReport {
     TurnEndReport {
         tool,
         session: session(),
         place: TurnPlace::default(),
         tasks: TaskSnapshot::Unavailable,
+        hook_started: later(),
     }
 }
 
@@ -1228,6 +1238,7 @@ fn a_native_handoff_asks_for_one_wait_through_the_drive_gate() {
         wait_registered,
         continued,
         tasks: TaskSnapshot::Unavailable,
+        hook_started: None,
     };
     let on = facts(T0, &s, &[]);
     assert_eq!(
@@ -1291,7 +1302,9 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
         work: Attending::Declared {
             name: name.into(),
             task: Some(task.into()),
+            kind: None,
             misses: 0,
+            tracked: Tracked::default(),
         },
         desc: name.into(),
         started: since,
@@ -2039,12 +2052,16 @@ fn native(s: &SessionId, wait_registered: bool, tasks: TaskSnapshot) -> Event {
         wait_registered,
         continued: false,
         tasks,
+        hook_started: later(),
     })
 }
 
 /// Grok's native Stop resolves and ends declarations by its own listing,
 /// for its own session only, and its waiter verdict is the handoff's
-/// alone: the listing never says whether a wait runs. A run outlives it.
+/// alone: the listing never says whether a wait runs. A subagent gone
+/// from a Stop that lists only the agent's own `clank wait` has finished:
+/// that wait is never a subagent's work. A shell newer than the subagent
+/// holds it, as work it may have started. A run outlives it.
 #[test]
 fn a_native_stop_ends_declarations_by_its_listing_and_keeps_its_verdict() {
     let s = session();
@@ -2083,13 +2100,36 @@ fn a_native_stop_ends_declarations_by_its_listing_and_keeps_its_verdict() {
         Verdict::Notify(vec![Notice::ArmWait]),
         "a listed `clank wait` is not a registered waiter"
     );
-    assert_eq!(names(&st), ["test run"], "Grok stopped listing it");
+    assert_eq!(
+        names(&st),
+        ["test run"],
+        "Grok stopped listing it, and its own wait is not the subagent's"
+    );
     assert_eq!(
         verdict(st.step(
             native(&s, true, TaskSnapshot::Unavailable),
             &facts(T0, &s, &[])
         )),
         Verdict::Silent(SilentWhy::WaitArmed)
+    );
+
+    let mut st = standing(&s);
+    st.step(native(&s, false, grok_listing(sub)), &facts(T0, &s, &[]));
+    let tests = serde_json::json!([{"id": "w1", "type": "shell", "status": "running",
+        "command": "clank wait"}, {"id": "t1", "type": "shell", "status": "running",
+        "command": "cargo test"}]);
+    st.step(native(&s, false, grok_listing(tests)), &facts(T0, &s, &[]));
+    assert_eq!(
+        entry(&st).phase(),
+        Some(&Phase::Parked {
+            on: vec![HeldTask {
+                id: "t1".into(),
+                kind: Some("shell".into()),
+                description: None,
+            }],
+            sure: false,
+        }),
+        "a shell newer than the subagent may be its work; the wait beside it is not"
     );
 
     let mut st = standing(&s);
@@ -2219,6 +2259,7 @@ fn placed_stop(turn: &str, position: u64) -> TurnEndReport {
             human_turn: false,
             read_to: None,
         },
+        hook_started: None,
         ..report(Tool::Codex)
     }
 }
@@ -2229,6 +2270,8 @@ fn stopped_at(turn: &str, position: u64, at: Ms) -> Option<Stopped> {
         position: Some(position),
         read_to: None,
         at,
+        hook_started: None,
+        listed: None,
     })
 }
 
@@ -2241,6 +2284,7 @@ fn unplaced_stop(turn: Option<&str>) -> TurnEndReport {
             human_turn: false,
             read_to: None,
         },
+        hook_started: None,
         ..report(Tool::Claude)
     }
 }
@@ -2251,6 +2295,8 @@ fn unplaced_at(turn: Option<&str>, at: Ms) -> Option<Stopped> {
         position: None,
         read_to: None,
         at,
+        hook_started: None,
+        listed: None,
     })
 }
 
@@ -2325,9 +2371,10 @@ fn only_a_turn_end_report_records_a_stop() {
         unplaced_at(Some("t1"), T0 + 3 * MINUTE),
         "reported again for the turn it named, it keeps its time"
     );
-    st.step(stop(), &facts(T0 + 5 * MINUTE, &s, &none));
+    let nameless = || Event::TurnEnd(unplaced_stop(None));
+    st.step(nameless(), &facts(T0 + 5 * MINUTE, &s, &none));
     assert_eq!(st.stopped, unplaced_at(None, T0 + 5 * MINUTE));
-    st.step(stop(), &facts(T0 + 6 * MINUTE, &s, &none));
+    st.step(nameless(), &facts(T0 + 6 * MINUTE, &s, &none));
     assert_eq!(
         st.stopped,
         unplaced_at(None, T0 + 6 * MINUTE),

@@ -190,6 +190,7 @@ async fn an_attending_groks_background_wait_delivers_a_new_event() {
         .unwrap();
     let handoff = Report::Handoff {
         tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+        hook_started: None,
         session: session.clone(),
         continued: false,
         deadline: u64::MAX,
@@ -347,6 +348,7 @@ async fn reporting(
             has_cli_sources: false,
             turn_end: Some(crate::cli::turn_wire::Report::Handoff {
                 tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+                hook_started: None,
                 session: session.clone(),
                 continued: false,
                 deadline: u64::MAX,

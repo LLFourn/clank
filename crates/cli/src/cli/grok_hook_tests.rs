@@ -117,8 +117,12 @@ fn a_stop_reports_its_native_listing_and_an_omitted_one_as_none() {
     let (_temp, repo, _, session, _) = fixture();
     let subagent = json!({"id": "g1", "type": "subagent", "status": "running",
         "description": "sleeper", "agentType": "explore"});
-    let tasks = |stop: Input| match report(stop, 0) {
-        Report::Handoff { tasks, .. } => tasks,
+    let tasks = |stop: Input| match report(stop, 7, 0) {
+        Report::Handoff {
+            tasks,
+            hook_started: Some(7),
+            ..
+        } => tasks,
         other => panic!("{other:?}"),
     };
     let listed = tasks(input(&repo, &session, "stop", json!([subagent.clone()])));

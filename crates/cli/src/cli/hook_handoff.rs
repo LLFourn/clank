@@ -127,6 +127,7 @@ mod tests {
                     session: clank_core::SessionId::parse("session-held").unwrap(),
                     place: Default::default(),
                     tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+                    hook_started: None,
                 },
                 deadline: 42,
             },

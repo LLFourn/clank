@@ -895,8 +895,8 @@ pub(crate) fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> S
         "clank check-in: {}. Nothing has been cancelled and nothing has failed. This is a \
          check-in, not a task: look at its output so far, renew what needs longer, and end your \
          turn. A `clank run` wakes you when its process ends. A declaration stands until your \
-         harness stops listing that work or you `clank attend --clear` it; clank itself never wakes \
-         you when declared work finishes.",
+         harness stops listing that work and anything it left running, or you `clank attend \
+         --clear` it; clank itself never wakes you when declared work finishes.",
         each.join("; ")
     )
 }
@@ -975,8 +975,9 @@ mod tests {
         assert!(text.contains("check-in, not a"), "{text}");
         assert!(
             text.contains(
-                "A declaration stands until your harness stops listing that work or you `clank \
-                 attend --clear` it; clank itself never wakes you when declared work finishes"
+                "A declaration stands until your harness stops listing that work and anything it \
+                 left running, or you `clank attend --clear` it; clank itself never wakes you \
+                 when declared work finishes"
             ),
             "{text}"
         );

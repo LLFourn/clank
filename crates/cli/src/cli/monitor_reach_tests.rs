@@ -173,6 +173,7 @@ impl Reached {
                 session: clank_core::SessionId::parse(SESSION).unwrap(),
                 place: crate::cli::wake_repeat::place(self.tool, Some(&self.record), Some(turn)),
                 tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+                hook_started: None,
             },
             deadline: u64::MAX,
             questions: Vec::new(),

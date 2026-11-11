@@ -11464,6 +11464,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }];
         let out = render(&s, 40, 80);
         let codex_row = visible(line_with(&out, "codex"));
@@ -12341,6 +12342,7 @@ mod tests {
                 declared: subagent,
                 check_in: None,
                 unqualified: why.map(str::to_string),
+                rests_on: None,
             }
         };
         vec![
@@ -12413,6 +12415,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }];
         let lines = render(&s, 40, 80);
         let agent = visible(line_with(&lines, "claude"));
@@ -12444,6 +12447,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }];
         let joined = render(&s, 40, 80).join("\n");
         assert!(
@@ -12482,6 +12486,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }];
         assert!(
             !render(&s, 40, 80).join("\n").contains("⌛"),
@@ -12501,6 +12506,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }];
         let wait = visible(line_with(&render(&s, 40, 80), "⌛"));
         assert!(
@@ -12539,6 +12545,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         };
 
         let mut s = two_agent_snap();
@@ -12592,6 +12599,7 @@ mod tests {
                 declared: false,
                 check_in: None,
                 unqualified: None,
+                rests_on: None,
             };
             let fields = att.marker_fields(now).expect("a live wait is drawn");
             let marker = fit_marker(&fields, 80).expect("80 columns is ample");
@@ -12620,6 +12628,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         };
         let fields = att.marker_fields(now).expect("a live wait is drawn");
         let marker = fit_marker(&fields, 80).unwrap();
@@ -12709,6 +12718,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }];
         let lines = render(&s, 40, 80);
         let agent = visible(line_with(&lines, "claude"));
@@ -12747,6 +12757,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }];
         // 11 columns: two to the indent, three to the glyph, leaving
         // six for the subject — one short of the floor once the
@@ -12815,6 +12826,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }];
         let lines = render(&s, 40, 80);
         let agent_at = lines
@@ -12855,6 +12867,7 @@ mod tests {
                 declared: false,
                 check_in: None,
                 unqualified: None,
+                rests_on: None,
             }
         };
         let me = std::process::id() as i32;
@@ -12920,6 +12933,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         };
         let error = Unavailable::Io(std::io::ErrorKind::PermissionDenied);
         let details = ProcessDetails {
@@ -12980,6 +12994,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         };
         let args = vec![
             format!("/{}界/tool", "directory/".repeat(30)).into(),
@@ -13087,6 +13102,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         };
         let command = Command::encode(&["tool".into(), "two  spaces".into(), "".into()]);
         let error = Unavailable::Io(std::io::ErrorKind::PermissionDenied);
@@ -13143,6 +13159,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         };
         let body = render_kill_confirm("claude", &att, 40, 80)
             .0
@@ -13191,6 +13208,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }];
         for cols in [18u16, 24, 40, 80] {
             for line in &render(&s, 40, cols) {

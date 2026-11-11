@@ -87,6 +87,7 @@ fn stop_of(tool: clank_core::Tool, deadline: u64) -> Report {
     Report::TurnEnd {
         stop: clank_core::turn_policy::TurnEndReport {
             tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            hook_started: None,
             tool,
             session: clank_core::SessionId::parse(SESSION).unwrap(),
             place: Default::default(),
@@ -107,6 +108,7 @@ pub(crate) fn handoff() -> Report {
 pub(crate) fn handoff_by(deadline: u64) -> Report {
     Report::Handoff {
         tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+        hook_started: None,
         session: clank_core::SessionId::parse(SESSION).unwrap(),
         continued: false,
         deadline,
@@ -676,6 +678,115 @@ async fn a_handoff_with_no_monitor_is_told_so_and_not_asked_to_arm_a_wait() {
             monitor_outage("starting one failed: no binary")
         )]
     );
+}
+
+/// A subagent's report with `left` to be answered in.
+fn child_report(left: std::time::Duration) -> Report {
+    Report::Child {
+        tool: clank_core::Tool::Claude,
+        seen: clank_core::turn_policy::ChildReport {
+            session: clank_core::SessionId::parse(SESSION).unwrap(),
+            child: "a1".into(),
+            hook_started: Some(1),
+            seen: clank_core::turn_policy::ChildSeen::Started,
+        },
+        deadline: within(left),
+    }
+}
+
+/// A child's report is beside its session's wait, never in its place: it
+/// is carried holding nothing, so the monitor supersedes no park for it.
+/// Its hook passes nothing on, so an outage it meets is not announced on
+/// it, with no monitor to be had or with one that took it and never
+/// answered: it ends on a diagnostic, and the session's one announcement
+/// is still there for the agent's own Stop.
+#[tokio::test(start_paused = true)]
+async fn a_childs_report_holds_no_wait_and_spends_no_announcement() {
+    let five = std::time::Duration::from_secs(5);
+    let (repo, author) = repo_with(clank_core::Tool::Claude, true);
+    let held = std::sync::Mutex::new(Vec::new());
+    let attach = |who: Who| -> Attaching<'_> {
+        if let Who::Agent { holder, .. } = who {
+            held.lock().unwrap().push(holder);
+        }
+        Box::pin(async { no_binary() })
+    };
+    let (owner_read, mut stdin) = std::io::pipe().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&child_report(five)).unwrap()
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    carry(
+        repo.path(),
+        &author,
+        Some(SESSION.into()),
+        Owner::reading(owner_read),
+        &mut out,
+        &attach,
+        &crate::upgrade::Authority::unwatched(),
+    )
+    .await;
+    drop(stdin);
+    let held = held.into_inner().unwrap();
+    assert!(
+        !held.is_empty() && held.iter().all(Option::is_none),
+        "{held:?}"
+    );
+    let printed = frames(out);
+    assert!(
+        matches!(
+            printed.as_slice(),
+            [Frame { verdict: WireVerdict::Diagnostic { message }, .. }]
+                if message.contains("still has no monitor")
+        ),
+        "{printed:?}"
+    );
+    assert!(!told(repo.path(), &author), "nothing was announced on it");
+
+    let monitors = std::sync::Mutex::new(Vec::new());
+    let beating = |_: Who| -> Attaching<'_> {
+        let (conn, monitor) = monitor_only_beating();
+        monitors.lock().unwrap().push(monitor);
+        Box::pin(async move { Attempt::Shared(conn) })
+    };
+    let printed = carried(repo.path(), &author, &child_report(five), &beating).await;
+    assert!(
+        matches!(
+            printed.as_slice(),
+            [Frame { verdict: WireVerdict::Diagnostic { message }, .. }]
+                if message.contains("has not answered")
+        ),
+        "{printed:?}"
+    );
+    assert!(!told(repo.path(), &author), "nor on one a monitor took");
+
+    let printed = carried(
+        repo.path(),
+        &author,
+        &child_report(OUTAGE_BUDGET * 3),
+        &|_: Who| -> Attaching<'_> { Box::pin(async { no_binary() }) },
+    )
+    .await;
+    assert!(
+        matches!(
+            printed.as_slice(),
+            [Frame { verdict: WireVerdict::Diagnostic { message }, .. }]
+                if message.contains("still has no monitor")
+        ),
+        "{printed:?}"
+    );
+    assert!(!told(repo.path(), &author), "nor past the outage budget");
+
+    let failing = |_: Who| -> Attaching<'_> { Box::pin(async { no_binary() }) };
+    assert_eq!(
+        carried(repo.path(), &author, &stop(u64::MAX), &failing).await,
+        vec![outage_notice()],
+        "the agent's own Stop is still told"
+    );
+    assert!(told(repo.path(), &author));
 }
 
 /// A connection whose monitor beats and never gives a verdict, with the

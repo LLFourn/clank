@@ -10,13 +10,20 @@
 //! clank never detects background work. What an agent attends is only what
 //! it declared: a `clank run` (its registered process) or a `clank attend`
 //! declaration. A harness's own task listing is read only to resolve and
-//! end a declaration; a listed task nobody declared is ignored.
+//! end a declaration, which a subagent's work may outlast
+//! ([`transition`]); a listed task nobody declared is ignored.
 //!
 use serde::{Deserialize, Serialize};
+
+use std::collections::BTreeMap;
 
 use crate::hook_io::{BackgroundTask, HookInput};
 use crate::ids::SessionId;
 use crate::vocab::{AutoMode, Role, Tool};
+
+mod child;
+
+pub use child::{HeldTask, Order, Phase, Sight, Tracked, transition};
 
 /// Milliseconds since the Unix epoch.
 pub type Ms = u64;
@@ -104,6 +111,28 @@ pub struct Stopped {
     /// by however long the report took to arrive. Never evidence that the
     /// record was unwritten at the Stop.
     pub at: Ms,
+    /// When the Stop's hook started, by the hook's own clock. Absent from
+    /// a hook that did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_started: Option<Ms>,
+    /// The ids the Stop's listing held. `None` where it carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed: Option<Vec<String>>,
+}
+
+impl Stopped {
+    /// Whether `record`, the agent's record as a later hook of its session
+    /// read it, is still what this Stop's hook saw: the same boundary of
+    /// the same turn, or with no boundary the same file at the same
+    /// length. Only then did no turn of the agent's begin in between.
+    pub fn stands_in(&self, record: &TurnPlace) -> bool {
+        match self.position {
+            Some(position) => {
+                self.turn.is_some() && record.turn == self.turn && record.position == Some(position)
+            }
+            None => self.read_to.is_some() && record.read_to == self.read_to,
+        }
+    }
 }
 
 /// One Stop, as the hook observed it.
@@ -115,6 +144,42 @@ pub struct TurnEndReport {
     /// A hook from before listings were reported again sends none.
     #[serde(default)]
     pub tasks: TaskSnapshot,
+    /// When the hook started, read by the hook from the host clock: the
+    /// only evidence of where this report sits among its session's
+    /// others. A hook from before it was reported sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_started: Option<Ms>,
+}
+
+/// What a subagent's own hook reported: it started, or its turn ended.
+/// Evidence about a declaration and nothing else: it ends no turn of the
+/// agent's, parks nothing and is owed no verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildReport {
+    pub session: SessionId,
+    /// The harness's id for the subagent, which is its task's id in a
+    /// listing.
+    pub child: String,
+    /// As [`TurnEndReport::hook_started`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_started: Option<Ms>,
+    pub seen: ChildSeen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSeen {
+    /// Spawned or resumed. The harness says which of neither, and sends
+    /// no listing.
+    Started,
+    /// Its turn ended, to wait on work of its own or for good.
+    Stopped {
+        /// The session's listing then. It still shows the subagent
+        /// itself as running.
+        tasks: TaskSnapshot,
+        /// The agent's own record as this hook read it.
+        agent: TurnPlace,
+    },
 }
 
 /// Work the generic owed-work fold says this agent is owed now.
@@ -233,18 +298,29 @@ pub enum Attending {
     Run(ShellProof),
     /// A `clank attend` declaration. Where the harness lists its tasks it
     /// resolves to the one live task whose description is `name`, and ends
-    /// when a known listing no longer has that task. Without a listing only
-    /// the agent's clear ends it; its deadline is a check-in, never proof
-    /// that the work finished.
+    /// by [`transition`]: when that task has gone and so has any work it
+    /// may have started. Without a listing only the agent's clear ends it;
+    /// its deadline is a check-in, never proof that the work finished.
     Declared {
         name: String,
         /// The harness's stable id of the task it resolved to. Bound once:
         /// a later task reusing the description is not this one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task: Option<String>,
-        /// Known listings in a row that had no task by this name.
+        /// The listed kind of `task` when it bound (`subagent`, `shell`,
+        /// …; empty when the listing gave none), which decides how it ends.
+        /// Absent only from a record bound before kinds were kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// The agent's Stop listings in a row that had no task by this
+        /// name.
         #[serde(default, skip_serializing_if = "is_zero")]
         misses: u8,
+        /// What the session's reports have shown of `task` since it was
+        /// bound. State saved before it was kept reads as a task running
+        /// with no baseline.
+        #[serde(default, skip_serializing_if = "Tracked::is_unobserved")]
+        tracked: Tracked,
     },
 }
 
@@ -261,7 +337,9 @@ impl Attending {
         Self::Declared {
             name,
             task: None,
+            kind: None,
             misses: 0,
+            tracked: Tracked::default(),
         }
     }
 }
@@ -307,6 +385,14 @@ impl Entry {
     pub fn task(&self) -> Option<&str> {
         match &self.work {
             Attending::Declared { task, .. } => task.as_deref(),
+            Attending::Run(_) => None,
+        }
+    }
+
+    /// Where a declaration's task stands by its session's reports.
+    pub fn phase(&self) -> Option<&Phase> {
+        match &self.work {
+            Attending::Declared { tracked, .. } => Some(&tracked.phase),
             Attending::Run(_) => None,
         }
     }
@@ -763,6 +849,13 @@ pub struct Persisted {
     /// past it. State saved before Stops were kept has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<Stopped>,
+    /// [`SessionState::seen`]. State saved before listings were
+    /// remembered has none, so nothing is baseline for what it attends.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub seen: BTreeMap<String, Option<Ms>>,
+    /// [`SessionState::starts`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub starts: BTreeMap<String, Option<Ms>>,
 }
 
 /// The persisted shapes from before attending was only what an agent
@@ -792,6 +885,10 @@ mod legacy {
         feedback: Vec<Notice>,
         #[serde(default)]
         stopped: Option<Stopped>,
+        #[serde(default)]
+        seen: BTreeMap<String, Option<Ms>>,
+        #[serde(default)]
+        starts: BTreeMap<String, Option<Ms>>,
     }
 
     #[derive(Deserialize)]
@@ -878,6 +975,8 @@ mod legacy {
                 unwatched: s.unwatched,
                 feedback: s.feedback,
                 stopped: s.stopped,
+                seen: s.seen,
+                starts: s.starts,
             }
         }
     }
@@ -917,7 +1016,9 @@ mod legacy {
                 None => Attending::Declared {
                     name,
                     task,
+                    kind: None,
                     misses: 0,
+                    tracked: Tracked::default(),
                 },
             },
             desc,
@@ -1015,6 +1116,15 @@ pub struct SessionState {
     /// it; a wake clank gave the agent since ends it, and a session start
     /// or a compaction is no evidence either way.
     pub stopped: Option<Stopped>,
+    /// Every task id any listing of this binding has shown, with the
+    /// earliest hook time it was shown at (`None` while only reports
+    /// without one showed it). What a declaration bound later takes its
+    /// baseline from.
+    pub seen: BTreeMap<String, Option<Ms>>,
+    /// The subagents a start was reported for before any declaration was
+    /// bound to them, with the latest such start's hook time (`None` once
+    /// one came without).
+    pub starts: BTreeMap<String, Option<Ms>>,
 }
 
 impl SessionState {
@@ -1031,6 +1141,8 @@ impl SessionState {
             unwatched: None,
             feedback: Vec::new(),
             stopped: None,
+            seen: BTreeMap::new(),
+            starts: BTreeMap::new(),
         }
     }
 
@@ -1047,6 +1159,8 @@ impl SessionState {
             unwatched: self.unwatched,
             feedback: self.feedback.clone(),
             stopped: self.stopped.clone(),
+            seen: self.seen.clone(),
+            starts: self.starts.clone(),
         }
     }
 
@@ -1073,6 +1187,8 @@ impl SessionState {
             unwatched: p.unwatched,
             feedback: p.feedback,
             stopped: p.stopped,
+            seen: p.seen,
+            starts: p.starts,
         }
     }
 
@@ -1226,18 +1342,27 @@ impl SessionState {
         before - self.attendances.len()
     }
 
-    /// Resolve and end declarations against THIS Stop's listing, the first
-    /// that can show work started in the turn that declared it. Runs are
-    /// untouched, and no listed task creates or names anything: a task no
-    /// declaration matches is ignored. Without a listing nothing changes.
+    /// Apply one report of the bound session to what it attends by
+    /// declaration. Runs are untouched, and no listed task creates or names
+    /// anything: a task no declaration matches is only remembered as seen.
     ///
-    /// A resolved declaration ends when the listing lacks its task. A
-    /// pending one binds to its one live match (merging into a declaration
-    /// already bound to that task), is dropped with a notice when several
-    /// match or its one match has no id to track, and with another when it
-    /// has gone unmatched for
-    /// [`MISSES_ALLOWED`] listings. Its notices join [`Self::feedback`].
-    fn resolve_declarations(&mut self, tasks: &TaskSnapshot) {
+    /// A pending declaration binds to its one live match in any listing
+    /// (merging into a declaration already bound to that task), is dropped
+    /// with a notice when several match or its one match has no id to
+    /// track, and with another when the agent's own Stops have gone
+    /// [`MISSES_ALLOWED`] listings without it. A bound one moves by
+    /// [`transition`], and leaves when that ends it. The notices join
+    /// [`Self::feedback`].
+    fn observe(&mut self, at: Option<Ms>, source: Source<'_>) {
+        let (tasks, stopping) = match source {
+            Source::ChildStart { child } => return self.child_started(child, at),
+            Source::AgentStop { tasks } => (tasks, None),
+            Source::ChildStop {
+                child,
+                tasks,
+                agent,
+            } => (tasks, Some((child, agent))),
+        };
         let Some(live) = tasks.live() else {
             return;
         };
@@ -1247,26 +1372,29 @@ impl SessionState {
         let held: Vec<String> = self
             .attendances
             .iter()
-            .filter_map(|e| e.task().filter(|id| listed(id)).map(str::to_owned))
+            .filter_map(|e| e.task().map(str::to_owned))
             .collect();
         let summaries = || live.iter().copied().map(TaskSummary::from).collect();
         let mut drop = vec![false; self.attendances.len()];
         for (i, entry) in self.attendances.iter_mut().enumerate() {
-            let Attending::Declared { name, task, misses } = &mut entry.work else {
+            let Attending::Declared {
+                name,
+                task,
+                kind,
+                misses,
+                tracked,
+            } = &mut entry.work
+            else {
                 continue;
             };
-            if let Some(id) = task {
-                drop[i] = !listed(id);
-                continue;
-            }
-            let matches: Vec<&BackgroundTask> = live
-                .iter()
-                .copied()
-                .filter(|t| t.description.as_deref() == Some(name.as_str()))
-                .collect();
-            match matches.as_slice() {
-                [BackgroundTask { id: Some(id), .. }] => {
-                    if held.contains(id) {
+            if task.is_none() {
+                let matches: Vec<&BackgroundTask> = live
+                    .iter()
+                    .copied()
+                    .filter(|t| t.description.as_deref() == Some(name.as_str()))
+                    .collect();
+                match matches.as_slice() {
+                    [BackgroundTask { id: Some(id), .. }] if held.contains(id) => {
                         merges.push(Merge {
                             task: id.clone(),
                             since: entry.since,
@@ -1274,36 +1402,79 @@ impl SessionState {
                             desc: entry.desc.clone(),
                         });
                         drop[i] = true;
-                    } else {
+                    }
+                    [matched @ BackgroundTask { id: Some(id), .. }] => {
+                        let started = self.starts.remove(id);
+                        let own_stop = stopping.is_some_and(|(child, _)| child == id);
+                        *tracked = Tracked {
+                            baseline: baseline(&self.seen, at),
+                            as_of: started.flatten(),
+                            // Its own stop cannot be ordered after a start
+                            // remembered for it except by that start's time.
+                            phase: match (own_stop, started) {
+                                (true, Some(since)) => Phase::Unsettled { since },
+                                _ => Phase::Live,
+                            },
+                        };
                         *task = Some(id.clone());
+                        *kind = Some(matched.kind.clone().unwrap_or_default());
                         *misses = 0;
                     }
-                }
-                [nameless] => {
-                    notices.push(Notice::Untrackable {
-                        name: name.clone(),
-                        task: TaskSummary::from(*nameless),
-                    });
-                    drop[i] = true;
-                }
-                [] => {
-                    *misses = misses.saturating_add(1);
-                    if *misses >= MISSES_ALLOWED {
-                        notices.push(Notice::NoMatch {
+                    [nameless] => {
+                        notices.push(Notice::Untrackable {
                             name: name.clone(),
-                            live: summaries(),
+                            task: TaskSummary::from(*nameless),
+                        });
+                        drop[i] = true;
+                    }
+                    [] if stopping.is_none() => {
+                        *misses = misses.saturating_add(1);
+                        if *misses >= MISSES_ALLOWED {
+                            notices.push(Notice::NoMatch {
+                                name: name.clone(),
+                                live: summaries(),
+                            });
+                            drop[i] = true;
+                        }
+                    }
+                    [] => {}
+                    many => {
+                        notices.push(Notice::Ambiguous {
+                            name: name.clone(),
+                            matches: many.iter().copied().map(TaskSummary::from).collect(),
                         });
                         drop[i] = true;
                     }
                 }
-                many => {
-                    notices.push(Notice::Ambiguous {
-                        name: name.clone(),
-                        matches: many.iter().copied().map(TaskSummary::from).collect(),
-                    });
-                    drop[i] = true;
-                }
             }
+            let Some(id) = task.as_deref().filter(|_| !drop[i]) else {
+                continue;
+            };
+            if !Subject::of(kind).follows_lifecycle(tracked) {
+                drop[i] = !listed(id);
+                continue;
+            }
+            let candidates = || candidates(&live, &tracked.baseline, id);
+            let sight = match stopping {
+                Some((child, agent)) if child == id => {
+                    let candidates = candidates();
+                    Sight::Stopped {
+                        sure: self
+                            .stopped
+                            .as_ref()
+                            .is_some_and(|stop| excludes_agent(stop, at, agent, &candidates)),
+                        candidates,
+                    }
+                }
+                _ if listed(id) => Sight::Listed,
+                _ => Sight::Absent {
+                    agent_stop: stopping.is_none(),
+                    live: live.iter().filter_map(|t| t.id.clone()).collect(),
+                    candidates: candidates(),
+                },
+            };
+            tracked.apply(at, sight);
+            drop[i] = tracked.phase == Phase::Ended;
         }
         let mut dropping = drop.into_iter();
         self.retain_entries(|_| !dropping.next().unwrap_or(false));
@@ -1317,6 +1488,56 @@ impl SessionState {
             }
         }
         self.feedback.append(&mut notices);
+        for id in live.iter().filter_map(|t| t.id.as_ref()) {
+            let first = self.seen.entry(id.clone()).or_insert(at);
+            *first = match (*first, at) {
+                (Some(known), Some(at)) => Some(known.min(at)),
+                (known, at) => known.or(at),
+            };
+        }
+    }
+
+    /// A start names no description, so it binds nothing: it moves the
+    /// declaration already bound to `child`, or is remembered for the
+    /// listing that binds one.
+    fn child_started(&mut self, child: &str, at: Option<Ms>) {
+        let bound = self.attendances.iter_mut().find_map(|e| match &mut e.work {
+            Attending::Declared {
+                task: Some(task),
+                tracked,
+                ..
+            } if task == child => Some(tracked),
+            _ => None,
+        });
+        match bound {
+            Some(tracked) => tracked.apply(at, Sight::Started),
+            None => {
+                let latest = self.starts.entry(child.to_string()).or_insert(at);
+                *latest = (*latest).zip(at).map(|(known, at)| known.max(at));
+            }
+        }
+    }
+
+    /// Apply a subagent's own report, and say whether it was this
+    /// binding's. It is evidence about declarations only: no Stop is
+    /// recorded, nothing is presented and no verdict is owed, so it needs
+    /// no knowledge of what is owed.
+    pub fn child(&mut self, report: &ChildReport, facts: &Facts<'_>) -> bool {
+        if facts.binding != Some(&report.session) || !self.bound(facts) {
+            return false;
+        }
+        let source = match &report.seen {
+            ChildSeen::Started => Source::ChildStart {
+                child: &report.child,
+            },
+            ChildSeen::Stopped { tasks, agent } => Source::ChildStop {
+                child: &report.child,
+                tasks,
+                agent,
+            },
+        };
+        self.observe(report.hook_started, source);
+        true
     }
 
     /// Today's `forget_if_stale`: a count describes one unbroken run of the
@@ -1345,8 +1566,13 @@ impl SessionState {
         if facts.binding != Some(&report.session) || !self.bound(facts) {
             return Verdict::Silent(SilentWhy::StaleBinding);
         }
-        self.record_stop(&report.place, facts.now);
-        self.resolve_declarations(&report.tasks);
+        self.record_stop(&report, facts.now);
+        self.observe(
+            report.hook_started,
+            Source::AgentStop {
+                tasks: &report.tasks,
+            },
+        );
         if let Some(gated) = drive_gate(facts) {
             return gated;
         }
@@ -1365,7 +1591,8 @@ impl SessionState {
     /// Stop and keeps the time it was first reported; one that names no
     /// turn and saw no record cannot be told from a later one, and is
     /// dated afresh.
-    fn record_stop(&mut self, place: &TurnPlace, now: Ms) {
+    fn record_stop(&mut self, report: &TurnEndReport, now: Ms) {
+        let place = &report.place;
         let again = self.stopped.as_ref().is_some_and(|held| {
             (held.turn.is_some() || held.read_to.is_some())
                 && held.turn == place.turn
@@ -1378,6 +1605,11 @@ impl SessionState {
                 position: place.position,
                 read_to: place.read_to,
                 at: now,
+                hook_started: report.hook_started,
+                listed: report
+                    .tasks
+                    .live()
+                    .map(|live| live.iter().filter_map(|t| t.id.clone()).collect()),
             });
         }
     }
@@ -1386,7 +1618,12 @@ impl SessionState {
     /// does, and the waiter verdict is [`handoff_verdict`]'s alone.
     fn native_turn_end(&mut self, handoff: Handoff, facts: &Facts<'_>) -> Verdict {
         if facts.binding == Some(&handoff.session) && self.bound(facts) {
-            self.resolve_declarations(&handoff.tasks);
+            self.observe(
+                handoff.hook_started,
+                Source::AgentStop {
+                    tasks: &handoff.tasks,
+                },
+            );
         }
         let verdict = handoff_verdict(&handoff, facts);
         self.with_feedback(verdict, facts)
@@ -1698,6 +1935,131 @@ impl SessionState {
     }
 }
 
+/// One report of the bound session, as declarations read it.
+enum Source<'a> {
+    /// The agent's own Stop.
+    AgentStop {
+        tasks: &'a TaskSnapshot,
+    },
+    ChildStop {
+        child: &'a str,
+        tasks: &'a TaskSnapshot,
+        /// The agent's record as the child's hook read it.
+        agent: &'a TurnPlace,
+    },
+    ChildStart {
+        child: &'a str,
+    },
+}
+
+/// The ids a listing taken at `at` cannot have been the first to show:
+/// those some report showed strictly earlier. Hook times order it, never
+/// arrival, so a listing that arrives first but was taken later adds
+/// nothing, and neither does one with no time.
+fn baseline(seen: &BTreeMap<String, Option<Ms>>, at: Option<Ms>) -> Vec<String> {
+    seen.iter()
+        .filter(|(_, first)| first.zip(at).is_some_and(|(first, at)| first < at))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// What a bound declaration's task is, by the kind its record keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Subject {
+    Subagent,
+    /// A shell, a monitor, or a task the listing gave no kind.
+    Other,
+    /// Bound before kinds were kept.
+    Unknown,
+}
+
+impl Subject {
+    fn of(kind: &Option<String>) -> Self {
+        match kind.as_deref() {
+            Some("subagent") => Subject::Subagent,
+            Some(_) => Subject::Other,
+            None => Subject::Unknown,
+        }
+    }
+
+    /// Whether the declaration ends by [`transition`] rather than when its
+    /// task leaves the listing. Only a subagent stops and resumes under one
+    /// id while work it started runs. Of the records with no kind, one the
+    /// subagent table has touched was written by the build that first kept
+    /// a subagent's phase, and wrote no kind: ending it on absence would
+    /// forget a stored park or an unsettled resume. One it never touched is
+    /// from before that table, and ended when its task left the listing.
+    fn follows_lifecycle(self, tracked: &Tracked) -> bool {
+        match self {
+            Subject::Subagent => true,
+            Subject::Other => false,
+            Subject::Unknown => !tracked.is_unobserved(),
+        }
+    }
+}
+
+/// The listed tasks subagent `child` may have started: not older than it,
+/// not itself, not another subagent, and not the session's own wait.
+fn candidates(live: &[&BackgroundTask], baseline: &[String], child: &str) -> Vec<HeldTask> {
+    live.iter()
+        .filter(|t| t.kind.as_deref() != Some("subagent"))
+        .filter(|t| !is_clank_wait(t))
+        .filter_map(|t| {
+            let id = t.id.as_ref()?;
+            (id != child && !baseline.contains(id)).then(|| HeldTask {
+                id: id.clone(),
+                kind: t.kind.clone(),
+                description: t.description.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Whether `task` runs `clank wait`: its command's program is `clank`, by
+/// any path, and its first argument is `wait`. Such a task is the agent's
+/// own waiter, never a subagent's work: subagents are told never to run
+/// one, and every Grok turn backgrounds one, so counting it would hold
+/// every finished subagent until its check-in. Matched by words, so a
+/// command that merely mentions it (`echo clank wait`) is not one.
+fn is_clank_wait(task: &BackgroundTask) -> bool {
+    let Some(command) = task.raw.get("command").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    let command = command.trim_start();
+    let (program, rest) = match command.chars().next() {
+        Some(quote @ ('"' | '\'')) => match command[1..].split_once(quote) {
+            Some((program, rest)) => (program, rest),
+            None => return false,
+        },
+        _ => command
+            .split_once(char::is_whitespace)
+            .unwrap_or((command, "")),
+    };
+    program.rsplit('/').next() == Some("clank") && rest.split_whitespace().next() == Some("wait")
+}
+
+/// Whether the agent could not have started any of `candidates`, listed
+/// by a child's hook at `at`: the agent's last Stop came first, `record`
+/// (its own record as that child's hook read it) is still what the Stop
+/// saw, and the Stop's listing had none of them. Judged by what the two
+/// hooks saw, never by where the agent is when the report arrives.
+fn excludes_agent(
+    stop: &Stopped,
+    at: Option<Ms>,
+    record: &TurnPlace,
+    candidates: &[HeldTask],
+) -> bool {
+    let earlier = stop
+        .hook_started
+        .zip(at)
+        .is_some_and(|(stop, at)| stop < at);
+    let unlisted = stop
+        .listed
+        .as_ref()
+        .is_some_and(|listed| candidates.iter().all(|c| !listed.contains(&c.id)));
+    earlier && stop.stands_in(record) && unlisted
+}
+
 /// `entry`'s line in a check-in at `now`.
 fn check_in_line(entry: &Entry, now: Ms) -> CheckInLine {
     CheckInLine {
@@ -1815,6 +2177,9 @@ pub struct Handoff {
     /// Grok's `backgroundTasks`, read only for declarations.
     #[serde(default)]
     pub tasks: TaskSnapshot,
+    /// As [`TurnEndReport::hook_started`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_started: Option<Ms>,
 }
 
 /// Grok's native turn-end, with or without a monitor: the drive gate, then
