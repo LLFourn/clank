@@ -494,7 +494,7 @@ fn turn_state_with_turn_scoped_declarations_reads_and_round_trips() {
 }
 
 /// The entries a build that resolved attendance against task listings
-/// wrote: a run keeps its registration, so its end is still recorded, and
+/// wrote: a run keeps its registration, so its end is still seen, and
 /// a named attendance keeps the task it resolved to, so the next listing
 /// still ends it.
 #[test]

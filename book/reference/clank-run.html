@@ -19,7 +19,7 @@
 <p class="chapter-no"><a href="index.html">Command reference</a></p>
 <h1>clank run</h1>
 <p class="lede">Run a command under clank, so it knows when the work ends</p>
-<p>Start this in the background instead of the bare command: <code>clank run --desc &quot;test run&quot; -- cargo test</code>. Clank registers the run with the monitor, beside anything else you attend, then BECOMES the command — same pid, same stdio, same exit status. When that process is gone you are woken once; its output and exit status are wherever you launched it. <code>--expect 30m</code> says how long it should take; past that you are checked in on once, and nothing is cancelled. With no monitor to take the registration the command is refused and does not run.</p>
+<p>Start this in the background instead of the bare command: <code>clank run --desc &quot;test run&quot; -- cargo test</code>. Clank registers the run with the monitor, beside anything else you attend, then BECOMES the command — same pid, same stdio, same exit status. When that process is gone the run is no longer attended; your harness tells you it ended, and its output and exit status are wherever you launched it. <code>--expect 30m</code> says how long it should take; past that you are checked in on once, and nothing is cancelled. With no monitor to take the registration the command is refused and does not run.</p>
 <h2 id="usage">Usage</h2>
 <p class="usage"><samp>clank run [OPTIONS] --desc &lt;TEXT&gt; &lt;CMD&gt;...</samp></p>
 <h2 id="arguments">Arguments</h2>

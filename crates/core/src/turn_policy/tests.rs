@@ -825,61 +825,45 @@ fn a_run_in_flight_keeps_the_agent_attending_across_turns() {
 }
 
 /// The run's end is its process being gone, by death or by another birth
-/// under its pid; either way exactly one terminal record, and only once it
-/// is written does the entry go. Nothing about it comes from a listing.
+/// under its pid. Its attendance leaves, and what it quieted is presented
+/// at the next turn end like any other owed work. Nothing about it comes
+/// from a listing.
 #[test]
-fn a_gone_run_is_ended_once_and_only_after_its_record() {
+fn a_gone_run_ends_its_attendance_and_releases_what_it_quieted() {
     let s = session();
     let a = owed("event:a", "read:a");
     let mut st = received_then(&s, &a, run("test run", 7001));
-    assert!(st.ended_runs(&LIVE, T0 + MINUTE).is_empty());
-    let ended = st.ended_runs(&DEAD, T0 + 2 * MINUTE);
-    assert_eq!(
-        ended,
-        [RunEnd {
-            proof: proof_of(7001),
-            desc: "test run".into(),
-            started: T0,
-            ended_seen: T0 + 2 * MINUTE,
-        }]
-    );
-    assert_eq!(
-        st.ended_runs(&DEAD, T0 + 3 * MINUTE).len(),
-        1,
-        "asking again before the record is written names it again"
-    );
+    assert!(!st.end_gone_runs(&LIVE));
+    assert_eq!(names(&st), ["test run"]);
     assert_eq!(
         st.recovery_quiet(&dead(T0 + 2 * MINUTE, &s, &a)),
         None,
-        "a gone run quiets nothing while its record is written"
+        "a gone run quiets nothing even before it is retired"
     );
-    st.end_run(&ended[0].proof);
+    assert!(st.end_gone_runs(&DEAD));
     assert!(st.attendances.is_empty());
-    assert!(
-        st.ended_runs(&DEAD, T0 + 4 * MINUTE).is_empty(),
-        "never twice"
-    );
     assert!(st.received.is_empty(), "what it quieted is released");
+    assert!(!st.end_gone_runs(&DEAD), "never twice");
+    let (_, identities) = presented(verdict(st.step(stop(), &facts(T0 + 3 * MINUTE, &s, &a))));
+    assert_eq!(identities, ["event:a"]);
 }
 
 /// A run's registration is durable: a monitor that restarts finds it and
-/// ends it once, and a second restart finds nothing.
+/// ends it, and a second restart finds nothing.
 #[test]
-fn a_restart_ends_a_run_that_went_while_nobody_watched_and_only_once() {
+fn a_restart_ends_a_run_that_went_while_nobody_watched() {
     let s = session();
     let mut st = SessionState::new(s.clone());
     st.step(run("test run", 7001), &facts(T0, &s, &[]));
     let saved = serde_json::to_string(&st.persisted()).unwrap();
     let mut back = SessionState::restored(serde_json::from_str(&saved).unwrap());
-    let ended = back.ended_runs(&DEAD, T0 + MINUTE);
-    assert_eq!(ended.len(), 1);
-    back.end_run(&ended[0].proof);
+    assert!(back.end_gone_runs(&DEAD));
     let saved = serde_json::to_string(&back.persisted()).unwrap();
-    let again = SessionState::restored(serde_json::from_str(&saved).unwrap());
-    assert!(again.ended_runs(&DEAD, T0 + 2 * MINUTE).is_empty());
+    let mut again = SessionState::restored(serde_json::from_str(&saved).unwrap());
+    assert!(!again.end_gone_runs(&DEAD));
 }
 
-/// Killing the command is its end like any other: the same one record.
+/// Killing the command is its end like any other.
 #[test]
 fn a_killed_run_ends_like_any_other() {
     let s = session();
@@ -896,10 +880,7 @@ fn a_killed_run_ends_like_any_other() {
             }
         }
     }
-    let ended = st.ended_runs(&Killed, T0 + MINUTE);
-    assert_eq!(ended.len(), 1);
-    assert_eq!(ended[0].desc, "server");
-    st.end_run(&ended[0].proof);
+    assert!(st.end_gone_runs(&Killed));
     assert_eq!(names(&st), ["build"], "the other run is untouched");
 }
 
@@ -1170,7 +1151,7 @@ fn a_wake_carrying_work_carries_the_check_in_beside_it() {
     assert_eq!(entry(&st).window.check_in, CheckIn::Fired);
 }
 
-/// A run gone by its check-in is presented none: its end is the wake.
+/// A run gone by its check-in is presented none: it has ended.
 #[test]
 fn a_run_gone_by_its_check_in_owes_none() {
     let s = session();
@@ -1641,7 +1622,9 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
             bound("watcher", "m1", T0, 10 * MINUTE, CheckIn::Due, 3),
         ]
     );
-    assert_eq!(listed.ended_runs(&DEAD, T0 + 2 * MINUTE).len(), 1);
+    let mut ended = listed.clone();
+    assert!(ended.end_gone_runs(&DEAD));
+    assert_eq!(ended.attendances.len(), 2, "only the run ends");
     assert_eq!(listed.next_window, 3, "a new window is not an old one");
 
     let mut st = restore(old_bytes::LISTED);
@@ -2444,14 +2427,14 @@ fn a_native_stop_ends_declarations_by_its_listing_and_keeps_its_verdict() {
 }
 
 /// A run whose process cannot be seen has not ended: it keeps its
-/// registration, writes no terminal record and owes no check-in as gone,
-/// but quiets nothing while unseen.
+/// registration and owes no check-in as gone, but quiets nothing while
+/// unseen.
 #[test]
 fn an_unseen_run_is_kept_and_never_ended() {
     let s = session();
     let a = owed("event:a", "read:a");
     let mut st = received_then(&s, &a, run("test run", 7001));
-    assert!(st.ended_runs(&UNSEEN, T0 + MINUTE).is_empty());
+    assert!(!st.end_gone_runs(&UNSEEN));
     let unseen = Facts {
         liveness: &UNSEEN,
         ..facts(T0 + MINUTE, &s, &a)
@@ -2471,11 +2454,8 @@ fn an_unseen_run_is_kept_and_never_ended() {
         "it may still be running: checked in on"
     );
     assert_eq!(names(&st), ["test run"]);
-    assert_eq!(
-        st.ended_runs(&DEAD, due + 1).len(),
-        1,
-        "once seen gone, it ends"
-    );
+    assert!(st.end_gone_runs(&DEAD), "once seen gone, it ends");
+    assert!(st.attendances.is_empty());
 }
 
 /// A presentation is in flight only for [`DELIVERY_RESULT_WITHIN`]. A

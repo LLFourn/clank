@@ -273,25 +273,42 @@ fn reborn() -> clank_core::turn_policy::ShellProof {
     )
 }
 
-fn run_ends(repo: &Path, who: &str) -> Vec<(String, u64)> {
-    crate::inbox::pending(repo, &label(who))
-        .into_iter()
-        .filter_map(|item| match item {
-            clank_core::wait::WaitItem::RunEnded {
-                desc,
-                presentation: Some(p),
-                ..
-            } => Some((desc, p.seq)),
-            _ => None,
-        })
-        .collect()
+/// Every file under `who`'s agent directory but its turn state, with its
+/// bytes: whatever a run's end could have written anywhere for the agent.
+fn written_for(repo: &Path, who: &str) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.file_name() != Some(std::ffi::OsStr::new("turn.json")) {
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = Default::default();
+    walk(&crate::agent_store::agents_root(repo).join(who), &mut out);
+    out
+}
+
+/// What a Stop of `session` with nothing owed is answered: no wake.
+fn nothing_presented(turns: &mut Turns, who: &str, session: &str, g: &Gathered) {
+    let frame = turns
+        .answer(&label(who), 9, &stop(Tool::Claude, session, None), true, g)
+        .unwrap();
+    assert_eq!(frame.presentation(), None, "{frame:?}");
+    assert_eq!(frame.rendered, None, "{frame:?}");
 }
 
 /// A run in flight keeps the agent attending; once its registered process
-/// is gone (a reused pid here) its end is written once to the agent's
-/// message log and wakes it until acked, and no listing is involved.
+/// is gone (a reused pid here) its attendance ends and nothing else
+/// happens: nothing is written for the agent, nothing is owed or shown,
+/// and no Stop is woken for it, however often it is looked at again.
 #[test]
-fn a_gone_run_is_recorded_once_and_wakes_until_acked() {
+fn a_gone_run_ends_its_attendance_and_nothing_else() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
@@ -310,55 +327,29 @@ fn a_gone_run_is_recorded_once_and_wakes_until_acked() {
             &g,
         )
         .unwrap();
-    turns.end_gone_runs(&author, &g);
-    assert_eq!(run_ends(repo.path(), "claude").len(), 1);
-    let [(desc, seq)] = &run_ends(repo.path(), "claude")[..] else {
-        panic!("one run ended");
-    };
-    let seq = *seq;
-    assert_eq!(desc, "test run");
+    let before = written_for(repo.path(), "claude");
+    assert!(turns.end_gone_runs(&author, &g));
     let shown = turns.projection(&author, &g).attended;
     assert_eq!(
         shown.iter().map(|a| a.task.as_str()).collect::<Vec<_>>(),
         ["live run"],
         "the live run still attends"
     );
-
-    turns.end_gone_runs(&author, &g);
-    assert_eq!(run_ends(repo.path(), "claude").len(), 1, "never twice");
-
-    let rows = crate::cli::github::log::EventLog::open(
-        &crate::agent_store::agents_root(repo.path()).join("claude/events"),
-        crate::inbox::MESSAGES_SOURCE,
-    )
-    .unwrap()
-    .read_rows()
-    .unwrap()
-    .unwrap()
-    .rows;
-    let row = rows.iter().find(|r| r.seq == seq).unwrap();
-    let mut log = crate::cli::github::log::EventLog::open(
-        &crate::agent_store::agents_root(repo.path()).join("claude/events"),
-        crate::inbox::MESSAGES_SOURCE,
-    )
-    .unwrap();
-    log.append_checked_ack(seq, &row.ident).unwrap();
+    assert!(!turns.end_gone_runs(&author, &g), "ended once");
     assert!(
-        run_ends(repo.path(), "claude").is_empty(),
-        "acked, it is done"
+        !Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g),
+        "and a restart finds it ended"
     );
-    turns.end_gone_runs(&author, &g);
-    assert!(
-        run_ends(repo.path(), "claude").is_empty(),
-        "and not re-recorded"
-    );
+    assert_eq!(written_for(repo.path(), "claude"), before);
+    assert!(crate::inbox::pending(repo.path(), &author).is_empty());
+    nothing_presented(&mut turns, "claude", "session-one", &g);
 }
 
 /// A monitor that restarts after a run ended, with the run still in its
-/// saved state, records it once; another restart records nothing more. A
-/// crash between the record and forgetting the run is the same case.
+/// saved state, retires it; a crash before that retirement was saved
+/// retires it again. Neither writes anything else.
 #[test]
-fn a_restart_records_a_run_that_ended_unwatched_exactly_once() {
+fn a_restart_retires_a_run_that_ended_unwatched() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let g = gathered(repo.path(), "claude", &[]);
@@ -370,24 +361,22 @@ fn a_restart_records_a_run_that_ended_unwatched_exactly_once() {
         )
         .unwrap();
     let saved = crate::agent_store::agents_root(repo.path()).join("claude/turn.json");
-    let before = std::fs::read(&saved).unwrap();
+    let stale = std::fs::read(&saved).unwrap();
+    let before = written_for(repo.path(), "claude");
 
-    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
-    assert_eq!(run_ends(repo.path(), "claude").len(), 1);
-    std::fs::write(&saved, &before).unwrap();
-    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
-    assert_eq!(
-        run_ends(repo.path(), "claude").len(),
-        1,
-        "the run was still saved, and its record is not written twice"
-    );
-    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
-    assert_eq!(run_ends(repo.path(), "claude").len(), 1);
+    assert!(Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g));
+    std::fs::write(&saved, &stale).unwrap();
+    assert!(Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g));
+    let mut back = Turns::new(repo.path().to_path_buf());
+    assert!(!back.end_gone_runs(&author, &g));
+    assert!(back.projection(&author, &g).attended.is_empty());
+    assert_eq!(written_for(repo.path(), "claude"), before);
+    nothing_presented(&mut back, "claude", "session-one", &g);
 }
 
-/// Killing the command ends the run like any other end: one record.
+/// Killing the command ends the run like any other end.
 #[test]
-fn a_killed_run_is_recorded_once() {
+fn a_killed_run_ends_like_any_other() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
@@ -405,19 +394,165 @@ fn a_killed_run_is_recorded_once() {
             &g,
         )
         .unwrap();
-    turns.end_gone_runs(&author, &g);
-    assert!(run_ends(repo.path(), "claude").is_empty(), "still running");
+    let before = written_for(repo.path(), "claude");
+    assert!(!turns.end_gone_runs(&author, &g), "still running");
     child.kill().unwrap();
     child.wait().unwrap();
-    turns.end_gone_runs(&author, &g);
-    turns.end_gone_runs(&author, &g);
+    assert!(turns.end_gone_runs(&author, &g));
+    assert!(!turns.end_gone_runs(&author, &g));
+    assert!(turns.projection(&author, &g).attended.is_empty());
+    assert_eq!(written_for(repo.path(), "claude"), before);
+    nothing_presented(&mut turns, "claude", "session-one", &g);
+}
+
+/// What an older clank left for runs that ended, around live messages:
+/// `run_ended` rows in the message log, acked by identity, by bare
+/// sequence and not at all, the newest of them the log's last sequence; a
+/// presentation in flight, a repeat and a receipt naming one; and a ledger
+/// that owes one. It all loads. Only the messages are owed, shown,
+/// presented or kept owed, and a new message is numbered past every old
+/// row, so no stale ack covers it.
+#[test]
+fn old_run_ended_bytes_load_and_are_never_owed_shown_or_presented() {
+    use crate::cli::github::log::EventLog;
+    const SESSION: &str = "00000000-0000-4000-8000-000000000001";
+    const BEFORE: &str = "event messages@1 k:message#claude/24b0857ddad36a442fff4ff8";
+    const AFTER: &str = "event messages@4 k:message#claude/e4cf31a918253b5123e28b82";
+    let repo = repo_with("claude", Tool::Claude, SESSION);
+    let author = label("claude");
+    let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+    std::fs::create_dir_all(dir.join("events")).unwrap();
+    for (name, bytes) in [
+        (
+            "events/messages.jsonl",
+            include_str!("../../tests/fixtures/formats/events-run-ended.jsonl"),
+        ),
+        (
+            "turn.json",
+            include_str!("../../tests/fixtures/formats/turn-run-ended-owed.json"),
+        ),
+        (
+            "ledger.json",
+            include_str!("../../tests/fixtures/formats/ledger-run-ended.json"),
+        ),
+        (
+            "delivered.json",
+            include_str!("../../tests/fixtures/formats/delivered-run-ended.json"),
+        ),
+    ] {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    let events = dir.join("events");
+
+    let loaded = EventLog::open(&events, crate::inbox::MESSAGES_SOURCE)
+        .unwrap()
+        .load();
+    assert!(!loaded.log_quarantined);
+    assert_eq!(loaded.foreign, 0, "no newer clank wrote them");
+    let read = EventLog::open(&events, crate::inbox::MESSAGES_SOURCE)
+        .unwrap()
+        .read_rows()
+        .unwrap()
+        .expect("readable");
+    assert_eq!(read.foreign, 0);
     assert_eq!(
-        run_ends(repo.path(), "claude")
-            .into_iter()
-            .map(|(d, _)| d)
-            .collect::<Vec<_>>(),
-        ["server"]
+        read.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        [1, 4],
+        "the timeline's rows are the messages alone"
     );
+
+    let owed = crate::inbox::pending(repo.path(), &author);
+    let subjects = |owed: &[clank_core::wait::WaitItem]| -> Vec<String> {
+        owed.iter()
+            .map(|item| match item {
+                clank_core::wait::WaitItem::Message { subject, .. } => subject.clone(),
+                other => panic!("only messages are owed: {other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(subjects(&owed), ["before the runs", "after the runs"]);
+
+    let g = gathered(repo.path(), "claude", &owed);
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let frame = turns
+        .answer(&author, 1, &stop(Tool::Claude, SESSION, None), true, &g)
+        .unwrap();
+    assert!(frame.presentation().is_some(), "{frame:?}");
+    let carried = &turns
+        .state(&author)
+        .unwrap()
+        .outstanding
+        .as_ref()
+        .unwrap()
+        .identities;
+    assert_eq!(carried, &[BEFORE, AFTER]);
+    let text = frame.rendered.unwrap();
+    for run in [
+        "run_ended",
+        "run ended",
+        "binsec core",
+        "test run",
+        "server",
+        "build",
+    ] {
+        assert!(!text.contains(run), "{run}: {text}");
+    }
+    assert!(
+        text.contains("before the runs") && text.contains("after the runs"),
+        "{text}"
+    );
+
+    let admitted: Vec<_> = owed
+        .iter()
+        .zip([BEFORE, AFTER])
+        .map(|(item, identity)| crate::cli::ledger::Admission {
+            identity: identity.into(),
+            item: item.clone(),
+            standing: crate::cli::wait::Standing::Owed,
+            pausable: false,
+            arrived: None,
+        })
+        .collect();
+    let ledger = crate::cli::ledger::fold_stored(
+        &dir,
+        &admitted,
+        &crate::cli::ledger::Evidence {
+            delivered: crate::cli::presentation::delivered_to(&dir, SESSION),
+            in_flight: None,
+        },
+        &Default::default(),
+        1794310000,
+    );
+    assert_eq!(
+        ledger
+            .entries
+            .iter()
+            .map(|e| e.identity.as_str())
+            .collect::<Vec<_>>(),
+        [BEFORE, AFTER]
+    );
+    assert_eq!(
+        crate::cli::ledger::load(&dir)
+            .into_keys()
+            .collect::<Vec<_>>(),
+        [BEFORE, AFTER],
+        "and the stored ledger no longer owes the run"
+    );
+
+    crate::inbox::deliver(
+        repo.path(),
+        &author,
+        None,
+        "2026-11-12T00:00:00Z",
+        "a new one",
+    )
+    .unwrap();
+    let owed = crate::inbox::pending(repo.path(), &author);
+    assert_eq!(
+        subjects(&owed),
+        ["before the runs", "after the runs", "a new one"]
+    );
+    assert_eq!(owed[2].presentation().unwrap().seq, 7);
 }
 
 /// The drive gate as the monitor holds it: auto off is a silence, an
@@ -1706,10 +1841,10 @@ fn only_an_explicit_end_or_another_birth_is_a_gone_process() {
     }
 }
 
-/// A registered run whose identity cannot be read is kept and records no
-/// end; the same run under a confirmed other birth records one.
+/// A registered run whose identity cannot be read is kept; the same run
+/// under a confirmed other birth ends.
 #[test]
-fn an_unreadable_run_is_kept_and_records_no_end() {
+fn an_unreadable_run_is_kept_and_does_not_end() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
@@ -1732,15 +1867,8 @@ fn an_unreadable_run_is_kept_and_records_no_end() {
             &g,
         )
         .unwrap();
-    turns.end_gone_runs(&author, &g);
-    turns.end_gone_runs(&author, &g);
-    assert_eq!(
-        run_ends(repo.path(), "claude")
-            .into_iter()
-            .map(|(d, _)| d)
-            .collect::<Vec<_>>(),
-        ["test run"]
-    );
+    assert!(turns.end_gone_runs(&author, &g));
+    assert!(!turns.end_gone_runs(&author, &g));
     let shown = turns.projection(&author, &g).attended;
     assert_eq!(
         shown.iter().map(|a| a.task.as_str()).collect::<Vec<_>>(),
@@ -1773,8 +1901,7 @@ fn a_registration_that_cannot_be_written_is_refused() {
     assert!(refused.contains("nothing was recorded"), "{refused}");
     assert!(turns.projection(&author, &g).attended.is_empty());
     assert_eq!(turns.next_deadline(), None);
-    turns.end_gone_runs(&author, &g);
-    assert!(run_ends(repo.path(), "claude").is_empty());
+    assert!(!turns.end_gone_runs(&author, &g));
 
     std::fs::remove_dir(&stored).unwrap();
     turns
@@ -1785,101 +1912,6 @@ fn a_registration_that_cannot_be_written_is_refused() {
         )
         .expect("once it can be written, it is accepted");
     assert!(stored.is_file());
-}
-
-/// A crash between writing a run's end and retiring its registration
-/// restores a registration that replays the record; the record is never
-/// written twice however far the log's identity horizon has moved on and
-/// however it was compacted and acked meanwhile.
-#[test]
-fn a_replayed_end_is_not_written_again_past_the_identity_horizon() {
-    use crate::cli::github::log::{COMPACT_AT, EventLog, LOG_IDENTITY_CAP, Transport};
-    let repo = repo_with("claude", Tool::Claude, "session-one");
-    let author = label("claude");
-    let g = gathered(repo.path(), "claude", &[]);
-    Turns::new(repo.path().to_path_buf())
-        .attend(
-            &author,
-            run_request("session-one", "test run", reborn()),
-            &g,
-        )
-        .unwrap();
-    let saved = crate::agent_store::agents_root(repo.path()).join("claude/turn.json");
-    let stale = std::fs::read(&saved).unwrap();
-    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
-    let [(_, seq)] = run_ends(repo.path(), "claude")[..] else {
-        panic!("one end");
-    };
-
-    let events = crate::agent_store::agents_root(repo.path()).join("claude/events");
-    let mut log = EventLog::open(&events, crate::inbox::MESSAGES_SOURCE).unwrap();
-    log.load();
-    let ident = log
-        .read_rows()
-        .unwrap()
-        .unwrap()
-        .rows
-        .into_iter()
-        .find(|r| r.seq == seq)
-        .unwrap()
-        .ident;
-    log.append_checked_ack(seq, &ident).unwrap();
-    for i in 0..COMPACT_AT {
-        let item = message(&format!("filler-{i}"));
-        log.append_inbox(
-            Transport::Message,
-            None,
-            Some(&format!("message#claude/filler-{i}")),
-            None,
-            &item,
-        )
-        .unwrap();
-    }
-    assert!(log.maybe_compact().is_ok());
-    let mut log = EventLog::open(&events, crate::inbox::MESSAGES_SOURCE).unwrap();
-    log.load();
-    for i in 0..=LOG_IDENTITY_CAP {
-        log.append_inbox(
-            Transport::Message,
-            None,
-            Some(&format!("message#claude/later-{i}")),
-            None,
-            &message(&format!("later-{i}")),
-        )
-        .unwrap();
-    }
-    let horizon = EventLog::open(&events, crate::inbox::MESSAGES_SOURCE)
-        .unwrap()
-        .load()
-        .action_keys;
-    assert!(
-        !horizon.contains(&"message#claude/filler-0".to_string()),
-        "the horizon moved past older keys"
-    );
-    assert!(
-        horizon.iter().any(|k| k.starts_with("run-ended#")),
-        "and kept the pinned end: {} keys, {:?}",
-        horizon.len(),
-        horizon
-            .iter()
-            .filter(|k| !k.starts_with("message#"))
-            .collect::<Vec<_>>()
-    );
-    assert!(horizon.len() <= LOG_IDENTITY_CAP + 1);
-
-    std::fs::write(&saved, &stale).unwrap();
-    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
-    assert!(
-        run_ends(repo.path(), "claude").is_empty(),
-        "the replay wrote no second end"
-    );
-    assert!(
-        Turns::new(repo.path().to_path_buf())
-            .projection(&author, &g)
-            .attended
-            .is_empty(),
-        "and the stale registration is retired"
-    );
 }
 
 fn presented(turns: &mut Turns, conn: u64, g: &Gathered) -> PresentationId {

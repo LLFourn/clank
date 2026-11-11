@@ -275,7 +275,6 @@ pub(crate) fn kind(item: &WaitItem) -> &'static str {
         WaitItem::GithubEvent { .. } => "github_event",
         WaitItem::TimerEvent { .. } => "timer",
         WaitItem::CommandEvent { .. } => "command_event",
-        WaitItem::RunEnded { .. } => "run_ended",
         WaitItem::Reviewer { .. } | WaitItem::AdHocReview { .. } => "review",
         WaitItem::AdHocRevise { .. } => "revision",
         WaitItem::Master { .. } => "work",
@@ -314,7 +313,6 @@ pub(crate) fn what(item: &WaitItem) -> Option<String> {
         },
         WaitItem::TimerEvent { name, .. } => format!("timer {name}"),
         WaitItem::CommandEvent { name, .. } => format!("event from {name}"),
-        WaitItem::RunEnded { desc, .. } => format!("end of run \"{desc}\""),
         WaitItem::Unblocked { carries, .. } => format!("answer to {}", carries.name),
         WaitItem::Idle { .. }
         | WaitItem::ForCommit { .. }
