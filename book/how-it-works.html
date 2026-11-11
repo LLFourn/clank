@@ -49,7 +49,7 @@
   <dt>Notify</dt>
   <dd>Wake the agent with text that is not work, such as Grok’s request to start its background wait, or a note that an attendance named no running task.</dd>
 </dl>
-<p>Every fact a decision rests on is re-checked when it is used, never cached. The one check-in owed when attended work runs past its <code>--expect</code> is not a verdict: it is typed into the agent’s pane, the way a nudge is.</p>
+<p>Every fact a decision rests on is re-checked when it is used, never cached. The one check-in owed when attended work runs past its <code>--expect</code> is never typed into a pane: it is a notice presented through the agent’s parked wait at its next turn end, beside any work delivered then, and spent only when that delivery succeeds. Grok gets it at its native Stop.</p>
 
 <h2 id="recovery">When nothing is delivering</h2>
 <p>A turn-end decision needs a turn to end. Some agents owe work and have nothing that will carry it to them, so the monitor reads each agent’s own session record and acts on what it shows:</p>

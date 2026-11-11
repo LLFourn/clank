@@ -528,6 +528,7 @@ async fn subagent(
         session,
         report,
         SUBAGENT_BUDGET,
+        |_| None,
     )
     .await;
     match frame.verdict {
@@ -674,16 +675,20 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Carry `report`, which never parks, to the monitor and return its
+/// Carry `report`, which never parks, to the monitor, and hand `emit` its
 /// verdict, or the one its tool takes when none comes within `budget`.
+/// `emit` says how writing it out went, or `None` when it wrote nothing; a
+/// presentation is answered by that, and is delivered only by a write
+/// that succeeded.
 pub(super) async fn answer_once(
     repo: &Path,
     label: &AgentLabel,
     session: &str,
     report: Report,
     budget: std::time::Duration,
-) -> Frame {
-    answer_with(&Spawner, repo, label, session, report, budget).await
+    emit: impl FnOnce(&Frame) -> Option<std::io::Result<()>>,
+) {
+    answer_with(&Spawner, repo, label, session, report, budget, emit).await;
 }
 
 async fn answer_with(
@@ -693,6 +698,7 @@ async fn answer_with(
     session: &str,
     report: Report,
     budget: std::time::Duration,
+    emit: impl FnOnce(&Frame) -> Option<std::io::Result<()>>,
 ) -> Frame {
     let tool = report.tool();
     let carried = await_verdict_under_deadline(
@@ -706,11 +712,38 @@ async fn answer_with(
     .await;
     match carried {
         Ok((frame, wait)) => {
-            Box::new(wait).answer(None).await;
+            let emitted = emit(&frame);
+            let result = result_of(&frame, emitted, "it was not written out");
+            Box::new(wait).answer(result).await;
             frame
         }
-        Err(frame) => frame,
+        Err(frame) => {
+            emit(&frame);
+            frame
+        }
     }
+}
+
+/// The one result for the presentation `frame` hands over, if it hands one
+/// over, by how writing it out went; `unwritten` says why when it was not.
+fn result_of(
+    frame: &Frame,
+    emitted: Option<std::io::Result<()>>,
+    unwritten: &str,
+) -> Option<TurnResult> {
+    frame.presentation().map(|id| match emitted {
+        Some(Ok(())) => TurnResult::Delivered {
+            presentation: id.clone(),
+        },
+        Some(Err(e)) => TurnResult::EmitFailed {
+            presentation: id.clone(),
+            why: e.to_string(),
+        },
+        None => TurnResult::EmitFailed {
+            presentation: id.clone(),
+            why: unwritten.into(),
+        },
+    })
 }
 
 /// Surface a session start's verdict: work or a notice as
@@ -738,19 +771,7 @@ async fn emit_session_start(
         stdout.write_all(b"\n")?;
         stdout.flush()
     });
-    let result = frame.presentation().map(|id| match emitted {
-        Some(Ok(())) => TurnResult::Delivered {
-            presentation: id.clone(),
-        },
-        Some(Err(e)) => TurnResult::EmitFailed {
-            presentation: id.clone(),
-            why: e.to_string(),
-        },
-        None => TurnResult::EmitFailed {
-            presentation: id.clone(),
-            why: "the session no longer holds the label".into(),
-        },
-    });
+    let result = result_of(&frame, emitted, "the session no longer holds the label");
     Box::new(wait).answer(result).await;
 }
 

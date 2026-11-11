@@ -2523,14 +2523,6 @@ impl Driver {
         current && still_permitted(w, &e, live)
     }
 
-    /// Whether a check-in may be typed into `author`'s pane now: its harness
-    /// is resumed by typing.
-    pub(crate) fn may_type_check_in(&self, author: &clank_core::ids::AgentLabel) -> bool {
-        self.agents
-            .get(author)
-            .is_some_and(|w| transport_for(w.tool) == Ok(Transport::Typed))
-    }
-
     /// Publish `author`'s turn projection as it is now.
     pub(crate) fn project(
         &mut self,

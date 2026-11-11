@@ -115,43 +115,48 @@ pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
         }
         Ok(route(&input, &repo, &Process)?.map(|label| (repo, label, input)))
     })();
-    let frame = match routed {
-        Ok(None) => return Ok(()),
+    match routed {
+        Ok(None) => {}
         Ok(Some((repo, label, input))) => {
             let bound = input.session_id.as_str().to_string();
-            let asked = super::stop_hook::answer_once(
+            super::stop_hook::answer_once(
                 &repo,
                 &label,
                 &bound,
                 report(input, hook_started, super::turn_custody::now_ms()),
                 HANDOFF_BUDGET,
-            );
-            still_bound(&repo, &label, &bound, asked).await
+                |frame| print(&still_bound(&repo, &label, &bound, frame.clone())),
+            )
+            .await;
         }
-        Err(e) => Frame::bare(WireVerdict::Diagnostic {
-            message: format!("{e:#}"),
-        }),
-    };
-    let (out, err) = wire(&frame);
-    if let Some(out) = out {
-        println!("{out}");
-    }
-    if let Some(err) = err {
-        eprintln!("{err}");
+        Err(e) => {
+            print(&Frame::bare(WireVerdict::Diagnostic {
+                message: format!("{e:#}"),
+            }));
+        }
     }
     Ok(())
 }
 
-/// The monitor's answer once `asked` resolves, while `session` still holds
-/// the label: one authorized for a binding replaced while it was in
-/// transit, or while its child was collected, is not this session's.
-async fn still_bound(
-    repo: &Path,
-    label: &AgentLabel,
-    session: &str,
-    asked: impl std::future::Future<Output = Frame>,
-) -> Frame {
-    let frame = asked.await;
+/// Write `frame` on Grok's wire: how writing its decision went, or `None`
+/// when it has none.
+fn print(frame: &Frame) -> Option<std::io::Result<()>> {
+    use std::io::Write;
+    let (out, err) = wire(frame);
+    if let Some(err) = err {
+        eprintln!("{err}");
+    }
+    out.map(|out| {
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{out}")?;
+        stdout.flush()
+    })
+}
+
+/// The monitor's answer as it is about to be written, while `session`
+/// still holds the label: one authorized for a binding replaced while it
+/// was in transit is not this session's.
+fn still_bound(repo: &Path, label: &AgentLabel, session: &str, frame: Frame) -> Frame {
     match binding_matches(repo, label, Tool::Grok, session) {
         true => frame,
         false => Frame::bare(WireVerdict::Silent {
@@ -160,11 +165,12 @@ async fn still_bound(
     }
 }
 
-/// Grok's wire for a verdict: a request for the wait blocks the Stop with
-/// its reason; a diagnostic goes to stderr; anything else says nothing.
+/// Grok's wire for a verdict: a request for the wait, or a check-in, blocks
+/// the Stop with its reason; a diagnostic goes to stderr; anything else
+/// says nothing.
 fn wire(frame: &Frame) -> (Option<String>, Option<String>) {
     match &frame.verdict {
-        WireVerdict::Notify => (
+        WireVerdict::Notify | WireVerdict::Deliver { .. } => (
             Some(
                 serde_json::json!({
                     "decision": "block",

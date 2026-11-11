@@ -1,6 +1,6 @@
 //! The pane a typed write goes to, shared by every writer: nudges, event
-//! interruption, recovery, check-ins and user commands. A pane is its
-//! agent's by its name alone, within the repo's TUI-anchored workspace;
+//! interruption, recovery and user commands. A pane is its agent's by its
+//! name alone, within the repo's TUI-anchored workspace;
 //! the harness in it is the one the roster gives that agent. No hook,
 //! inbox or session binding is read, and nothing runs between lookups.
 

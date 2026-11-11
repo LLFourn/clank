@@ -453,3 +453,88 @@ async fn the_registered_waiter_alone_decides_whether_grok_arms_one() {
         "the wait exited, so its registration is gone"
     );
 }
+
+/// A due check-in reaches Grok at its native Stop, never through its idle
+/// background wait: the wait is served nothing, the Stop's report is handed
+/// the check-in as a presentation its own connection carries, and only
+/// that connection's delivered result spends it.
+#[tokio::test]
+async fn groks_check_in_rides_its_stop_and_never_its_background_wait() {
+    use crate::cli::turn_wire::{TurnResult, WireVerdict};
+    let (repo, author, session) = fixture();
+    let mut turns = crate::cli::turn_custody::Turns::new(repo.path().to_path_buf());
+    let then = crate::cli::turn_custody::now_ms() - 120_000;
+    turns
+        .attend(
+            &author,
+            clank_core::turn_policy::AttendRequest::Declare {
+                session: session.clone(),
+                name: "sleeper".into(),
+                desc: None,
+                expect: 60_000,
+            },
+            &crate::cli::turn_custody::Gathered::of(repo.path(), &author, None).at(then),
+        )
+        .unwrap();
+    let mut clients = vec![];
+    let (wait, mut wait_peer) = connecting(repo.path(), &author, &session).await;
+    assert!(joining(repo.path(), &mut clients, wait).is_empty());
+    let state = folded(repo.path()).await.unwrap();
+    serve(repo.path(), &mut clients, &state);
+    let mut line = String::new();
+    wait_peer.read_line(&mut line).await.unwrap();
+    assert!(
+        !matches!(
+            serde_json::from_str::<Note>(&line).unwrap(),
+            Note::Items { .. }
+        ),
+        "the idle wait carries nothing: {line}"
+    );
+
+    let (report, mut peer) = reporting(repo.path(), &author, &session).await;
+    let conn = report.conn;
+    clients.push(report);
+    for writer in serve_reports(
+        repo.path(),
+        &mut clients,
+        None,
+        None,
+        &[],
+        &mut Default::default(),
+        &Default::default(),
+        &mut turns,
+    ) {
+        writer.await.unwrap();
+    }
+    let frame = loop {
+        let mut line = String::new();
+        assert!(peer.read_line(&mut line).await.unwrap() > 0, "no verdict");
+        if let Note::Verdict(frame) = serde_json::from_str::<Note>(&line).unwrap() {
+            break frame;
+        }
+    };
+    let presentation = frame.presentation().expect("a presentation").clone();
+    assert!(matches!(frame.verdict, WireVerdict::Deliver { .. }));
+    let text = frame.rendered.unwrap_or_default();
+    assert!(
+        text.starts_with("clank check-in: declared work \"sleeper\""),
+        "{text}"
+    );
+    assert!(
+        !text.contains(crate::cli::wake_render::ARM_WAIT),
+        "its wait is registered: {text}"
+    );
+    assert_eq!(turns.carrier(conn), Some(&author));
+    let g = crate::cli::turn_custody::Gathered::of(repo.path(), &author, None);
+    let row = |turns: &mut crate::cli::turn_custody::Turns| {
+        turns.projection(&author, &g).attended[0].check_in.clone()
+    };
+    assert_eq!(row(&mut turns).as_deref(), Some("check-in due"));
+    assert!(
+        turns
+            .result(&author, conn, TurnResult::Delivered { presentation }, &g)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(row(&mut turns).as_deref(), Some("checked in"));
+}

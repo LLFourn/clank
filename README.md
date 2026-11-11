@@ -306,7 +306,7 @@ the command it runs, so a pane you start by hand, named for the agent,
 is that agent's pane. Rename one by hand and clank believes you.
 
 Everything clank types into an agent (`clank nudge`, an interrupting
-event, recovery's nudges and retries, attendance check-ins, user
+event, recovery's nudges and retries, user
 commands) goes to the one live pane with that name in the repo's
 workspace, as the tool the roster gives the agent. No such pane, two of
 them, or a pane whose name could be read as two agents means nothing is
@@ -829,7 +829,7 @@ paths and the obvious Bash spellings, not every Bash path to the same
 bytes.
 
 **Ordinary text cannot reach a shell mode.** Every other pane write
-(`send --interrupt`, recovery, check-ins, the web chat) goes through one
+(`send --interrupt`, recovery, the web chat) goes through one
 admission rule: CR becomes LF, Tab a space, other control characters
 U+FFFD, and a leading `!` gets `·` before it. It then types only when one
 dump reads the input as an ordinary prompt (Claude, Codex). Grok's and
@@ -927,8 +927,15 @@ An agent attends several things at once. Each `attend` or `run` adds one
 entry, or renews what already stands under that name or process, and
 never touches another. Each takes `--expect` (default 5m): if it still
 stands past that, the work already shown wakes the agent again through
-its wait, and it is checked in on once in its pane where clank can type
-there; entries due together share one check-in. Nothing is cancelled and
+its wait, and it is checked in on once. The check-in is a notice its
+parked hook returns, never text typed into its pane: if the agent is
+parked it comes at once, and otherwise (mid-turn, or with no waiter) it
+waits for the next park. Grok gets it at its next turn end, not while
+it idles on its background wait, because nothing reports a Grok turn
+starting. Every entry due before one delivery shares that
+one check-in, which beside owed work rides the same wake. It is spent
+only when that wake is delivered; a failed or lost one leaves it owed,
+and the row says `check-in due` until then. Nothing is cancelled and
 nothing times out. `clank attend "<name>" --expect 1h` renews an entry, a
 run's by its `--desc`; `clank attend --clear "<name>"` withdraws one, and
 `clank attend --clear` all of them. `clank tui` shows every entry on the

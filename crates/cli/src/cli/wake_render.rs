@@ -852,6 +852,7 @@ pub(crate) fn notice_text(notice: &clank_core::turn_policy::Notice) -> String {
         Notice::MonitorOutage { why } => monitor_outage(why),
         Notice::MonitorUnanswered => MONITOR_UNANSWERED.to_string(),
         Notice::ArmWait => ARM_WAIT.to_string(),
+        Notice::CheckIn(lines) => check_in_text(lines),
     }
 }
 
@@ -861,14 +862,13 @@ pub(crate) const ARM_WAIT: &str = "Run `clank wait` as one background terminal t
      (block_until_ms: 0, with no positive timeout), then finish the turn. Its completion wakes \
      you. Do not poll it or launch a second wait.";
 
-/// The one check-in for every entry that fell due together, written for
-/// an agent with no context. It must not read as an error or as work, and
-/// every value in its recipe is filled in, so it can be pasted. One line:
-/// it is typed into the agent's pane.
+/// The one check-in for every entry owed one, written for an agent with
+/// no context. It must not read as an error or as work, and every value in
+/// its recipe is filled in, so it can be pasted.
 ///
 /// A deadline is not an end: the check-in claims nothing finished, and
 /// says what does end each kind of entry.
-pub(crate) fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> String {
+fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> String {
     use crate::shell_quote::shell_quote;
     let each: Vec<String> = lines
         .iter()
@@ -935,10 +935,7 @@ mod tests {
         expect: u64,
     ) -> clank_core::turn_policy::CheckInLine {
         clank_core::turn_policy::CheckInLine {
-            check_in: clank_core::turn_policy::CheckInRef {
-                key: clank_core::turn_policy::EntryKey::Name(name.into()),
-                since: 0,
-            },
+            check_in: clank_core::turn_policy::CheckInRef { window: 1 },
             desc: desc.into(),
             name: name.into(),
             run,
@@ -982,7 +979,6 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("its completion still wakes you"), "{text}");
-        assert!(!text.contains('\n'), "it is typed into a pane: one line");
     }
 
     /// Each declaration notice names the agent's own request, shell-safe,

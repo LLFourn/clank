@@ -238,25 +238,17 @@ pub struct Facts<'a> {
     pub user_command: bool,
 }
 
-/// An entry's one check-in, armed from the moment the entry is accepted.
+/// An entry's one check-in per expectation, armed from the moment the
+/// entry is accepted or renewed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "legacy::StoredCheckIn")]
 pub enum CheckIn {
-    /// `Unarmed` is how state saved before attending took effect at once
-    /// spelled an entry not yet in force.
-    #[serde(alias = "Unarmed")]
     Armed,
+    /// Its expectation has passed and no presentation carrying its
+    /// check-in has been delivered yet: the agent's next park is owed it.
+    Due,
+    /// A presentation carrying it was delivered.
     Fired,
-    /// Due while a gate held it back. Spent, not deferred: what lifts the
-    /// gate (the person's answer, auto turning on) is itself a wake, and
-    /// past the deadline the entry no longer quiets recovery.
-    Withheld(Withheld),
-    /// Fired, and the route could not carry it. Never counted as
-    /// delivered; past the deadline recovery treats the agent as any
-    /// other.
-    Undeliverable(String),
-    /// Due after its run's process had already gone: the run's end is the
-    /// wake it owes.
-    ProcessGone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,12 +258,30 @@ pub enum Withheld {
     Blocked,
 }
 
-/// Which entry a check-in was fired for, and the moment its clock started:
-/// a renewal restarts the clock, so a result for the old one is told apart.
+/// Which expectation window a check-in was presented for. A renewal opens
+/// a new window, so a result for the old one is told apart; binding or
+/// merging a declaration moves its window, so a result still finds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "legacy::StoredRef")]
 pub struct CheckInRef {
-    pub key: EntryKey,
+    pub window: WindowId,
+}
+
+/// A window's identity, unique within its binding. Zero names no window.
+pub type WindowId = u64;
+
+/// One expectation of an entry's: from `since`, for `expect`, with its one
+/// check-in. Created only by a declaration, a run or a renewal; binding
+/// and merging move it whole.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Window {
+    /// Absent from state saved before windows had identities, which loading
+    /// assigns.
+    #[serde(rename = "window", default)]
+    pub id: WindowId,
     pub since: Ms,
+    pub expect: Ms,
+    pub check_in: CheckIn,
 }
 
 /// Whether the facts now allow the agent to be woken by clank at all.
@@ -365,9 +375,8 @@ pub struct Entry {
     pub desc: String,
     /// When it was first accepted; renewals leave it.
     pub started: Ms,
-    pub since: Ms,
-    pub expect: Ms,
-    pub check_in: CheckIn,
+    #[serde(flatten)]
+    pub window: Window,
 }
 
 impl Entry {
@@ -413,18 +422,15 @@ impl Entry {
     }
 
     pub fn deadline(&self) -> Ms {
-        self.since.saturating_add(self.expect)
+        self.window.since.saturating_add(self.window.expect)
     }
 
-    /// A new expectation from `since`, with its check-in re-armed against
-    /// it.
-    fn renew(&mut self, since: Ms, expect: Ms, desc: Option<String>) {
-        self.since = since;
-        self.expect = expect;
+    /// A new expectation, in its own window.
+    fn renew(&mut self, window: Window, desc: Option<String>) {
+        self.window = window;
         if let Some(desc) = desc {
             self.desc = desc;
         }
-        self.check_in = CheckIn::Armed;
     }
 }
 
@@ -446,8 +452,8 @@ pub enum Unqualified {
     PastDeadline,
 }
 
-/// THE rule. Turn-end, check-in and recovery all ask this and nothing
-/// else whether an entry may quiet anything.
+/// THE rule. Turn-end and recovery ask this and nothing else whether an
+/// entry may quiet anything.
 pub fn qualifies(entry: &Entry, facts: &Facts<'_>) -> Qualifies {
     match entry.proof().map(|p| facts.liveness.presence(p)) {
         Some(Presence::Gone) => return Qualifies::No(Unqualified::ProcessGone),
@@ -556,6 +562,9 @@ pub struct Presentation {
     /// a result had a bound; such a presentation died with its monitor.
     #[serde(default)]
     pub handed: Ms,
+    /// The check-ins it carries, each spent only when it is delivered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_ins: Vec<CheckInRef>,
 }
 
 /// How long a carrier has to answer for the presentation it was handed.
@@ -599,13 +608,14 @@ pub enum Notice {
     /// Grok's native handoff: run `clank wait` in the background, whose
     /// completion wakes the agent.
     ArmWait,
+    /// One check-in for every entry owed one when it was presented.
+    CheckIn(Vec<CheckInLine>),
 }
 
-/// A pending declaration's renewal of the one already bound to `task`.
+/// A pending declaration merging into the one already bound to `task`.
 struct Merge {
     task: String,
-    since: Ms,
-    expect: Ms,
+    window: Window,
     desc: String,
 }
 
@@ -732,12 +742,10 @@ pub enum AttendReply {
 pub enum Effect {
     CommitReceipts(Vec<String>),
     CommitRepeat(Option<RepeatRecord>),
-    /// Deliver one check-in, for every entry due together, through the
-    /// nudge transport.
-    CheckIn(Vec<CheckInLine>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One entry's line in a check-in, as it stood when presented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckInLine {
     pub check_in: CheckInRef,
     pub desc: String,
@@ -796,16 +804,18 @@ pub enum Event {
     /// no result: it failed, terminally, as a closed connection fails it.
     /// A result that arrives afterwards finds nothing in flight.
     ResultOverdue,
+    /// An entry's expectation may have passed. Every step makes each one
+    /// passed owed its check-in; this one exists so the moment is stepped
+    /// when nothing else happens.
     CheckInDue,
-    /// The check-in fired for these entries could not be delivered, and
-    /// why.
-    CheckInUndeliverable {
-        check_ins: Vec<CheckInRef>,
-        why: String,
-    },
-    /// A report answered Park, stepped again because the state or facts
-    /// changed. It is not a new Stop: no turn ended.
+    /// The very Stop report a park holds, stepped again because the state
+    /// or facts changed. It is not a new Stop: no turn ended. Only the
+    /// carrier holding that report may send it.
     Parked(TurnEndReport),
+    /// A compaction's report of the park the last Stop armed: a new report,
+    /// stepped as that park, which holds the Stop only by its own placement
+    /// ([`Stopped::stands_in`]).
+    Compacted(TurnEndReport),
     /// A session started: its owed work, presented once and never counted
     /// as a repeat, or nothing.
     SessionStart(SessionId),
@@ -838,6 +848,8 @@ pub struct Persisted {
     pub outstanding_episode_broken: bool,
     pub resolved: Option<(PresentationId, Resolution)>,
     pub next_seq: u64,
+    /// The last window identity this binding gave out.
+    pub next_window: WindowId,
     /// State saved before receipt evidence was kept has none, so nothing
     /// it owes is quiet.
     pub received: Vec<String>,
@@ -878,6 +890,8 @@ mod legacy {
         resolved: Option<(PresentationId, Resolution)>,
         next_seq: u64,
         #[serde(default)]
+        next_window: WindowId,
+        #[serde(default)]
         received: Vec<String>,
         #[serde(default)]
         unwatched: Option<Unwatched>,
@@ -889,6 +903,56 @@ mod legacy {
         seen: BTreeMap<String, Option<Ms>>,
         #[serde(default)]
         starts: BTreeMap<String, Option<Ms>>,
+    }
+
+    /// A check-in reference as any build saved it. One saved before windows
+    /// had identities names none: the presentation carrying it died with
+    /// its monitor, so nothing it could spend is lost.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    pub(super) enum StoredRef {
+        Current {
+            window: WindowId,
+        },
+        /// Keyed by the entry's selector and `since`.
+        Keyed(serde::de::IgnoredAny),
+    }
+
+    impl From<StoredRef> for CheckInRef {
+        fn from(stored: StoredRef) -> Self {
+            match stored {
+                StoredRef::Current { window } => CheckInRef { window },
+                StoredRef::Keyed(_) => CheckInRef { window: 0 },
+            }
+        }
+    }
+
+    /// A check-in as any build saved it. Each state an older build could
+    /// leave a check-in in without it reaching the model is still owed.
+    #[derive(Deserialize)]
+    pub(super) enum StoredCheckIn {
+        /// How state saved before attending took effect at once spelled
+        /// an entry not yet in force.
+        #[serde(alias = "Unarmed")]
+        Armed,
+        Due,
+        Fired,
+        Withheld(serde::de::IgnoredAny),
+        Undeliverable(serde::de::IgnoredAny),
+        ProcessGone,
+    }
+
+    impl From<StoredCheckIn> for CheckIn {
+        fn from(stored: StoredCheckIn) -> Self {
+            match stored {
+                StoredCheckIn::Armed => CheckIn::Armed,
+                StoredCheckIn::Fired => CheckIn::Fired,
+                StoredCheckIn::Due
+                | StoredCheckIn::Withheld(_)
+                | StoredCheckIn::Undeliverable(_)
+                | StoredCheckIn::ProcessGone => CheckIn::Due,
+            }
+        }
     }
 
     #[derive(Deserialize)]
@@ -959,10 +1023,20 @@ mod legacy {
 
     impl From<Stored> for Persisted {
         fn from(s: Stored) -> Self {
-            let attendances = match s.attendances {
+            let mut attendances: Vec<Entry> = match s.attendances {
                 Some(entries) => entries.into_iter().map(StoredEntry::current).collect(),
                 None => s.attendance.map(entries).unwrap_or_default(),
             };
+            let mut next_window = attendances
+                .iter()
+                .map(|e| e.window.id)
+                .max()
+                .unwrap_or(0)
+                .max(s.next_window);
+            for entry in attendances.iter_mut().filter(|e| e.window.id == 0) {
+                next_window += 1;
+                entry.window.id = next_window;
+            }
             Persisted {
                 binding: s.binding,
                 attendances,
@@ -971,6 +1045,7 @@ mod legacy {
                 outstanding_episode_broken: s.outstanding_episode_broken,
                 resolved: s.resolved,
                 next_seq: s.next_seq,
+                next_window,
                 received: s.received,
                 unwatched: s.unwatched,
                 feedback: s.feedback,
@@ -1023,9 +1098,12 @@ mod legacy {
             },
             desc,
             started: since,
-            since,
-            expect,
-            check_in,
+            window: Window {
+                id: 0,
+                since,
+                expect,
+                check_in,
+            },
         }
     }
 
@@ -1102,6 +1180,8 @@ pub struct SessionState {
     /// result is told apart from a result no connection could send.
     pub resolved: Option<(PresentationId, Resolution)>,
     pub next_seq: u64,
+    /// The last window identity this binding gave out.
+    pub next_window: WindowId,
     /// The identities of owed work a presentation on this binding was
     /// `Delivered` with, sorted: the only work a qualifying entry may
     /// quiet. Never wider than what is still owed.
@@ -1137,6 +1217,7 @@ impl SessionState {
             outstanding_episode_broken: false,
             resolved: None,
             next_seq: 0,
+            next_window: 0,
             received: Vec::new(),
             unwatched: None,
             feedback: Vec::new(),
@@ -1155,6 +1236,7 @@ impl SessionState {
             outstanding_episode_broken: self.outstanding_episode_broken,
             resolved: self.resolved.clone(),
             next_seq: self.next_seq,
+            next_window: self.next_window,
             received: self.received.clone(),
             unwatched: self.unwatched,
             feedback: self.feedback.clone(),
@@ -1183,6 +1265,7 @@ impl SessionState {
             outstanding_episode_broken: false,
             resolved,
             next_seq: p.next_seq,
+            next_window: p.next_window,
             received,
             unwatched: p.unwatched,
             feedback: p.feedback,
@@ -1206,7 +1289,7 @@ impl SessionState {
     pub fn next_deadline(&self) -> Option<Ms> {
         self.attendances
             .iter()
-            .filter(|e| e.check_in == CheckIn::Armed)
+            .filter(|e| e.window.check_in == CheckIn::Armed)
             .map(Entry::deadline)
             .min()
     }
@@ -1271,21 +1354,20 @@ impl SessionState {
     pub fn step(&mut self, event: Event, facts: &Facts<'_>) -> Output {
         self.prune_received(facts);
         self.forget_stale_repeat(facts);
+        self.fall_due(facts);
         let out = match event {
             Event::TurnEnd(report) => Output::Verdict(self.turn_end(report, facts)),
             Event::Attend(req) => Output::Attend(self.attend(req, facts)),
             Event::Delivered(id) => Output::Result(self.settle(id, Resolution::Delivered, facts)),
             Event::EmitFailed(id) => Output::Result(self.settle(id, Resolution::Failed, facts)),
             Event::ResultOverdue => Output::Result(self.overdue(facts)),
-            Event::CheckInDue => Output::Effects(self.check_in_due(facts)),
-            Event::CheckInUndeliverable { check_ins, why } => {
-                self.check_in_undeliverable(&check_ins, why);
-                Output::Effects(Vec::new())
+            Event::CheckInDue | Event::Observed => Output::Effects(Vec::new()),
+            Event::Parked(report) => Output::Verdict(self.parked(report, facts, Carrier::Held)),
+            Event::Compacted(report) => {
+                Output::Verdict(self.parked(report, facts, Carrier::Compacted))
             }
-            Event::Parked(report) => Output::Verdict(self.parked(report, facts)),
             Event::SessionStart(session) => Output::Verdict(self.session_start(session, facts)),
             Event::NativeTurnEnd(handoff) => Output::Verdict(self.native_turn_end(handoff, facts)),
-            Event::Observed => Output::Effects(Vec::new()),
         };
         // A notice wakes the agent with no result to wait for: it is past
         // its Stop as soon as the hook is told.
@@ -1397,8 +1479,7 @@ impl SessionState {
                     [BackgroundTask { id: Some(id), .. }] if held.contains(id) => {
                         merges.push(Merge {
                             task: id.clone(),
-                            since: entry.since,
-                            expect: entry.expect,
+                            window: entry.window.clone(),
                             desc: entry.desc.clone(),
                         });
                         drop[i] = true;
@@ -1484,7 +1565,8 @@ impl SessionState {
                 .iter_mut()
                 .find(|e| e.task() == Some(&m.task))
             {
-                held.renew(m.since, m.expect, Some(m.desc));
+                held.window = m.window;
+                held.desc = m.desc;
             }
         }
         self.feedback.append(&mut notices);
@@ -1579,8 +1661,10 @@ impl SessionState {
         if report.tool == Tool::Grok {
             return grok_verdict();
         }
-        let verdict =
-            release_for_user_command(self.deliver_or_park(facts, Some(&report.place)), facts);
+        let verdict = release_for_user_command(
+            self.deliver_or_park(facts, Some(&report.place), Carrier::Stop),
+            facts,
+        );
         self.with_feedback(verdict, facts)
     }
 
@@ -1615,9 +1699,12 @@ impl SessionState {
     }
 
     /// Grok's native Stop: its listing does for declarations what a Stop's
-    /// does, and the waiter verdict is [`handoff_verdict`]'s alone.
+    /// does, and the waiter verdict is [`handoff_verdict`]'s. It is Grok's
+    /// one evidence that a turn has ended, so it, never the background
+    /// wait, carries the check-ins owed, beside any request for that wait.
     fn native_turn_end(&mut self, handoff: Handoff, facts: &Facts<'_>) -> Verdict {
-        if facts.binding == Some(&handoff.session) && self.bound(facts) {
+        let bound = facts.binding == Some(&handoff.session) && self.bound(facts);
+        if bound {
             self.observe(
                 handoff.hook_started,
                 Source::AgentStop {
@@ -1625,8 +1712,37 @@ impl SessionState {
                 },
             );
         }
-        let verdict = handoff_verdict(&handoff, facts);
+        let verdict = match handoff_verdict(&handoff, facts) {
+            waiting @ (Verdict::Notify(_) | Verdict::Silent(SilentWhy::WaitArmed)) if bound => {
+                self.check_in_at_turn_end(waiting, facts)
+            }
+            other => other,
+        };
         self.with_feedback(verdict, facts)
+    }
+
+    /// `verdict`, a turn end's answer that carries no work, joined by every
+    /// check-in owed as one new presentation, when one may wake the agent
+    /// and none is in flight.
+    fn check_in_at_turn_end(&mut self, verdict: Verdict, facts: &Facts<'_>) -> Verdict {
+        let lines = self.carried_check_ins(Carrier::NativeStop, None, false, facts);
+        if lines.is_empty() {
+            return verdict;
+        }
+        let p = self.present(&[], &lines, None, facts.now);
+        let mut notices = vec![Notice::CheckIn(lines)];
+        if let Verdict::Notify(mut asked) = verdict {
+            notices.append(&mut asked);
+        }
+        let verdict = Verdict::Deliver {
+            presentation: p.id.clone(),
+            identities: Vec::new(),
+            repeat: 0,
+            escalated: false,
+            notices,
+        };
+        self.outstanding = Some(p);
+        verdict
     }
 
     /// Held feedback joins a verdict that wakes the agent anyway. It turns
@@ -1651,7 +1767,7 @@ impl SessionState {
         with_notices(verdict, std::mem::take(&mut self.feedback))
     }
 
-    fn parked(&mut self, report: TurnEndReport, facts: &Facts<'_>) -> Verdict {
+    fn parked(&mut self, report: TurnEndReport, facts: &Facts<'_>, carrier: Carrier) -> Verdict {
         if facts.binding != Some(&report.session) || !self.bound(facts) {
             return Verdict::Silent(SilentWhy::StaleBinding);
         }
@@ -1661,8 +1777,10 @@ impl SessionState {
         if report.tool == Tool::Grok {
             return grok_verdict();
         }
-        let verdict =
-            release_for_user_command(self.deliver_or_park(facts, Some(&report.place)), facts);
+        let verdict = release_for_user_command(
+            self.deliver_or_park(facts, Some(&report.place), carrier),
+            facts,
+        );
         self.with_feedback(verdict, facts)
     }
 
@@ -1673,27 +1791,40 @@ impl SessionState {
         if let Some(gated) = drive_gate(facts) {
             return gated;
         }
-        self.deliver_or_park(facts, None)
+        self.deliver_or_park(facts, None, Carrier::SessionStart)
     }
 
-    /// The [`deliverable`](Self::deliverable) work as one new presentation,
-    /// or Park when there is none or another presentation is in flight. A
-    /// park keeps the hook's wait armed, so work that arrives later still
-    /// wakes the agent. `place` is the Stop it counts against; without one
-    /// it is not counted.
-    fn deliver_or_park(&mut self, facts: &Facts<'_>, place: Option<&TurnPlace>) -> Verdict {
-        let deliverable = self.deliverable(facts);
-        if deliverable.is_empty() || self.outstanding.is_some() {
+    /// The [`deliverable`](Self::deliverable) work and, at a park, every
+    /// check-in owed, as one new presentation; or Park when there is
+    /// neither or another presentation is in flight. A park keeps the
+    /// hook's wait armed, so work that arrives later still wakes the agent.
+    /// `place` is the Stop it counts against; without one it is not
+    /// counted.
+    fn deliver_or_park(
+        &mut self,
+        facts: &Facts<'_>,
+        place: Option<&TurnPlace>,
+        carrier: Carrier,
+    ) -> Verdict {
+        if self.outstanding.is_some() {
             return Verdict::Park;
         }
-        let p = self.present(&deliverable, place, facts.now);
+        let deliverable = self.deliverable(facts);
+        let lines = self.carried_check_ins(carrier, place, !deliverable.is_empty(), facts);
+        if deliverable.is_empty() && lines.is_empty() {
+            return Verdict::Park;
+        }
+        let p = self.present(&deliverable, &lines, place, facts.now);
         let repeat = p.repeat.count();
         let verdict = Verdict::Deliver {
             presentation: p.id.clone(),
             identities: p.identities.clone(),
             repeat,
             escalated: repeat >= ESCALATE_AT,
-            notices: Vec::new(),
+            notices: match lines.is_empty() {
+                true => Vec::new(),
+                false => vec![Notice::CheckIn(lines)],
+            },
         };
         self.outstanding = Some(p);
         verdict
@@ -1702,8 +1833,14 @@ impl SessionState {
     /// Always a new presentation, counted from the last COMMITTED repeat
     /// record. A failed one is never reused: its count belongs to the
     /// episode it was made in, which an observed change may since have
-    /// ended.
-    fn present(&mut self, owed: &[OwedItem], place: Option<&TurnPlace>, now: Ms) -> Presentation {
+    /// ended. One carrying no work counts nothing.
+    fn present(
+        &mut self,
+        owed: &[OwedItem],
+        check_ins: &[CheckInLine],
+        place: Option<&TurnPlace>,
+        now: Ms,
+    ) -> Presentation {
         let identities = owed_identities(owed);
         let receipts: Vec<String> = owed.iter().flat_map(|o| o.receipts.clone()).collect();
         self.next_seq += 1;
@@ -1713,13 +1850,72 @@ impl SessionState {
                 seq: self.next_seq,
             },
             repeat: match place {
-                Some(place) => count_delivery(self.repeat.as_ref(), &identities, place),
-                None => RepeatDecision::Uncounted,
+                Some(place) if !identities.is_empty() => {
+                    count_delivery(self.repeat.as_ref(), &identities, place)
+                }
+                _ => RepeatDecision::Uncounted,
             },
             identities,
             receipts,
             handed: now,
+            check_ins: check_ins.iter().map(|l| l.check_in.clone()).collect(),
         }
+    }
+
+    /// The check-ins a presentation made for `carrier`, reported at `place`
+    /// and carrying work or not, may carry: every one owed, when no other
+    /// presentation is in flight, the carrier is at a turn's end, and it
+    /// carries work or may wake the agent without it. The one gate every
+    /// carrier passes.
+    fn carried_check_ins(
+        &self,
+        carrier: Carrier,
+        place: Option<&TurnPlace>,
+        with_work: bool,
+        facts: &Facts<'_>,
+    ) -> Vec<CheckInLine> {
+        let at_turn_end = match carrier {
+            Carrier::Stop | Carrier::Held | Carrier::NativeStop => true,
+            Carrier::Compacted => {
+                place.is_some_and(|p| self.stopped.as_ref().is_some_and(|s| s.stands_in(p)))
+            }
+            Carrier::SessionStart => false,
+        };
+        match self.outstanding.is_none()
+            && at_turn_end
+            && (with_work || may_wake_without_work(facts))
+        {
+            true => self.owed_check_ins(facts),
+            false => Vec::new(),
+        }
+    }
+
+    /// Every entry whose expectation has passed is owed its check-in from
+    /// now on. Not gated on [`qualifies`]: at the deadline it is false by
+    /// definition, and the check-in is exactly the wake that deadline owes.
+    fn fall_due(&mut self, facts: &Facts<'_>) {
+        if !self.bound(facts) {
+            return;
+        }
+        for entry in &mut self.attendances {
+            if entry.window.check_in == CheckIn::Armed && facts.now >= entry.deadline() {
+                entry.window.check_in = CheckIn::Due;
+            }
+        }
+    }
+
+    /// The lines of every check-in owed now, in one. A run whose process
+    /// is gone is left out: the run's end is the wake it owes.
+    fn owed_check_ins(&self, facts: &Facts<'_>) -> Vec<CheckInLine> {
+        self.attendances
+            .iter()
+            .filter(|e| e.window.check_in == CheckIn::Due)
+            .filter(|e| {
+                e.proof()
+                    .is_none_or(|p| facts.liveness.presence(p) != Presence::Gone)
+            })
+            .map(|e| check_in_line(e, facts.now))
+            .collect()
     }
 
     fn attend(&mut self, req: AttendRequest, facts: &Facts<'_>) -> AttendReply {
@@ -1768,23 +1964,39 @@ impl SessionState {
         now: Ms,
     ) -> AttendReply {
         let mut renewed = false;
-        for entry in self.attendances.iter_mut().filter(|e| same(e)) {
+        for i in 0..self.attendances.len() {
+            if !same(&self.attendances[i]) {
+                continue;
+            }
+            let window = self.open_window(now, expect);
+            let entry = &mut self.attendances[i];
             let desc = entry.proof().is_none().then(|| desc.clone());
-            entry.renew(now, expect, desc);
+            entry.renew(window, desc);
             renewed = true;
         }
         if renewed {
             return AttendReply::Renewed;
         }
+        let window = self.open_window(now, expect);
         self.attendances.push(Entry {
             work,
             desc,
             started: now,
-            since: now,
-            expect,
-            check_in: CheckIn::Armed,
+            window,
         });
         AttendReply::Accepted
+    }
+
+    /// A new window from `since`, its check-in armed, with an identity no
+    /// window of this binding has had.
+    fn open_window(&mut self, since: Ms, expect: Ms) -> Window {
+        self.next_window += 1;
+        Window {
+            id: self.next_window,
+            since,
+            expect,
+            check_in: CheckIn::Armed,
+        }
     }
 
     fn clear(&mut self, which: Clearing) -> AttendReply {
@@ -1799,8 +2011,10 @@ impl SessionState {
     /// Settle the in-flight presentation with its one result. A success
     /// commits its receipts and its repeat decision, which was made
     /// against the record nothing could replace while it was in flight,
-    /// and is the only evidence that its work was received. The agent
-    /// starts a turn on it.
+    /// and is the only evidence that its work was received. It spends the
+    /// check-ins it carried, but only for entries still in the expectation
+    /// it was presented for: one renewed meanwhile keeps its new one. The
+    /// agent starts a turn on it.
     fn settle(&mut self, id: PresentationId, how: Resolution, facts: &Facts<'_>) -> ResultOutcome {
         if !self.bound(facts) {
             return ResultOutcome::ProtocolViolation(id);
@@ -1818,6 +2032,11 @@ impl SessionState {
             return ResultOutcome::Resolved(Vec::new());
         }
         self.stopped = None;
+        for entry in &mut self.attendances {
+            if p.check_ins.iter().any(|r| still_owed(entry, r)) {
+                entry.window.check_in = CheckIn::Fired;
+            }
+        }
         let owed = owed_identities(facts.owed);
         for identity in p.identities.into_iter().filter(|i| owed.contains(i)) {
             if let Err(at) = self.received.binary_search(&identity) {
@@ -1833,86 +2052,6 @@ impl SessionState {
             effects.push(Effect::CommitRepeat(self.repeat.clone()));
         }
         ResultOutcome::Resolved(effects)
-    }
-
-    /// Every entry whose check-in falls due, in ONE check-in. Not gated on
-    /// [`qualifies`]: at the deadline it is false by definition, and the
-    /// check-in is exactly the wake that deadline owes. It is gated on
-    /// [`wake_gate`], as every wake clank makes is, and each due entry
-    /// resolves either way, so no due timer is scheduled again. An entry
-    /// not yet due is not touched.
-    fn check_in_due(&mut self, facts: &Facts<'_>) -> Vec<Effect> {
-        if !self.bound(facts) {
-            return Vec::new();
-        }
-        let gate = wake_gate(facts);
-        let mut lines = Vec::new();
-        for entry in &mut self.attendances {
-            if entry.check_in != CheckIn::Armed || facts.now < entry.deadline() {
-                continue;
-            }
-            if entry
-                .proof()
-                .is_some_and(|p| facts.liveness.presence(p) == Presence::Gone)
-            {
-                entry.check_in = CheckIn::ProcessGone;
-                continue;
-            }
-            if let Err(why) = gate {
-                entry.check_in = CheckIn::Withheld(why);
-                continue;
-            }
-            entry.check_in = CheckIn::Fired;
-            lines.push(check_in_line(entry, facts.now));
-        }
-        if lines.is_empty() {
-            Vec::new()
-        } else {
-            vec![Effect::CheckIn(lines)]
-        }
-    }
-
-    /// Only an entry still holding the check-in fired for it records its
-    /// loss: a renewal made while it was being typed has its own.
-    fn check_in_undeliverable(&mut self, fired: &[CheckInRef], why: String) {
-        for entry in &mut self.attendances {
-            if fired.iter().any(|r| is_fired(entry, r)) {
-                entry.check_in = CheckIn::Undeliverable(why.clone());
-            }
-        }
-    }
-
-    /// The last look before a fired check-in is typed: the session still
-    /// bound and every wake gate still open. What may be typed is only the
-    /// entries it was fired for that still hold it, as they stand now: one
-    /// renewed or cleared while it was prepared drops out, and the rest
-    /// are still owed theirs.
-    pub fn may_type_check_in(
-        &self,
-        fired: &[CheckInRef],
-        facts: &Facts<'_>,
-    ) -> Result<Vec<CheckInLine>, String> {
-        if !self.bound(facts) {
-            return Err("the session no longer holds the label".into());
-        }
-        wake_gate(facts).map_err(|why| {
-            match why {
-                Withheld::AutoOff => "auto turned off",
-                Withheld::Asking => "a question is pending",
-                Withheld::Blocked => "a block is pending",
-            }
-            .to_string()
-        })?;
-        let lines: Vec<CheckInLine> = self
-            .attendances
-            .iter()
-            .filter(|e| fired.iter().any(|r| is_fired(e, r)))
-            .map(|e| check_in_line(e, facts.now))
-            .collect();
-        if lines.is_empty() {
-            return Err("the attendance it was for was cleared or renewed".into());
-        }
-        Ok(lines)
     }
 
     /// Why recovery must leave this agent alone, if it must. Recovery has
@@ -2064,21 +2203,37 @@ fn excludes_agent(
 fn check_in_line(entry: &Entry, now: Ms) -> CheckInLine {
     CheckInLine {
         check_in: CheckInRef {
-            key: entry.key(),
-            since: entry.since,
+            window: entry.window.id,
         },
         desc: entry.desc.clone(),
         name: entry.name().to_string(),
         run: entry.proof().is_some(),
-        elapsed: now.saturating_sub(entry.since),
-        expect: entry.expect,
+        elapsed: now.saturating_sub(entry.window.since),
+        expect: entry.window.expect,
     }
 }
 
-/// Whether `entry` is still the one `fired` was fired for, with that
-/// check-in still in flight.
-fn is_fired(entry: &Entry, fired: &CheckInRef) -> bool {
-    entry.check_in == CheckIn::Fired && entry.since == fired.since && entry.key() == fired.key
+/// Whether `entry` still holds the window `presented` was presented for,
+/// and still owes it.
+fn still_owed(entry: &Entry, presented: &CheckInRef) -> bool {
+    entry.window.check_in == CheckIn::Due && entry.window.id == presented.window
+}
+
+/// What a presentation is made for, by which report carries it. A Stop
+/// as it is reported, and the very report a park holds for it, are the
+/// agent sitting at a turn's end with its hook passing on what it is told,
+/// and so is Grok's native Stop. A compaction is a new report, at that turn's end only while both it and
+/// the Stop read a record and it has not moved ([`Stopped::stands_in`]):
+/// missing or contradicting placement is no evidence. Only those carry a
+/// check-in; a session start's context may never reach the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carrier {
+    Stop,
+    Held,
+    Compacted,
+    /// Grok's native Stop, which answers at once and parks nothing.
+    NativeStop,
+    SessionStart,
 }
 
 /// The gates every presentation passes before attendance or work: an
