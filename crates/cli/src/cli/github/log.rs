@@ -83,19 +83,9 @@ pub(crate) const LOG_IDENTITY_CAP: usize = 1000;
 /// left to produce a key under this prefix.
 pub(crate) const MIGRATED_MESSAGE_PREFIX: &str = "migrated-message#";
 
-/// The key a `clank run`'s terminal record is logged under. Pinned for
-/// the same reason a migrated message is: the monitor writes the record
-/// before it retires the registration, so a crash between the two
-/// restores a registration that will replay the record, however many
-/// identities the log has taken since. One identity per run, kept for the
-/// life of the log, is the price of never waking an agent twice for one
-/// run.
-pub(crate) const RUN_ENDED_PREFIX: &str = "run-ended#";
-
 /// Whether this action key must survive the horizon.
 pub(crate) fn identity_is_pinned(action_key: Option<&str>) -> bool {
-    action_key
-        .is_some_and(|k| k.starts_with(MIGRATED_MESSAGE_PREFIX) || k.starts_with(RUN_ENDED_PREFIX))
+    action_key.is_some_and(|k| k.starts_with(MIGRATED_MESSAGE_PREFIX))
 }
 
 /// Total-line threshold that triggers compaction on ingest appends.
@@ -166,7 +156,28 @@ pub(crate) struct EventReply {
 #[derive(Debug, Clone)]
 enum Line {
     Known(Box<Record>),
-    Foreign { raw: String, seq: Option<u64> },
+    Foreign {
+        raw: String,
+        seq: Option<u64>,
+    },
+    /// An inbox row of a kind this build retired. It means nothing and is
+    /// owed nothing, but keeps its `seq` reserved until compaction drops it
+    /// with its acks, so a stale plain ack never covers a new event.
+    Retired {
+        seq: u64,
+    },
+}
+
+/// Item kinds older clanks logged that this one no longer has. `run_ended`
+/// repeated a `clank run`'s end, which the agent's harness already reports.
+const RETIRED_KINDS: &[&str] = &["run_ended"];
+
+fn retired_seq(value: &serde_json::Value) -> Option<u64> {
+    let kind = value.get("item")?.get("kind")?.as_str()?;
+    if value.get("t")?.as_str()? != "inbox" || !RETIRED_KINDS.contains(&kind) {
+        return None;
+    }
+    value.get("seq")?.as_u64()
 }
 
 /// One JSONL line. `t`-tagged so a reader can never confuse its record
@@ -989,7 +1000,9 @@ impl EventLog {
     /// is dropped as a normal crash artifact. Well-formed objects this
     /// version can't interpret are [`Line::Foreign`] — skipped for
     /// semantics, preserved for custody, and their envelope `seq`
-    /// still reserves the allocator namespace.
+    /// still reserves the allocator namespace. Rows this version knows
+    /// and retired are [`Line::Retired`]: not foreign, because no newer
+    /// clank will ever give them meaning.
     fn parse(text: &str) -> Result<Vec<Line>, ()> {
         let mut out = Vec::new();
         let lines: Vec<&str> = text.split('\n').collect();
@@ -1006,6 +1019,10 @@ impl EventLog {
                 _ if i == n - 1 && !ends_with_newline => continue,
                 _ => return Err(()),
             };
+            if let Some(seq) = retired_seq(&value) {
+                out.push(Line::Retired { seq });
+                continue;
+            }
             // Known iff the kind parses fully AND its version is one
             // this binary understands. A recognized `t` whose fields
             // no longer parse is FOREIGN, not corruption — additive
@@ -1071,6 +1088,10 @@ impl EventLog {
                     if let Some(seq) = seq {
                         max_seq = max_seq.max(seq);
                     }
+                    continue;
+                }
+                Line::Retired { seq } => {
+                    max_seq = max_seq.max(seq);
                     continue;
                 }
             };
@@ -1266,7 +1287,7 @@ impl EventLog {
                         ));
                     }
                 },
-                Line::Foreign { .. } => {
+                Line::Foreign { .. } | Line::Retired { .. } => {
                     return Err(std::io::Error::other(
                         "foreign timer WAL record; repair required",
                     ));
@@ -2055,6 +2076,7 @@ impl EventLog {
                     foreign.push((raw, seq));
                     continue;
                 }
+                Line::Retired { .. } => continue,
             };
             match r {
                 Record::Inbox {
@@ -2943,6 +2965,88 @@ pub(crate) mod tests {
             .append_inbox(Transport::Poll, Some("later"), None, None, &item(1))
             .unwrap();
         assert!(next > 4, "the foreign record keeps seq 4 reserved: {next}");
+    }
+
+    /// Frozen bytes: `run_ended` rows an older clank logged between two
+    /// messages, acked by identity, by bare sequence and not at all, the
+    /// last of them the log's highest sequence.
+    const FROZEN_RUN_ENDS: &str =
+        include_str!("../../../tests/fixtures/formats/events-run-ended.jsonl");
+
+    fn unhandled_seqs(log: &mut EventLog) -> Vec<u64> {
+        let loaded = log.load();
+        assert!(!loaded.log_quarantined, "a retired kind is not corruption");
+        assert_eq!(loaded.foreign, 0, "nor another clank's record");
+        loaded.unhandled.iter().map(|e| e.seq).collect()
+    }
+
+    /// A retired row is owed nothing and shown nowhere, but its sequence
+    /// stays reserved, so the next message is numbered past it, until
+    /// compaction drops it.
+    #[test]
+    fn a_retired_run_end_is_never_owed_and_keeps_its_seq_until_compacted() {
+        let dir = tempdir();
+        std::fs::write(dir.join("messages.jsonl"), FROZEN_RUN_ENDS).unwrap();
+        let mut log = EventLog::open(&dir, "messages").unwrap();
+        assert_eq!(unhandled_seqs(&mut log), [1, 4]);
+        let read = log.read_rows().unwrap().expect("readable");
+        assert_eq!(read.foreign, 0);
+        assert_eq!(read.rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [1, 4]);
+        let next = log
+            .append_inbox(
+                Transport::Message,
+                None,
+                Some("message#claude/new"),
+                None,
+                &item(1),
+            )
+            .unwrap();
+        assert_eq!(next, 7, "past every retired row");
+        assert_eq!(unhandled_seqs(&mut log), [1, 4, 7]);
+
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let text = std::fs::read_to_string(dir.join("messages.jsonl")).unwrap();
+        assert!(
+            !text.contains("run_ended") && !text.contains("run-ended#"),
+            "{text}"
+        );
+        let mut restarted = EventLog::open(&dir, "messages").unwrap();
+        assert_eq!(unhandled_seqs(&mut restarted), [1, 4, 7]);
+    }
+
+    /// A bare ack of a retired row's sequence covers no later event:
+    /// compaction drops the ack with the row, so a sequence reused after
+    /// it is a new event's own.
+    #[test]
+    fn a_stale_ack_of_a_retired_seq_never_covers_a_new_event() {
+        let dir = tempdir();
+        let mut lines = FROZEN_RUN_ENDS.lines();
+        let message = lines.next().unwrap();
+        let run_end = lines.next().unwrap();
+        std::fs::write(
+            dir.join("messages.jsonl"),
+            format!(
+                "{message}\n{run_end}\n{{\"t\":\"ack\",\"v\":1,\"seq\":2,\"at\":1794302000}}\n"
+            ),
+        )
+        .unwrap();
+        let mut log = EventLog::open(&dir, "messages").unwrap();
+        assert_eq!(unhandled_seqs(&mut log), [1]);
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let mut restarted = EventLog::open(&dir, "messages").unwrap();
+        assert_eq!(unhandled_seqs(&mut restarted), [1]);
+        let next = restarted
+            .append_inbox(
+                Transport::Message,
+                None,
+                Some("message#claude/new"),
+                None,
+                &item(1),
+            )
+            .unwrap();
+        assert_eq!(unhandled_seqs(&mut restarted), [1, next]);
     }
 
     #[test]

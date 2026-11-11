@@ -52,7 +52,9 @@ use clank_core::wait::WaitItem;
 // `clank attend` declares a name, and Grok's handoff carries no waiter
 // evidence because the monitor's own registration is it. A 19 monitor would
 // wait for a listing that never comes.
-pub(crate) const PROTO: u32 = 20;
+// 21 no longer carries `run_ended` items, which a 20 monitor can still send
+// and this build cannot decode.
+pub(crate) const PROTO: u32 = 21;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -3767,8 +3769,16 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             }
             Wake::RunEnded(author) => {
                 if owner {
-                    let g = crate::cli::turn_custody::Gathered::of(&repo, &author, None);
-                    turns.end_gone_runs(&author, &g);
+                    leaving.extend(retire_gone_runs(
+                        &repo,
+                        &mut clients,
+                        folded_state.as_ref(),
+                        &pending,
+                        &hosted,
+                        &mut turns,
+                        &mut recovery,
+                        &author,
+                    ));
                 }
             }
             Wake::UserCommands | Wake::UserCommandsDue => {}
@@ -5226,15 +5236,53 @@ async fn typed_send(
     }
 }
 
-/// Record the end of every bound agent's `clank run` whose process is
-/// gone. Each fold asks, so the first fold after a restart ends those
-/// that went while no monitor watched; a run that ends while one does
-/// is reported by its exit ([`RunExits`]).
+/// Retire every bound agent's `clank run` whose process is gone. Each
+/// fold asks, so the first fold after a restart ends those that went
+/// while no monitor watched; a run that ends while one does is reported
+/// by its exit ([`RunExits`]), and [`retire_gone_runs`] retires it.
 fn end_gone_runs(repo: &std::path::Path, turns: &mut crate::cli::turn_custody::Turns) {
     for author in roster_authors(repo) {
         let g = crate::cli::turn_custody::Gathered::of(repo, &author, None);
         turns.end_gone_runs(&author, &g);
     }
+}
+
+/// Retire `author`'s runs whose process is gone, and serve its parked wait
+/// again: what they held quiet is deliverable now, and no repo change marks
+/// that moment.
+#[allow(clippy::too_many_arguments)]
+fn retire_gone_runs(
+    repo: &std::path::Path,
+    clients: &mut Vec<Client>,
+    state: Option<&crate::repo_state::RepoState>,
+    pending: &[(AgentLabel, WaitItem)],
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    turns: &mut crate::cli::turn_custody::Turns,
+    recovery: &mut crate::cli::recovery::Driver,
+    author: &AgentLabel,
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
+    let g = gather(
+        repo,
+        state,
+        author,
+        hosted,
+        &mut Default::default(),
+        pending,
+    );
+    if !turns.end_gone_runs(author, &g) {
+        return Vec::new();
+    }
+    project(recovery, turns, author, &g);
+    serve_reports(
+        repo,
+        clients,
+        state,
+        Some(author),
+        pending,
+        &mut Default::default(),
+        hosted,
+        turns,
+    )
 }
 
 /// Step every agent with a check-in due by `now`, gathering each as it is
@@ -11053,7 +11101,7 @@ mod tests {
     /// declined rather than half-read.
     #[test]
     fn a_hook_that_reports_a_task_listing_is_declined() {
-        assert_eq!(PROTO, 20);
+        const { assert!(PROTO >= 20) };
         let repo = repo_with_roster();
         let hello = |proto: u32| {
             serde_json::to_string(&Hello {

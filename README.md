@@ -883,10 +883,11 @@ it again while the work runs; new work still wakes it.
   started without blocking the agent's turn (each tool's skill names its
   form). Clank registers the run with the monitor, then becomes the
   command (same pid, stdio and exit status). When that process is gone,
-  by exit, kill or a reused pid, the agent is woken once with a
-  `run_ended` item, which stays owed until acked; its output and exit
-  status are wherever it was launched. With no monitor to take the
-  registration, the command is refused and does not run.
+  by exit, kill or a reused pid, the run is no longer attended, and
+  clank writes and sends nothing about it: the agent's harness reports
+  the end of its own background task, and its output and exit status are
+  wherever it was launched. With no monitor to take the registration,
+  the command is refused and does not run.
 - `clank attend "<name>"` declares other work, such as a subagent. It
   takes effect at once. Where the harness's Stop lists its own background
   tasks (Claude's `background_tasks`, Grok's `backgroundTasks`), the name

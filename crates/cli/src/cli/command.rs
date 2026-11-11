@@ -388,8 +388,9 @@ pub enum Command {
     /// `clank run --desc "test run" -- cargo test`. Clank registers the
     /// run with the monitor, beside anything else you attend, then BECOMES
     /// the command — same pid, same stdio, same exit status. When that
-    /// process is gone you are woken once; its output and exit status are
-    /// wherever you launched it. `--expect 30m` says how long it should
+    /// process is gone the run is no longer attended; your harness tells
+    /// you it ended, and its output and exit status are wherever you
+    /// launched it. `--expect 30m` says how long it should
     /// take; past that you are checked in on once, and nothing is
     /// cancelled. With no monitor to take the registration the command is
     /// refused and does not run.

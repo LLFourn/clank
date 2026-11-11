@@ -328,25 +328,6 @@ pub enum WaitItem {
         answer: String,
         carries: AnswerRef,
     },
-    /// A `clank run` of this agent's ended: the process it registered is
-    /// gone. Logged once per run in the agent's message log, so it wakes
-    /// until acked. It carries no output and no exit status: those are
-    /// where the agent launched the run.
-    RunEnded {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        presentation: Option<EventPresentation>,
-        /// The run's identity, one per registered process.
-        run: String,
-        desc: String,
-        /// Unix ms the run registered.
-        started: u64,
-        /// Unix ms clank saw its process gone, which is not when it
-        /// exited.
-        ended_seen: u64,
-        /// What to pass `clank events ack` to finish this one.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selector: Option<String>,
-    },
 }
 
 impl WaitItem {
@@ -355,8 +336,7 @@ impl WaitItem {
             Self::Message { presentation, .. }
             | Self::GithubEvent { presentation, .. }
             | Self::TimerEvent { presentation, .. }
-            | Self::CommandEvent { presentation, .. }
-            | Self::RunEnded { presentation, .. } => presentation.as_ref(),
+            | Self::CommandEvent { presentation, .. } => presentation.as_ref(),
             _ => None,
         }
     }
@@ -365,8 +345,7 @@ impl WaitItem {
             Self::Message { presentation, .. }
             | Self::GithubEvent { presentation, .. }
             | Self::TimerEvent { presentation, .. }
-            | Self::CommandEvent { presentation, .. }
-            | Self::RunEnded { presentation, .. } => *presentation = Some(key),
+            | Self::CommandEvent { presentation, .. } => *presentation = Some(key),
             _ => {}
         }
     }
@@ -461,7 +440,6 @@ wake_kinds! {
     ForBlocked => "for_blocked",
     Blocked => "blocked",
     Unblocked => "unblocked",
-    RunEnded => "run_ended",
 }
 
 /// One event, whatever produced it
@@ -557,7 +535,6 @@ impl WaitItem {
             WaitItem::ForBlocked { .. } => WaitKind::ForBlocked,
             WaitItem::Blocked { .. } => WaitKind::Blocked,
             WaitItem::Unblocked { .. } => WaitKind::Unblocked,
-            WaitItem::RunEnded { .. } => WaitKind::RunEnded,
         }
     }
 
@@ -662,24 +639,6 @@ impl WaitItem {
                 selector: selector.as_deref(),
                 failure: false,
                 requires_reply: *requires_reply,
-                recurrence: None,
-                github: None,
-            }),
-            WaitItem::RunEnded {
-                desc,
-                ended_seen,
-                selector,
-                ..
-            } => Some(EventView {
-                source: "clank run",
-                kind: "run_ended",
-                content: Some(desc.as_str()),
-                body: None,
-                at: Some(*ended_seen / 1000),
-                instructions: None,
-                selector: selector.as_deref(),
-                failure: false,
-                requires_reply: false,
                 recurrence: None,
                 github: None,
             }),

@@ -1654,6 +1654,101 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
     );
 }
 
+/// A run whose process exits ends its attendance, and the parked wait is
+/// served again at once with the work that attendance held quiet: no repo
+/// change marks that moment, and nothing about the run itself is shown.
+#[tokio::test]
+async fn a_run_ending_presents_its_parked_agent_the_work_it_held_quiet() {
+    let (repo, author, state) = owed_repo().await;
+    let now = crate::cli::turn_custody::now_ms();
+    let g = gathered(repo.path(), &author, &state).at(now);
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let first = turns.answer(&author, 1, &stop_report(), true, &g).unwrap();
+    let presentation = first.presentation().expect("the owed work").clone();
+    assert!(
+        turns
+            .result(&author, 1, TurnResult::Delivered { presentation }, &g)
+            .unwrap()
+            .is_some()
+    );
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = child.id() as i32;
+    turns
+        .attend(
+            &author,
+            clank_core::turn_policy::AttendRequest::Run {
+                session: clank_core::SessionId::parse(SESSION).unwrap(),
+                proof: crate::cli::turn_custody::shell_proof(
+                    pid,
+                    &crate::proc_identity::token_for(pid).expect("the child's token"),
+                ),
+                desc: "slow build".into(),
+                expect: 600_000,
+            },
+            &g,
+        )
+        .unwrap();
+    let parked = turns
+        .answer(&author, 2, &hooked_stop(now + 1), true, &g.at(now + 1))
+        .unwrap();
+    assert_eq!(parked.verdict, WireVerdict::Park, "received work is quiet");
+
+    let (out, mut queue) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+    let mut clients = vec![Client {
+        who: Served::Agent {
+            author: author.clone(),
+        },
+        holder: None,
+        out,
+        writer: None,
+        farewell: None,
+        shown: Default::default(),
+        conn: 2,
+        admitted: Default::default(),
+        report: Some(Box::new(Reporting {
+            report: hooked_stop(now + 1),
+            stepped: true,
+            reader: None,
+        })),
+    }];
+    let mut recovery =
+        crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
+    let mut retire = |clients: &mut Vec<Client>, turns: &mut Turns| {
+        retire_gone_runs(
+            repo.path(),
+            clients,
+            Some(&state),
+            &[],
+            &Default::default(),
+            turns,
+            &mut recovery,
+            &author,
+        )
+    };
+
+    retire(&mut clients, &mut turns);
+    assert!(queue.try_recv().is_err(), "the run still holds it quiet");
+    assert_eq!(clients.len(), 1);
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    retire(&mut clients, &mut turns);
+    let note = queue.try_recv().expect("the parked wait was served");
+    assert!(
+        note.contains("deliver") && note.contains("scheduled work"),
+        "{note}"
+    );
+    for run in ["slow build", "run_ended", "run ended"] {
+        assert!(!note.contains(run), "{run}: {note}");
+    }
+    assert!(clients.is_empty(), "a delivery retires the parked report");
+    let g = gathered(repo.path(), &author, &state);
+    assert!(turns.projection(&author, &g).attended.is_empty());
+}
+
 /// `author`'s Claude record holds a prompt and an answer with no end
 /// marker: the record alone reads the turn as running.
 fn answered_without_an_end(repo: &std::path::Path, author: &AgentLabel) {

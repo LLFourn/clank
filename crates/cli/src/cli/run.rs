@@ -51,8 +51,8 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     .await;
     Err(match not_run {
         NotRun::Unattended(why) => anyhow::anyhow!(
-            "{why}; `{program}` was not run. Retry, or run it some other way knowing nothing \
-             will wake you when it ends"
+            "{why}; `{program}` was not run. Retry, or run it some other way knowing clank \
+             will not attend it"
         ),
         NotRun::Refused(why) => anyhow::anyhow!("{why}; `{program}` was not run"),
         NotRun::Exec(err) => anyhow::anyhow!("cannot run `{program}`: {err}"),
@@ -67,8 +67,8 @@ type Submitted<'a> = std::pin::Pin<
 /// Why the command is not running.
 #[derive(Debug)]
 enum NotRun {
-    /// No monitor took the registration, so nothing could record the run's
-    /// end, and the command was never run.
+    /// No monitor took the registration, so nothing could attend the run,
+    /// and the command was never run.
     Unattended(crate::cli::attend::NotDone),
     /// The monitor refused the registration, so the command was never run.
     Refused(crate::cli::attend::NotDone),
@@ -79,7 +79,7 @@ enum NotRun {
 /// command was tried, and then nothing is running: the registration is
 /// taken back by its own process proof, so nothing else the agent attends
 /// is touched. A command runs only once a monitor holds its registration:
-/// the run's end is a wake only a monitor can deliver.
+/// only a monitor can attend it.
 async fn launch<'a>(
     register: Control,
     clear: Control,
@@ -326,7 +326,7 @@ mod tests {
     }
 
     /// No monitor took the registration: the command is refused and never
-    /// runs, since nothing could deliver its end. A monitor's refusal stops
+    /// runs, since nothing could attend it. A monitor's refusal stops
     /// it the same way.
     #[tokio::test]
     async fn without_a_monitor_the_command_is_refused_and_never_runs() {

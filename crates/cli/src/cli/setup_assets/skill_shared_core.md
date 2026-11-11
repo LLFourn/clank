@@ -22,8 +22,8 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
   tests, servers, subagents) runs as `clank run --desc "two words" --
   <cmd>`, {{BACKGROUND_RUN}}, or is declared with `clank attend
   "<name>"`. No exceptions, for any tool.
-- **Never wait for it in a turn**: start it, end the turn. A run wakes
-  you when its process ends; its output and exit status are where you
+- **Never wait for it in a turn**: start it, end the turn. Your harness
+  tells you when a run ends; its output and exit status are where you
   launched it. {{DECLARED_ENDS}} It checks in once at
   `--expect` (5m); messages don't end it. Never poll it or start a wait.
 - **clank detects no background work**: what you don't mark isn't

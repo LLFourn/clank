@@ -946,35 +946,21 @@ impl Turns {
         }
     }
 
-    /// Write the one terminal record of every run of `author`'s whose
-    /// registered process is gone, then forget it. The record is written
-    /// first and is idempotent per run, so a crash or restart between the
-    /// two writes it again rather than losing it, and never twice.
-    pub(crate) fn end_gone_runs(&mut self, author: &AgentLabel, g: &Gathered) {
-        let repo = self.repo.clone();
+    /// Retire every run of `author`'s whose registered process is gone.
+    /// Whether any was: what they held quiet is deliverable now.
+    pub(crate) fn end_gone_runs(&mut self, author: &AgentLabel, g: &Gathered) -> bool {
         let Some(custody) = self.custody(author, g) else {
-            return;
+            return false;
         };
-        let mut ended = false;
-        for run in custody.state.ended_runs(&Process, g.now) {
-            match crate::inbox::record_run_end(&repo, author, &run) {
-                Ok(()) => {
-                    custody.state.end_run(&run.proof);
-                    ended = true;
-                }
-                Err(e) => eprintln!(
-                    "monitor: could not record that `{author}`'s run \"{}\" ended: {e:#}",
-                    run.desc
-                ),
-            }
-        }
+        let ended = custody.state.end_gone_runs(&Process);
         if ended {
             self.persist(author, None);
         }
+        ended
     }
 
     /// Every run registered with an agent in custody, by its proof: the
-    /// processes whose exits [`Self::end_gone_runs`] records.
+    /// processes whose exits [`Self::end_gone_runs`] retires.
     pub(crate) fn runs(&self) -> Vec<(AgentLabel, clank_core::turn_policy::ShellProof)> {
         self.agents
             .iter()

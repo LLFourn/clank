@@ -1,0 +1,8 @@
+{"t":"inbox","v":1,"seq":1,"at":1794300000,"event_at":1794300000,"transport":"message","action_key":"message#claude/24b0857ddad36a442fff4ff8","item":{"kind":"message","handle":"24b0857ddad36a442fff4ff8","subject":"before the runs","body":"before the runs"}}
+{"t":"inbox","v":1,"seq":2,"at":1794300600,"event_at":1794300600,"transport":"message","action_key":"run-ended#claude/53efd34463baad0567d7e328","item":{"kind":"run_ended","run":"53efd34463baad0567d7e328","desc":"binsec core","started":1794300000000,"ended_seen":1794300600000}}
+{"t":"inbox","v":1,"seq":3,"at":1794301900,"event_at":1794301900,"transport":"message","action_key":"run-ended#claude/15ecc31e3d98700716c7ea4f","item":{"kind":"run_ended","run":"15ecc31e3d98700716c7ea4f","desc":"test run","started":1794301000000,"ended_seen":1794301900000}}
+{"t":"ack","v":1,"seq":2,"at":1794302000,"ident":"k:run-ended#claude/53efd34463baad0567d7e328"}
+{"t":"inbox","v":1,"seq":4,"at":1794303000,"event_at":1794303000,"transport":"message","action_key":"message#claude/e4cf31a918253b5123e28b82","item":{"kind":"message","handle":"e4cf31a918253b5123e28b82","subject":"after the runs","body":"after the runs"}}
+{"t":"inbox","v":1,"seq":5,"at":1794304000,"event_at":1794304000,"transport":"message","action_key":"run-ended#claude/9a0d3c1e5b7f2468ace13579","item":{"kind":"run_ended","run":"9a0d3c1e5b7f2468ace13579","desc":"server","started":1794303500000,"ended_seen":1794304000000}}
+{"t":"ack","v":1,"seq":5,"at":1794304100}
+{"t":"inbox","v":1,"seq":6,"at":1794305000,"event_at":1794305000,"transport":"message","action_key":"run-ended#claude/0f1e2d3c4b5a69788796a5b4","item":{"kind":"run_ended","run":"0f1e2d3c4b5a69788796a5b4","desc":"build","started":1794304500000,"ended_seen":1794305000000}}

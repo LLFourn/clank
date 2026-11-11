@@ -109,8 +109,6 @@ pub(crate) struct WaitItem {
     handle: Option<String>,
     from: Option<String>,
     subject: Option<String>,
-    /// An ended `clank run`'s `--desc`.
-    desc: Option<String>,
 }
 
 impl WaitItem {
@@ -274,10 +272,6 @@ pub(crate) fn classify(
         ),
         K::GithubEvent => (
             Until("fires until the event is acked — `clank events ack`"),
-            Duty::Event,
-        ),
-        K::RunEnded => (
-            Until("fires until the run's end is acked — `clank events ack`"),
             Duty::Event,
         ),
         K::AdHocReview => (
@@ -571,18 +565,6 @@ pub(crate) fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, rol
                     .unwrap_or_default();
                 out.push_str(&format!("  - message: {handle} {from}: {subject}{ack}\n"));
             }
-            K::RunEnded => {
-                let desc = item.desc.as_deref().unwrap_or("?");
-                let ack = item
-                    .selector
-                    .as_deref()
-                    .map(|s| format!(" — ack `clank events ack {s}`"))
-                    .unwrap_or_default();
-                out.push_str(&format!(
-                    "  - run ended: `clank run` \"{desc}\": its process is gone; read its output \
-                     and exit status where you launched it{ack}\n"
-                ));
-            }
             K::PromoteFromQueue => {
                 let name = item.name.as_deref().unwrap_or("?");
                 let priority = item.priority.unwrap_or(0);
@@ -732,7 +714,6 @@ pub(crate) fn selected_presentations<'a>(
                 item.wake_kind(),
                 Some(
                     clank_core::wait::WaitKind::Message
-                        | clank_core::wait::WaitKind::RunEnded
                         | clank_core::wait::WaitKind::GithubEvent
                         | clank_core::wait::WaitKind::CommandEvent
                         | clank_core::wait::WaitKind::TimerEvent
@@ -894,7 +875,7 @@ fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> String {
     format!(
         "clank check-in: {}. Nothing has been cancelled and nothing has failed. This is a \
          check-in, not a task: look at its output so far, renew what needs longer, and end your \
-         turn. A `clank run` wakes you when its process ends. A declaration stands until your \
+         turn. Your harness tells you when a `clank run` ends. A declaration stands until your \
          harness stops listing that work and anything it left running, or you `clank attend \
          --clear` it; clank itself never wakes you when declared work finishes.",
         each.join("; ")
@@ -946,9 +927,9 @@ mod tests {
 
     /// One check-in names every entry due with it, each with a renewal
     /// that is one shell-safe line however its name reads: user text must
-    /// arrive as the same letters, not run. Only a run is promised a wake
-    /// at its end; a declaration is told what ends it, and nothing claims
-    /// it finished.
+    /// arrive as the same letters, not run. Only a run's end is said to be
+    /// reported, by the harness; a declaration is told what ends it, and
+    /// nothing claims it finished.
     #[test]
     fn one_check_in_names_each_due_entry_with_a_shell_safe_renewal() {
         let text = check_in_text(&[

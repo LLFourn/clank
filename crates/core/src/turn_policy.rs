@@ -443,8 +443,8 @@ pub enum Qualifies {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unqualified {
-    /// A run whose registered process is gone: it has ended, and its
-    /// terminal record is being written.
+    /// A run whose registered process is gone: it has ended, and the
+    /// monitor has not yet retired it.
     ProcessGone,
     /// A run whose process cannot be seen now: still registered, but
     /// nothing proves the work runs.
@@ -464,17 +464,6 @@ pub fn qualifies(entry: &Entry, facts: &Facts<'_>) -> Qualifies {
         return Qualifies::No(Unqualified::PastDeadline);
     }
     Qualifies::Yes
-}
-
-/// A run whose registered process is gone: everything its one terminal
-/// record says. clank captured no output and claims no exit status.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunEnd {
-    pub proof: ShellProof,
-    pub desc: String,
-    pub started: Ms,
-    /// When clank saw the process gone, which is not when it exited.
-    pub ended_seen: Ms,
 }
 
 /// How many times in a row the same items have been delivered.
@@ -751,8 +740,8 @@ pub struct CheckInLine {
     pub desc: String,
     /// What `clank attend` renews it by.
     pub name: String,
-    /// A `clank run`, whose end wakes the agent; otherwise a declaration,
-    /// whose end nothing reports.
+    /// A `clank run`, whose end the agent's harness reports; otherwise a
+    /// declaration, whose end nothing reports.
     pub run: bool,
     pub elapsed: Ms,
     pub expect: Ms,
@@ -837,7 +826,7 @@ pub enum Output {
 
 /// What survives a monitor restart: every entry, a run's registration
 /// included, so a run that ended while no monitor watched is still
-/// recorded once.
+/// retired.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "legacy::Stored")]
 pub struct Persisted {
@@ -1073,7 +1062,7 @@ mod legacy {
         }
     }
 
-    /// A run keeps its registration, so its end is still recorded. A named
+    /// A run keeps its registration, so its end is still seen. A named
     /// attendance keeps the task a listing resolved it to, so the next
     /// listing still ends it.
     fn entry(
@@ -1325,30 +1314,13 @@ impl SessionState {
             .collect()
     }
 
-    /// Every run whose registered process is positively gone, as its
-    /// terminal record reads; one whose process cannot be seen is kept. Nothing is removed: the monitor writes each record durably
-    /// first and only then calls [`Self::end_run`], so a crash between the
-    /// two writes the same record again rather than none.
-    pub fn ended_runs(&self, liveness: &dyn Liveness, now: Ms) -> Vec<RunEnd> {
-        self.attendances
-            .iter()
-            .filter_map(|e| {
-                let proof = e
-                    .proof()
-                    .filter(|p| liveness.presence(p) == Presence::Gone)?;
-                Some(RunEnd {
-                    proof: proof.clone(),
-                    desc: e.desc.clone(),
-                    started: e.started,
-                    ended_seen: now,
-                })
-            })
-            .collect()
-    }
-
-    /// The run `proof` registered is over and its record is written.
-    pub fn end_run(&mut self, proof: &ShellProof) {
-        self.retain_entries(|e| e.proof() != Some(proof));
+    /// Retire every run whose registered process is positively gone; one
+    /// whose process cannot be seen is kept. Whether any was retired.
+    pub fn end_gone_runs(&mut self, liveness: &dyn Liveness) -> bool {
+        self.retain_entries(|e| {
+            e.proof()
+                .is_none_or(|p| liveness.presence(p) != Presence::Gone)
+        }) > 0
     }
 
     pub fn step(&mut self, event: Event, facts: &Facts<'_>) -> Output {
@@ -1905,7 +1877,7 @@ impl SessionState {
     }
 
     /// The lines of every check-in owed now, in one. A run whose process
-    /// is gone is left out: the run's end is the wake it owes.
+    /// is gone is left out: it has ended, and the harness reports that.
     fn owed_check_ins(&self, facts: &Facts<'_>) -> Vec<CheckInLine> {
         self.attendances
             .iter()

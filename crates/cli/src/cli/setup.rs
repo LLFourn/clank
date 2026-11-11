@@ -2903,7 +2903,7 @@ mod tests {
                     "clank attend\n  \"<name>\"",
                     "No exceptions, for any tool",
                     "Never wait for it in a turn",
-                    "A run wakes\n  you when its process ends",
+                    "Your harness\n  tells you when a run ends",
                     "messages don't end it",
                     "Never poll it or start a wait",
                     declared_ends(tool),
