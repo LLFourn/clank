@@ -109,11 +109,6 @@ fn with_prompt(
     })
 }
 
-/// How often a follower re-reads the holder's log and retries the
-/// lease, when the watch has no `poll_interval` to borrow. These are
-/// local file reads, never GitHub's.
-const TAIL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// The lease-gated source runtime (wal-single-ingest-writer): only the
 /// INGEST LEASE holder reads github; a non-holder TAILS the WAL,
 /// presenting logged unhandled entries, and takes over (polling only
@@ -158,12 +153,19 @@ async fn source_supervisor<F, R, C>(
     // damaged logs can hold distinct events at one seq and each must
     // present (codex 20cdd09). Re-arms re-present (at-least-once).
     let mut presented: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
-    let configured = src
-        .poll_interval
-        .as_deref()
-        .and_then(|s| crate::cli::wait::parse_duration_str(s).ok().flatten());
+    // A follower is woken by the holder's log changing and by the lease
+    // coming free, never by a clock: GitHub is polled only by the holder.
+    let mut changes: Option<crate::cli::github::log::LogChanges> = None;
+    let mut freed: Option<
+        tokio::sync::oneshot::Receiver<std::io::Result<crate::cli::github::log::IngestLease>>,
+    > = None;
+    let mut handed: Option<std::io::Result<crate::cli::github::log::IngestLease>> = None;
     loop {
-        let lease = match crate::cli::github::log::IngestLease::try_acquire(&dir, &key) {
+        let taken = match handed.take() {
+            Some(waited) => waited.map(Some),
+            None => crate::cli::github::log::IngestLease::try_acquire(&dir, &key),
+        };
+        let lease = match taken {
             Ok(l) => l,
             Err(e) => {
                 // A REAL lease failure (unopenable dir, exotic fs) is
@@ -233,6 +235,23 @@ async fn source_supervisor<F, R, C>(
             );
             warned_tail = true;
         }
+        // Watching before reading: a row the holder logs between the
+        // two is then either read or heard.
+        if changes.is_none() {
+            match crate::cli::github::log::LogChanges::watch(&dir) {
+                Ok(watch) => changes = Some(watch),
+                Err(e) => {
+                    tx.report(
+                        &key,
+                        crate::cli::event_source::Lifecycle::Stopped {
+                            why: format!("cannot watch the log it follows: {e}"),
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+        crate::cli::github::log::follow_gap(&dir);
         // Tail one cycle: present the leased writer's unhandled
         // entries this process hasn't presented yet. read_rows is the
         // read-only inspector — a tailer never quarantines.
@@ -251,7 +270,26 @@ async fn source_supervisor<F, R, C>(
                 }
             }
         }
-        tokio::time::sleep(configured.unwrap_or(TAIL_INTERVAL)).await;
+        let lease_free = freed
+            .get_or_insert_with(|| crate::cli::github::log::IngestLease::when_free(&dir, &key));
+        tokio::select! {
+            changed = changes.as_mut().expect("watched").changed() => {
+                if let Err(why) = changed {
+                    eprintln!("wait: github {} — cannot follow its log any more: {why}", src.repo);
+                    tx.report(
+                        &key,
+                        crate::cli::event_source::Lifecycle::Stopped {
+                            why: format!("its log's watch failed: {why}"),
+                        },
+                    );
+                    return;
+                }
+            }
+            waited = lease_free => {
+                freed = None;
+                handed = Some(waited.unwrap_or_else(|e| Err(std::io::Error::other(e))));
+            }
+        }
     }
 }
 
@@ -407,7 +445,22 @@ mod tests {
         // Holder dies → the tailer's next cycle takes the lease and
         // becomes the ingester: github is polled.
         drop(lease);
-        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        // The lease is handed over by a thread of its own, on the real
+        // clock, while this test's clock is paused and leaps ahead
+        // whenever the runtime is idle: a virtual wait alone can be over
+        // before that thread has run. A blocking pause holds the virtual
+        // clock still for a real moment each step.
+        for _ in 0..3000 {
+            if fetched.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
         assert!(
             fetched.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "takeover must begin polling"
@@ -498,6 +551,126 @@ mod tests {
             numbers,
             vec![Some(7)],
             "the tail presents through the scope, not around it",
+        );
+    }
+
+    /// A row the holder logs while the follower is setting up — after
+    /// its watch could be armed, before its first read — is presented,
+    /// with no later write and no lease change to rescue it.
+    #[tokio::test]
+    async fn a_row_logged_while_the_follower_sets_up_is_presented() {
+        let dir = wal_tempdir();
+        let s = src(&[GithubEventKind::PrComment], true);
+        let key = source_key(&s);
+        let _lease = crate::cli::github::log::IngestLease::try_acquire(&dir, &key).unwrap();
+        {
+            let (dir, key) = (dir.clone(), key.clone());
+            crate::cli::github::log::FOLLOW_GAPS.lock().unwrap().push((
+                dir.clone(),
+                Box::new(move || {
+                    crate::cli::github::log::EventLog::open(&dir, &key)
+                        .unwrap()
+                        .append_inbox(
+                            crate::cli::github::log::Transport::Poll,
+                            Some("feed7"),
+                            Some("pr_issue_comment#7"),
+                            None,
+                            &gh_item("pr_comment", Some(7)),
+                        )
+                        .unwrap();
+                    // Long enough that a watch armed only after this
+                    // could not be credited with the row.
+                    std::thread::sleep(Duration::from_secs(1));
+                }),
+            ));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
+        let (d, s2) = (dir.clone(), s.clone());
+        let handle = tokio::spawn(async move {
+            source_supervisor(
+                &s2,
+                FeedSide {
+                    fetcher: &ScriptFetcher::new(vec![]),
+                    login: &FixedLogin("me"),
+                },
+                &NoCi,
+                &tx,
+                Some(d),
+                source_key(&s2),
+            )
+            .await;
+        });
+        let heard = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            matches!(
+                heard,
+                Ok(Some((
+                    WaitItem::GithubEvent {
+                        number: Some(7),
+                        ..
+                    },
+                    _
+                )))
+            ),
+            "{heard:?}"
+        );
+    }
+
+    /// A follower hears the holder's log change: a row logged after it
+    /// started is presented with no clock to wait out.
+    #[tokio::test]
+    async fn the_follower_is_woken_by_the_holders_log() {
+        let dir = wal_tempdir();
+        let s = src(&[GithubEventKind::PrComment], true);
+        let key = source_key(&s);
+        let _lease = crate::cli::github::log::IngestLease::try_acquire(&dir, &key).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
+        let (d, s2) = (dir.clone(), s.clone());
+        let handle = tokio::spawn(async move {
+            source_supervisor(
+                &s2,
+                FeedSide {
+                    fetcher: &ScriptFetcher::new(vec![]),
+                    login: &FixedLogin("me"),
+                },
+                &NoCi,
+                &tx,
+                Some(d),
+                source_key(&s2),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(rx.try_recv().is_err(), "nothing is logged yet");
+        crate::cli::github::log::EventLog::open(&dir, &key)
+            .unwrap()
+            .append_inbox(
+                crate::cli::github::log::Transport::Poll,
+                Some("feed7"),
+                Some("pr_issue_comment#7"),
+                None,
+                &gh_item("pr_comment", Some(7)),
+            )
+            .unwrap();
+        let heard = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            matches!(
+                heard,
+                Ok(Some((
+                    WaitItem::GithubEvent {
+                        number: Some(7),
+                        ..
+                    },
+                    _
+                )))
+            ),
+            "{heard:?}"
         );
     }
 

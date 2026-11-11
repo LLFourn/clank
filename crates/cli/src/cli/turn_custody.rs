@@ -973,6 +973,20 @@ impl Turns {
         }
     }
 
+    /// Every run registered with an agent in custody, by its proof: the
+    /// processes whose exits [`Self::end_gone_runs`] records.
+    pub(crate) fn runs(&self) -> Vec<(AgentLabel, clank_core::turn_policy::ShellProof)> {
+        self.agents
+            .iter()
+            .flat_map(|(author, c)| {
+                c.state
+                    .attendances
+                    .iter()
+                    .filter_map(|e| e.proof().map(|p| (author.clone(), p.clone())))
+            })
+            .collect()
+    }
+
     /// The soonest moment a check-in is due or a presentation in flight
     /// runs out of time, across every agent.
     pub(crate) fn next_deadline(&self) -> Option<Ms> {

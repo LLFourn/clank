@@ -3607,6 +3607,13 @@ pub(crate) struct RecordWatch {
 
 type Backend = Box<dyn notify::Watcher + Send>;
 
+/// The directories watched for records written in place: every `*.jsonl`
+/// in one has its writes followed. A harness keeps few transcripts beside
+/// the one followed, while a recursive root, under which a rollout is
+/// still to be found, holds every session ever recorded and is followed
+/// for its entries alone.
+type Followed = std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>;
+
 /// A path as the backend reports it: canonical where it still exists, and
 /// through its directory where it does not.
 fn canonical(path: &Path) -> PathBuf {
@@ -3621,8 +3628,20 @@ fn canonical(path: &Path) -> PathBuf {
 
 impl RecordWatch {
     pub(crate) fn spawn(changed: tokio::sync::mpsc::UnboundedSender<RecordEvent>) -> Self {
-        Self::spawn_with(changed, |handler| {
-            Ok(Box::new(notify::recommended_watcher(handler)?) as Backend)
+        Self::spawn_with(changed, |handler, followed| {
+            let watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
+                move |path: &Path| {
+                    path.extension().is_some_and(|ext| ext == "jsonl")
+                        && path.parent().is_some_and(|dir| {
+                            followed
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .contains(dir)
+                        })
+                },
+                handler,
+            )?;
+            Ok(Box::new(watcher) as Backend)
         })
     }
 
@@ -3630,6 +3649,7 @@ impl RecordWatch {
         changed: tokio::sync::mpsc::UnboundedSender<RecordEvent>,
         backend: impl FnOnce(
             Box<dyn FnMut(notify::Result<notify::Event>) + Send>,
+            Followed,
         ) -> notify::Result<Backend>
         + Send
         + 'static,
@@ -3645,27 +3665,40 @@ impl RecordWatch {
             let (seen, to) = (watches.clone(), changed.clone());
             let handler = Box::new(move |res: notify::Result<notify::Event>| {
                 let mut watches = seen.lock().unwrap_or_else(|p| p.into_inner());
-                let event = match res {
-                    Ok(event) => event,
-                    Err(e) => {
-                        // Blamed on the watches it names; one naming none
-                        // may be any of them. Each is let go here, so the
-                        // driver's next install is a real one.
-                        let failed: Vec<_> = e.paths.iter().map(|p| canonical(p)).collect();
-                        watches.retain(|watch, dir| {
-                            let lost = failed.is_empty() || failed.contains(dir);
-                            if lost {
-                                let _ = to.send(RecordEvent::Failed {
-                                    watch: watch.clone(),
-                                });
-                            }
-                            !lost
-                        });
+                if let Err(e) = &res {
+                    // Blamed on the watches it names; one naming none may
+                    // be any of them. Each is let go here, so the driver's
+                    // next install is a real one.
+                    let failed: Vec<_> = e.paths.iter().map(|p| canonical(p)).collect();
+                    watches.retain(|watch, dir| {
+                        let lost = failed.is_empty() || failed.contains(dir);
+                        if lost {
+                            let _ = to.send(RecordEvent::Failed {
+                                watch: watch.clone(),
+                            });
+                        }
+                        !lost
+                    });
+                    return;
+                }
+                let paths = match crate::fs_notice::notice(&res) {
+                    crate::fs_notice::Notice::Changed(paths) => paths,
+                    // A pass reading a record is no change to it.
+                    crate::fs_notice::Notice::Read | crate::fs_notice::Notice::Failed(_) => return,
+                    // What changed is not known, so every record watched
+                    // is read again.
+                    crate::fs_notice::Notice::Rescan => {
+                        for watch in watches.keys() {
+                            let _ = to.send(RecordEvent::Changed {
+                                watch: watch.clone(),
+                                path: watch.dir.clone(),
+                            });
+                        }
                         return;
                     }
                 };
-                for path in event.paths {
-                    let at = canonical(&path);
+                for path in paths {
+                    let at = canonical(path);
                     for (watch, dir) in watches.iter() {
                         let under = if watch.recursive {
                             at.starts_with(dir)
@@ -3682,7 +3715,8 @@ impl RecordWatch {
                     }
                 }
             });
-            let mut watcher = match backend(handler) {
+            let followed = Followed::default();
+            let mut watcher = match backend(handler, followed.clone()) {
                 Ok(w) => Some(w),
                 Err(e) => {
                     eprintln!("monitor: recovery cannot watch records on this machine: {e}");
@@ -3700,6 +3734,10 @@ impl RecordWatch {
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .remove(&watch);
+                        followed
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&watch.dir);
                         if let Some(w) = watcher.as_mut() {
                             let _ = w.unwatch(&watch.dir);
                         }
@@ -3714,6 +3752,12 @@ impl RecordWatch {
                 let set = match watcher.as_mut() {
                     _ if installed => Ok(()),
                     Some(w) => {
+                        if !watch.recursive {
+                            followed
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(watch.dir.clone());
+                        }
                         // A watch the backend gave up on may still be
                         // registered with it.
                         let _ = w.unwatch(&watch.dir);
@@ -5334,28 +5378,18 @@ pub(crate) mod tests {
         store(dir.path(), None).unwrap();
     }
 
-    fn poll_backend(
-        handler: Box<dyn FnMut(notify::Result<notify::Event>) + Send>,
-    ) -> notify::Result<Backend> {
-        Ok(Box::new(notify::PollWatcher::new(
-            handler,
-            // Its mtimes are whole seconds; contents see every append.
-            notify::Config::default()
-                .with_poll_interval(std::time::Duration::from_millis(20))
-                .with_compare_contents(true),
-        )?) as Backend)
-    }
-
     /// A watch reports itself once set up, so what changed while it was
     /// being set up is read, then each change under it, by the path that
     /// changed.
     #[tokio::test]
     async fn a_watch_reports_what_changes_under_it() {
         let dir = tempfile::tempdir().unwrap();
-        let record = dir.path().join("rollout.jsonl");
+        let record = dunce::canonicalize(dir.path())
+            .unwrap()
+            .join("rollout.jsonl");
         append(&record, &["{}"]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let watch = RecordWatch::spawn_with(tx, poll_backend);
+        let watch = RecordWatch::spawn(tx);
         let key = watch_of(&record);
         watch.watch(key.clone());
         let within = std::time::Duration::from_secs(10);
@@ -5430,7 +5464,7 @@ pub(crate) mod tests {
     impl Fake {
         fn spawn(&self, tx: tokio::sync::mpsc::UnboundedSender<RecordEvent>) -> RecordWatch {
             let fake = self.clone();
-            RecordWatch::spawn_with(tx, move |handler| {
+            RecordWatch::spawn_with(tx, move |handler, _| {
                 *fake.handler.lock().unwrap() = Some(handler);
                 Ok(Box::new(FakeBackend(fake)) as Backend)
             })
@@ -5444,6 +5478,58 @@ pub(crate) mod tests {
         fn installs(&self) -> usize {
             self.installs.lock().unwrap().len()
         }
+
+        fn deliver(&self, res: notify::Result<notify::Event>) {
+            (self.handler.lock().unwrap().as_mut().unwrap())(res);
+        }
+    }
+
+    /// A pass reading a record is not a change to it, or each read would
+    /// schedule the next. A rescan names nothing, so every installed watch
+    /// is read again: a change it stands for is not lost.
+    #[tokio::test]
+    async fn reads_are_not_changes_and_a_rescan_rereads_every_watch() {
+        let (one, two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let fake = Fake::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = fake.spawn(tx);
+        let keys: Vec<WatchKey> = [&one, &two]
+            .iter()
+            .map(|d| WatchKey {
+                dir: d.path().to_path_buf(),
+                recursive: false,
+            })
+            .collect();
+        for key in &keys {
+            watch.watch(key.clone());
+            assert_eq!(
+                next_event(&mut rx).await,
+                RecordEvent::Changed {
+                    watch: key.clone(),
+                    path: key.dir.clone()
+                },
+                "set up"
+            );
+        }
+        let record = dunce::canonicalize(one.path())
+            .unwrap()
+            .join("rollout.jsonl");
+        fake.deliver(crate::fs_notice::tests::opened(&record));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(rx.try_recv().is_err(), "a read is not a change");
+
+        fake.deliver(Ok(notify::Event::new(notify::EventKind::Any)));
+        let mut reread = vec![next_event(&mut rx).await, next_event(&mut rx).await];
+        reread.sort_by_key(|e| format!("{e:?}"));
+        let mut want: Vec<_> = keys
+            .iter()
+            .map(|key| RecordEvent::Changed {
+                watch: key.clone(),
+                path: key.dir.clone(),
+            })
+            .collect();
+        want.sort_by_key(|e| format!("{e:?}"));
+        assert_eq!(reread, want);
     }
 
     fn forward(watch: &RecordWatch, acts: &[Act]) {

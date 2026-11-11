@@ -65,6 +65,8 @@ pub struct Repo(gix::Repository);
 #[cfg(test)]
 thread_local! {
     pub static OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts [`Repo::working_tree_dirty`] walks, for the walk-once tests.
+    pub static DIRTY_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Open `repo` for reuse across reads. See [`Repo`]. Sets a warm object
@@ -104,6 +106,8 @@ impl Repo {
     /// that refreshed `.git/index` would fire the very watcher that drove
     /// the probe.
     pub fn working_tree_dirty(&self) -> Result<Option<DirtyStats>, GitIoError> {
+        #[cfg(test)]
+        DIRTY_WALKS.with(|c| c.set(c.get() + 1));
         let git = &self.0;
 
         let workdir = git
@@ -920,6 +924,224 @@ impl PathIgnore {
             .map(|platform| platform.is_excluded())
             .unwrap_or(false)
     }
+
+    /// True if the index as it is on disk now holds `rela`, or anything
+    /// under it. An index that cannot be read answers `true`, so the
+    /// caller treats the path as a Git input rather than dropping it.
+    pub fn is_tracked(&self, rela: &Path) -> bool {
+        let Ok(index) = self.repo.index_or_empty() else {
+            return true;
+        };
+        let path = gix::path::to_unix_separators_on_windows(gix::path::into_bstr(rela));
+        if index.entry_by_path(path.as_ref()).is_some() {
+            return true;
+        }
+        let mut dir = path.into_owned();
+        dir.push(b'/');
+        index.prefixed_entries(dir.as_ref()).is_some()
+    }
+}
+
+/// Files outside the worktree and the git directories that decide what
+/// a status walk reports: every configuration file Git would consult for
+/// this repo, and the global excludes file, whether or not each exists
+/// yet or holds anything.
+pub fn status_inputs_elsewhere(repo: &Path) -> Result<Vec<std::path::PathBuf>, GitIoError> {
+    let r = gix::open(repo).map_err(|e| gix_err(format!("open `{}`", repo.display()), e))?;
+    let config = r.config_snapshot();
+    let mut paths = config_sources(&r)?;
+    match config.trusted_path("core.excludesFile") {
+        Some(Ok(path)) => paths.push(path.into_owned()),
+        Some(Err(_)) => {}
+        None => {
+            if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|d| !d.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".config")))
+            {
+                paths.push(dir.join("git").join("ignore"));
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Every configuration file Git would consult: the standard levels, and
+/// each file an `include.path` or `includeIf.*.path` names in one of
+/// them, followed through the files they name in turn.
+///
+/// Walked from the files' own text rather than from what the loaded
+/// configuration holds: a file that contributes no section — empty,
+/// comment-only or missing — leaves no trace there, and its first write
+/// can add values or further includes. A conditional include is followed
+/// whatever its condition says now, since the condition can turn (a
+/// branch switched) without any of these files changing.
+fn config_sources(r: &gix::Repository) -> Result<Vec<std::path::PathBuf>, GitIoError> {
+    use gix::config::Source;
+    let queue: Vec<std::path::PathBuf> = [
+        Source::GitInstallation,
+        Source::System,
+        Source::Git,
+        Source::User,
+    ]
+    .into_iter()
+    .filter_map(|source| source.storage_location(&mut |name| std::env::var_os(name)))
+    .map(|path| path.into_owned())
+    .chain([
+        r.common_dir().join("config"),
+        r.git_dir().join("config.worktree"),
+    ])
+    .collect();
+    include_closure(queue)
+}
+
+/// `roots` and every file their includes name, in turn, whatever their
+/// content.
+fn include_closure(roots: Vec<std::path::PathBuf>) -> Result<Vec<std::path::PathBuf>, GitIoError> {
+    use gix::config::Source;
+    // Git's own `MAX_INCLUDE_DEPTH`: past it Git refuses the
+    // configuration, so a chain this deep is an error here too.
+    const MAX_DEPTH: usize = 10;
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, usize)> =
+        roots.into_iter().map(|path| (path, 0)).collect();
+    // Breadth first, so a file reached by two routes is followed from the
+    // shallower one; a cycle ends where it comes round.
+    let mut seen = std::collections::HashSet::new();
+    let mut sources = Vec::new();
+    while let Some((path, depth)) = queue.pop_front() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        sources.push(path.clone());
+        let Ok(file) = gix::config::File::from_path_no_includes(path.clone(), Source::Api) else {
+            continue;
+        };
+        for section in file.sections() {
+            let header = section.header();
+            let name = header.name();
+            let includes = (name.eq_ignore_ascii_case(b"include")
+                && header.subsection_name().is_none())
+                || (name.eq_ignore_ascii_case(b"includeIf") && header.subsection_name().is_some());
+            if !includes {
+                continue;
+            }
+            for value in section.values("path") {
+                let Some(included) = include_target(&value, &path) else {
+                    continue;
+                };
+                if seen.contains(&included) {
+                    continue;
+                }
+                if depth + 1 > MAX_DEPTH {
+                    return Err(gix_err(
+                        format!("follow the includes from `{}`", path.display()),
+                        format!("exceeded maximum include depth ({MAX_DEPTH})"),
+                    ));
+                }
+                queue.push_back((included, depth + 1));
+            }
+        }
+    }
+    Ok(sources)
+}
+
+#[cfg(test)]
+mod include_tests {
+    use super::*;
+
+    fn write(path: &Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Git's names are case-insensitive: a mixed-case include and a
+    /// mixed-case conditional one are followed, to an empty file and to
+    /// a missing one.
+    #[test]
+    fn mixed_case_includes_are_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let (empty, missing) = (dir.path().join("empty"), dir.path().join("missing"));
+        write(&empty, "");
+        write(
+            &root,
+            "[InClUdE]\n\tPaTh = empty\n[INCLUDEIF \"gitdir:/nowhere/\"]\n\tPATH = missing\n",
+        );
+        let found = include_closure(vec![root.clone()]).unwrap();
+        assert!(
+            found.contains(&empty) && found.contains(&missing),
+            "{found:?}"
+        );
+    }
+
+    /// An `includeIf` with no condition is not one Git follows.
+    #[test]
+    fn an_include_if_without_a_condition_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write(&root, "[includeIf]\n\tpath = other\n");
+        assert_eq!(include_closure(vec![root.clone()]).unwrap(), vec![root]);
+    }
+
+    /// Nothing is dropped for being many.
+    #[test]
+    fn a_wide_include_set_is_followed_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let body: String = (0..300)
+            .map(|n| format!("[include]\n\tpath = {n}\n"))
+            .collect();
+        write(&root, &body);
+        let found = include_closure(vec![root]).unwrap();
+        let missing = (0..300)
+            .filter(|n| !found.contains(&dir.path().join(n.to_string())))
+            .count();
+        assert_eq!(missing, 0, "dropped");
+    }
+
+    /// Ten levels of includes are followed, as Git follows them; an
+    /// eleventh is an error, said, not a quietly partial set. A cycle is
+    /// cut where it comes round.
+    #[test]
+    fn nesting_past_gits_depth_is_an_error_and_a_cycle_is_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |n: usize| dir.path().join(n.to_string());
+        let link =
+            |from: usize, to: usize| write(&file(from), &format!("[include]\n\tpath = {to}\n"));
+        link(0, 1);
+        link(1, 0);
+        assert_eq!(include_closure(vec![file(0)]).unwrap().len(), 2, "a cycle");
+        for n in 1..10 {
+            link(n, n + 1);
+        }
+        assert_eq!(
+            include_closure(vec![file(0)]).unwrap().len(),
+            11,
+            "ten deep"
+        );
+        link(10, 11);
+        let deep = include_closure(vec![file(0)]);
+        assert!(
+            deep.as_ref()
+                .is_err_and(|e| e.to_string().contains("maximum include depth")),
+            "{deep:?}"
+        );
+    }
+}
+
+/// Where an include in `from` points, as Git resolves it: `~/` from the
+/// home directory, and a relative path from the including file's own
+/// directory.
+fn include_target(value: &gix::bstr::BStr, from: &Path) -> Option<std::path::PathBuf> {
+    let value = gix::path::try_from_bstr(value).ok()?;
+    if let Ok(rest) = value.strip_prefix("~") {
+        return Some(std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest));
+    }
+    if value.is_absolute() {
+        return Some(value.into_owned());
+    }
+    Some(from.parent()?.join(value))
 }
 
 /// The raw working-tree status: tracked paths differing from HEAD

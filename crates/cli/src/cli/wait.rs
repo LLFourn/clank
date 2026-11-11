@@ -379,9 +379,6 @@ async fn items_with_context(
     if args.die_with_owner {
         crate::owner_sentinel::spawn_stdin_sentinel();
     }
-    // One env read for the entire process, here at the CLI
-    // boundary. Downstream takes a plain `bool`.
-    let poll_mode = args.effective_poll();
 
     let repo = resolve_repo(args.repo.as_deref())?;
 
@@ -391,7 +388,7 @@ async fn items_with_context(
     // resolution: the observed repo has no session binding for the
     // caller, and --author is deliberately ignored.
     if let Some(event) = args.r#for {
-        run_observer(&repo, event, poll_mode, args.no_cache, args.json).await?;
+        run_observer(&repo, event, args.no_cache, args.json).await?;
         return Ok(None);
     }
 
@@ -524,17 +521,19 @@ async fn items_with_context(
     }
 
     let (tx, rx) = mpsc::channel::<()>();
-    // The shared core watcher: `.clank/` gate dirs + gitdir (gitdir
-    // skipped in poll mode — the heartbeat tick below covers git then).
-    // Same producer `clank status` uses, so the panel and this loop wake
-    // on the same changes.
+    // The shared core watcher: `.clank/` gate dirs + gitdir. Same
+    // producer `clank status` uses, so the panel and this loop wake on
+    // the same changes.
     let timer_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _watcher = crate::repo_watch::RepoStateWatcher::attach_with_timer_invalidation(
+    let watcher = crate::repo_watch::RepoStateWatcher::attach_with_timer_invalidation(
         &repo,
-        poll_mode,
-        tx,
+        tx.clone(),
         Some(timer_dirty.clone()),
     )?;
+    // A change between the initial fold and the attach is one the
+    // watcher took as its baseline, so the loop refolds once now.
+    let _ = tx.send(());
+    drop(tx);
     // Close the admission race: ack may have happened after the initial fold
     // but before this watcher existed. Later writes leave dirty set for a wake.
     if let Some(timers) = &mut timers {
@@ -542,19 +541,9 @@ async fn items_with_context(
     }
     timer_backlog.invalidate();
 
-    // Refold cadence. Native mode uses a 1.5s heartbeat as the
-    // finalize-race safety net (the watcher carries the load).
-    // Polling mode shortens to 500ms — it IS the primary git-
-    // change signal because the gitdir watch is skipped.
-    let tick: Duration = if poll_mode {
-        Duration::from_millis(500)
-    } else {
-        Duration::from_millis(1500)
-    };
-
     // ONE supervised async loop (extra-wait-events, codex cdcf111):
     // the watcher's sync channel is bridged into a tokio::select over
-    // repo wakes, external source items, and the heartbeat tick.
+    // repo wakes, external source items, and the timers' own deadlines.
     // Sources spawn only when the wait actually PARKS (the
     // initial pass above returns without them) and are cancelled AND
     // joined on every return path below.
@@ -581,16 +570,21 @@ async fn items_with_context(
             // the repo projection yields — one emitted result).
             let mut external: Vec<WaitItem> = Vec::new();
             let timer_deadline = timers.as_ref().and_then(|timers| timers.next_deadline());
+            let timer_retry = timers.as_mut().and_then(|timers| timers.retry_due());
             let existing_wake = tokio::select! {
                 _ = crate::cli::timer_source::clock::sleep_until(timer_deadline) => {
                     if let Some(timers) = &mut timers { timers.due(); }
                     timer_backlog.invalidate();
                     false
                 }
-                _ = tokio::time::sleep(tick) => { true }
+                _ = crate::cli::timer_source::clock::sleep_until(timer_retry) => {
+                    if let Some(timers) = &mut timers { timers.retry_failed(); }
+                    timer_backlog.invalidate();
+                    false
+                }
                 w = beat.rx.recv() => {
                     if w.is_none() {
-                        anyhow::bail!("filesystem watcher disconnected");
+                        anyhow::bail!("{}", watcher_stopped(&watcher));
                     }
                     // Debounce: let a burst settle, then drain it —
                     // one logical change, one refold.
@@ -610,7 +604,7 @@ async fn items_with_context(
                 }
             };
             let timers_changed = timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
-            if poll_mode || timers_changed {
+            if timers_changed {
                 if let Some(timers) = &mut timers {
                     timers.refresh();
                     timers.retry_one_shots();
@@ -696,6 +690,14 @@ async fn items_with_context(
     Ok(Some(outcome?))
 }
 
+/// What a wait says when its repo watcher's channel closes.
+fn watcher_stopped(watcher: &crate::repo_watch::RepoStateWatcher) -> String {
+    match watcher.fault() {
+        Some(why) => format!("the repo watcher failed: {why}"),
+        None => "the repo watcher stopped".to_string(),
+    }
+}
+
 /// The watcher's sync channel, bridged into async.
 ///
 /// The bridge is not a convenience. `mpsc::Receiver::recv_timeout` is
@@ -725,24 +727,21 @@ impl Beat {
         Self { rx: arx }
     }
 
-    /// One beat: the next FS event or the heartbeat tick, whichever
-    /// lands first, with event bursts debounced to one refold. Ends on
-    /// a wake, a real error, or owner death — never a clock
-    /// (remove-wait-timeout).
-    pub(crate) async fn next(&mut self, tick: Duration) -> anyhow::Result<()> {
-        tokio::select! {
-            _ = tokio::time::sleep(tick) => Ok(()),
-            w = self.rx.recv() => {
-                if w.is_none() {
-                    anyhow::bail!("filesystem watcher disconnected");
-                }
-                // Let a burst settle, then drain it — one logical
-                // change, one refold.
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                while self.rx.try_recv().is_ok() {}
-                Ok(())
-            }
+    /// The next FS event, however long it takes, with a burst debounced
+    /// to one.
+    pub(crate) async fn changed(&mut self) -> anyhow::Result<()> {
+        if self.rx.recv().await.is_none() {
+            anyhow::bail!("filesystem watcher disconnected");
         }
+        self.settle().await;
+        Ok(())
+    }
+
+    /// Let a burst settle, then drain it — one logical change, one
+    /// refold.
+    async fn settle(&mut self) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while self.rx.try_recv().is_ok() {}
     }
 }
 
@@ -751,12 +750,11 @@ impl Beat {
 /// work projection, and (like `--peek`) NO lifecycle side effects.
 /// The baseline is captured synchronously before the watcher loop, so
 /// only events strictly after startup fire; anything landing between
-/// capture and the watcher attaching is caught by the first heartbeat
-/// refold.
+/// capture and the watcher attaching is caught by one refold right
+/// after the attach.
 async fn run_observer(
     repo: &Path,
     event: crate::cli::WaitFor,
-    poll_mode: bool,
     no_cache: bool,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -771,15 +769,14 @@ async fn run_observer(
     let baseline = ObserverBaseline::capture(repo, &state);
 
     let (tx, rx) = mpsc::channel::<()>();
-    let _watcher = crate::repo_watch::RepoStateWatcher::attach(repo, poll_mode, tx)?;
-    let tick: Duration = if poll_mode {
-        Duration::from_millis(500)
-    } else {
-        Duration::from_millis(1500)
-    };
+    let watcher = crate::repo_watch::RepoStateWatcher::attach(repo, tx.clone())?;
+    let _ = tx.send(());
+    drop(tx);
     let mut beat = Beat::bridge(rx);
     loop {
-        beat.next(tick).await?;
+        if beat.changed().await.is_err() {
+            anyhow::bail!("{}", watcher_stopped(&watcher));
+        }
         let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
@@ -952,10 +949,10 @@ impl WakeSources {
 /// trying and does not fail a second time.
 ///
 /// While it holds no items the wait is parked, and that is where
-/// `replacing` turns it into the installed build: on a beat while a
-/// monitor serves it, and whenever one is lost or refuses it. A wait that
-/// is stale and could not be replaced goes on trying both, and fails for
-/// no outage: an upgrade costs the agent no turn.
+/// `replacing` turns it into the installed build: when an install is
+/// seen while a monitor serves it, and whenever one is lost or refuses
+/// it. A wait that is stale and could not be replaced goes on trying
+/// both, and fails for no outage: an upgrade costs the agent no turn.
 ///
 /// The attaching is a parameter because no test may start a monitor.
 async fn monitored<F>(
@@ -985,8 +982,7 @@ where
         let unserved = match attach(who).await.served(repo) {
             Ok(conn) => {
                 tracing::debug!(%author, "monitor subscription registered");
-                let grace = crate::cli::monitor::BEAT_GRACE;
-                let shared = shared_wait_within(conn, repo, author, binding, grace, &mut outage);
+                let shared = shared_wait_within(conn, repo, author, binding, &mut outage);
                 tokio::pin!(shared);
                 let ended = tokio::select! {
                     // Items in hand go out before anything else is considered.
@@ -1004,7 +1000,7 @@ where
         let why = unserved.why();
         tracing::debug!(%why, "no monitor serves this wait");
         if replacing.pass(Hosting::Nothing) != Pass::Current {
-            tokio::time::sleep(replacing.due_in()).await;
+            replacing.until_current().await;
             continue;
         }
         let pause = match outage.lost(tokio::time::Instant::now(), &unserved) {
@@ -1065,18 +1061,18 @@ enum Shared {
 /// `owed_for`, which is `present_with_blocks`, so a block's blast radius
 /// is settled in the one place that settles it.
 ///
-/// Silence for `grace` ends it: a wedged monitor and a dead one look the
-/// same to a client, and the beat is what distinguishes either from a
-/// quiet repo. Every note heard ends `outage`.
+/// Only the socket closing ends it: a monitor that dies closes it, and
+/// one that wedges is stood down by its own watchdog, which closes it
+/// too. A quiet repo is silence, and silence is not loss. Every note
+/// heard ends `outage`.
 async fn shared_wait_within(
     conn: crate::cli::monitor::Conn,
     repo: &Path,
     author: &AgentLabel,
     binding: &WaitBinding,
-    grace: Duration,
     outage: &mut crate::cli::monitor::Outage,
 ) -> anyhow::Result<Shared> {
-    let mut notes = bridge_notes(conn, grace)?;
+    let mut notes = bridge_notes(conn)?;
     let mut served = false;
     // The sharing ends exactly one way: the reader is gone. A failed
     // read is the REASON, not a second ending — giving it an arm of
@@ -1088,7 +1084,7 @@ async fn shared_wait_within(
             Some(Ok(note)) => {
                 outage.answered();
                 // A subscription is served by the first thing its monitor
-                // says, whatever it is: an idle agent hears only beats.
+                // says, whatever it is: the first fold's note.
                 if !std::mem::replace(&mut served, true)
                     && let Some((_, session)) = &binding.0
                     && let Err(e) = crate::agent_store::outage_served(repo, author, session)
@@ -1097,11 +1093,11 @@ async fn shared_wait_within(
                 }
                 // Ownership is a LIFECYCLE check, not a condition on
                 // delivery: every note is this wait's chance to notice
-                // it has been superseded, exactly as the local loop
-                // checks on every beat. Checking only when items
-                // arrive left a rebound session parked forever
-                // whenever the repo happened to owe nothing — healthy
-                // beats, no work, no exit (codex on 90985a6).
+                // it has been superseded. A rebinding is a write the
+                // monitor folds on, and every fold sends each agent a
+                // note, owed or not. Checking only when items arrive
+                // left a rebound session parked forever whenever the
+                // repo happened to owe nothing (codex on 90985a6).
                 binding.ensure_current(repo, author)?;
                 // A fold that owes this author nothing, and the beat
                 // that says the monitor is alive, are both just "keep
@@ -1140,20 +1136,18 @@ async fn shared_wait_within(
 /// `Conn` reads a BLOCKING socket, and a park that holds the runtime
 /// thread is what `Beat::bridge` exists to avoid on the local path. It
 /// is also what leaves the loop above with no await point: nothing can
-/// bound a future that never yields, so a monitor's silence becomes a
-/// hang instead of a fallback.
+/// bound a future that never yields.
 ///
-/// Dropping the receiver shuts down the socket and immediately releases the
-/// reader thread, including when a different source wins the wait's select.
-pub(crate) fn bridge_notes(
-    mut conn: crate::cli::monitor::Conn,
-    grace: Duration,
-) -> std::io::Result<Notes> {
+/// It reads with no deadline: the socket closing, from either end, ends
+/// it. Dropping the receiver shuts down the socket and immediately
+/// releases the reader thread, including when a different source wins
+/// the wait's select.
+pub(crate) fn bridge_notes(mut conn: crate::cli::monitor::Conn) -> std::io::Result<Notes> {
     let socket = conn.cancellation_socket()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
         loop {
-            let note = conn.note(std::time::Instant::now() + grace);
+            let note = conn.next_note();
             let ended = note.is_err();
             if tx.send(note.map_err(|e| e.to_string())).is_err() || ended {
                 return;
@@ -1177,7 +1171,7 @@ impl Notes {
 impl Drop for Notes {
     fn drop(&mut self) {
         // Cancelled selects close the connection and wake its blocked reader
-        // immediately, so a replacement never waits for the monitor heartbeat.
+        // immediately.
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -1738,8 +1732,20 @@ pub(crate) async fn run_command_source_with(
     // presented while tailing.
     let mut presented: std::collections::HashSet<(u64, String)> = Default::default();
     let mut warned_tail = false;
+    // A follower is woken by the log changing, by the lease coming free
+    // and by its own deferred group's members exiting; never by a clock.
+    let mut changes: Option<crate::cli::github::log::LogChanges> = None;
+    let mut freed: Option<
+        tokio::sync::oneshot::Receiver<std::io::Result<crate::cli::github::log::IngestLease>>,
+    > = None;
+    let mut deferral_pause = cs::DEFERRAL_FIRST_RETRY;
+    let mut handed: Option<std::io::Result<crate::cli::github::log::IngestLease>> = None;
     loop {
-        match crate::cli::github::log::IngestLease::try_acquire_now(&store_dir, &key) {
+        let taken = match handed.take() {
+            Some(waited) => waited.map(Some),
+            None => crate::cli::github::log::IngestLease::try_acquire_now(&store_dir, &key),
+        };
+        match taken {
             Ok(Some(lease)) => {
                 run_leased_command_source(
                     &src,
@@ -1769,6 +1775,23 @@ pub(crate) async fn run_command_source_with(
                 // The holder may be this process, whose group deferred
                 // its retirement and so still holds the lease.
                 owners.retry_deferred(&cs::producer_path(&store_dir, &key));
+                // Watching before reading: a row the holder logs between
+                // the two is then either read or heard.
+                if changes.is_none() {
+                    match crate::cli::github::log::LogChanges::watch(&store_dir) {
+                        Ok(watch) => changes = Some(watch),
+                        Err(e) => {
+                            tx.report(
+                                &key,
+                                crate::cli::event_source::Lifecycle::Stopped {
+                                    why: format!("cannot watch the log it follows: {e}"),
+                                },
+                            );
+                            return;
+                        }
+                    }
+                }
+                crate::cli::github::log::follow_gap(&store_dir);
                 // `read_rows` is the read-only inspector: a tailer
                 // must never quarantine a log it does not own.
                 if let Ok(log) = crate::cli::github::log::EventLog::open(&store_dir, &key)
@@ -1793,8 +1816,35 @@ pub(crate) async fn run_command_source_with(
                         }
                     }
                 }
-                if pause_unless_stopped(&mut stop, cs::TAIL_INTERVAL).await {
-                    return;
+                let lease_free = freed.get_or_insert_with(|| {
+                    crate::cli::github::log::IngestLease::when_free(&store_dir, &key)
+                });
+                let ours_deferred = owners.deferred(&cs::producer_path(&store_dir, &key));
+                let mut unstoppable = StopRequest::never();
+                tokio::select! {
+                    _ = stop.requested() => return,
+                    changed = changes.as_mut().expect("watched").changed() => {
+                        if let Err(why) = changed {
+                            eprintln!(
+                                "wait: command source `{}` cannot follow its log any more: {why}",
+                                src.name
+                            );
+                            tx.report(
+                                &key,
+                                crate::cli::event_source::Lifecycle::Stopped {
+                                    why: format!("its log's watch failed: {why}"),
+                                },
+                            );
+                            return;
+                        }
+                    }
+                    waited = lease_free => {
+                        freed = None;
+                        handed = Some(waited.unwrap_or_else(|e| Err(std::io::Error::other(e))));
+                    }
+                    _ = until_retirement_may_settle(&store_dir, &key, &mut unstoppable, deferral_pause), if ours_deferred => {
+                        deferral_pause = (deferral_pause * 2).min(cs::DEFERRAL_RETRY_CAP);
+                    }
                 }
             }
             Err(e) => {
@@ -1861,6 +1911,32 @@ impl StopRequest {
                 let _ = rx.wait_for(|stop| *stop).await;
             }
         }
+    }
+}
+
+/// Wait for a deferred retirement to be worth trying again: a member of
+/// the group recorded for `key` exiting, or `pause`, the backoff of a
+/// retirement that goes on deferring — or a stop. Whether one was.
+async fn until_retirement_may_settle(
+    store_dir: &Path,
+    key: &str,
+    stop: &mut StopRequest,
+    pause: Duration,
+) -> bool {
+    use crate::cli::command_source::{self as cs, Os as _};
+    let Some(group) = cs::recorded_group(store_dir, key) else {
+        return pause_unless_stopped(stop, pause).await;
+    };
+    // A thread of its own, for the reason `IngestLease::when_free` gives.
+    let (tx, exited) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let by = std::time::Instant::now() + pause;
+        cs::Native { children: &[] }.until_a_member_exits(group, &|| Some(by));
+        let _ = tx.send(());
+    });
+    tokio::select! {
+        _ = stop.requested() => true,
+        _ = exited => stop.is_requested(),
     }
 }
 
@@ -2064,6 +2140,7 @@ async fn run_leased_command_source(
 
     source_group::retire_on_termination();
     let mut deferral_warned = false;
+    let mut deferral_pause = cs::DEFERRAL_FIRST_RETRY;
     // This host's own group, when its retirement could not confirm it
     // ended. Still owned, so nothing replaces it until it does.
     let mut unended: Option<source_group::Owned> = None;
@@ -2092,7 +2169,8 @@ async fn run_leased_command_source(
                 deferral_warned = true;
             }
             unended = Some(owned);
-            pause_unless_stopped(stop, cs::TAIL_INTERVAL).await;
+            until_retirement_may_settle(&store_dir, &key, stop, deferral_pause).await;
+            deferral_pause = (deferral_pause * 2).min(cs::DEFERRAL_RETRY_CAP);
             continue;
         }
         // Holding the lease means the previous owner is GONE — a lease
@@ -2118,10 +2196,12 @@ async fn run_leased_command_source(
                 );
                 deferral_warned = true;
             }
-            pause_unless_stopped(stop, cs::TAIL_INTERVAL).await;
+            until_retirement_may_settle(&store_dir, &key, stop, deferral_pause).await;
+            deferral_pause = (deferral_pause * 2).min(cs::DEFERRAL_RETRY_CAP);
             continue;
         }
         deferral_warned = false;
+        deferral_pause = cs::DEFERRAL_FIRST_RETRY;
 
         let started = std::time::Instant::now();
         let cmd = crate::proc_run::Spec::new(&src.command[0])
@@ -3303,7 +3383,6 @@ mod shared_tests {
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
             &WaitBinding(None, WaitPolicy::Manual),
-            crate::cli::monitor::BEAT_GRACE,
             &mut Default::default(),
         )
         .await
@@ -3331,7 +3410,6 @@ mod shared_tests {
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
             &WaitBinding(None, WaitPolicy::Manual),
-            crate::cli::monitor::BEAT_GRACE,
             &mut Default::default(),
         )
         .await
@@ -3363,7 +3441,6 @@ mod shared_tests {
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
             &WaitBinding(None, WaitPolicy::Manual),
-            crate::cli::monitor::BEAT_GRACE,
             &mut Default::default(),
         )
         .await
@@ -3598,10 +3675,10 @@ mod shared_tests {
         );
     }
 
-    /// A parked wait served by a monitor is replaced on a beat, with no
-    /// monitor lost: an install is noticed while everything is healthy.
+    /// A parked wait served by a monitor is replaced with no monitor
+    /// lost: an install is noticed while everything is healthy.
     #[tokio::test(start_paused = true)]
-    async fn a_served_wait_asks_to_be_replaced_on_a_beat() {
+    async fn a_served_wait_asks_to_be_replaced_when_parked() {
         use crate::cli::monitor::Attempt;
         let (repo, author, binding) = unbound();
         let installed = crate::upgrade::tests::Installed::current();
@@ -3618,7 +3695,7 @@ mod shared_tests {
                 let conn = conn.borrow_mut().take().expect("attached once");
                 async move { Attempt::Shared(conn) }
             });
-            let parked = tokio::time::timeout(crate::upgrade::BEAT * 2, waiting).await;
+            let parked = tokio::time::timeout(Duration::from_secs(60), waiting).await;
             assert!(parked.is_err(), "the wait ended: {parked:?}");
         }
         drop(monitor_end);
@@ -4541,8 +4618,6 @@ mod shared_tests {
         );
     }
 
-    /// A monitor that stops speaking sends the wait back to watching
-    /// for itself, rather than leaving it listening forever.
     /// A wait told it is superseded ends as superseded: it does not go
     /// on to watch for itself, which would deliver the newer wait's work
     /// a second time.
@@ -4565,7 +4640,6 @@ mod shared_tests {
                 repo.path(),
                 &AgentLabel::parse("claude").unwrap(),
                 &WaitBinding(None, WaitPolicy::Manual),
-                std::time::Duration::from_secs(1),
                 &mut Default::default(),
             ),
         )
@@ -4577,104 +4651,56 @@ mod shared_tests {
         assert!(e.is::<WaitSuperseded>(), "{e:#}");
     }
 
+    /// Silence is a quiet repo, not a lost monitor: the wait goes on
+    /// waiting through it, and ends only when the socket closes. Several
+    /// clients at once, each of them recovering alone, since a monitor's
+    /// loss stranding some of its clients and not others is the failure
+    /// worth excluding. A wedged monitor reaches its clients the same
+    /// way: its watchdog stands it down and the socket closes.
     #[tokio::test]
-    async fn silence_ends_the_sharing() {
+    async fn silence_is_waited_through_and_a_close_ends_the_sharing() {
         let repo = tempfile::tempdir().unwrap();
-        let (mine, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        // `_theirs` is held open and silent: a dead monitor and a
-        // wedged one are the same thing to a client. Non-blocking, as
-        // `connect_within` hands it back, so the grace below is the
-        // only thing that can end the wait.
-        mine.set_nonblocking(true).unwrap();
-
-        // Bounded: swallowing the error loops forever, and a hung
-        // suite hides a regression where a failing one reports it.
-        let why = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            shared_wait_within(
-                Conn::over(mine),
-                repo.path(),
-                &AgentLabel::parse("claude").unwrap(),
-                &WaitBinding(None, WaitPolicy::Manual),
-                std::time::Duration::from_millis(150),
-                &mut Default::default(),
-            ),
-        )
-        .await
-        .expect("silence must end the sharing, not be waited on")
-        .expect("silence is not an error: the wait watches for itself instead");
-
-        let Shared::Lost(why) = why else {
-            panic!("silence is not a wake, got {why:?}")
-        };
-        assert!(why.contains("stopped answering"), "{why}");
+        let mut parked = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..4 {
+            let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            mine.set_nonblocking(true).unwrap();
+            peers.push(theirs);
+            let repo = repo.path().to_path_buf();
+            parked.push(tokio::spawn(async move {
+                shared_wait_within(
+                    Conn::over(mine),
+                    &repo,
+                    &AgentLabel::parse("claude").unwrap(),
+                    &WaitBinding(None, WaitPolicy::Manual),
+                    &mut Default::default(),
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(
-            why.contains("did not answer within"),
-            "and it must carry the read's own reason, not just the close: {why}"
+            parked.iter().all(|client| !client.is_finished()),
+            "silence ended a wait"
         );
-    }
-
-    /// Both doors out of sharing, with CONCURRENT clients.
-    ///
-    /// They are different paths and the plan asks for both: a monitor
-    /// that DIES is an EOF on the next read, and one that WEDGES
-    /// answers nothing while its socket stays open, which only the
-    /// grace can end. One client recovering proves little — the
-    /// failure mode worth excluding is a monitor's loss stranding some
-    /// of its clients and not others — so each door is driven by
-    /// several at once and every one of them must come back alone.
-    #[tokio::test]
-    async fn every_client_recovers_from_a_dead_monitor_and_from_a_wedged_one() {
-        let repo = tempfile::tempdir().unwrap();
-
-        for door in ["died", "wedged"] {
-            let mut parked = Vec::new();
-            let mut peers = Vec::new();
-            for _ in 0..4 {
-                let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-                mine.set_nonblocking(true).unwrap();
-                peers.push(theirs);
-                let repo = repo.path().to_path_buf();
-                parked.push(tokio::spawn(async move {
-                    shared_wait_within(
-                        Conn::over(mine),
-                        &repo,
-                        &AgentLabel::parse("claude").unwrap(),
-                        &WaitBinding(None, WaitPolicy::Manual),
-                        std::time::Duration::from_millis(200),
-                        &mut Default::default(),
-                    )
-                    .await
-                }));
-            }
-
-            if door == "died" {
-                // The first door: the process is gone, so the socket
-                // reaches EOF — no grace need elapse at all.
-                peers.clear();
-            }
-            // The second door keeps `peers` alive and silent, which is
-            // a monitor still accepting and no longer folding.
-
-            for client in parked {
-                let got = tokio::time::timeout(std::time::Duration::from_secs(5), client)
-                    .await
-                    .unwrap_or_else(|_| panic!("a {door} monitor must not strand a client"))
-                    .expect("the client task did not panic")
-                    .expect("recovery is not an error: the wait watches for itself");
-                let Shared::Lost(why) = got else {
-                    panic!("a {door} monitor is not a wake, got {got:?}")
-                };
-                assert!(why.contains("stopped answering"), "{door}: {why}");
-            }
-            drop(peers);
+        peers.clear();
+        for client in parked {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+                .await
+                .expect("a closed monitor must not strand a client")
+                .expect("the client task did not panic")
+                .expect("recovery is not an error: the wait watches for itself");
+            let Shared::Lost(why) = got else {
+                panic!("a closed monitor is not a wake, got {got:?}")
+            };
+            assert!(why.contains("stopped answering"), "{why}");
         }
     }
 
     /// A rebind retires a wait that is owed NOTHING.
     ///
-    /// The old session must not sit parked on healthy beats while its
-    /// successor runs: ownership has to be checked on every note, not
+    /// The old session must not sit parked on the notes of folds that
+    /// owe it nothing while its successor runs: ownership has to be checked on every note, not
     /// only when work turns up, or an idle repo keeps the loser alive
     /// indefinitely. Nothing actionable is ever sent here, so the exit
     /// can only come from the lifecycle check.
@@ -4710,14 +4736,7 @@ mod shared_tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            shared_wait_within(
-                conn,
-                repo,
-                &label,
-                &binding,
-                std::time::Duration::from_secs(1),
-                &mut Default::default(),
-            ),
+            shared_wait_within(conn, repo, &label, &binding, &mut Default::default()),
         )
         .await
         .expect("a superseded wait must not park on beats")
@@ -4771,7 +4790,6 @@ mod shared_tests {
                 repo,
                 &label,
                 &binding,
-                std::time::Duration::from_secs(1),
                 &mut Default::default(),
             ),
         )
@@ -5420,7 +5438,7 @@ mod tests {
             ))
         };
 
-        tokio::time::sleep(cs::TAIL_INTERVAL * 2).await;
+        tokio::time::sleep(cs::DEFERRAL_FIRST_RETRY * 2).await;
         assert!(
             !marker.exists(),
             "a deferral must not start a second producer beside the first"
@@ -6494,6 +6512,142 @@ mod tests {
             Some(format!("{key}@{seq}").as_str()),
             "a re-presented event still says how to finish itself",
         );
+    }
+
+    /// A wait that folds for itself wakes on the repo's changes, its
+    /// sources and its timers' own deadlines, and on nothing else: an
+    /// idle repo refolds never. Read from the source, as its loop runs a
+    /// real fold.
+    #[test]
+    fn a_self_folding_wait_has_no_tick() {
+        let src = include_str!("wait.rs");
+        let from = src
+            .find("            let existing_wake = tokio::select! {")
+            .expect("the loop's select");
+        let arms = &src[from..from + src[from..].find("\n            };\n").expect("its end")];
+        assert!(!arms.contains("_ = tokio::time::sleep("), "{arms}");
+        assert!(!arms.contains("tick"), "{arms}");
+        let observer = &src[src.find("async fn run_observer(").expect("the observer")..];
+        let observer = &observer[..observer.find("\n}\n").expect("its end")];
+        assert!(
+            observer.contains("beat.changed().await.is_err()"),
+            "{observer}"
+        );
+        assert!(!observer.contains("tick"), "{observer}");
+    }
+
+    /// A row the holder logs while the follower is setting up — after
+    /// its watch could be armed, before its first read — is presented,
+    /// with no later write and no lease change to rescue it.
+    #[tokio::test]
+    async fn a_row_logged_while_a_command_follower_sets_up_is_presented() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = command_source("followed", &["sh", "-c", "sleep 300"]);
+        let key = src.source_key();
+        let _held = crate::cli::github::log::IngestLease::try_acquire(dir.path(), &key).unwrap();
+        {
+            let (events, key) = (dir.path().to_path_buf(), key.clone());
+            crate::cli::github::log::FOLLOW_GAPS.lock().unwrap().push((
+                events.clone(),
+                Box::new(move || {
+                    let logged = WaitItem::CommandEvent {
+                        presentation: None,
+                        source_cwd: None,
+                        name: "followed".into(),
+                        id: "gap".into(),
+                        event: "k".into(),
+                        content: "logged in the gap".into(),
+                        at: None,
+                        failure: false,
+                        requires_reply: false,
+                        reply_route: None,
+                        selector: None,
+                    };
+                    crate::cli::github::log::EventLog::open(&events, &key)
+                        .unwrap()
+                        .append_inbox(
+                            crate::cli::github::log::Transport::Command,
+                            Some("gap"),
+                            None,
+                            None,
+                            &logged,
+                        )
+                        .unwrap();
+                    std::thread::sleep(Duration::from_secs(1));
+                }),
+            ));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            tx,
+            Some(dir.path().to_path_buf()),
+            key,
+            |_: &Path, _: &str| crate::cli::command_source::Retired::Clear,
+            &crate::cli::source_group::OWNERS,
+            StopRequest::never(),
+        ));
+        let heard = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
+        task.abort();
+        let _ = task.await;
+        let Ok(Some((item, _))) = heard else {
+            panic!("the row logged in the gap was lost: {heard:?}")
+        };
+        assert_eq!(event_parts(&item), ("gap", "k", "logged in the gap"));
+    }
+
+    /// A follower hears the holder's log change: a row the holder logs
+    /// after the follower started is presented with no clock to wait out.
+    #[tokio::test]
+    async fn a_command_follower_is_woken_by_the_holders_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = command_source("followed", &["sh", "-c", "sleep 300"]);
+        let key = src.source_key();
+        let _held = crate::cli::github::log::IngestLease::try_acquire(dir.path(), &key).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            tx,
+            Some(dir.path().to_path_buf()),
+            key.clone(),
+            |_: &Path, _: &str| crate::cli::command_source::Retired::Clear,
+            &crate::cli::source_group::OWNERS,
+            StopRequest::never(),
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(rx.try_recv().is_err(), "nothing is logged yet");
+        let logged = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
+            name: "followed".into(),
+            id: "late".into(),
+            event: "k".into(),
+            content: "logged by the holder".into(),
+            at: None,
+            failure: false,
+            requires_reply: false,
+            reply_route: None,
+            selector: None,
+        };
+        crate::cli::github::log::EventLog::open(dir.path(), &key)
+            .unwrap()
+            .append_inbox(
+                crate::cli::github::log::Transport::Command,
+                Some("late"),
+                None,
+                None,
+                &logged,
+            )
+            .unwrap();
+        let heard = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+        task.abort();
+        let _ = task.await;
+        let Ok(Some((item, _))) = heard else {
+            panic!("the follower did not hear the holder's row: {heard:?}")
+        };
+        assert_eq!(event_parts(&item), ("late", "k", "logged by the holder"));
     }
 
     /// THE HANDOVER: the backend gets its OWN directory, and clank

@@ -12,6 +12,7 @@ pub mod agent_env;
 pub mod agent_store;
 pub mod build_stamp;
 pub mod feedback_scan;
+pub(crate) mod fs_notice;
 pub mod fs_plan_state_lookup;
 pub mod git_io;
 pub mod git_plumbing;

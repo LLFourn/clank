@@ -53,7 +53,7 @@ pub(crate) struct UserCommands {
     /// When each agent's park was last released.
     released: BTreeMap<AgentLabel, u64>,
     next_due: Option<u64>,
-    _watcher: Option<notify::RecommendedWatcher>,
+    _watcher: Option<crate::proc_identity::tree_watch::KernelWatcher>,
 }
 
 impl UserCommands {
@@ -65,9 +65,17 @@ impl UserCommands {
         let (asks_tx, asks) = tokio::sync::mpsc::unbounded_channel();
         let (done_tx, done) = tokio::sync::mpsc::unbounded_channel();
         let watcher = match store.ensure_repo(&tag) {
-            Ok(dir) => watch(&dir, changed_tx)
-                .map_err(|e| eprintln!("monitor: cannot watch user commands: {e:#}"))
-                .ok(),
+            Ok(dir) => match watch(&dir, changed_tx.clone()) {
+                Ok(attached) => {
+                    // A pass, for what changed before the watch.
+                    let _ = changed_tx.send(());
+                    Some(attached)
+                }
+                Err(e) => {
+                    eprintln!("monitor: cannot watch user commands: {e:#}");
+                    None
+                }
+            },
             Err(e) => {
                 eprintln!("monitor: user commands are unavailable: {e:#}");
                 None
@@ -209,17 +217,45 @@ fn record_history(repo: &Path, label: &AgentLabel, record: &nudge_log::Record) {
 fn watch(
     dir: &Path,
     changed: tokio::sync::mpsc::UnboundedSender<()>,
-) -> notify::Result<notify::RecommendedWatcher> {
+) -> notify::Result<crate::proc_identity::tree_watch::KernelWatcher> {
     use notify::Watcher;
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res
-            && changes_a_record(&event)
-        {
-            let _ = changed.send(());
-        }
-    })?;
+    let mut watcher =
+        crate::proc_identity::tree_watch::KernelWatcher::new(is_record, handler(changed))?;
     watcher.watch(dir, notify::RecursiveMode::Recursive)?;
     Ok(watcher)
+}
+
+/// [`watch`]'s callback, apart from any backend so a test can drive it. A
+/// failed watch is said once and then stops waking anything, as one that
+/// could not be set up does: the loop's other wakes still drive passes.
+fn handler(
+    changed: tokio::sync::mpsc::UnboundedSender<()>,
+) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+    use crate::fs_notice::{Notice, notice};
+    let mut changed = Some(changed);
+    move |res: notify::Result<notify::Event>| {
+        let Some(wake) = &changed else {
+            return;
+        };
+        match notice(&res) {
+            Notice::Read => {}
+            Notice::Rescan => {
+                let _ = wake.send(());
+            }
+            Notice::Changed(_) => {
+                if res.as_ref().is_ok_and(changes_a_record) {
+                    let _ = wake.send(());
+                }
+            }
+            Notice::Failed(why) => {
+                eprintln!(
+                    "monitor: the watch on user commands failed: {why}; their changes are \
+                     seen only on the loop's other wakes from now on"
+                );
+                changed = None;
+            }
+        }
+    }
 }
 
 /// Whether `event` is a record being written, replaced or removed. Reads
@@ -376,6 +412,25 @@ mod tests {
             .fold(notify::Event::new(kind), |e, p| e.add_path(p.into()))
     }
 
+    /// A rescan wakes the loop, since what it stands for is unknown, and a
+    /// failed watch closes its channel rather than going on as if healthy.
+    #[test]
+    fn a_rescan_wakes_and_a_failure_stops_the_watch() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handle = handler(tx);
+        handle(Ok(notify::Event::new(notify::EventKind::Any)));
+        assert_eq!(rx.try_recv(), Ok(()));
+        handle(crate::fs_notice::tests::opened(std::path::Path::new(
+            "/s/tag/claude/r1.json",
+        )));
+        assert!(rx.try_recv().is_err(), "a read");
+        handle(Err(notify::Error::generic("the stream died")));
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        );
+    }
+
     /// Reading a record, as every pass and `status` do, wakes nothing,
     /// however the backend reports it; only writing, replacing or removing
     /// one does.
@@ -441,6 +496,38 @@ mod tests {
             !pass_reads.iter().any(changes_a_record),
             "a read-only pass schedules nothing"
         );
+    }
+
+    /// Through the kernel watch: a record saved in an agent's directory
+    /// made after the watch began wakes the loop, and so does one written
+    /// in place; reading one, or touching its lock, does not.
+    #[test]
+    fn the_watch_wakes_on_records_and_not_on_reads_or_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _watch = watch(&root, tx).unwrap();
+        let woken = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>, ms| {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            let mut any = false;
+            while rx.try_recv().is_ok() {
+                any = true;
+            }
+            any
+        };
+        let agent = root.join("claude");
+        std::fs::create_dir(&agent).unwrap();
+        let _ = woken(&mut rx, 300);
+        let tmp = agent.join(".uc-x1.tmp");
+        let record = agent.join("r1.json");
+        std::fs::write(&tmp, "{}").unwrap();
+        std::fs::rename(&tmp, &record).unwrap();
+        assert!(woken(&mut rx, 1000), "a record saved in a new agent dir");
+        let _ = std::fs::read(&record).unwrap();
+        std::fs::write(agent.join("r1.lock"), "").unwrap();
+        assert!(!woken(&mut rx, 500), "a read or a lock");
+        std::fs::write(&record, "{\"x\":1}").unwrap();
+        assert!(woken(&mut rx, 1000), "a record written in place");
     }
 
     /// Only record files wake the loop: locks and the store's temporaries,

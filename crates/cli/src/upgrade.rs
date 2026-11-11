@@ -15,10 +15,6 @@ use std::time::{Duration, Instant};
 
 use crate::build_stamp::{Build, Install, Installation, Stamp};
 
-/// How often a long-lived process looks at its installation when nothing
-/// else prompts it to.
-pub const BEAT: Duration = Duration::from_secs(5);
-
 /// What a display process shows while it runs a build that is no longer
 /// the installed one.
 pub const STALE_BADGE: &str = "newer clank installed · restart to upgrade";
@@ -74,7 +70,8 @@ impl From<Stale> for std::io::Error {
     }
 }
 
-#[derive(Debug)]
+type Wake = Arc<dyn Fn() + Send + Sync>;
+
 struct Inner {
     watched: Option<(Installation, Stamp)>,
     seen: Option<Install>,
@@ -83,6 +80,21 @@ struct Inner {
     installed: Option<Build>,
     in_flight: usize,
     refused: u64,
+    subscribers: Vec<(u64, Wake)>,
+    next_subscriber: u64,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("watched", &self.watched)
+            .field("seen", &self.seen)
+            .field("installed", &self.installed)
+            .field("in_flight", &self.in_flight)
+            .field("refused", &self.refused)
+            .field("subscribers", &self.subscribers.len())
+            .finish()
+    }
 }
 
 impl Inner {
@@ -126,6 +138,8 @@ impl Authority {
             installed: None,
             in_flight: 0,
             refused: 0,
+            subscribers: Vec::new(),
+            next_subscriber: 0,
         })))
     }
 
@@ -155,6 +169,32 @@ impl Authority {
     /// Where the last look left this process, without looking again.
     pub fn standing(&self) -> Standing {
         self.inner().standing()
+    }
+
+    /// Call `wake` whenever where this process stands may have moved: an
+    /// entry of a directory holding the installation changed (an install
+    /// replaces the file, or retargets the link to it), or the last work
+    /// in flight on a stale build finished. `wake` only signals; the
+    /// subscriber looks. Subscribe before looking, so an install landing
+    /// between the two is still heard. Ends when the [`Subscription`] is
+    /// dropped.
+    pub fn subscribe(&self, wake: impl Fn() + Send + Sync + 'static) -> Subscription {
+        let wake: Wake = Arc::new(wake);
+        let installed = self
+            .inner()
+            .watched
+            .as_ref()
+            .map(|(installation, _)| installation.path().to_path_buf());
+        let watch = installed.and_then(|installed| watch_install(&installed, wake.clone()));
+        let mut inner = self.inner();
+        let id = inner.next_subscriber;
+        inner.next_subscriber += 1;
+        inner.subscribers.push((id, wake));
+        Subscription {
+            id,
+            authority: self.0.clone(),
+            _watch: watch,
+        }
     }
 
     /// How many permits have been refused so far. A process that stays
@@ -205,7 +245,90 @@ impl Drop for Permit {
     fn drop(&mut self) {
         let mut inner = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         inner.in_flight = inner.in_flight.saturating_sub(1);
+        if inner.in_flight > 0 || inner.installed.is_none() {
+            return;
+        }
+        let wakes: Vec<Wake> = inner.subscribers.iter().map(|(_, w)| w.clone()).collect();
+        drop(inner);
+        for wake in wakes {
+            wake();
+        }
     }
+}
+
+/// A live [`Authority::subscribe`]. Dropping it stops the watching.
+pub struct Subscription {
+    id: u64,
+    authority: Arc<Mutex<Inner>>,
+    _watch: Option<crate::proc_identity::tree_watch::KernelWatcher>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let mut inner = self
+            .authority
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        inner.subscribers.retain(|(id, _)| *id != self.id);
+    }
+}
+
+/// The directories whose entries an install changes: the one holding
+/// the path clank is installed at, and the one holding what that path
+/// resolves to when it is a link.
+/// Watch an installation: the directories holding its path and the file
+/// it resolves to, for an install that renames over it or retargets a
+/// link, and that file's own writes, for one that writes over it in
+/// place. A replaced file is followed by its directory's listing.
+fn watch_install(
+    installed: &std::path::Path,
+    wake: Wake,
+) -> Option<crate::proc_identity::tree_watch::KernelWatcher> {
+    use notify::Watcher as _;
+    let path = installed.to_path_buf();
+    let watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
+        move |file| file == path || std::fs::canonicalize(&path).is_ok_and(|real| real == file),
+        {
+            let shown = installed.to_path_buf();
+            move |res: notify::Result<notify::Event>| {
+                if let crate::fs_notice::Notice::Failed(why) = crate::fs_notice::notice(&res) {
+                    eprintln!(
+                        "clank: the watch on {} failed: {why}; an install is no longer \
+                         noticed until this process restarts",
+                        shown.display()
+                    );
+                }
+                if crate::fs_notice::notice(&res) != crate::fs_notice::Notice::Read {
+                    wake()
+                }
+            }
+        },
+    );
+    let mut watcher = match watcher {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            tracing::warn!(path = %installed.display(), "cannot watch for an install: {e}");
+            return None;
+        }
+    };
+    for dir in install_dirs(installed) {
+        if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+            tracing::warn!(dir = %dir.display(), "cannot watch for an install: {e}");
+        }
+    }
+    Some(watcher)
+}
+
+fn install_dirs(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> =
+        [Some(path.to_path_buf()), std::fs::canonicalize(path).ok()]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.parent().map(std::path::Path::to_path_buf))
+            .filter(|dir| dir.is_dir())
+            .collect();
+    dirs.dedup();
+    dirs
 }
 
 fn armed() -> &'static Authority {
@@ -340,13 +463,10 @@ impl Mover {
         }
     }
 
-    /// How long until the next pass is due: a beat, or a failed
-    /// replacement's pause when that ends sooner.
-    pub fn due_in(&self, now: Instant) -> Duration {
-        match self.retry {
-            Some((at, _)) => BEAT.min(at.saturating_duration_since(now)),
-            None => BEAT,
-        }
+    /// How long until a failed replacement's pause ends, while one is
+    /// running. Nothing else makes a pass due by the clock.
+    pub fn retry_in(&self, now: Instant) -> Option<Duration> {
+        self.retry.map(|(at, _)| at.saturating_duration_since(now))
     }
 }
 
@@ -392,9 +512,14 @@ impl<E: FnMut(&Build) -> std::io::Error> Replacing<E> {
         pass
     }
 
-    /// How long until the next pass is due.
-    pub fn due_in(&self) -> Duration {
-        self.mover.due_in(now())
+    /// How long until a failed replacement's pause ends, while one is
+    /// running.
+    pub fn retry_in(&self) -> Option<Duration> {
+        self.mover.retry_in(now())
+    }
+
+    pub fn authority(&self) -> &Authority {
+        self.mover.authority()
     }
 
     /// Whether the last pass found a different build installed.
@@ -402,13 +527,40 @@ impl<E: FnMut(&Build) -> std::io::Error> Replacing<E> {
         self.mover.authority().standing().stale().is_some()
     }
 
-    /// Pass on every beat, for as long as this is polled. For a process
-    /// to select against while it is parked: whatever it is parked on
-    /// goes first, so a pass only ever runs with nothing in hand.
+    /// Pass now, and again on each [`Authority::subscribe`] wake or when
+    /// a failed replacement's pause ends, for as long as this is polled.
+    /// For a process to select against while it is parked: whatever it
+    /// is parked on goes first, so a pass only ever runs with nothing in
+    /// hand.
     pub async fn parked(&mut self) -> std::convert::Infallible {
         loop {
-            tokio::time::sleep(self.due_in()).await;
-            self.pass(Hosting::Nothing);
+            self.pass_until(|_| false).await;
+        }
+    }
+
+    /// Pass as [`Self::parked`] does until a pass finds this process
+    /// current, which may be at once.
+    pub async fn until_current(&mut self) {
+        self.pass_until(|pass| *pass == Pass::Current).await;
+    }
+
+    async fn pass_until(&mut self, done: impl Fn(&Pass) -> bool) {
+        let woken = Arc::new(tokio::sync::Notify::new());
+        let _subscription = self.authority().subscribe({
+            let woken = woken.clone();
+            move || woken.notify_one()
+        });
+        loop {
+            if done(&self.pass(Hosting::Nothing)) {
+                return;
+            }
+            match self.retry_in() {
+                Some(pause) => tokio::select! {
+                    _ = tokio::time::sleep(pause) => {}
+                    _ = woken.notified() => {}
+                },
+                None => woken.notified().await,
+            }
         }
     }
 }
@@ -488,6 +640,23 @@ pub(crate) mod tests {
             let mut other = crate::build_stamp::running().0;
             other[0] ^= n;
             self.install(Stamp(other));
+            Stamp(other)
+        }
+
+        /// Install the `n`th other build by writing over the file in
+        /// place, as a copy onto the same path does: no entry of its
+        /// directory changes.
+        pub(crate) fn overwrite(&self, n: u8) -> Stamp {
+            use std::io::Write as _;
+            let mut other = crate::build_stamp::running().0;
+            other[0] ^= n;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+                .unwrap();
+            file.write_all(&crate::build_stamp::executable_with(Stamp(other), "9.9.9"))
+                .unwrap();
             Stamp(other)
         }
 
@@ -600,7 +769,7 @@ pub(crate) mod tests {
                         ),
                         Pass::Waiting
                     );
-                    assert_eq!(mover.due_in(now), BEAT.min(retry_in));
+                    assert_eq!(mover.retry_in(now), Some(retry_in));
                     pauses.push(retry_in);
                     now += retry_in;
                 }
@@ -633,7 +802,7 @@ pub(crate) mod tests {
             Pass::Current,
             "its own build installed again"
         );
-        assert_eq!(mover.due_in(now), BEAT);
+        assert_eq!(mover.retry_in(now), None, "nothing is due by the clock");
     }
 
     /// A process hosting someone is never replaced, and is stale all the
@@ -861,6 +1030,168 @@ pub(crate) mod tests {
         );
         drop(settling);
         assert!(matches!(authority.standing(), Standing::Replaceable { .. }));
+    }
+
+    /// An install is an event: replacing the file, as `cargo install`
+    /// does, wakes a subscriber with no clock involved.
+    #[test]
+    fn an_install_wakes_a_subscriber() {
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let subscription = authority.subscribe(move || {
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing yet"
+        );
+        installed.replace(1);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the install"
+        );
+        drop(subscription);
+        while rx.try_recv().is_ok() {}
+        installed.replace(2);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "nothing once dropped"
+        );
+    }
+
+    /// The last work in flight on a stale build finishing is the other
+    /// thing that moves where it stands.
+    #[test]
+    fn the_last_permit_dropped_on_a_stale_build_wakes_a_subscriber() {
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let presenting = authority.permit().expect("current");
+        installed.replace(1);
+        assert!(matches!(authority.look(), Standing::Quiescing { .. }));
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _subscription = authority.subscribe({
+            let woken = woken.clone();
+            move || {
+                woken.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        });
+        let before = woken.load(std::sync::atomic::Ordering::Acquire);
+        drop(presenting);
+        assert!(woken.load(std::sync::atomic::Ordering::Acquire) > before);
+    }
+
+    /// A parked process passes once when it parks, then only when woken:
+    /// an install while parked replaces it, and one that landed before
+    /// it subscribed is acted on at once.
+    #[tokio::test]
+    async fn a_parked_process_is_replaced_by_an_install_and_by_nothing_else() {
+        let installed = Installed::current();
+        let tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut replacing = Replacing::new(installed.authority(), {
+            let tried = tried.clone();
+            move |build: &Build| {
+                tried.lock().unwrap().push(build.stamp);
+                std::io::Error::other("no exec in a test")
+            }
+        });
+        let idle = tokio::time::timeout(Duration::from_millis(500), replacing.parked()).await;
+        assert!(idle.is_err());
+        assert!(tried.lock().unwrap().is_empty(), "nothing to replace");
+
+        let installing = std::thread::spawn({
+            let path = installed.path.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                let mut other = crate::build_stamp::running().0;
+                other[0] ^= 1;
+                let tmp = path.with_extension("new");
+                std::fs::write(&tmp, crate::build_stamp::executable_with(Stamp(other), "9"))
+                    .unwrap();
+                std::fs::rename(&tmp, &path).unwrap();
+                Stamp(other)
+            }
+        });
+        let _ = tokio::time::timeout(Duration::from_millis(1500), replacing.parked()).await;
+        let other = installing.join().unwrap();
+        assert_eq!(tried.lock().unwrap().first(), Some(&other), "while parked");
+
+        let third = installed.replace(2);
+        let mut late = Replacing::new(installed.authority(), {
+            let tried = tried.clone();
+            move |build: &Build| {
+                tried.lock().unwrap().push(build.stamp);
+                std::io::Error::other("no exec in a test")
+            }
+        });
+        tried.lock().unwrap().clear();
+        let _ = tokio::time::timeout(Duration::from_millis(100), late.parked()).await;
+        assert_eq!(
+            tried.lock().unwrap().first(),
+            Some(&third),
+            "an install before the subscription"
+        );
+    }
+
+    /// An install that writes over the installed file in place changes
+    /// no directory entry; a parked process still hears it, and is
+    /// replaced by the build written.
+    #[tokio::test]
+    async fn a_parked_process_is_replaced_by_an_install_written_in_place() {
+        let installed = Installed::current();
+        let path = installed.path.clone();
+        let ino = || std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+        let before = ino();
+        let tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut replacing = Replacing::new(installed.authority(), {
+            let tried = tried.clone();
+            move |build: &Build| {
+                tried.lock().unwrap().push(build.stamp);
+                std::io::Error::other("no exec in a test")
+            }
+        });
+        let idle = tokio::time::timeout(Duration::from_millis(300), replacing.parked()).await;
+        assert!(idle.is_err());
+        let installed = std::sync::Arc::new(installed);
+        let writing = std::thread::spawn({
+            let installed = installed.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                installed.overwrite(1)
+            }
+        });
+        let _ = tokio::time::timeout(Duration::from_millis(1500), replacing.parked()).await;
+        let other = writing.join().unwrap();
+        assert_eq!(ino(), before, "written in place, not replaced");
+        assert_eq!(tried.lock().unwrap().first(), Some(&other), "while parked");
+    }
+
+    /// A stale process waiting to become current again returns as soon
+    /// as its own build is installed back.
+    #[tokio::test]
+    async fn until_current_returns_when_its_build_is_back() {
+        let installed = Installed::current();
+        installed.replace(1);
+        let mut replacing = Replacing::new(installed.authority(), |_: &Build| {
+            std::io::Error::other("no exec in a test")
+        });
+        let restoring = std::thread::spawn({
+            let path = installed.path.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                let tmp = path.with_extension("new");
+                std::fs::write(
+                    &tmp,
+                    crate::build_stamp::executable_with(crate::build_stamp::running(), "9"),
+                )
+                .unwrap();
+                std::fs::rename(&tmp, &path).unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), replacing.until_current())
+            .await
+            .expect("current again");
+        restoring.join().unwrap();
     }
 
     /// An installation that cannot be read proves nothing either way.

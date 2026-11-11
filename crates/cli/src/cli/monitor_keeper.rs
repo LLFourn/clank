@@ -13,10 +13,9 @@
 //! read-only through [`super::core_wakes`].
 
 use super::{
-    Attached, Attempt, BEAT_GRACE, Conn, SUBSCRIBE_POLL, Started, Who, attempt_with, beat_overdue,
-    reconcile_after, subscribe,
+    Attached, Attempt, Conn, Hangup, Started, Who, attempt_with, reconcile_after, subscribe,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -213,13 +212,13 @@ impl FreshRebuild {
 pub(crate) struct Live<A, M, W> {
     attempt: A,
     watch: M,
-    sub: Option<(Conn, Instant)>,
+    sub: Option<Conn>,
     local: Option<W>,
     local_tx: mpsc::Sender<()>,
     local_rx: mpsc::Receiver<()>,
     wake: mpsc::Sender<()>,
     fresh: FreshRebuild,
-    stop: Arc<AtomicBool>,
+    stop: Arc<Hangup>,
     closed: bool,
 }
 
@@ -234,13 +233,17 @@ where
         sub: Option<Conn>,
         wake: mpsc::Sender<()>,
         fresh: FreshRebuild,
-        stop: Arc<AtomicBool>,
+        stop: Arc<Hangup>,
     ) -> Self {
         let (local_tx, local_rx) = mpsc::channel();
+        stop.poke_on_stop(local_tx.clone());
+        if let Some(conn) = &sub {
+            stop.hang_up_on(conn);
+        }
         Self {
             attempt,
             watch,
-            sub: sub.map(|conn| (conn, Instant::now())),
+            sub,
             local: None,
             local_tx,
             local_rx,
@@ -262,40 +265,41 @@ where
     }
 
     fn stopped(&self) -> bool {
-        self.closed || self.stop.load(Ordering::Acquire)
+        self.closed || self.stop.stopped()
     }
 
     fn hear(&mut self, until: Option<Instant>) -> Option<Event> {
         if self.stopped() {
             return None;
         }
-        if let Some((conn, last)) = &mut self.sub {
-            // Polled rather than blocked on so a stop is noticed; a
-            // lapsed poll is not loss, silence past the grace is.
-            return match conn.note(Instant::now() + SUBSCRIBE_POLL) {
-                Ok(_) => {
-                    *last = Instant::now();
-                    Some(Event::Wake)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    if !beat_overdue(last.elapsed(), BEAT_GRACE) {
-                        return Some(Event::Quiet);
-                    }
-                    eprintln!("clank: the monitor went quiet; watching this repo directly");
-                    self.sub = None;
-                    Some(Event::Lost)
-                }
-                Err(_) => {
+        // Blocked on rather than polled: a stop shuts the socket and
+        // pokes the local channel, and an observer is sent a note only
+        // when the fold moved, so silence is never loss. A monitor that
+        // dies or is stood down by its watchdog closes the socket.
+        if let Some(conn) = &mut self.sub {
+            return match conn.next_note() {
+                Ok(_) => Some(Event::Wake),
+                Err(_) if self.stopped() => None,
+                Err(e) => {
+                    eprintln!("clank: the monitor went away ({e}); watching this repo directly");
                     self.sub = None;
                     Some(Event::Lost)
                 }
             };
         }
-        let wait = until.map_or(SUBSCRIBE_POLL, |at| {
-            at.saturating_duration_since(Instant::now())
-                .min(SUBSCRIBE_POLL)
-        });
-        match self.local_rx.recv_timeout(wait) {
+        let heard = match until {
+            Some(at) => self
+                .local_rx
+                .recv_timeout(at.saturating_duration_since(Instant::now())),
+            None => self
+                .local_rx
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        if self.stopped() {
+            return None;
+        }
+        match heard {
             Ok(()) => Some(Event::Wake),
             Err(_) => Some(Event::Quiet),
         }
@@ -315,7 +319,8 @@ where
     }
 
     fn adopt(&mut self, conn: Conn) {
-        self.sub = Some((conn, Instant::now()));
+        self.stop.hang_up_on(&conn);
+        self.sub = Some(conn);
     }
 
     fn forward(&mut self) {
@@ -340,8 +345,9 @@ where
 /// thread's retry work and releases its watcher; the monitor itself is
 /// independent and never signalled.
 pub(crate) struct MonitorKeeper {
-    stop: Arc<AtomicBool>,
+    stop: Arc<Hangup>,
     fresh: FreshRebuild,
+    fault: crate::fs_notice::Fault,
 }
 
 impl MonitorKeeper {
@@ -353,8 +359,9 @@ impl MonitorKeeper {
         wake: mpsc::Sender<()>,
         spawn: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn Started>> + Send + 'static,
     ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(Hangup::default());
         let fresh = FreshRebuild::default();
+        let fault = crate::fs_notice::Fault::default();
         let first = match subscribe(repo) {
             Attached::Shared(conn) => Some(conn),
             Attached::Alone(why) => {
@@ -364,7 +371,7 @@ impl MonitorKeeper {
         };
         let repo = repo.to_path_buf();
         {
-            let (stop, fresh) = (stop.clone(), fresh.clone());
+            let (stop, fresh, watching) = (stop.clone(), fresh.clone(), fault.clone());
             std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -376,7 +383,19 @@ impl MonitorKeeper {
                         Ok(runtime) => runtime.block_on(attempt_with(&repo, Who::Observer, &spawn)),
                         Err(e) => Attempt::Unproven(format!("no runtime to attach on: {e}")),
                     },
-                    |tx| crate::repo_watch::RepoStateWatcher::attach(&watched, false, tx),
+                    |tx| {
+                        crate::repo_watch::RepoStateWatcher::attach_reporting_to(
+                            &watched,
+                            tx,
+                            watching.clone(),
+                        )
+                        .inspect_err(|e| {
+                            crate::fs_notice::record(
+                                &watching,
+                                format!("cannot watch {}: {e:#}", watched.display()),
+                            )
+                        })
+                    },
                     first,
                     wake,
                     fresh,
@@ -385,7 +404,13 @@ impl MonitorKeeper {
                 drive(&mut live, attached);
             });
         }
-        Self { stop, fresh }
+        Self { stop, fresh, fault }
+    }
+
+    /// Why the watcher it keeps while no monitor serves failed, once it
+    /// has: from then on nothing wakes the panel for the repo's state.
+    pub(crate) fn fault(&self) -> Option<String> {
+        crate::fs_notice::read(&self.fault)
     }
 
     /// The fresh rebuilds this keeper owes the panel.
@@ -396,7 +421,7 @@ impl MonitorKeeper {
 
 impl Drop for MonitorKeeper {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.stop();
     }
 }
 
@@ -662,7 +687,7 @@ mod tests {
             None,
             wake,
             fresh.clone(),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(Hangup::default()),
         );
         let (mut phase, effects) = start(false);
         assert_eq!(effects, [Effect::WatchLocally, Effect::Attempt]);
@@ -721,7 +746,7 @@ mod tests {
     #[test]
     fn cancellation_stops_retry_work_and_releases_the_watcher() {
         let (wake, _woken) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(Hangup::default());
         let (watch, watching, _) = counted_watcher();
         let (attempted, attempts) = mpsc::channel();
         let live = Live::new(
@@ -740,7 +765,7 @@ mod tests {
             drive(&mut live, false);
         });
         attempts.recv().unwrap();
-        stop.store(true, Ordering::Release);
+        stop.stop();
         let began = Instant::now();
         keeper.join().unwrap();
         assert!(began.elapsed() < FIRST_RETRY, "not held for the backoff");
@@ -771,7 +796,11 @@ mod tests {
             None,
             wake,
             FreshRebuild::default(),
-            Arc::new(AtomicBool::new(true)),
+            {
+                let stop = Arc::new(Hangup::default());
+                stop.stop();
+                stop
+            },
         );
         drive(&mut live, false);
         assert_eq!(attempts.load(Ordering::Acquire), 0);
@@ -785,7 +814,7 @@ mod tests {
     #[test]
     fn an_attempt_cancelled_in_flight_is_discarded() {
         let (wake, woken) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(Hangup::default());
         let (watch, watching, _) = counted_watcher();
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
         let fresh = FreshRebuild::default();
@@ -794,7 +823,7 @@ mod tests {
                 let stop = stop.clone();
                 let mut ours = Some(ours);
                 move || {
-                    stop.store(true, Ordering::Release);
+                    stop.stop();
                     Attempt::Shared(Conn::over(ours.take().expect("one attempt")))
                 }
             },
@@ -828,7 +857,7 @@ mod tests {
     struct FakeMonitor {
         _dir: tempfile::TempDir,
         heard: mpsc::Receiver<super::super::Hello>,
-        gone: Arc<AtomicBool>,
+        gone: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Drop for FakeMonitor {
@@ -855,7 +884,7 @@ mod tests {
             },
         )
         .unwrap();
-        let gone = Arc::new(AtomicBool::new(false));
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tell, heard) = mpsc::channel();
         {
             let gone = gone.clone();

@@ -47,8 +47,6 @@ fn wait_args(repo: &Path, mut events: Vec<String>) -> WaitArgs {
         r#for: None,
         peek: false,
         no_cache: false,
-        poll: true,
-        no_poll: false,
     }
 }
 
@@ -173,9 +171,7 @@ async fn recurring_timer_deadline_wakes_real_local_wait_without_an_extra_produce
     let mut timer: serde_json::Value =
         serde_json::from_str(&timer_event("recurring-future", due)).unwrap();
     timer["repeat_every"] = "1h".into();
-    let mut args = wait_args(env.repo(), vec![timer.to_string()]);
-    args.poll = false;
-    args.no_poll = true;
+    let args = wait_args(env.repo(), vec![timer.to_string()]);
     let got = tokio::time::timeout(
         common::race_deadline(env.repo()),
         clank::cli::wait::items(args),

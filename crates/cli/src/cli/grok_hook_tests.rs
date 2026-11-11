@@ -237,8 +237,6 @@ fn automatic_wait_accepts_same_repo_and_rejects_other_repo_or_stale_session() {
         r#for: None,
         peek: false,
         no_cache: false,
-        poll: false,
-        no_poll: false,
     };
     assert!(
         super::super::wait::automatic_grok(&args, &env)

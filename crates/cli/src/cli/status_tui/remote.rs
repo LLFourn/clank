@@ -153,9 +153,8 @@ pub(super) struct Remote<O: Opener> {
     /// start is legal, which only the fresh read in the start task
     /// may decide (codex on 5149876).
     configured: std::cell::RefCell<Configured>,
-    /// How often the panes are re-listed, and how long a stop lets
-    /// the tasks end on their own; the production values, or a test's.
-    poll: std::time::Duration,
+    /// How long a stop lets the tasks end on their own; the production
+    /// value, or a test's.
     grace: std::time::Duration,
     opener: O,
     state: State,
@@ -176,7 +175,6 @@ impl<O: Opener> Remote<O> {
         repo: PathBuf,
         home: Option<PathBuf>,
         panes: PanesSource,
-        poll: std::time::Duration,
         grace: std::time::Duration,
         opener: O,
         wake: Arc<dyn Fn() + Send + Sync>,
@@ -187,7 +185,6 @@ impl<O: Opener> Remote<O> {
             panes,
             tunnel: Arc::new(|| Ok(None)),
             configured: std::cell::RefCell::new(Configured::Absent),
-            poll,
             grace,
             opener,
             state: State::Off,
@@ -377,8 +374,7 @@ impl<O: Opener> Remote<O> {
                 }
                 self.generation += 1;
                 let mut report = self.reporter();
-                let (repo, home, poll, grace) =
-                    (self.repo.clone(), self.home.clone(), self.poll, self.grace);
+                let (repo, home, grace) = (self.repo.clone(), self.home.clone(), self.grace);
                 // Finding zellij is the task's too: it lists the session
                 // synchronously, which is not the loop's to wait for
                 // (codex on 369e74e).
@@ -415,7 +411,6 @@ impl<O: Opener> Remote<O> {
                                 panes,
                                 crate::cli::web::Startup {
                                     tunnel: Some(start),
-                                    poll,
                                     grace,
                                     seed,
                                     reopen,
@@ -431,7 +426,6 @@ impl<O: Opener> Remote<O> {
                                 panes,
                                 crate::cli::web::Startup {
                                     tunnel: None,
-                                    poll,
                                     grace,
                                     seed,
                                     reopen,
@@ -458,6 +452,13 @@ impl<O: Opener> Remote<O> {
     }
 
     /// The TUI rebuilt its snapshot; the page follows.
+    /// The TUI's panes may have changed; nothing unless on.
+    pub(super) fn panes_changed(&self) {
+        if let State::On { instance } = &self.state {
+            instance.panes_changed();
+        }
+    }
+
     pub(super) fn observe(&self, snap: &crate::cli::status::StatusSnapshot) {
         self.recheck_configured();
         if let State::On { instance } = &self.state {
@@ -744,7 +745,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             Recorder::default(),
             Arc::new(|| {}),
@@ -832,7 +832,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             rec.clone(),
             Arc::new(|| {}),
@@ -883,7 +882,6 @@ mod tests {
             repo.path().to_path_buf(),
             None,
             Arc::new(|| panic!("no panes requested")),
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             Recorder::default(),
             Arc::new(|| {}),
@@ -1001,7 +999,6 @@ mod tests {
             repo,
             answers,
             std::time::Duration::ZERO,
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
         )
     }
@@ -1016,7 +1013,6 @@ mod tests {
         repo: &std::path::Path,
         answers: bool,
         slow: std::time::Duration,
-        poll: std::time::Duration,
         grace: std::time::Duration,
     ) -> (Remote<Recorder>, Recorder) {
         // A tunnel needs a home for its lease, and this fake one
@@ -1054,7 +1050,6 @@ mod tests {
                 std::thread::sleep(slow);
                 Ok(Arc::new(FakePanes { answers, slow }) as Arc<dyn Panes>)
             }),
-            poll,
             grace,
             rec.clone(),
             Arc::new(|| {}),
@@ -1089,7 +1084,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             rec.clone(),
             Arc::new(|| {}),
@@ -1147,7 +1141,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             rec.clone(),
             Arc::new(|| {}),
@@ -1192,7 +1185,6 @@ mod tests {
                         slow: std::time::Duration::ZERO,
                     }) as Arc<dyn Panes>)
                 }),
-                crate::cli::web::PANE_POLL,
                 crate::cli::web::STOP_GRACE,
                 rec.clone(),
                 Arc::new(|| {}),
@@ -1224,7 +1216,6 @@ mod tests {
             repo.path(),
             true,
             Duration::from_millis(10),
-            Duration::from_millis(10),
             Duration::from_millis(150),
         );
         let snap = snap();
@@ -1246,9 +1237,9 @@ mod tests {
         r.stop().await;
     }
 
-    /// A listing longer than the grace: the poll's task is aborted
-    /// when the grace runs out, but the listing it was waiting for is
-    /// waited for all the same — off returns only once it has ended,
+    /// A listing longer than the grace: the supervisor's task is
+    /// aborted when the grace runs out, but the listing it was waiting
+    /// for is waited for all the same — off returns only once it has ended,
     /// and nothing of the remote's is left running.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn off_waits_for_a_listing_past_the_grace() {
@@ -1260,12 +1251,12 @@ mod tests {
             repo.path(),
             true,
             Duration::from_millis(1200),
-            Duration::from_millis(10),
             Duration::from_millis(150),
         );
         let snap = snap();
         r.toggle(&snap);
         settle(&mut r, &snap).await;
+        r.panes_changed();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let pressed = std::time::Instant::now();
         r.toggle(&snap);
@@ -1283,13 +1274,13 @@ mod tests {
         assert_eq!(metrics.num_alive_tasks(), baseline, "nothing left running");
     }
 
-    /// Off ends a poll that is in the middle of a slow listing: the
+    /// Off ends a supervisor that is in the middle of a slow listing: the
     /// task is aborted and joined, not asked and left — the runtime's
     /// live-task count is back where it was the moment off returns,
     /// while a cancel alone would leave the task until the listing
     /// came back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn off_joins_a_poll_in_flight() {
+    async fn off_joins_a_listing_in_flight() {
         use std::time::Duration;
         let repo = repo_with_config();
         let metrics = tokio::runtime::Handle::current().metrics();
@@ -1298,13 +1289,12 @@ mod tests {
             repo.path(),
             true,
             Duration::from_millis(600),
-            Duration::from_millis(10),
             crate::cli::web::STOP_GRACE,
         );
         let snap = snap();
         r.toggle(&snap);
         settle(&mut r, &snap).await;
-        // Past the first poll's sleep, so a listing is under way.
+        r.panes_changed();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(metrics.num_alive_tasks() > baseline);
         let pressed = std::time::Instant::now();
@@ -1429,7 +1419,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             Recorder::default(),
             Arc::new(|| {}),
@@ -1573,7 +1562,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             rec.clone(),
             Arc::new(|| {}),
@@ -1702,7 +1690,6 @@ mod tests {
             repo.path(),
             true,
             Duration::from_millis(300),
-            crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
         );
         let snap = snap();

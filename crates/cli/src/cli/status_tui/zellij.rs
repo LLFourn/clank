@@ -1820,6 +1820,12 @@ impl RuntimeWatch {
         let mut requests_seen = RequestScan::new(repo);
         let scan_dir = dir.clone().ok();
         let sink = move |wake_: Wake<()>| {
+            if let Wake::Failed(why) = &wake_ {
+                eprintln!(
+                    "clank: the runtime directory's watch failed: {why}; remote requests are no \
+                     longer heard"
+                );
+            }
             if let (Wake::Dir, Some(dir)) = (wake_, &scan_dir) {
                 for id in requests_seen.new_ids(dir) {
                     let _ = requests.send(id);

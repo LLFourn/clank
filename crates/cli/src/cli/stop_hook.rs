@@ -32,8 +32,9 @@
 //!
 //! # An install under a parked Stop (`--handoff`)
 //!
-//! A hook parked in step 3 looks at its installation on a beat. When a
-//! different build is installed it becomes that build in place: `exec`
+//! A hook parked in step 3 looks at its installation when it parks and
+//! whenever the installation's directory changes. When a different build
+//! is installed it becomes that build in place: `exec`
 //! closes the child's pipes, which ends the child as a killed hook would,
 //! and the new image starts a child of its own, so the frames between a
 //! hook and its child are always one build's. What only the old image

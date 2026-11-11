@@ -72,6 +72,8 @@ mod reach_tests;
 
 #[path = "monitor_keeper.rs"]
 pub(crate) mod keeper;
+#[path = "monitor_watchdog.rs"]
+pub(crate) mod watchdog;
 
 /// What a monitor can do, not just what its frames look like.
 ///
@@ -283,25 +285,11 @@ pub(crate) enum Note {
     Done { what: String },
     /// A turn-end verdict, for a connection carrying a report.
     Verdict(super::turn_wire::Frame),
-    /// Proof of life, and nothing else.
-    ///
-    /// It carried the monitor's fold counter so a client could tell a
-    /// WEDGED monitor from a quiet one. Two separate signals already
-    /// answer that, and neither needs the number:
-    ///
-    /// - A CLIENT watches arrival. It gives up on silence past
-    ///   `BEAT_GRACE` and attaches again, which is the same answer for a
-    ///   wedged monitor and a dead one — and both are the answer it can
-    ///   act on.
-    /// - The WATCHDOG, inside the monitor, compares successive reads
-    ///   of a private counter that only a COMPLETED fold advances.
-    ///   That is the one place two of these were ever compared.
-    ///
-    /// A beat does not stand for a fresh fold, and the first version
-    /// of this comment said it did (codex on 258d979): `admit_into`
-    /// and the author-source branch both serve against the CACHED
-    /// folded state, so beats and counter advances are not one for
-    /// one.
+    /// A fold happened and owes this client nothing new. Sent only on
+    /// a fold, never on a clock: a client that hears nothing is on a
+    /// quiet repo, and learns of a dead or wedged monitor (its watchdog
+    /// stands it down) from the socket closing. Each one is a client's
+    /// chance to notice it has been superseded.
     Beat,
 }
 
@@ -426,34 +414,6 @@ pub(crate) fn admits(ours: u32, theirs: u32) -> bool {
     ours == theirs
 }
 
-/// Whether a client has waited too long for any `Note`.
-///
-/// The only liveness question a client needs to ask, because the beat
-/// comes from the fold loop: a loop that is stuck — or stuck INSIDE a
-/// fold — emits nothing, so a wedged monitor and a dead one both show
-/// up here as silence. Comparing tick numbers would add nothing a
-/// client can act on.
-///
-/// Takes the ELAPSED time, not two instants, so the caller must have
-/// measured it monotonically. The first shape took two wall-clock
-/// milliseconds and invited exactly the bug that shape invites: a
-/// clock rollback postpones the timeout until the clock catches up,
-/// and saturating arithmetic hides it rather than fixing it (codex on
-/// adb5453).
-pub(crate) fn beat_overdue(since_last: Duration, grace: Duration) -> bool {
-    since_last > grace
-}
-
-/// What one look at the fold decides.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Watch {
-    /// Carry on, remembering what was seen and how long it has been
-    /// still.
-    Keep { tick: u64, missed: u32 },
-    /// Evict ourselves, so the lease frees.
-    StandDown,
-}
-
 /// Whether a bounded retirement is under way, as the watchdog sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Retiring {
@@ -461,53 +421,6 @@ pub(crate) enum Retiring {
     Within,
     /// Past its deadline and the margin after it.
     Overdue,
-}
-
-/// Fold the watchdog's state forward by one look.
-///
-/// A state machine rather than a predicate because the question is
-/// about a SEQUENCE — how many looks in a row found the fold where it
-/// was — and a predicate takes that count as an argument, which means
-/// every test supplies by hand the very thing that can be wrong.
-///
-/// Why the monitor evicts itself at all: a lease serialises owners and
-/// cannot evict a wedged one, and unlinking the lock to force it would
-/// leave two processes holding flocks on two inodes — two owners. So
-/// the monitor stands down on its own, from a thread that is not the
-/// fold loop (the thing that may be stuck), and the lease frees
-/// honestly for the next client to take.
-///
-/// A monitor retiring has stopped folding on purpose, so while its
-/// retirement is within its deadline the fold's age is not judged; past
-/// it, the monitor is forced out like a stalled one.
-pub(crate) fn watchdog_look(
-    seen: u64,
-    now: u64,
-    missed: u32,
-    limit: u32,
-    retiring: Retiring,
-) -> Watch {
-    match retiring {
-        Retiring::No => {}
-        Retiring::Within => {
-            return Watch::Keep {
-                tick: now,
-                missed: 0,
-            };
-        }
-        Retiring::Overdue => return Watch::StandDown,
-    }
-    if now != seen {
-        return Watch::Keep {
-            tick: now,
-            missed: 0,
-        };
-    }
-    let missed = missed + 1;
-    if missed >= limit {
-        return Watch::StandDown;
-    }
-    Watch::Keep { tick: now, missed }
 }
 
 /// Whether a mode keeps a socket to its owner.
@@ -946,13 +859,6 @@ pub(crate) fn greeting_of(line: &str, repo: &std::path::Path) -> Greeting {
 /// help if `attach` never returns (codex on af1efd2).
 pub(crate) const ATTACH_BUDGET: Duration = Duration::from_secs(5);
 
-/// How long a client waits for any note before it stops sharing.
-///
-/// Comfortably more than the monitor's fold tick, so an ordinary quiet
-/// repo never trips it: silence past this means the monitor is dead or
-/// wedged, and both are the same answer to a client.
-pub(crate) const BEAT_GRACE: Duration = Duration::from_secs(20);
-
 /// What the handoff adds to `ATTACH_BUDGET`: the one deadline over
 /// finding, starting and attaching to a monitor is their sum.
 pub(crate) const SPAWN_SETTLE: Duration = Duration::from_millis(600);
@@ -1008,6 +914,19 @@ impl Conn {
         let line = read_frame(&mut self.io, &mut self.partial, deadline)?;
         serde_json::from_str(line.trim_end())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Read the next `Note`, however long it is in coming. The socket
+    /// closing, from either end, is what ends the wait.
+    pub(crate) fn next_note(&mut self) -> std::io::Result<Note> {
+        loop {
+            // A bound only because `poll` takes one; it is not a look.
+            let far = std::time::Instant::now() + Duration::from_secs(86_400);
+            match self.note(far) {
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                read => return read,
+            }
+        }
     }
 }
 
@@ -2566,13 +2485,6 @@ async fn look_after(
     Some(look(left))
 }
 
-/// How often a fold subscriber looks up from its socket.
-///
-/// Only so it can notice it has been asked to stop; a quiet monitor
-/// beats every `FOLD_TICK`, so a lapsed deadline here is not news and
-/// is never read as one.
-const SUBSCRIBE_POLL: Duration = Duration::from_millis(500);
-
 /// Subscribe to this repo's fold, read-only, or report why not.
 ///
 /// Attaches but never STARTS one. A panel is not a reason to put a
@@ -2604,61 +2516,149 @@ pub(crate) fn subscribe(repo: &std::path::Path) -> Attached {
     attach_by(repo, Who::Observer, ATTACH_BUDGET, connect_within)
 }
 
-/// Forward a monitor's beats onto `wake` until the sharing ends, then
+/// How a subscriber's reading thread is told to stop: a flag it reads,
+/// a shutdown of the socket it is blocked on, and a wake for a thread
+/// parked holding a watcher. Nothing about it is looked at on a clock.
+#[derive(Default)]
+pub(crate) struct Hangup {
+    stopped: std::sync::Mutex<bool>,
+    parked: std::sync::Condvar,
+    socket: std::sync::Mutex<Option<std::os::unix::net::UnixStream>>,
+    pokes: std::sync::Mutex<Vec<std::sync::mpsc::Sender<()>>>,
+}
+
+impl Hangup {
+    fn lock_stopped(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn stop(&self) {
+        let mut stopped = self.lock_stopped();
+        *stopped = true;
+        self.parked.notify_all();
+        let socket = self
+            .socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(socket) = socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        for poke in self
+            .pokes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
+            let _ = poke.send(());
+        }
+    }
+
+    /// Send on `poke` at [`Self::stop`], for a thread blocked receiving.
+    pub(crate) fn poke_on_stop(&self, poke: std::sync::mpsc::Sender<()>) {
+        let stopped = self.lock_stopped();
+        if *stopped {
+            let _ = poke.send(());
+        } else {
+            self.pokes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(poke);
+        }
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        *self.lock_stopped()
+    }
+
+    /// Shut `conn`'s socket down on [`Self::stop`], or now if that
+    /// already happened, so a read blocked on it returns.
+    pub(crate) fn hang_up_on(&self, conn: &Conn) {
+        let stopped = self.lock_stopped();
+        let Ok(socket) = conn.cancellation_socket() else {
+            return;
+        };
+        if *stopped {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        } else {
+            *self
+                .socket
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(socket);
+        }
+    }
+
+    /// Block until [`Self::stop`].
+    pub(crate) fn park(&self) {
+        let mut stopped = self.lock_stopped();
+        while !*stopped {
+            stopped = self
+                .parked
+                .wait(stopped)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// Forward a monitor's notes onto `wake` until the sharing ends, then
 /// hand the job back to a local watcher for good.
 ///
 /// On its own thread: `Conn` reads a blocking socket, and the callers
 /// are the status loop and the TUI, neither of which has a place to
-/// await. `stop` is checked between reads, which is why the read has a
-/// deadline at all.
-///
-/// A lapsed deadline is NOT loss — beats come every `FOLD_TICK` and
-/// this looks more often than that — so staleness is judged by how
-/// long it has been since the last beat, which is the one question a
-/// client can answer about a monitor that has gone quiet.
+/// await. It reads with no deadline. A monitor that dies closes the
+/// socket, and a wedged one is stood down by its own watchdog, which
+/// closes it too; `stop` shuts it from this end. An observer is sent a
+/// note only when the fold moved, so silence is the healthy idle state
+/// and is never read as loss.
 fn forward_beats(
     mut conn: Conn,
     repo: std::path::PathBuf,
     wake: std::sync::mpsc::Sender<()>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<Hangup>,
+    fault: crate::fs_notice::Fault,
 ) {
     std::thread::spawn(move || {
-        let mut last = std::time::Instant::now();
+        stop.hang_up_on(&conn);
         loop {
-            if stop.load(std::sync::atomic::Ordering::Acquire) {
+            if stop.stopped() {
                 return;
             }
-            match conn.note(std::time::Instant::now() + SUBSCRIBE_POLL) {
+            match conn.next_note() {
                 Ok(_) => {
-                    last = std::time::Instant::now();
                     if wake.send(()).is_err() {
                         return;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    if beat_overdue(last.elapsed(), BEAT_GRACE) {
-                        eprintln!(
-                            "clank: the monitor for {} went quiet; watching this repo directly",
-                            repo.display()
-                        );
-                        break;
+                Err(e) => {
+                    if stop.stopped() {
+                        return;
                     }
+                    eprintln!(
+                        "clank: the monitor for {} went away ({e}); watching this repo directly",
+                        repo.display()
+                    );
+                    break;
                 }
-                Err(_) => break,
             }
         }
         // Losing the monitor must not leave a panel frozen on stale
         // state, so this thread takes over the watching itself rather
         // than returning and leaving nobody.
-        let Some(watcher) = reconcile_after(
-            &wake,
-            crate::repo_watch::RepoStateWatcher::attach(&repo, false, wake.clone()),
-        ) else {
+        let attached = crate::repo_watch::RepoStateWatcher::attach_reporting_to(
+            &repo,
+            wake.clone(),
+            fault.clone(),
+        );
+        if let Err(e) = &attached {
+            crate::fs_notice::record(&fault, format!("cannot watch {}: {e:#}", repo.display()));
+            let _ = wake.send(());
+        }
+        let Some(watcher) = reconcile_after(&wake, attached) else {
             return;
         };
-        while !stop.load(std::sync::atomic::Ordering::Acquire) {
-            std::thread::sleep(SUBSCRIBE_POLL);
-        }
+        stop.park();
         drop(watcher);
     });
 }
@@ -2701,15 +2701,24 @@ fn reconcile_after<W>(
 /// to be woken when the repo changes, and whether that comes from the
 /// shared fold or a local watcher is this module's business.
 pub(crate) struct CoreWakes {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<Hangup>,
     /// Held only in the unshared case; the shared one keeps its
     /// watcher, if it ever needs one, inside its thread.
     _local: Option<crate::repo_watch::RepoStateWatcher>,
+    fault: crate::fs_notice::Fault,
+}
+
+impl CoreWakes {
+    /// Why the repo watcher behind these wakes failed, once it has: from
+    /// then on nothing will wake its owner for the repo's state.
+    pub(crate) fn fault(&self) -> Option<String> {
+        crate::fs_notice::read(&self.fault)
+    }
 }
 
 impl Drop for CoreWakes {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.stop.stop();
     }
 }
 
@@ -2724,19 +2733,27 @@ pub(crate) fn core_wakes(
     repo: &std::path::Path,
     wake: std::sync::mpsc::Sender<()>,
 ) -> anyhow::Result<CoreWakes> {
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = std::sync::Arc::new(Hangup::default());
+    let fault = crate::fs_notice::Fault::default();
     match subscribe(repo) {
         Attached::Shared(conn) => {
-            forward_beats(conn, repo.to_path_buf(), wake, stop.clone());
-            Ok(CoreWakes { stop, _local: None })
+            forward_beats(conn, repo.to_path_buf(), wake, stop.clone(), fault.clone());
+            Ok(CoreWakes {
+                stop,
+                _local: None,
+                fault,
+            })
         }
         Attached::Alone(why) => {
             tracing::debug!("watching {} directly: {why}", repo.display());
             Ok(CoreWakes {
                 stop,
-                _local: Some(crate::repo_watch::RepoStateWatcher::attach(
-                    repo, false, wake,
+                _local: Some(crate::repo_watch::RepoStateWatcher::attach_reporting_to(
+                    repo,
+                    wake,
+                    fault.clone(),
                 )?),
+                fault,
             })
         }
     }
@@ -3245,29 +3262,72 @@ pub async fn run(args: super::MonitorArgs) -> anyhow::Result<()> {
     }
 }
 
-/// How often the fold loop ticks when nothing changes.
-///
-/// The tick is the evidence of life — a quiet repo produces no new
-/// state, so a client watching for silence needs the loop to speak
-/// even when the repo does not.
-const FOLD_TICK: Duration = Duration::from_secs(5);
+/// The pause before a failed fold is tried again, doubling up to the cap
+/// while it goes on failing; the watchdog stands the monitor down if it
+/// fails for longer than [`watchdog::BUDGET`].
+const FOLD_FIRST_RETRY: Duration = Duration::from_millis(500);
+const FOLD_RETRY_CAP: Duration = Duration::from_secs(8);
 
-/// How often the watchdog looks, and how many still looks end it.
-///
-/// `FOLD_TICK` is the loop's own cadence, so four still looks at a
-/// five-second interval are four chances the loop had to advance and
-/// did not. Twenty seconds is also `BEAT_GRACE`: a client gives up on
-/// a silent monitor at about the moment that monitor stands down, so
-/// the fallback and the freed lease arrive together and the next park
-/// starts a fresh one.
-///
-/// The tension is real and settled deliberately. Too short kills a
-/// monitor whose fold is merely slow on a large repo; too long leaves
-/// the lease held by a process nobody can use. A needless restart
-/// costs one spawn — clients watch locally meanwhile — while a lease
-/// held forever is the failure this whole mechanism exists to end.
-const WATCHDOG_TICK: Duration = Duration::from_secs(5);
-const WATCHDOG_MISSES: u32 = 4;
+/// Told when a client's writer ends, which is how the loop learns a
+/// client went: a peer's close ends its writer.
+static CLIENT_GONE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Exit watches on every registered run, so a run's end is an event the
+/// loop records rather than something it looks for.
+struct RunExits {
+    watch: Option<crate::proc_identity::exit_watch::ExitWatch<(AgentLabel, i32)>>,
+    armed: Vec<(AgentLabel, clank_core::turn_policy::ShellProof)>,
+    ended: tokio::sync::mpsc::UnboundedSender<Result<AgentLabel, String>>,
+}
+
+impl RunExits {
+    /// `ended` hears each run's author as it ends, or why the watch on
+    /// them failed.
+    fn new(ended: tokio::sync::mpsc::UnboundedSender<Result<AgentLabel, String>>) -> Self {
+        use crate::proc_identity::exit_watch::Wake;
+        let watch = crate::proc_identity::exit_watch::ExitWatch::new(None, {
+            let ended = ended.clone();
+            move |wake| match wake {
+                Wake::Exited((author, _)) => {
+                    let _ = ended.send(Ok(author));
+                }
+                Wake::Failed(why) => {
+                    let _ = ended.send(Err(why));
+                }
+                Wake::Dir => {}
+            }
+        });
+        if let Err(e) = &watch {
+            eprintln!("monitor: cannot watch for runs ending: {e}");
+        }
+        RunExits {
+            watch: watch.ok(),
+            armed: Vec::new(),
+            ended,
+        }
+    }
+
+    /// Watch exactly `runs`. One already gone, or whose identity cannot
+    /// be read, is said to have ended at once, so the loop looks at it.
+    fn track(&mut self, runs: Vec<(AgentLabel, clank_core::turn_policy::ShellProof)>) {
+        use crate::proc_identity::exit_watch::Armed;
+        let Some(watch) = &self.watch else {
+            return;
+        };
+        for (author, proof) in self.armed.iter().filter(|run| !runs.contains(run)) {
+            watch.disarm(&(author.clone(), proof.pid));
+        }
+        for (author, proof) in runs.iter().filter(|run| !self.armed.contains(run)) {
+            let armed = serde_json::from_str::<crate::proc_identity::ProcToken>(&proof.token)
+                .map(|token| watch.arm((author.clone(), proof.pid), proof.pid, &token))
+                .unwrap_or(Armed::Unknown);
+            if armed == Armed::Ended {
+                let _ = self.ended.send(Ok(author.clone()));
+            }
+        }
+        self.armed = runs;
+    }
+}
 
 /// Standing down is not success, and not the caller's failure either.
 /// Nothing reads it — a spawned monitor's stdio is null and its
@@ -3320,7 +3380,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let pid = std::process::id() as i32;
     let (listener, socket) = bind_listener(&socket_dirs(me, xdg.as_deref()), pid, me, &lease)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    forget_dead_observations(&repo);
+    forget_dead_observation(&repo);
     let described = installed.as_ref().map(|r| DescribedBuild {
         running: running.to_string(),
         version: Some(crate::build_stamp::VERSION.to_string()),
@@ -3365,13 +3425,17 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         move || publish(&repo, &describe_this()).map_err(|e| e.to_string())
     };
     let lease_lost = tenure.watch.clone();
+    let installs = std::sync::Arc::new(tokio::sync::Notify::new());
+    let _installs = authority.subscribe({
+        let installs = installs.clone();
+        move || installs.notify_one()
+    });
 
     // The monitor's own fold counter. Private on purpose: it was
     // once published and put on every frame, and no reader ever
-    // compared two of them — `beat_overdue`'s own doc says comparing
-    // ticks "would add nothing a client can act on". What needs it is
-    // the watchdog, in this process, and a stalled fold reaches a
-    // client as silence rather than as a number that failed to move.
+    // compared two of them. What needs it is the watchdog, in this
+    // process, which stands a stalled monitor down, and a client sees
+    // that as its socket closing.
     let mut fold: u64 = 0;
     publish(&repo, &describe_this())?;
     println!(
@@ -3399,29 +3463,66 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let (fs_tx, fs_rx) = std::sync::mpsc::channel::<()>();
     let timer_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let event_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _watcher = crate::repo_watch::RepoStateWatcher::attach_with_invalidations(
-        &repo,
-        false,
-        fs_tx,
-        Some(timer_dirty.clone()),
-        Some(event_dirty.clone()),
-    )?;
+    // The first fold now, and the watcher attached off the loop: its
+    // native registration can take seconds, and clients attaching
+    // meanwhile must be greeted. Attached, it wakes the loop once for
+    // the gap it took as its baseline; failing to attach closes the
+    // channel, which ends the monitor saying so.
+    let _ = fs_tx.send(());
+    let watcher: std::sync::Arc<std::sync::Mutex<Option<crate::repo_watch::RepoStateWatcher>>> =
+        Default::default();
+    {
+        let (repo, watcher, timer_dirty, event_dirty) = (
+            repo.clone(),
+            watcher.clone(),
+            timer_dirty.clone(),
+            event_dirty.clone(),
+        );
+        std::thread::spawn(move || {
+            match crate::repo_watch::RepoStateWatcher::attach_with_invalidations(
+                &repo,
+                fs_tx.clone(),
+                Some(timer_dirty),
+                Some(event_dirty),
+            ) {
+                Ok(attached) => {
+                    *watcher
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attached);
+                    let _ = fs_tx.send(());
+                }
+                Err(e) => eprintln!("monitor: cannot watch {}: {e:#}", repo.display()),
+            }
+        });
+    }
     let mut timer_backlogs: std::collections::BTreeMap<
         AgentLabel,
         crate::cli::timer_source::Backlog,
     > = Default::default();
-    let mut beats = beats(fs_rx, FOLD_TICK);
+    let mut repo_changes = changes(fs_rx);
 
-    // Stamped by the fold loop below and by nothing else. A stamp from
-    // the accept loop would prove only that the process breathes —
-    // which is precisely the wedged monitor it has to detect.
-    let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(fold));
-    watch_the_fold(
-        heartbeat.clone(),
-        tenure.watch.clone(),
-        WATCHDOG_TICK,
-        WATCHDOG_MISSES,
-    );
+    let busy = std::sync::Arc::new(watchdog::Busy::default());
+    watchdog::start(busy.clone(), tenure.watch.clone(), watchdog::BUDGET);
+    // The lease's path is looked at when an entry of its directory
+    // changes: a removed or replaced lease file is one.
+    let (run_ended, mut runs_ended) =
+        tokio::sync::mpsc::unbounded_channel::<Result<AgentLabel, String>>();
+    let _lease_entries = {
+        let (lease, failed) = (tenure.watch.clone(), run_ended.clone());
+        crate::proc_identity::exit_watch::ExitWatch::<()>::new(
+            tenure.watch.path.parent(),
+            move |wake| match wake {
+                crate::proc_identity::exit_watch::Wake::Failed(why) => {
+                    let _ = failed.send(Err(format!("the lease's watch failed: {why}")));
+                }
+                _ => lease.observe(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("cannot watch the lease's directory: {e}"))?
+    };
+    let mut run_exits = RunExits::new(run_ended);
+    // Retried after a failure, a little later each time.
+    let mut fold_retry: Option<(tokio::time::Instant, Duration)> = None;
 
     // THE producers for this repo. One set per author, owned by this
     // process rather than by whichever parked wait happened to take
@@ -3506,6 +3607,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             tenure
                 .watch
                 .begin_retiring(LEASE_RETIREMENT + SETTLE_BUDGET);
+            busy.poke();
             let decision = stand_down(
                 &repo,
                 std::mem::take(&mut clients),
@@ -3529,6 +3631,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 Shutdown::RequiresProcessExit(_) => exit_holding_the_lease(),
             }
         }
+        // Before every wait, so a run registered in the last turn is
+        // watched before the loop sleeps.
+        run_exits.track(turns.runs());
         let timer_deadline = hosted
             .values()
             .filter_map(|host| {
@@ -3558,12 +3663,24 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             let wait = at.saturating_sub(crate::cli::recovery::unix_now());
             tokio::time::Instant::now() + Duration::from_secs(wait)
         });
+        let timer_retry = hosted
+            .values_mut()
+            .filter_map(|host| host.timers.as_mut().and_then(|timers| timers.retry_due()))
+            .min();
+        // Once: an agent with no waiter is said to have none only after
+        // the monitor has served long enough for its waits to arrive.
+        let settles = (serving_since.elapsed() < WAITERS_SETTLE)
+            .then(|| tokio::time::Instant::from_std(serving_since + WAITERS_SETTLE));
+        let quiesced = tenure.quiesce_by.map(tokio::time::Instant::from_std);
         // Receive, then look at the lease, then act: whatever woke the
         // loop, nothing it leads to runs as owner on a lease not
         // verified since.
         let wake = tokio::select! {
             // The watchdog saw the lease's path change.
             _ = lease_lost.wake.notified() => Wake::LeaseChanged,
+            // Each wake looks at the installation; this one only has to
+            // happen.
+            _ = installs.notified() => Wake::Installed,
             _ = crate::cli::timer_source::deadline(recovery_due) => Wake::RecoveryDue,
             _ = crate::cli::timer_source::deadline(turns_due) => Wake::TurnsDue,
             Some((conn, said)) = heard.recv() => Wake::Heard(conn, said),
@@ -3577,6 +3694,17 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 Wake::Records(events)
             }
             _ = crate::cli::timer_source::clock::sleep_until(timer_deadline) => Wake::TimersDue,
+            _ = crate::cli::timer_source::clock::sleep_until(timer_retry) => Wake::TimerRetry,
+            _ = crate::cli::timer_source::deadline(fold_retry.map(|(at, _)| at)) => Wake::Changed(true),
+            _ = crate::cli::timer_source::deadline(settles) => Wake::Settled,
+            _ = crate::cli::timer_source::deadline(quiesced) => Wake::Settled,
+            Some(ended) = runs_ended.recv() => match ended {
+                Ok(author) => Wake::RunEnded(author),
+                Err(why) => anyhow::bail!("a process watch failed: {why}"),
+            },
+            // A client's writer ended, which is how a closed client is
+            // seen: `tend` below finds it.
+            _ = CLIENT_GONE.notified() => Wake::Settled,
             Some(()) = uc_changed.recv() => {
                 while uc_changed.try_recv().is_ok() {}
                 Wake::UserCommands
@@ -3599,11 +3727,11 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             // gone to `arrivals`; this only stops us owning the task.
             Some(_) = owned.greeting.next(), if !owned.greeting.is_empty() => Wake::Collected,
             Some(_) = owned.hearing.next(), if !owned.hearing.is_empty() => Wake::Collected,
-            // A beat: the FS event or the heartbeat, whichever landed.
             // Receiving from a channel is cancel-safe and carries no
-            // state, which is the point — see `beats`.
-            beat = beats.recv() => Wake::Beat(beat.is_some()),
+            // state, which is the point — see `changes`.
+            changed = repo_changes.recv() => Wake::Changed(changed.is_some()),
         };
+        let _turn = busy.turn();
         let owner = tenure.may_act(&republish);
         if owner {
             leaving.extend(tend(
@@ -3627,7 +3755,22 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             _ => None,
         };
         match wake {
-            Wake::LeaseChanged | Wake::Collected => {}
+            Wake::LeaseChanged | Wake::Collected | Wake::Installed | Wake::Settled => {}
+            Wake::TimerRetry => {
+                if owner {
+                    for host in hosted.values_mut() {
+                        if let Some(timers) = &mut host.timers {
+                            timers.retry_failed();
+                        }
+                    }
+                }
+            }
+            Wake::RunEnded(author) => {
+                if owner {
+                    let g = crate::cli::turn_custody::Gathered::of(&repo, &author, None);
+                    turns.end_gone_runs(&author, &g);
+                }
+            }
             Wake::UserCommands | Wake::UserCommandsDue => {}
             Wake::UserCommandDone(done) => user_commands.finished(done),
             Wake::UserCommandAsk(ask) => {
@@ -4137,9 +4280,15 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 }
             }
             Wake::Interrupted(author) => owned.interrupting.completed(&repo, author),
-            Wake::Beat(open) => {
+            Wake::Changed(open) => {
                 if !open {
-                    anyhow::bail!("the repo watcher stopped");
+                    let why = watcher
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .and_then(|w| w.fault())
+                        .unwrap_or_else(|| "it could not attach".to_string());
+                    anyhow::bail!("the repo watcher stopped: {why}");
                 }
                 let events_changed = event_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
                 let timers_changed = timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
@@ -4153,9 +4302,10 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 // rebuild would show the watchdog progress that never
                 // happened — the invariant this plan set for itself
                 // (codex on 13e9fa7).
-                match advance(&repo, fold, &heartbeat).await {
+                match advance(&repo, fold, &busy).await {
                     Some((next, state)) => {
                         fold = next;
+                        fold_retry = None;
                         // Looked at again: the fold was a long await.
                         let owner = owner && tenure.may_act(&republish);
                         if events_changed && owner {
@@ -4246,7 +4396,13 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         if timers_changed {
                             timer_dirty.store(true, std::sync::atomic::Ordering::Release);
                         }
-                        eprintln!("monitor: fold failed, held at {fold}");
+                        let pause = fold_retry.map_or(FOLD_FIRST_RETRY, |(_, pause)| {
+                            (pause * 2).min(FOLD_RETRY_CAP)
+                        });
+                        fold_retry = Some((tokio::time::Instant::now() + pause, pause));
+                        eprintln!(
+                            "monitor: fold failed, held at {fold}; trying again in {pause:?}"
+                        );
                     }
                 }
             }
@@ -4313,8 +4469,18 @@ enum Wake {
     Heard(u64, Heard),
     /// A task this loop owned has ended.
     Collected,
-    /// Whether the watcher is still there.
-    Beat(bool),
+    /// Where this build stands against its installation may have moved.
+    Installed,
+    /// The repo changed, or a failed fold is due again; `false` once the
+    /// watcher is gone.
+    Changed(bool),
+    /// A failed timer's retry is due.
+    TimerRetry,
+    /// A registered run's process exited.
+    RunEnded(AgentLabel),
+    /// A deadline that only asks the loop to look again: the waiters'
+    /// settling, a quiescing build's end, a client gone.
+    Settled,
     /// A user-command record changed on disk.
     UserCommands,
     /// A waiting user command expires, or a released park has settled.
@@ -5061,9 +5227,9 @@ async fn typed_send(
 }
 
 /// Record the end of every bound agent's `clank run` whose process is
-/// gone. Each beat asks, so a run ends within one beat of its process,
-/// and the first beat after a restart ends those that went while no
-/// monitor watched.
+/// gone. Each fold asks, so the first fold after a restart ends those
+/// that went while no monitor watched; a run that ends while one does
+/// is reported by its exit ([`RunExits`]).
 fn end_gone_runs(repo: &std::path::Path, turns: &mut crate::cli::turn_custody::Turns) {
     for author in roster_authors(repo) {
         let g = crate::cli::turn_custody::Gathered::of(repo, &author, None);
@@ -5312,63 +5478,6 @@ fn act_on_recovery(
     }
 }
 
-/// Watch the fold from a thread of its own, and stand down if it stops.
-///
-/// Not a task: the runtime is what may be wedged, and a task on a
-/// stalled executor is exactly as stuck as the loop it is meant to
-/// judge. A thread is scheduled by the kernel regardless.
-///
-/// It reads the loop's OWN tick, not the published descriptor — the
-/// stamp on disk is written by the fold loop too, but going through
-/// the filesystem would add a way for this to be wrong (an unwritable
-/// `.clank/` would read as a stall) without adding anything it can
-/// learn.
-///
-/// It also looks at the lease's path, and only looks: a change it sees
-/// is flagged for the loop, which alone re-takes or retires.
-fn watch_the_fold(
-    tick: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    lease: std::sync::Arc<LeaseWatch>,
-    every: Duration,
-    limit: u32,
-) {
-    std::thread::spawn(move || {
-        let mut seen = tick.load(std::sync::atomic::Ordering::Acquire);
-        let mut missed = 0;
-        loop {
-            std::thread::sleep(every);
-            let now = tick.load(std::sync::atomic::Ordering::Acquire);
-            let retiring = lease.retiring(unix_ms(), every * limit);
-            match watchdog_look(seen, now, missed, limit, retiring) {
-                Watch::Keep { tick, missed: m } => {
-                    seen = tick;
-                    missed = m;
-                }
-                Watch::StandDown => {
-                    let why = match retiring {
-                        Retiring::Overdue => "its retirement overran its deadline".to_string(),
-                        _ => format!(
-                            "the fold has not advanced past {seen} in {:?}",
-                            every * limit
-                        ),
-                    };
-                    eprintln!(
-                        "monitor: lease {} ({}) at {}: forced: {why}; producers are cut off, \
-                         not drained",
-                        lease.path.display(),
-                        lease.held(),
-                        timestamp(),
-                    );
-                    crate::cli::source_group::exit(STOOD_DOWN_EXIT);
-                }
-            }
-            if retiring == Retiring::No {
-                lease.observe();
-            }
-        }
-    });
-}
-
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5423,6 +5532,19 @@ impl LeaseWatch {
             unix_ms() + within.as_millis() as u64,
             std::sync::atomic::Ordering::Release,
         );
+    }
+
+    /// How long the retirement under way has left, its margin included.
+    fn retiring_left(&self, now_ms: u64, margin: Duration) -> Option<Duration> {
+        match self
+            .retiring_until
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            0 => None,
+            until => Some(Duration::from_millis(
+                (until + margin.as_millis() as u64).saturating_sub(now_ms),
+            )),
+        }
     }
 
     fn retiring(&self, now_ms: u64, margin: Duration) -> Retiring {
@@ -6382,34 +6504,25 @@ fn client_refusal(repo: &std::path::Path, client: &Client) -> Option<String> {
     None
 }
 
-/// Beats, produced independently of client traffic.
+/// The repo's changes, produced independently of client traffic.
 ///
-/// `Beat::next` is a fresh `sleep(tick)` racing the watcher channel and
-/// then a 200ms debounce — THREE awaits. Rebuilding it inside the
-/// owner's select was wrong twice (codex on 24ea491):
-///
-/// - every accepted connection or arrival dropped the future and
-///   restarted the sleep, so client traffic faster than `tick` could
-///   postpone the heartbeat forever and a newly admitted client never
-///   got its first items;
-/// - and it could consume a filesystem wake and then be cancelled
-///   during the debounce, so the channel item was gone and the owner
-///   never saw the beat. A dropped repo change is a silent agent, which
-///   is the failure this plan exists to prevent.
+/// `Beat::changed` is a receive and then a 200ms debounce. Inside the
+/// owner's select it could consume a filesystem wake and then be
+/// cancelled during the debounce, so the channel item was gone and the
+/// owner never saw the change (codex on 24ea491). A dropped repo change
+/// is a silent agent, which is the failure this plan exists to prevent.
 ///
 /// A dedicated task owns the `Beat` instead. Nothing cancels it, so its
 /// state cannot be discarded, and the owner only ever awaits a channel
-/// receive — which holds no state to lose. Capacity 1 coalesces beats
+/// receive — which holds no state to lose. Capacity 1 coalesces changes
 /// for a busy owner rather than queueing them, and the watcher's own
-/// channel buffers the events meanwhile.
-fn beats(fs_rx: std::sync::mpsc::Receiver<()>, tick: Duration) -> tokio::sync::mpsc::Receiver<()> {
+/// channel buffers the events meanwhile. It closes when the watcher
+/// does.
+fn changes(fs_rx: std::sync::mpsc::Receiver<()>) -> tokio::sync::mpsc::Receiver<()> {
     let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
         let mut beat = crate::cli::wait::Beat::bridge(fs_rx);
-        loop {
-            if beat.next(tick).await.is_err() {
-                break;
-            }
+        while beat.changed().await.is_ok() {
             if tx.send(()).await.is_err() {
                 break;
             }
@@ -6487,28 +6600,29 @@ pub(crate) fn note_observation(
     std::fs::rename(tmp, path)
 }
 
-/// Remove this repo's observation records whose process is gone, as
-/// left by monitors that died.
-fn forget_dead_observations(repo: &std::path::Path) {
-    let marker = runtime_path(repo, OBSERVATION_PREFIX);
-    let (Some(dir), Some(prefix)) = (marker.parent(), marker.file_name()) else {
+/// Remove the observation record of the monitor `repo`'s descriptor
+/// names, if that monitor died: every other way a monitor ends removes
+/// its own. Looked up by name, not by listing the runtime directory,
+/// which every repo on the machine shares and which a test suite leaves
+/// tens of thousands of entries in: a listing there cost a starting
+/// monitor seconds before it could publish.
+fn forget_dead_observation(repo: &std::path::Path) {
+    let Some(pid) = std::fs::read(runtime_path(repo, "json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<PidEnvelope>(&raw).ok())
+        .map(|p| p.pid)
+    else {
         return;
     };
-    let prefix = prefix.to_string_lossy().into_owned();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let path = observation_path(repo, pid);
+    let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
-    for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
-            continue;
-        }
-        let alive = std::fs::read(entry.path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Observation>(&bytes).ok())
-            .is_some_and(|o| o.birth.is_some_and(|b| b.still_holds(o.pid)));
-        if !alive {
-            let _ = std::fs::remove_file(entry.path());
-        }
+    let alive = serde_json::from_slice::<Observation>(&bytes)
+        .ok()
+        .is_some_and(|o| o.birth.is_some_and(|b| b.still_holds(o.pid)));
+    if !alive {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -6615,20 +6729,20 @@ fn describe_build(pid: i32, build: Option<&DescribedBuild>, observed: Option<&Ob
     )
 }
 
-/// Fold, and move the heartbeat ONLY if that succeeded.
+/// Fold, and count it ONLY if that succeeded: a failure arms the
+/// watchdog until a fold succeeds.
 ///
-/// The heartbeat means a fold completed. Advancing it first and then
-/// failing the rebuild would advertise progress that never happened,
-/// and a loop that kept failing would keep looking fresh to the
-/// watchdog — the invariant this plan set for itself, inverted
-/// (codex on 13e9fa7).
+/// Counting it first and then failing the rebuild would advertise
+/// progress that never happened, and a loop that kept failing would
+/// keep looking fresh to the watchdog — the invariant this plan set for
+/// itself, inverted (codex on 13e9fa7).
 async fn advance(
     repo: &std::path::Path,
     fold: u64,
-    heartbeat: &std::sync::atomic::AtomicU64,
+    busy: &watchdog::Busy,
 ) -> Option<(u64, crate::repo_state::RepoState)> {
     let outcome = folded(repo).await;
-    advance_with(fold, heartbeat, outcome)
+    advance_with(fold, busy, outcome)
 }
 
 /// The ORDERING, with the fold's outcome supplied.
@@ -6640,26 +6754,23 @@ async fn advance(
 /// order — nothing is published unless a fold completed — and that is
 /// decided here.
 ///
-/// The watchdog's `heartbeat` is stamped here too, and ONLY here. It
-/// is the same claim as the descriptor's, so it belongs to the same
-/// decision: a heartbeat the accept loop could touch would prove the
-/// process breathes, which is exactly the wedged monitor the watchdog
-/// exists to catch. The caller is given no opportunity to stamp it.
+/// The watchdog is told of the outcome here, and ONLY here, so the
+/// caller has no way to report a fold that did not complete.
 fn advance_with(
     fold: u64,
-    heartbeat: &std::sync::atomic::AtomicU64,
+    busy: &watchdog::Busy,
     outcome: anyhow::Result<crate::repo_state::RepoState>,
 ) -> Option<(u64, crate::repo_state::RepoState)> {
     let state = match outcome {
         Ok(state) => state,
         Err(e) => {
             eprintln!("monitor: {e}");
+            busy.failing(true);
             return None;
         }
     };
-    let next = fold + 1;
-    heartbeat.store(next, std::sync::atomic::Ordering::Release);
-    Some((next, state))
+    busy.failing(false);
+    Some((fold + 1, state))
 }
 
 /// One completed fold of the repo.
@@ -7020,7 +7131,9 @@ async fn write_to_within(
         let mut byte = [0u8; 1];
         let _ = read.read(&mut byte).await;
     };
-    write_queued(write, queued, farewell, author, budget, unexpected).await
+    let wrote = write_queued(write, queued, farewell, author, budget, unexpected).await;
+    CLIENT_GONE.notify_one();
+    wrote
 }
 
 /// Write what is queued to `socket` until the queue closes, or until
@@ -7995,11 +8108,9 @@ fn registered_waiter(c: &Client) -> Option<(&AgentLabel, &str)> {
 }
 
 /// How long a monitor serves before a missing connection means a missing
-/// waiter: a waiter that outlived the last monitor notices the silence,
+/// waiter: a waiter that outlived the last monitor sees its socket close,
 /// backs off, and attaches again within this.
-const WAITERS_SETTLE: Duration = BEAT_GRACE
-    .saturating_add(OUTAGE_RETRY_CAP)
-    .saturating_add(ATTACH_BUDGET);
+const WAITERS_SETTLE: Duration = OUTAGE_RETRY_CAP.saturating_add(ATTACH_BUDGET);
 
 /// The deliverer `c` is, if it is one: an agent's open connection that
 /// work can be handed down, a wait or a report that parks, with the tool
@@ -11336,19 +11447,6 @@ mod tests {
                 "a half holder invents or loses an identity: {raw}"
             );
         }
-    }
-
-    /// The wedge case: the socket answers, the fold does not advance.
-    /// A client sees it as silence because the beat is the loop's.
-    #[test]
-    fn silence_and_staleness_are_one_signal_to_a_client() {
-        let grace = Duration::from_secs(30);
-        assert!(!beat_overdue(Duration::from_secs(29), grace), "inside");
-        assert!(!beat_overdue(grace, grace), "exactly at it");
-        assert!(
-            beat_overdue(grace + Duration::from_millis(1), grace),
-            "past it"
-        );
     }
 
     /// The reason the socket is not under the repo.
@@ -14799,44 +14897,41 @@ mod tests {
         assert!(!revoked(&other), "an unreadable config is transient");
     }
 
-    /// A fold that FAILED must not advertise progress.
-    ///
-    /// The heartbeat is what the watchdog reads, and a failing loop
-    /// that kept it fresh is exactly the wedge the watchdog could then
-    /// never see. Tested on the ORDERING with the fold's outcome
-    /// supplied, because the rebuild is fail-soft — it returns `Ok`
-    /// for a repo with no git, a broken `.git` file and an empty
-    /// `.git` directory — so a failing fold cannot be provoked
-    /// through it.
+    /// A fold that FAILED must not advertise progress: it arms the
+    /// watchdog from the first failure until a fold completes. Tested on
+    /// the ORDERING with the fold's outcome supplied, because the rebuild
+    /// is fail-soft — it returns `Ok` for a repo with no git, a broken
+    /// `.git` file and an empty `.git` directory — so a failing fold
+    /// cannot be provoked through it.
     #[test]
     fn a_failed_fold_does_not_advertise_progress() {
-        let at_zero = 0;
-        let heartbeat = std::sync::atomic::AtomicU64::new(0);
-        let beat = || heartbeat.load(std::sync::atomic::Ordering::Acquire);
-
-        let failed = advance_with(
-            at_zero,
-            &heartbeat,
-            Err(anyhow::anyhow!("the fold did not complete")),
-        );
+        let busy = watchdog::Busy::default();
+        let failing = |busy: &watchdog::Busy| {
+            matches!(
+                watchdog::look(
+                    None,
+                    busy.failing_since(),
+                    Retiring::No,
+                    None,
+                    std::time::Instant::now() + watchdog::BUDGET,
+                    watchdog::BUDGET,
+                ),
+                watchdog::Look::StandDown(_)
+            )
+        };
+        let failed = advance_with(0, &busy, Err(anyhow::anyhow!("the fold did not complete")));
         assert!(failed.is_none(), "a failed fold yields nothing to serve");
-        assert_eq!(beat(), 0, "and the watchdog's heartbeat does not move");
-
-        for _ in 0..3 {
-            let _ = advance_with(at_zero, &heartbeat, Err(anyhow::anyhow!("still failing")));
-        }
-        assert_eq!(beat(), 0, "repeated failure must not creep it either");
-
+        assert!(failing(&busy), "and the watchdog is armed by it");
         let ok = advance_with(
-            at_zero,
-            &heartbeat,
+            0,
+            &busy,
             Ok(crate::repo_state::RepoState::empty(
                 std::path::PathBuf::from("/w/proj"),
             )),
         )
         .expect("a completed fold serves");
         assert_eq!(ok.0, 1);
-        assert_eq!(beat(), 1, "and the watchdog sees the fold that completed");
+        assert!(!failing(&busy), "and a completed one disarms it");
     }
 
     /// Fill a stream so a later `write_all` on it cannot drain, and
@@ -14962,114 +15057,194 @@ mod tests {
         );
     }
 
-    /// The heartbeat is not postponed by client traffic.
-    ///
-    /// Rebuilding `Beat::next` inside the owner's select restarted its
-    /// sleep on every accept or arrival, so traffic faster than the
-    /// tick postponed the heartbeat forever and a newly admitted
-    /// client never got its first items. A dedicated producer cannot
-    /// be reset by anything the owner does (codex on 24ea491).
-    #[tokio::test(start_paused = true)]
-    async fn a_heartbeat_arrives_whatever_the_owner_is_doing() {
-        let (_fs_tx, fs_rx) = std::sync::mpsc::channel::<()>();
-        let mut beats = beats(fs_rx, FOLD_TICK);
-
-        // Stand in for the owner being busy with clients: time moves,
-        // nothing is received, and the producer is never polled by the
-        // select that used to cancel it.
-        for _ in 0..10 {
-            tokio::time::advance(FOLD_TICK / 4).await;
+    /// The loop has no tick: each arm it waits on is a channel, a
+    /// notification, or one of its own deadlines, each computed from
+    /// state it holds. Read from the source, since no test may run a
+    /// monitor: a heartbeat restored as an arm fails here, and an idle
+    /// repo with no deadline therefore wakes nothing — no fold, no
+    /// serve, no probe, no note to any client.
+    #[test]
+    fn the_loop_waits_only_on_events_and_its_own_deadlines() {
+        let src = include_str!("monitor.rs");
+        let from = src
+            .find("        let wake = tokio::select! {")
+            .expect("the loop's select");
+        let arms = &src[from..from + src[from..].find("\n        };\n").expect("its end")];
+        for poll in ["sleep(", "interval", "Beat::next", "tick"] {
+            assert!(!arms.contains(poll), "{poll} in the loop's select");
         }
-
-        let beat = tokio::time::timeout(FOLD_TICK * 2, beats.recv()).await;
+        let body = &src[src.find("    let ended = loop {").expect("the loop")..from];
         assert!(
-            matches!(beat, Ok(Some(()))),
-            "no heartbeat: client traffic postponed it"
+            body.contains("run_exits.track(turns.runs());"),
+            "every registered run is watched before the loop sleeps"
+        );
+        let stopped = &src[src
+            .find("            Wake::Changed(open) => {")
+            .expect("the change arm")..];
+        let stopped = &stopped[..stopped.find("match advance(").expect("its fold")];
+        assert!(
+            stopped.contains("anyhow::bail!(\"the repo watcher stopped: {why}\")")
+                && stopped.contains(".and_then(|w| w.fault())"),
+            "a closed change stream ends the monitor, saying why: {stopped}"
+        );
+        let turn = &src[from..from
+            + src[from..]
+                .find("let owner = tenure.may_act")
+                .expect("after")];
+        assert!(
+            turn.contains("let _turn = busy.turn();"),
+            "the watchdog is armed for every turn and only then"
+        );
+        let deadlines: Vec<&str> = arms
+            .lines()
+            .filter(|line| line.contains("deadline(") || line.contains("sleep_until("))
+            .map(str::trim)
+            .collect();
+        let named = [
+            "deadline(recovery_due)",
+            "deadline(turns_due)",
+            "sleep_until(timer_deadline)",
+            "sleep_until(timer_retry)",
+            "deadline(fold_retry",
+            "deadline(settles)",
+            "deadline(quiesced)",
+            "deadline(uc_due)",
+        ];
+        assert_eq!(deadlines.len(), named.len(), "{deadlines:#?}");
+        for deadline in named {
+            assert!(
+                deadlines.iter().any(|line| line.contains(deadline)),
+                "{deadline} is not among {deadlines:#?}"
+            );
+        }
+    }
+
+    /// A run watch whose kernel wait fails is a failure the loop hears,
+    /// which ends the monitor, not silence.
+    #[test]
+    fn a_failed_run_watch_is_told_to_the_loop() {
+        let (ended, mut runs_ended) = tokio::sync::mpsc::unbounded_channel();
+        let exits = RunExits::new(ended);
+        exits.watch.as_ref().unwrap().fail_for_test();
+        let began = std::time::Instant::now();
+        let heard = loop {
+            match runs_ended.try_recv() {
+                Ok(heard) => break Some(heard),
+                Err(_) if began.elapsed() < Duration::from_secs(5) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => break None,
+            }
+        };
+        assert!(matches!(heard, Some(Err(_))), "{heard:?}");
+    }
+
+    /// A registered run's exit is an event: the loop is told the author,
+    /// and one already gone is told at once.
+    #[test]
+    fn a_run_that_exits_is_reported_without_being_looked_for() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let token = serde_json::to_string(&crate::proc_identity::token_for(pid).unwrap()).unwrap();
+        let author = AgentLabel::parse("claude").unwrap();
+        let proof = clank_core::turn_policy::ShellProof { pid, token };
+        let (ended, mut runs_ended) = tokio::sync::mpsc::unbounded_channel();
+        let mut exits = RunExits::new(ended);
+        exits.track(vec![(author.clone(), proof.clone())]);
+        exits.track(vec![(author.clone(), proof.clone())]);
+        assert!(runs_ended.try_recv().is_err(), "it is running");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let began = std::time::Instant::now();
+        let heard = loop {
+            match runs_ended.try_recv() {
+                Ok(who) => break Some(who),
+                Err(_) if began.elapsed() < Duration::from_secs(5) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => break None,
+            }
+        };
+        assert_eq!(heard, Some(Ok(author.clone())), "its exit");
+
+        let (ended, mut runs_ended) = tokio::sync::mpsc::unbounded_channel();
+        let mut later = RunExits::new(ended);
+        later.track(vec![(author.clone(), proof.clone())]);
+        assert_eq!(runs_ended.try_recv().ok(), Some(Ok(author)), "already gone");
+        later.track(vec![(AgentLabel::parse("claude").unwrap(), proof)]);
+        assert!(runs_ended.try_recv().is_err(), "and said once");
+    }
+
+    /// With nothing changing, the loop's change producer says nothing,
+    /// however much time passes: there is no heartbeat to make a fold of.
+    #[tokio::test(start_paused = true)]
+    async fn no_change_is_no_wake_however_long_it_is() {
+        let (_fs_tx, fs_rx) = std::sync::mpsc::channel::<()>();
+        let mut changes = changes(fs_rx);
+        for _ in 0..24 {
+            tokio::time::advance(Duration::from_secs(3600)).await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3600), changes.recv())
+                .await
+                .is_err(),
+            "a day of nothing woke the loop"
         );
     }
 
     /// A filesystem wake survives the owner being busy.
     ///
     /// The old shape could consume the wake and then be cancelled
-    /// during its 200ms debounce — the channel item gone, the beat
+    /// during its 200ms debounce — the channel item gone, the change
     /// never delivered. A dropped repo change is a silent agent.
     ///
     /// REAL time, not paused: `Beat::bridge` forwards from the std
     /// channel on an OS thread, and paused time does not wait for
-    /// thread scheduling. Pausing made this pass alone and fail under
-    /// the full suite's load, which is the worse of the two failures.
+    /// thread scheduling.
     #[tokio::test]
     async fn a_filesystem_wake_is_not_lost_while_the_owner_is_busy() {
         let (fs_tx, fs_rx) = std::sync::mpsc::channel::<()>();
-        // An hour's heartbeat, so a beat can only be the wake.
-        let mut beats = beats(fs_rx, Duration::from_secs(3600));
-
+        let mut changes = changes(fs_rx);
         fs_tx.send(()).unwrap();
-
-        let beat = tokio::time::timeout(Duration::from_secs(5), beats.recv()).await;
+        let change = tokio::time::timeout(Duration::from_secs(5), changes.recv()).await;
         assert!(
-            matches!(beat, Ok(Some(()))),
+            matches!(change, Ok(Some(()))),
             "the wake was consumed and then discarded"
         );
     }
 
-    /// A burst is one refold, and the debounce still belongs to `wait`.
+    /// A burst is one refold, and changes coalesce for a busy owner
+    /// rather than queueing a backlog of folds, each already superseded.
     #[tokio::test]
-    async fn a_burst_of_changes_is_one_beat() {
+    async fn a_burst_of_changes_is_one_refold() {
         let (fs_tx, fs_rx) = std::sync::mpsc::channel::<()>();
-        let mut beats = beats(fs_rx, Duration::from_secs(3600));
-
+        let mut changes = changes(fs_rx);
         for _ in 0..20 {
             fs_tx.send(()).unwrap();
         }
-
         assert!(
             matches!(
-                tokio::time::timeout(Duration::from_secs(5), beats.recv()).await,
+                tokio::time::timeout(Duration::from_secs(5), changes.recv()).await,
                 Ok(Some(()))
             ),
-            "the burst produced no beat"
+            "the burst produced no wake"
         );
-        // A second would mean the burst was not coalesced, and the
-        // heartbeat cannot supply one for an hour.
         assert!(
-            tokio::time::timeout(Duration::from_millis(600), beats.recv())
+            tokio::time::timeout(Duration::from_millis(600), changes.recv())
                 .await
                 .is_err(),
             "the burst produced more than one refold"
         );
-    }
-
-    /// Beats COALESCE for a busy owner rather than queueing.
-    ///
-    /// A deep queue would let a busy owner accumulate a backlog of
-    /// folds to grind through afterwards, each one already superseded.
-    /// Capacity 1 makes the producer wait instead, so the owner does
-    /// the current fold and not twenty stale ones.
-    #[tokio::test(start_paused = true)]
-    async fn beats_coalesce_for_a_busy_owner() {
-        let tick = Duration::from_millis(100);
-        let (_fs_tx, fs_rx) = std::sync::mpsc::channel::<()>();
-        let mut beats = beats(fs_rx, tick);
-
-        // Twenty heartbeats' worth of time, nothing received.
-        for _ in 0..20 {
-            tokio::time::advance(tick).await;
-        }
-
-        let mut drained = 0;
-        while tokio::time::timeout(Duration::from_millis(1), beats.recv())
-            .await
-            .is_ok()
-        {
-            drained += 1;
-            if drained > 5 {
-                break;
-            }
-        }
-        assert!(
-            drained <= 2,
-            "{drained} beats queued up: a busy owner would fold that many times over"
+        drop(fs_tx);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), changes.recv())
+                .await
+                .ok(),
+            Some(None),
+            "a watcher gone closes the channel"
         );
     }
 
@@ -17032,54 +17207,6 @@ something to promote
         );
     }
 
-    /// Drive the watchdog over a SEQUENCE of ticks and say when it
-    /// stood down, which is the only thing worth asserting about it.
-    fn stood_down_after(ticks: &[u64], limit: u32) -> Option<usize> {
-        let mut seen = ticks[0];
-        let mut missed = 0;
-        for (i, now) in ticks.iter().enumerate().skip(1) {
-            match watchdog_look(seen, *now, missed, limit, Retiring::No) {
-                Watch::Keep { tick, missed: m } => {
-                    seen = tick;
-                    missed = m;
-                }
-                Watch::StandDown => return Some(i),
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn a_monitor_stands_down_only_when_its_fold_has_stopped() {
-        assert_eq!(
-            stood_down_after(&[7, 8, 9, 10, 11, 12], 4),
-            None,
-            "a fold that keeps advancing never stands down"
-        );
-        assert_eq!(
-            stood_down_after(&[7, 7, 7], 4),
-            None,
-            "three still looks is not yet the limit"
-        );
-        assert_eq!(
-            stood_down_after(&[7, 7, 7, 7, 7], 4),
-            Some(4),
-            "four in a row is the wedge"
-        );
-        // The part a predicate taking `missed` cannot state: the count
-        // RESETS, so a slow fold is not a dying one.
-        assert_eq!(
-            stood_down_after(&[7, 7, 7, 8, 8, 8, 9], 4),
-            None,
-            "a fold that advances late clears what it had missed"
-        );
-        assert_eq!(
-            stood_down_after(&[7, 7, 7, 8, 8, 8, 8, 8], 4),
-            Some(7),
-            "and stalling after that still ends it"
-        );
-    }
-
     /// The frames must survive the wire, since a client that cannot
     /// read a note has no way to tell that from having no work.
     #[test]
@@ -17325,16 +17452,6 @@ mod lease_tests {
     /// stall outside one still does.
     #[test]
     fn a_retirement_is_judged_by_its_deadline_not_the_folds_age() {
-        assert_eq!(
-            watchdog_look(7, 7, 3, 4, Retiring::Within),
-            Watch::Keep { tick: 7, missed: 0 }
-        );
-        assert_eq!(
-            watchdog_look(7, 8, 0, 4, Retiring::Overdue),
-            Watch::StandDown
-        );
-        assert_eq!(watchdog_look(7, 7, 3, 4, Retiring::No), Watch::StandDown);
-
         let (_home, dir, path) = namespace();
         let watch = LeaseWatch::new(&take(&dir, &path).unwrap());
         let margin = Duration::from_secs(20);
@@ -17835,6 +17952,51 @@ mod build_tests {
             ),
             "the loop's first question"
         );
+    }
+
+    /// A starting monitor forgets the record its dead predecessor left,
+    /// and keeps one whose process lives.
+    #[test]
+    fn a_dead_predecessors_observation_is_forgotten() {
+        let repo = repo();
+        let record = |pid: i32, birth| Observation {
+            pid,
+            birth,
+            running: running().to_string(),
+            installed_at: "/bin/clank".into(),
+            source: Source::Invocation,
+            state: Observed::Current,
+        };
+        let predecessor = |pid: i32| {
+            let d = Descriptor {
+                pid,
+                ..describe(repo.path(), pid, std::path::Path::new("/tmp/old.sock"))
+            };
+            publish(repo.path(), &d).unwrap();
+        };
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id() as i32;
+        let birth = crate::proc_identity::token_for(dead);
+        child.wait().unwrap();
+        note_observation(repo.path(), &record(dead, birth)).unwrap();
+        predecessor(dead);
+        forget_dead_observation(repo.path());
+        assert!(
+            !observation_path(repo.path(), dead).exists(),
+            "a dead one's"
+        );
+
+        let me = std::process::id() as i32;
+        note_observation(
+            repo.path(),
+            &record(me, crate::proc_identity::token_for(me)),
+        )
+        .unwrap();
+        predecessor(me);
+        forget_dead_observation(repo.path());
+        assert!(observation_path(repo.path(), me).exists(), "a live one's");
+        let _ = std::fs::remove_file(observation_path(repo.path(), me));
     }
 
     /// The old monitor's last word lands under its own process, never on

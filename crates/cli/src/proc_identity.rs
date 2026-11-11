@@ -15,6 +15,7 @@
 
 pub mod exit_watch;
 pub mod inspect;
+pub mod tree_watch;
 
 #[cfg(any(target_os = "linux", test))]
 mod linux;

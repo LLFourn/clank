@@ -45,8 +45,6 @@ fn wait_args(repo: &Path, author: &str) -> WaitArgs {
         r#for: None,
         peek: false,
         no_cache: false,
-        poll: true,
-        no_poll: false,
     }
 }
 

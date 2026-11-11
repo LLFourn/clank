@@ -143,11 +143,19 @@ struct Entry {
     recurrence: Option<recurrence::Recurrence>,
 }
 
-/// Ordered deadlines plus failed entries awaiting an *existing* owner wake.
-/// Failed due entries leave the sleep set, preventing a zero-delay hot loop.
+/// The first pause before failed entries are retried, and its cap.
+const FIRST_RETRY: Duration = Duration::from_secs(1);
+const RETRY_CAP: Duration = Duration::from_secs(60);
+
+/// Ordered deadlines plus failed entries awaiting a retry. Failed due
+/// entries leave the sleep set, preventing a zero-delay hot loop; their
+/// retry has a deadline of its own ([`TimerSet::retry_due`]) that backs
+/// off while they keep failing.
 pub(crate) struct TimerSet {
     entries: BTreeMap<(Instant, String), Entry>,
     recovery: Vec<Entry>,
+    retry_at: Option<Instant>,
+    retry_pause: Duration,
     pending: BTreeMap<String, Entry>,
     dir: PathBuf,
     sink: EmissionSink,
@@ -219,6 +227,8 @@ impl TimerSet {
         Ok(Self {
             entries,
             recovery: Vec::new(),
+            retry_at: None,
+            retry_pause: FIRST_RETRY,
             pending: BTreeMap::new(),
             dir: dir.to_owned(),
             sink,
@@ -270,6 +280,26 @@ impl TimerSet {
     }
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.entries.first_key_value().map(|(key, _)| key.0)
+    }
+
+    /// When the failed entries are next retried, while there are any:
+    /// a pause after the failure, doubling up to [`RETRY_CAP`] while they
+    /// go on failing. Nothing healthy is ever retried by the clock.
+    pub(crate) fn retry_due(&mut self) -> Option<Instant> {
+        if self.recovery.is_empty() {
+            self.retry_at = None;
+            return None;
+        }
+        let pause = self.retry_pause;
+        Some(*self.retry_at.get_or_insert_with(|| clock::now() + pause))
+    }
+
+    /// [`Self::retry_due`] has come: retry every failed entry, and back
+    /// off for those that fail again.
+    pub(crate) fn retry_failed(&mut self) {
+        self.retry_entries(true);
+        self.retry_at = None;
+        self.retry_pause = (self.retry_pause * 2).min(RETRY_CAP);
     }
 
     /// Constructors are passive, so a complete replacement can be validated
@@ -330,6 +360,9 @@ impl TimerSet {
             return;
         }
         self.due_at(wall_now(), clock::now());
+        if self.recovery.is_empty() {
+            self.retry_pause = FIRST_RETRY;
+        }
     }
 
     fn due_at(&mut self, wall: u64, now: Instant) {
@@ -1280,6 +1313,40 @@ mod tests {
             WaitItem::TimerEvent { .. }
         ));
         assert_eq!(rows(dir.path(), &key).len(), 1);
+    }
+
+    /// A failed entry is retried at a deadline of its own, backing off
+    /// while it goes on failing, and nothing is due once it succeeds:
+    /// no heartbeat stands in for the retry.
+    #[tokio::test]
+    async fn a_failed_entry_is_retried_at_a_backing_off_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source("locked", 1);
+        let key = src.source_key(None);
+        let lease = IngestLease::try_acquire(dir.path(), &key).unwrap().unwrap();
+        let (mut timers, mut rx) = set(dir.path(), vec![src]);
+        assert_eq!(timers.retry_due(), None, "nothing has failed");
+        timers.due();
+        let first = timers.retry_due().expect("a failure is retried");
+        assert_eq!(
+            timers.retry_due(),
+            Some(first),
+            "one deadline, not a new one per look"
+        );
+        let now = clock::now();
+        assert!(first > now && first <= now + FIRST_RETRY);
+        timers.retry_failed();
+        timers.due();
+        let second = timers.retry_due().expect("still failing");
+        assert!(second > clock::now() + FIRST_RETRY, "it backs off");
+        drop(lease);
+        timers.retry_failed();
+        timers.due();
+        assert_eq!(timers.retry_due(), None, "nothing is owed once it succeeds");
+        assert!(matches!(
+            rx.recv().await.unwrap().0,
+            WaitItem::TimerEvent { .. }
+        ));
     }
 
     #[tokio::test]

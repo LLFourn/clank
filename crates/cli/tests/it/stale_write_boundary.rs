@@ -159,7 +159,7 @@ const UNGATED: &[(&str, &str, &str)] = &[
     ),
     (
         "cli/monitor.rs",
-        "forget_dead_observations",
+        "forget_dead_observation",
         "OWN: observations of monitors that are gone, removed at startup",
     ),
     (
@@ -254,8 +254,8 @@ const UNGATED: &[(&str, &str, &str)] = &[
     ),
     (
         "proc_identity/exit_watch.rs",
-        "new",
-        "OWN: opens a directory to watch",
+        "open_to_watch",
+        "OWN: opens a directory or file to watch, which writes nothing",
     ),
     (
         "state_cache.rs",

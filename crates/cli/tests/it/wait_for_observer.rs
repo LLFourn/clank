@@ -46,8 +46,6 @@ fn observer_args(repo: &Path, event: WaitFor) -> WaitArgs {
         r#for: Some(event),
         peek: false,
         no_cache: false,
-        poll: true,
-        no_poll: false,
     }
 }
 

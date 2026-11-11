@@ -307,6 +307,15 @@ impl Owners {
     /// Try again to end any group recorded at `path` whose retirement
     /// deferred. Run where a host would otherwise just wait on the
     /// lease that group still holds.
+    /// Whether this process holds a group at `path` whose retirement
+    /// deferred.
+    pub(crate) fn deferred(&self, path: &Path) -> bool {
+        self.table()
+            .live
+            .values()
+            .any(|entry| entry.deferred && entry.path == path)
+    }
+
     pub(crate) fn retry_deferred(&self, path: &Path) {
         let ids: Vec<u64> = self
             .table()
@@ -418,6 +427,8 @@ impl Owners {
         {
             Self::begin_grace(entry, now);
         }
+        drop(table);
+        crate::cli::command_source::deadlines_moved();
     }
 
     /// Retire every group for a process told to stop, as a drain does:
@@ -461,6 +472,7 @@ impl Owners {
         if let Some(drain) = &mut self.table().drain {
             drain.cutoff = drain.cutoff.min(std::time::Instant::now());
         }
+        crate::cli::command_source::deadlines_moved();
     }
 
     /// Note that a host is reading `path`'s producer output, until the

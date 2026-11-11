@@ -464,6 +464,13 @@ impl Observe for Watched {
                 .filter_map(|w| match w {
                     Wake::Exited(owner) => Some(owner),
                     Wake::Dir => None,
+                    Wake::Failed(why) => {
+                        eprintln!(
+                            "clank: the watch on the owning TUI failed: {why}; its answer is \
+                             not followed"
+                        );
+                        None
+                    }
                 })
                 .collect(),
         )
