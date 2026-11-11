@@ -77,10 +77,17 @@ fn gathered(repo: &Path, who: &str, owed: &[clank_core::wait::WaitItem]) -> Gath
     Gathered::of(repo, &label(who), Some((owed, None)))
 }
 
+/// A hook time later than every one handed out before it.
+fn later() -> Option<clank_core::turn_policy::Ms> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000);
+    Some(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 fn stop(tool: Tool, session: &str, position: Option<u64>) -> Report {
     Report::TurnEnd {
         stop: TurnEndReport {
             tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            hook_started: later(),
             tool,
             session: sid(session),
             place: TurnPlace {
@@ -125,7 +132,10 @@ fn a_declaration_is_in_force_at_once_and_shown() {
         let g = gathered(repo.path(), "agent", &[]);
         let said = attend_name(&mut turns, "agent", "session-one", &g);
         let ends = match tool {
-            Tool::Claude => "until your harness stops listing the task with that exact description",
+            Tool::Claude => {
+                "until your harness stops listing the task with that exact description and any \
+                 background work it left running"
+            }
             _ => "until you clear it with `clank attend --clear` once your harness reports it",
         };
         assert!(said.contains(ends), "{tool:?}: {said}");
@@ -1116,6 +1126,7 @@ fn a_grok_handoff_is_answered_without_waiting_for_a_fold() {
     let unfolded = Gathered::of(repo.path(), &author, None);
     let handoff = Report::Handoff {
         tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+        hook_started: later(),
         session: sid("session-one"),
         continued: false,
         deadline: u64::MAX,
@@ -1153,6 +1164,7 @@ fn a_grok_handoff_is_answered_without_waiting_for_a_fold() {
     );
     let listed = |tasks: serde_json::Value| Report::Handoff {
         tasks: clank_core::turn_policy::TaskSnapshot::Known(serde_json::from_value(tasks).unwrap()),
+        hook_started: later(),
         session: sid("session-one"),
         continued: false,
         deadline: u64::MAX,
@@ -2044,6 +2056,7 @@ fn a_stale_monitor_answers_no_report_and_writes_no_turn_state() {
             session: sid(&fixture.session),
             continued: false,
             tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            hook_started: later(),
             deadline: u64::MAX,
         },
     ] {
@@ -2072,4 +2085,379 @@ fn a_stale_monitor_leaves_an_unbound_agents_turn_state_for_its_successor() {
     installed.install(crate::build_stamp::running());
     turns.retire(&fixture.author);
     assert!(!turn_file(&fixture).exists());
+}
+
+const IMPLEMENT_X: &str = "Implement X";
+
+fn listed_task(id: &str, kind: &str, description: &str) -> clank_core::BackgroundTask {
+    clank_core::BackgroundTask::from(serde_json::json!({
+        "id": id, "type": kind, "status": "running", "description": description,
+    }))
+}
+
+/// The agent's Stop at hook time `at`, in turn `turn`, listing `tasks`.
+fn listing_stop(
+    session: &str,
+    turn: &str,
+    at: Ms,
+    tasks: Vec<clank_core::BackgroundTask>,
+) -> Report {
+    Report::TurnEnd {
+        stop: TurnEndReport {
+            tool: Tool::Claude,
+            session: sid(session),
+            place: TurnPlace {
+                turn: Some(turn.into()),
+                position: Some(40),
+                human_turn: false,
+                read_to: None,
+            },
+            tasks: clank_core::turn_policy::TaskSnapshot::Known(tasks),
+            hook_started: Some(at),
+        },
+        deadline: u64::MAX,
+        questions: Vec::new(),
+    }
+}
+
+/// A subagent's stop at hook time `at`, its hook having read the agent's
+/// record in turn `turn`.
+fn child_stop(
+    session: &str,
+    child: &str,
+    turn: &str,
+    at: Option<Ms>,
+    tasks: Vec<clank_core::BackgroundTask>,
+) -> Report {
+    Report::Child {
+        tool: Tool::Claude,
+        seen: clank_core::turn_policy::ChildReport {
+            session: sid(session),
+            child: child.into(),
+            hook_started: at,
+            seen: clank_core::turn_policy::ChildSeen::Stopped {
+                tasks: clank_core::turn_policy::TaskSnapshot::Known(tasks),
+                agent: TurnPlace {
+                    turn: Some(turn.into()),
+                    position: Some(40),
+                    human_turn: false,
+                    read_to: None,
+                },
+            },
+        },
+        deadline: u64::MAX,
+    }
+}
+
+fn child_start(session: &str, child: &str, at: Option<Ms>) -> Report {
+    Report::Child {
+        tool: Tool::Claude,
+        seen: clank_core::turn_policy::ChildReport {
+            session: sid(session),
+            child: child.into(),
+            hook_started: at,
+            seen: clank_core::turn_policy::ChildSeen::Started,
+        },
+        deadline: u64::MAX,
+    }
+}
+
+fn recorded(turns: &mut Turns, author: &AgentLabel, report: &Report, g: &Gathered) {
+    assert_eq!(
+        turns.answer(author, 9, report, true, g),
+        Some(Frame::bare(WireVerdict::Recorded)),
+        "{report:?}"
+    );
+}
+
+/// What status and the TUI say of a declared subagent that has stopped.
+/// Parked on a task the agent could not have started, the row names the
+/// task; where the agent's turn was open it adds that the task may be the
+/// agent's own; after a start that could not be ordered it says the
+/// subagent may be running again. A running one says none of it. Each is
+/// taken with no fold, is written to `turn.json`, and reads the same to a
+/// monitor started afterwards.
+#[test]
+fn a_parked_attendance_says_what_it_rests_on() {
+    let now = time::OffsetDateTime::now_utc();
+    let shell = || listed_task("s1", "shell", "Run the mutation checks");
+    let subagent = || listed_task("x1", "subagent", IMPLEMENT_X);
+    let rows = |turns: &mut Turns, author: &AgentLabel, g: &Gathered| {
+        let attended = turns.projection(author, g).attended;
+        let [row] = attended.as_slice() else {
+            panic!("one attendance: {attended:?}");
+        };
+        let age = row.age(now).expect("it has an age");
+        (
+            row.rests_on.clone(),
+            row.summary(now).replace(&age, "AGE"),
+            row.line(now).replace(&age, "AGE"),
+        )
+    };
+    for (childs_turn, rests_on) in [
+        ("prompt-1", "waiting on shell \"Run the mutation checks\""),
+        (
+            "prompt-2",
+            "waiting on shell \"Run the mutation checks\" (may be yours)",
+        ),
+    ] {
+        let repo = repo_with("claude", Tool::Claude, "session-one");
+        let author = label("claude");
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let g = gathered(repo.path(), "claude", &[]);
+        let unfolded = Gathered::of(repo.path(), &author, None);
+        turns
+            .attend(
+                &author,
+                AttendRequest::Declare {
+                    session: sid("session-one"),
+                    name: IMPLEMENT_X.into(),
+                    desc: None,
+                    expect: 10 * MINUTE,
+                },
+                &g,
+            )
+            .unwrap();
+        let stop = listing_stop("session-one", "prompt-1", 1000, vec![subagent()]);
+        assert_eq!(
+            turns.answer(&author, 1, &stop, true, &g).unwrap().verdict,
+            WireVerdict::Park
+        );
+        assert_eq!(
+            rows(&mut turns, &author, &g),
+            (
+                None,
+                format!("{IMPLEMENT_X} · AGE"),
+                format!("⌛ {IMPLEMENT_X} · AGE")
+            ),
+            "running"
+        );
+        let stopped_before = turns.state(&author).unwrap().stopped.clone();
+        assert!(stopped_before.is_some());
+
+        let parks = child_stop(
+            "session-one",
+            "x1",
+            childs_turn,
+            Some(2000),
+            vec![subagent(), shell()],
+        );
+        recorded(&mut turns, &author, &parks, &unfolded);
+        let parked = (
+            Some(rests_on.to_string()),
+            format!("{IMPLEMENT_X} · {rests_on} · AGE"),
+            format!("⌛ {IMPLEMENT_X} · {rests_on} · AGE"),
+        );
+        assert_eq!(rows(&mut turns, &author, &g), parked);
+        assert_eq!(
+            turns.state(&author).unwrap().stopped,
+            stopped_before,
+            "a child's report is no Stop of the agent's"
+        );
+        let mut back = Turns::new(repo.path().to_path_buf());
+        assert_eq!(rows(&mut back, &author, &g), parked, "after a restart");
+
+        recorded(
+            &mut turns,
+            &author,
+            &child_start("session-one", "x1", Some(2000)),
+            &unfolded,
+        );
+        let unsettled = (
+            Some("may be running again".to_string()),
+            format!("{IMPLEMENT_X} · may be running again · AGE"),
+            format!("⌛ {IMPLEMENT_X} · may be running again · AGE"),
+        );
+        assert_eq!(rows(&mut turns, &author, &g), unsettled);
+        let mut back = Turns::new(repo.path().to_path_buf());
+        assert_eq!(rows(&mut back, &author, &g), unsettled, "after a restart");
+
+        let other = child_stop("session-two", "x1", "prompt-1", Some(3000), vec![]);
+        assert_eq!(
+            turns.answer(&author, 9, &other, true, &unfolded),
+            Some(Frame::bare(WireVerdict::Silent {
+                why: SilentReason::StaleBinding
+            })),
+            "another session's subagent"
+        );
+        assert_eq!(rows(&mut turns, &author, &g), unsettled);
+
+        let ends = child_stop(
+            "session-one",
+            "x1",
+            "prompt-1",
+            Some(3000),
+            vec![subagent()],
+        );
+        recorded(&mut turns, &author, &ends, &unfolded);
+        assert!(turns.projection(&author, &g).attended.is_empty());
+    }
+}
+
+/// `turn.json` as the last build before listings were remembered wrote
+/// it, read from disk by the monitor: the declaration is still attended,
+/// as a task running. It names no kind, so it keeps the rule it was bound
+/// by: its subagent's stop, which still lists it, leaves it attended with
+/// nothing to rest on, and a listing without it ends it.
+#[test]
+fn a_turn_state_written_before_listings_were_remembered_is_kept() {
+    const OLD: &str = r#"{"binding":"session-one","attendances":[{"work":{"Declared":{"name":"Implement X","task":"x1"}},"desc":"Implement X","started":1000000,"since":1000000,"expect":600000,"check_in":"Armed"}],"repeat":null,"outstanding":null,"outstanding_episode_broken":false,"resolved":null,"next_seq":3,"received":[],"unwatched":null,"stopped":{"turn":"prompt-1","position":40,"at":1000000}}"#;
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+    std::fs::write(dir.join("turn.json"), OLD).unwrap();
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "claude", &[]).at(1_000_000 + MINUTE);
+    let attended = turns.projection(&author, &g).attended;
+    assert!(
+        matches!(attended.as_slice(), [row] if row.task == IMPLEMENT_X && row.rests_on.is_none()),
+        "{attended:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("turn.json")).unwrap(),
+        OLD,
+        "reading it rewrites nothing"
+    );
+    let stops = child_stop(
+        "session-one",
+        "x1",
+        "prompt-1",
+        Some(2_000_000),
+        vec![
+            listed_task("x1", "subagent", IMPLEMENT_X),
+            listed_task("s1", "shell", "Run the mutation checks"),
+        ],
+    );
+    recorded(&mut turns, &author, &stops, &g);
+    let attended = turns.projection(&author, &g).attended;
+    assert!(
+        matches!(attended.as_slice(), [row] if row.rests_on.is_none()),
+        "{attended:?}"
+    );
+    let gone = child_stop(
+        "session-one",
+        "b1",
+        "prompt-1",
+        Some(2_000_100),
+        vec![listed_task("s1", "shell", "Run the mutation checks")],
+    );
+    recorded(&mut turns, &author, &gone, &g);
+    assert!(turns.projection(&author, &g).attended.is_empty());
+}
+
+/// A monitor restarted under a parked agent is handed the agent's Stop
+/// again as a first report, stamped with its hook's original time. Here
+/// that Stop came while the declared subagent was away, so it does not
+/// list it; the subagent has since stopped and its resume could not be
+/// ordered, leaving it unsettled since its stop's time. The replayed
+/// Stop is from before that barrier and is no resume: it leaves the
+/// barrier as it was. The subagent's later stop with nothing left then
+/// ends the attendance, and the parked Stop is handed the work it quieted.
+#[test]
+fn a_stop_replayed_to_a_new_monitor_keeps_an_unsettled_barrier() {
+    use clank_core::turn_policy::Phase;
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let owed = [message("7")];
+    let g = gathered(repo.path(), "claude", &owed);
+    let unfolded = Gathered::of(repo.path(), &author, None);
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let first = turns
+        .answer(
+            &author,
+            1,
+            &stop(Tool::Claude, "session-one", None),
+            true,
+            &g,
+        )
+        .unwrap();
+    let presentation = first.presentation().expect("the owed message").clone();
+    assert!(
+        turns
+            .result(&author, 1, TurnResult::Delivered { presentation }, &g)
+            .unwrap()
+            .is_some()
+    );
+    turns
+        .attend(
+            &author,
+            AttendRequest::Declare {
+                session: sid("session-one"),
+                name: IMPLEMENT_X.into(),
+                desc: None,
+                expect: 10 * MINUTE,
+            },
+            &g,
+        )
+        .unwrap();
+    let subagent = || listed_task("x1", "subagent", IMPLEMENT_X);
+    let shell = || listed_task("s1", "shell", "Run the mutation checks");
+    let binds = listing_stop("session-one", "prompt-1", 500, vec![subagent()]);
+    assert_eq!(
+        turns.answer(&author, 2, &binds, true, &g).unwrap().verdict,
+        WireVerdict::Park
+    );
+    let parked_stop = listing_stop("session-one", "prompt-2", 1800, vec![shell()]);
+    assert_eq!(
+        turns
+            .answer(&author, 3, &parked_stop, true, &g)
+            .unwrap()
+            .verdict,
+        WireVerdict::Park
+    );
+    let parks = child_stop(
+        "session-one",
+        "x1",
+        "prompt-2",
+        Some(2000),
+        vec![subagent(), shell()],
+    );
+    recorded(&mut turns, &author, &parks, &unfolded);
+    recorded(
+        &mut turns,
+        &author,
+        &child_start("session-one", "x1", Some(2000)),
+        &unfolded,
+    );
+    let phase = |turns: &Turns| {
+        turns.state(&author).unwrap().attendances[0]
+            .phase()
+            .cloned()
+    };
+    let unsettled = Some(Phase::Unsettled { since: Some(2000) });
+    assert_eq!(phase(&turns), unsettled);
+
+    let mut restarted = Turns::new(repo.path().to_path_buf());
+    assert_eq!(
+        restarted
+            .answer(&author, 3, &parked_stop, true, &g)
+            .unwrap()
+            .verdict,
+        WireVerdict::Park,
+        "still attended"
+    );
+    assert_eq!(
+        phase(&restarted),
+        unsettled,
+        "a Stop from before the barrier is no resume"
+    );
+
+    let ends = child_stop(
+        "session-one",
+        "x1",
+        "prompt-2",
+        Some(3000),
+        vec![subagent()],
+    );
+    recorded(&mut restarted, &author, &ends, &unfolded);
+    assert!(restarted.projection(&author, &g).attended.is_empty());
+    let woke = restarted
+        .answer(&author, 3, &parked_stop, false, &g)
+        .unwrap();
+    assert!(
+        woke.rendered
+            .as_deref()
+            .is_some_and(|t| t.contains("message: 7")),
+        "{woke:?}"
+    );
 }

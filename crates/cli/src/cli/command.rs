@@ -369,7 +369,8 @@ pub enum Command {
     /// still does. On a harness whose Stop lists its background tasks
     /// (Claude, Grok) the name is matched to the one listed task with that
     /// description, and the declaration ends when the listing no longer
-    /// has it; elsewhere it stands until you `--clear` it. Messages you get
+    /// has it or any background work it left running; elsewhere it stands
+    /// until you `--clear` it. Messages you get
     /// meanwhile never end it. You can declare several things at once,
     /// and a name a `clank run` carries renews that run. Say how long you
     /// expect it to take (`--expect`, default 5m): if it still stands past

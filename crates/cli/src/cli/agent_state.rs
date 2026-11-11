@@ -356,6 +356,10 @@ pub(crate) struct Attended {
     /// Why it covers nothing now, while it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) unqualified: Option<String>,
+    /// What a declared subagent that has stopped is still attended for:
+    /// the work it may be waiting on, or that it may be running again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rests_on: Option<String>,
 }
 
 /// A state a monitor published before an agent could attend several
@@ -388,10 +392,14 @@ impl Attended {
     pub(crate) fn line(&self, now: time::OffsetDateTime) -> String {
         match (&self.unqualified, self.covers()) {
             (Some(why), _) => format!("○ {} — {why}", self.subject()),
-            (None, true) => match self.age(now) {
-                Some(age) => format!("⌛ {} · {age}", self.subject()),
-                None => format!("⌛ {}", self.subject()),
-            },
+            (None, true) => {
+                let mut line = format!("⌛ {}", self.subject());
+                for more in self.rests_on.iter().cloned().chain(self.age(now)) {
+                    line.push_str(" · ");
+                    line.push_str(&more);
+                }
+                line
+            }
             (None, false) => format!("○ {} — process ended", self.subject()),
         }
     }
@@ -411,9 +419,9 @@ impl Attended {
             Some(pid) => format!("{pid} ({})", self.task),
             None => self.task.clone(),
         };
-        if let Some(why) = &self.unqualified {
+        for more in self.unqualified.iter().chain(&self.rests_on) {
             out.push_str(" · ");
-            out.push_str(why);
+            out.push_str(more);
         }
         match (self.process_alive(), self.age(now)) {
             (Some(false), _) => out.push_str(" · stale, ended"),
@@ -1605,6 +1613,7 @@ mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         };
         assert_eq!(rec.age(now).as_deref(), Some("3m/5m"));
         rec.expect.as_mut().unwrap().since = at(720);
@@ -1636,6 +1645,7 @@ mod tests {
             declared: true,
             check_in: Some("check-in undeliverable: no pane".into()),
             unqualified: None,
+            rests_on: None,
         };
         assert_eq!(
             rec.marker_fields(now).map(|f| f.subject),

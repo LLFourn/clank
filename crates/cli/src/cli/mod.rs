@@ -1145,6 +1145,12 @@ pub struct StopHookArgs {
     /// beside the asyncrewake Stop entry.
     #[arg(long, conflicts_with = "session_start")]
     pub post_compact: bool,
+    /// Claude's SubagentStop and SubagentStart handler: reports that a
+    /// subagent of the session stopped or started, so work the agent
+    /// declared stays attended while that subagent waits on work of its
+    /// own. Returns at once and never wakes anything itself.
+    #[arg(long, value_enum, conflicts_with_all = ["session_start", "post_compact"])]
+    pub subagent: Option<SubagentArg>,
     /// Resume the parked hook this process replaced, from the handoff it
     /// left here. Passed only by clank itself, when a newer build is
     /// installed under a parked hook.
@@ -1186,6 +1192,12 @@ pub struct StopHookArgs {
     /// The turn the attempt started, when the harness named it.
     #[arg(long, requires = "recovery_reply")]
     pub started: Option<String>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SubagentArg {
+    Start,
+    Stop,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]

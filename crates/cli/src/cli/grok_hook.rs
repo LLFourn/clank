@@ -79,11 +79,16 @@ fn hook_repo(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
 
 /// What a routed Stop reports at `now`: an omitted `backgroundTasks` is no
 /// listing, never an empty one.
-fn report(input: Input, now: clank_core::turn_policy::Ms) -> Report {
+fn report(
+    input: Input,
+    hook_started: clank_core::turn_policy::Ms,
+    now: clank_core::turn_policy::Ms,
+) -> Report {
     Report::Handoff {
         session: input.session_id,
         continued: input.stop_hook_active,
         tasks: TaskSnapshot::listed(input.background_tasks),
+        hook_started: Some(hook_started),
         deadline: now + HANDOFF_BUDGET.as_millis() as u64,
     }
 }
@@ -92,6 +97,7 @@ fn report(input: Input, now: clank_core::turn_policy::Ms) -> Report {
 const HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
+    let hook_started = super::turn_custody::now_ms();
     let routed = (|| -> Result<Option<(PathBuf, AgentLabel, Input)>> {
         let mut bytes = Vec::new();
         std::io::stdin()
@@ -117,7 +123,7 @@ pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
                 &repo,
                 &label,
                 &bound,
-                report(input, super::turn_custody::now_ms()),
+                report(input, hook_started, super::turn_custody::now_ms()),
                 HANDOFF_BUDGET,
             );
             still_bound(&repo, &label, &bound, asked).await

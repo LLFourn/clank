@@ -141,11 +141,9 @@ pub(crate) async fn carry(
         },
         Said::Gone => return,
     };
-    // A handoff holds nothing for its session: holding it would take the
-    // place of the very wait whose running it reports.
     let holder = session
         .as_ref()
-        .filter(|_| !matches!(report, Report::Handoff { .. }))
+        .filter(|_| report.holds_session())
         .map(|session| super::monitor::Holder {
             tool: report.tool(),
             session: session.clone(),
@@ -210,7 +208,8 @@ pub(crate) async fn carry(
                         // A monitor of a replaced build answers nothing
                         // new while it settles what it handed out: that
                         // silence is the upgrade, and no news to an agent.
-                        if super::monitor::outgoing(repo)
+                        if !report.reaches_agent()
+                            || super::monitor::outgoing(repo)
                             || !told_once(repo, author, &report, Notice::MonitorUnanswered, out)
                         {
                             emit_final(out, &still("the monitor has not answered"));
@@ -239,7 +238,7 @@ pub(crate) async fn carry(
         stale = authority.look().stale().is_some();
         let pause = match outage.lost(tokio::time::Instant::now(), &unserved) {
             Some(pause) => pause,
-            None if stale => OUTAGE_RETRY_CAP,
+            None if stale || !report.reaches_agent() => OUTAGE_RETRY_CAP,
             None => match told_once(repo, author, &report, outage_of(&why), out) {
                 true => return,
                 false => OUTAGE_RETRY_CAP,
@@ -260,7 +259,11 @@ pub(crate) async fn carry(
             out,
             &super::turn_custody::Turns::deadline_frame(report.tool()),
         );
-    } else if stale || retiring || !told_once(repo, author, &report, outage_of(&why), out) {
+    } else if stale
+        || retiring
+        || !report.reaches_agent()
+        || !told_once(repo, author, &report, outage_of(&why), out)
+    {
         emit_final(out, &still(&format!("clank still has no monitor: {why}")));
     }
 }

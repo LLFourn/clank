@@ -11364,6 +11364,7 @@ pub(crate) mod tests {
             declared: false,
             check_in: None,
             unqualified: None,
+            rests_on: None,
         }
     }
 

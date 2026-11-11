@@ -1172,6 +1172,13 @@ async fn provider_user_checks(
                         &path,
                         &format!("{} PostCompact", path.display()),
                     ));
+                    for event in ["SubagentStop", "SubagentStart"] {
+                        out.push(check_subagent(
+                            &path,
+                            event,
+                            &format!("{} {event}", path.display()),
+                        ));
+                    }
                 }
                 if tool == Tool::Codex {
                     let path = root.join("rules/default.rules");
@@ -1334,6 +1341,21 @@ fn check_post_compact(path: &Path, display: &str) -> CheckResult {
         "no clank PostCompact hook in claude config: a compaction leaves the agent with no \
          wait, so work reaches it only by a nudge — run `clank setup`"
             .to_string(),
+    )
+}
+
+/// Without these a declared subagent that waits on work it started reads
+/// as finished the moment it leaves Claude's task listing.
+fn check_subagent(path: &Path, event: &str, display: &str) -> CheckResult {
+    check_clank_hook(
+        path,
+        event,
+        "claude",
+        display,
+        format!(
+            "no clank {event} hook in claude config: a subagent you `clank attend` stops being \
+             attended when it waits on background work of its own — run `clank setup`"
+        ),
     )
 }
 
@@ -2088,6 +2110,29 @@ mod tests {
                 && row.message.contains("no clank PostCompact hook")),
             "{rows:?}"
         );
+
+        for event in ["SubagentStop", "SubagentStart"] {
+            value["hooks"]
+                .as_object_mut()
+                .unwrap()
+                .remove(event)
+                .unwrap_or_else(|| panic!("setup installed a {event} hook"));
+        }
+        std::fs::write(&settings, value.to_string()).unwrap();
+        let rows = provider_user_checks(
+            "selected",
+            clank_core::Tool::Claude,
+            Some(&launch),
+            temp.path(),
+            &ambient,
+        )
+        .await;
+        let missing: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.status != CheckStatus::Ok && r.message.contains("clank attend"))
+            .map(|r| r.name.rsplit(' ').next().unwrap())
+            .collect();
+        assert_eq!(missing, ["SubagentStop", "SubagentStart"], "{rows:?}");
     }
 
     #[tokio::test]

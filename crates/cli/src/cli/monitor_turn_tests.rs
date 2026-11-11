@@ -711,6 +711,7 @@ fn stop_report() -> Report {
     Report::TurnEnd {
         stop: clank_core::turn_policy::TurnEndReport {
             tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            hook_started: None,
             tool: clank_core::Tool::Claude,
             session: clank_core::SessionId::parse(SESSION).unwrap(),
             place: Default::default(),
@@ -2097,6 +2098,8 @@ async fn a_park_that_delivered_records_no_loss() {
 /// carrier started in this process and its monitor end handed to the test,
 /// and the exit code kept.
 struct Compacting {
+    /// What the host clock reads when the hook starts.
+    now: u64,
     stdin: String,
     spawner: Reaching,
     stdout: Vec<u8>,
@@ -2132,6 +2135,9 @@ impl crate::cli::stop_hook::Spawn for Reaching {
 }
 
 impl crate::cli::stop_hook::Host for Compacting {
+    fn now_ms(&self) -> u64 {
+        self.now
+    }
     fn input(&mut self) -> Result<String, String> {
         Ok(self.stdin.clone())
     }
@@ -2241,6 +2247,7 @@ async fn a_compaction_rearms_the_park_that_replaces_the_stops() {
     .unwrap();
     let (carriers, reached) = std::sync::mpsc::channel();
     let mut host = Compacting {
+        now: 1_794_355_246_100,
         stdin: serde_json::json!({
             "session_id": SESSION,
             "transcript_path": transcript,
@@ -2276,6 +2283,7 @@ async fn a_compaction_rearms_the_park_that_replaces_the_stops() {
         client.report.as_ref().map(|r| &r.report),
         Some(Report::Compacted { stop, .. })
             if stop.place.turn.as_deref() == Some("39853d54-8cd0-40a0-ac97-a8fd8111f7a6")
+                && stop.hook_started == Some(1_794_355_246_100)
     ));
     leaving.extend(admit(&mut clients, client, &mut turns));
     assert_eq!(
@@ -2458,4 +2466,368 @@ async fn a_stale_monitor_types_no_check_in() {
     assert!(why.contains(crate::upgrade::STALE_BADGE), "{why}");
     assert!(!asked.get());
     assert!(typist.typed.lock().unwrap().is_empty());
+}
+
+/// A payload recorded under `core/tests/fixtures/stop_hook/`, as Claude
+/// would send it for [`SESSION`] working in `root`.
+fn recorded_payload(fixture: &str, root: &std::path::Path) -> serde_json::Value {
+    let path = format!(
+        "{}/../core/tests/fixtures/stop_hook/{fixture}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    payload["session_id"] = SESSION.into();
+    payload["cwd"] = root.to_str().unwrap().into();
+    payload
+}
+
+/// The agent's Stop at hook time `at`, listing what `payload` lists.
+fn listing_stop(payload: &serde_json::Value, at: u64) -> Report {
+    Report::TurnEnd {
+        stop: clank_core::turn_policy::TurnEndReport {
+            tasks: clank_core::turn_policy::TaskSnapshot::Known(
+                serde_json::from_value(payload["background_tasks"].clone()).unwrap(),
+            ),
+            hook_started: Some(at),
+            tool: clank_core::Tool::Claude,
+            session: clank_core::SessionId::parse(SESSION).unwrap(),
+            place: Default::default(),
+        },
+        deadline: u64::MAX,
+        questions: Vec::new(),
+    }
+}
+
+/// The monitor a subagent's hook reaches: what it holds, and the round it
+/// runs when a report arrives.
+struct Reached<'a> {
+    root: &'a std::path::Path,
+    author: &'a AgentLabel,
+    state: &'a crate::repo_state::RepoState,
+    clients: Vec<Client>,
+    turns: Turns,
+    recovery: crate::cli::recovery::Driver,
+    heard: tokio::sync::mpsc::UnboundedSender<(u64, Heard)>,
+    leaving: Vec<tokio::task::JoinHandle<Wrote>>,
+}
+
+impl Reached<'_> {
+    /// Run `command`, an entry setup installed, as Claude would: on
+    /// `payload`, its clock reading `now`. Its report is admitted and
+    /// served as the loop serves a newcomer's, and the hook must then be
+    /// gone with exit 0 and nothing written.
+    async fn subagent_hook(&mut self, command: &str, payload: serde_json::Value, now: u64) {
+        let crate::cli::command::Command::StopHook(args) =
+            <crate::cli::command::Cli as clap::Parser>::try_parse_from(
+                shell_words::split(command).unwrap(),
+            )
+            .unwrap()
+            .command
+        else {
+            panic!("the entry runs stop-hook");
+        };
+        let (carriers, reached) = std::sync::mpsc::channel();
+        let mut host = Compacting {
+            now,
+            stdin: payload.to_string(),
+            spawner: Reaching(carriers),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit: None,
+        };
+        let hook = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(crate::cli::stop_hook::run(args, &mut host))
+                .unwrap();
+            host
+        });
+        let theirs = tokio::task::spawn_blocking(move || {
+            reached.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap()
+        .expect("the hook carries its report");
+        let client = admitted(theirs, self.root, &self.heard).await;
+        assert!(client.holder.is_none(), "it holds nothing for the session");
+        assert!(waiter(&client).is_none(), "and is nobody's waiter");
+        let parked: Vec<u64> = self.clients.iter().map(|c| c.conn).collect();
+        self.leaving.extend(admit_into(
+            self.root,
+            &mut self.clients,
+            client,
+            Some(self.state),
+            &mut Vec::new(),
+            &Default::default(),
+        ));
+        assert_eq!(
+            self.clients.iter().map(|c| c.conn).collect::<Vec<_>>()[..parked.len()],
+            parked[..],
+            "it supersedes no wait"
+        );
+        self.leaving.extend(tend(
+            self.root,
+            &mut self.clients,
+            Some(self.state),
+            &[],
+            &Default::default(),
+            &mut self.turns,
+            &mut self.recovery,
+        ));
+        let hosted = Default::default();
+        let serving = Serving {
+            repo: self.root,
+            state: Some(self.state),
+            pending: &[],
+            hosted: &hosted,
+        };
+        self.leaving.extend(serve_newcomer(
+            &serving,
+            &mut self.clients,
+            self.author,
+            true,
+            &mut self.turns,
+            &mut self.recovery,
+        ));
+        let host = tokio::task::spawn_blocking(move || hook.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(host.exit, Some(clank_core::HOOK_OK_EXIT), "{command}");
+        assert!(
+            host.stdout.is_empty() && host.stderr.is_empty(),
+            "{command}: {:?} {:?}",
+            String::from_utf8_lossy(&host.stdout),
+            String::from_utf8_lossy(&host.stderr)
+        );
+    }
+
+    fn phase(&self) -> Option<clank_core::turn_policy::Phase> {
+        let state = self.turns.state(self.author)?;
+        state.attendances.first()?.phase().cloned()
+    }
+
+    /// What the published state says the agent's one attendance rests on.
+    fn shown(&self) -> Vec<Option<String>> {
+        let dir = crate::agent_store::agents_root(self.root).join(self.author.as_str());
+        crate::cli::agent_state::load(&dir)
+            .unwrap()
+            .attending
+            .into_iter()
+            .map(|a| a.rests_on)
+            .collect()
+    }
+}
+
+/// The SubagentStop and SubagentStart entries `clank setup` installs, run
+/// from their own argv on the recorded payloads against an agent parked
+/// with received work quiet behind its declaration. A's first stop binds
+/// the declaration and parks it on A's shell, which status then names;
+/// the agent's own Stop, which no longer lists A, parks; B's stop and A's
+/// resume change nothing the agent holds; and A's last stop ends the
+/// attendance and hands the quiet work to the parked wait in the same
+/// round, with no Stop of the agent's. No hook is ever the agent's
+/// waiter, takes its park's place, or touches the Stop it reported, and
+/// each exits 0 having written nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_subagent_hooks_hold_a_parked_agents_work_and_release_it_with_no_stop() {
+    let (repo, author, timer) = timer_repo();
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    log_timer_event(repo.path(), &timer);
+    let root = dunce::canonicalize(repo.path()).unwrap();
+    let root = root.as_path();
+    let state = folded(root).await.unwrap();
+    let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let mut monitor = Reached {
+        root,
+        author: &author,
+        state: &state,
+        clients: Vec::new(),
+        turns: Turns::new(root.to_path_buf()),
+        recovery: recovering(root, &author),
+        heard: heard_tx.clone(),
+        leaving: Vec::new(),
+    };
+
+    let profile = tempfile::tempdir().unwrap();
+    crate::cli::setup::install_provider(
+        &profile.path().join("home"),
+        clank_core::Tool::Claude,
+        profile.path(),
+        true,
+        false,
+        false,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(profile.path().join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    let command = |event: &str| {
+        let [entry] = crate::cli::setup::clank_hook_entries(&settings, event)[..] else {
+            panic!("one {event} entry: {settings}");
+        };
+        entry["command"].as_str().unwrap().to_string()
+    };
+    let (on_stop, on_start) = (command("SubagentStop"), command("SubagentStart"));
+
+    let parks = recorded_payload("subagent_stop_a_parks.json", root);
+    let child = parks["agent_id"].as_str().unwrap().to_string();
+    let now = crate::cli::turn_custody::now_ms();
+    let g = gathered(root, &author, &state);
+    // Not recorded: an earlier Stop of the session, which showed its
+    // monitor task and was handed the owed event.
+    let mut earlier = parks.clone();
+    earlier["background_tasks"] = serde_json::json!([parks["background_tasks"][0]]);
+    let first = monitor
+        .turns
+        .answer(&author, 1, &listing_stop(&earlier, now - 600_000), true, &g)
+        .unwrap();
+    let presentation = first.presentation().expect("the owed event").clone();
+    assert!(
+        monitor
+            .turns
+            .result(&author, 1, TurnResult::Delivered { presentation }, &g)
+            .unwrap()
+            .is_some()
+    );
+    attend_named(
+        &mut monitor.turns,
+        &author,
+        "probe-A background sleeper",
+        &g,
+    );
+
+    let start = serde_json::json!({
+        "session_id": SESSION,
+        "transcript_path": "/REDACTED/transcript.jsonl",
+        "cwd": root,
+        "hook_event_name": "SubagentStart",
+        "agent_id": child,
+        "agent_type": "general-purpose",
+    });
+    monitor.subagent_hook(&on_start, start.clone(), now).await;
+    let begun = monitor.turns.state(&author).unwrap();
+    assert_eq!(begun.starts.get(&child), Some(&Some(now)), "remembered");
+    assert_eq!(begun.attendances[0].task(), None, "a start binds nothing");
+
+    monitor.subagent_hook(&on_stop, parks, now + 100).await;
+    let shell = "waiting on shell \"Sleep 240 seconds as a background timing probe\" \
+                 (may be yours)";
+    assert_eq!(monitor.shown(), [Some(shell.to_string())]);
+
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let stop = listing_stop(
+        &recorded_payload("stop_a_parked_b_running.json", root),
+        now + 150,
+    );
+    let mut park = Hook::carrying(root, &author, &stop, ours);
+    let client = admitted(theirs, root, &heard_tx).await;
+    let conn = client.conn;
+    monitor.leaving.extend(admit_into(
+        root,
+        &mut monitor.clients,
+        client,
+        Some(&state),
+        &mut Vec::new(),
+        &Default::default(),
+    ));
+    monitor.leaving.extend(tend(
+        root,
+        &mut monitor.clients,
+        Some(&state),
+        &[],
+        &Default::default(),
+        &mut monitor.turns,
+        &mut monitor.recovery,
+    ));
+    monitor.leaving.extend(serve(
+        root,
+        &mut monitor.clients,
+        &state,
+        &mut monitor.turns,
+    ));
+    let (parked, mut park) = tokio::task::spawn_blocking(move || (park.frame(), park))
+        .await
+        .unwrap();
+    assert_eq!(
+        parked.verdict,
+        WireVerdict::Park,
+        "A is absent and attended"
+    );
+    let reported = monitor.turns.state(&author).unwrap().stopped.clone();
+    assert!(reported.is_some());
+    let held = |monitor: &Reached<'_>| {
+        let waiting = waiters(&monitor.clients, Duration::MAX);
+        (
+            monitor.clients.iter().map(|c| c.conn).collect::<Vec<_>>(),
+            waiting.connected.get(&author).map_or(0, Vec::len),
+            monitor.turns.state(&author).unwrap().stopped.clone(),
+            monitor.turns.state(&author).unwrap().unwatched,
+        )
+    };
+    let parked_as = (vec![conn], 1, reported, None);
+    assert_eq!(held(&monitor), parked_as);
+
+    let finishes = recorded_payload("subagent_stop_b_finished.json", root);
+    monitor.subagent_hook(&on_stop, finishes, now + 3_000).await;
+    assert_eq!(held(&monitor), parked_as, "another subagent's stop");
+    assert_eq!(monitor.shown(), [Some(shell.to_string())]);
+
+    monitor.subagent_hook(&on_start, start, now + 242_000).await;
+    assert_eq!(held(&monitor), parked_as, "A's resume");
+    assert_eq!(monitor.phase(), Some(clank_core::turn_policy::Phase::Live));
+    assert_eq!(monitor.shown(), [None]);
+
+    let last = recorded_payload("subagent_stop_a_final.json", root);
+    monitor.subagent_hook(&on_stop, last, now + 242_500).await;
+    assert_eq!(monitor.phase(), None, "the attendance is over");
+    assert!(
+        monitor.clients.is_empty(),
+        "the delivery retires the park in the round the stop arrived in"
+    );
+    assert!(monitor.shown().is_empty());
+    let (woke, mut park) = tokio::task::spawn_blocking(move || (park.frame(), park))
+        .await
+        .unwrap();
+    let presentation = woke.presentation().expect("the quiet work").clone();
+    assert!(
+        woke.rendered
+            .as_deref()
+            .is_some_and(|t| t.contains("scheduled work")),
+        "{woke:?}"
+    );
+    park.answer(&TurnResult::Delivered { presentation });
+    let said = loop {
+        match next_heard(&mut heard).await {
+            (from, said) if from == conn => break said,
+            _ => {}
+        }
+    };
+    let Heard::Line(line) = said else {
+        panic!("the park's result comes before its close");
+    };
+    let result: TurnResult = serde_json::from_str(&line).unwrap();
+    assert!(
+        monitor
+            .turns
+            .result(&author, conn, result, &g)
+            .unwrap()
+            .is_some(),
+        "the delivery commits"
+    );
+    park.child.join().unwrap();
+    for writer in std::mem::take(&mut monitor.leaving) {
+        let _ = writer.await;
+    }
 }

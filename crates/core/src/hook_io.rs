@@ -63,6 +63,11 @@ pub struct HookInput {
     /// whether anything is running; `Some(vec![])` says nothing is.
     #[serde(default)]
     pub background_tasks: Option<Vec<BackgroundTask>>,
+    /// Claude's id for the subagent a `SubagentStop` or `SubagentStart`
+    /// is about, which is that subagent's task id in a listing. The
+    /// agent's own hooks send none.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// One entry of a harness's Stop-time task listing: Claude's
@@ -273,6 +278,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bare.background_tasks, None);
+    }
+
+    /// Claude's captured `SubagentStop`s name their subagent, and still
+    /// list it as running in the stop that reports it; the agent's own
+    /// Stop names none. No `SubagentStart` was captured: the last payload
+    /// is the documented shape (the common fields plus `agent_id` and
+    /// `agent_type`), not a recording.
+    #[test]
+    fn a_subagents_hooks_name_it_and_the_agents_do_not() {
+        let parks = fixture("subagent_stop_a_parks.json");
+        assert_eq!(parks.agent_id.as_deref(), Some("a2185a1add00531a0"));
+        let listed: Vec<_> = parks
+            .background_tasks
+            .iter()
+            .flatten()
+            .map(|t| {
+                (
+                    t.id.as_deref().unwrap(),
+                    t.kind.as_deref().unwrap(),
+                    t.live(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("sxc82ytp5", "monitor", true),
+                ("a2185a1add00531a0", "subagent", true),
+                ("aeedcce3823eb5bd2", "subagent", true),
+                ("bl2req1k0", "shell", true),
+            ]
+        );
+        assert_eq!(fixture("stop_a_parked_b_running.json").agent_id, None);
+
+        let started: HookInput = serde_json::from_str(
+            r#"{"session_id":"00000000-0000-0000-0000-000000000000",
+                "transcript_path":"/REDACTED/transcript.jsonl","cwd":"/REDACTED/repo",
+                "hook_event_name":"SubagentStart","agent_id":"a2185a1add00531a0",
+                "agent_type":"general-purpose"}"#,
+        )
+        .unwrap();
+        assert_eq!(started.agent_id.as_deref(), Some("a2185a1add00531a0"));
+        assert_eq!(started.background_tasks, None, "a start lists nothing");
     }
 
     #[test]
