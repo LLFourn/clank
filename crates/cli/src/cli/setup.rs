@@ -119,7 +119,7 @@ const WORK_LOOP_CLAUDE_ASYNC: WorkLoop = WorkLoop {
     arrival: "\
 - **Work arrives on its own.** When you end a turn, clank parks a
   watcher inside the Stop hook; when work exists you are WOKEN with
-  the items as a system reminder (\"Clank wait returned work…\").
+  the items as a system reminder (\"Clank: work for…\").
   Act on them IMMEDIATELY. Run `clank status` if you need more than
   the hint carries (short SHAs resolve wherever a `<sha>` is wanted).
   Each item is a one-line hint: kind, plan, short sha.",
@@ -1725,7 +1725,7 @@ impl HookKind for CodexHook {
         "codex"
     }
     fn status_message(&self) -> Option<&'static str> {
-        Some("Clank: checking for pending review work")
+        Some("Clank: waiting for work")
     }
 }
 
@@ -3581,17 +3581,30 @@ mod tests {
     }
 
     #[test]
-    fn merge_hook_codex_carries_status_message() {
+    fn merge_hook_codex_refreshes_the_role_neutral_status_message() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".codex/hooks.json");
         let mut summary = Vec::new();
+        merge_hook_into_settings(&path, CodexHook, false, &mut summary).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["statusMessage"],
+            "Clank: waiting for work"
+        );
+        v["hooks"]["Stop"][0]["hooks"][0]["statusMessage"] =
+            serde_json::json!("Clank: checking for pending review work");
+        v["unrelated"] = serde_json::json!({"keep": true});
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         merge_hook_into_settings(&path, CodexHook, false, &mut summary).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let msg = v["hooks"]["Stop"][0]["hooks"][0]["statusMessage"]
             .as_str()
             .unwrap();
-        assert!(msg.contains("Clank"));
+        assert_eq!(msg, "Clank: waiting for work");
+        assert_eq!(v["unrelated"]["keep"], true);
+        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
     }
 
     /// The codex SessionStart companion is installed beside the Stop

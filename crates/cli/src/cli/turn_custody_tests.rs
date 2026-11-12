@@ -640,7 +640,7 @@ fn owed_work_is_presented_with_the_text_the_hook_frames() {
     assert!(frame.presentation().is_some(), "{frame:?}");
     let text = frame.rendered.expect("rendered");
     assert!(
-        text.starts_with("Clank wait returned work for `claude` (master). Items:"),
+        text.starts_with("Clank: work for `claude` (master)"),
         "{text}"
     );
     assert!(text.contains("message: 7"), "{text}");
@@ -854,7 +854,7 @@ fn a_check_in_with_no_waiter_waits_for_the_next_park() {
         let next = turns.answer(&author, 2, &report, true, &at_due).unwrap();
         assert!(next.presentation().is_some(), "{tool:?}: {next:?}");
         let text = next.rendered.unwrap_or_default();
-        assert!(text.starts_with("clank check-in: "), "{tool:?}: {text}");
+        assert!(text.starts_with("Check-in: "), "{tool:?}: {text}");
         assert!(
             text.contains(&format!("clank attend '{SUBAGENT}' --expect 20m")),
             "{tool:?}: {text}"
@@ -907,10 +907,7 @@ fn a_compaction_carries_a_check_in_only_while_the_stop_still_holds() {
             0 => {
                 assert!(frame.presentation().is_some(), "{case}: {frame:?}");
                 assert!(
-                    frame
-                        .rendered
-                        .unwrap_or_default()
-                        .starts_with("clank check-in: "),
+                    frame.rendered.unwrap_or_default().starts_with("Check-in: "),
                     "{case}"
                 );
             }
@@ -986,10 +983,7 @@ fn an_unplaced_park_carries_a_check_in_only_as_the_stops_own_report() {
                 assert_eq!(shown[0].check_in.as_deref(), Some("check-in due"), "{case}");
             }
             _ => assert!(
-                again
-                    .rendered
-                    .unwrap_or_default()
-                    .starts_with("clank check-in: "),
+                again.rendered.unwrap_or_default().starts_with("Check-in: "),
                 "{case}"
             ),
         }
@@ -1065,10 +1059,7 @@ fn a_compaction_with_the_stops_clock_is_not_its_report() {
     let at_due = gathered(repo.path(), "claude", &[]).at(due);
     let again = turns.answer(&author, 1, &held, false, &at_due).unwrap();
     assert!(
-        again
-            .rendered
-            .unwrap_or_default()
-            .starts_with("clank check-in: "),
+        again.rendered.unwrap_or_default().starts_with("Check-in: "),
         "the held Stop of a hook too old to say when it started"
     );
 }
@@ -1448,7 +1439,7 @@ fn a_presentation_is_worded_for_the_role_the_roster_gives_now() {
         .unwrap();
     let text = frame.rendered.expect("presented");
     assert!(
-        text.starts_with("Clank wait returned work for `codex` (reviewer). Items:"),
+        text.starts_with("Clank: work for `codex` (reviewer)"),
         "{text}"
     );
 }

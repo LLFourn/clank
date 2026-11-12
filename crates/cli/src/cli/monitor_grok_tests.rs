@@ -517,7 +517,8 @@ async fn groks_check_in_rides_its_stop_and_never_its_background_wait() {
     assert!(matches!(frame.verdict, WireVerdict::Deliver { .. }));
     let text = frame.rendered.unwrap_or_default();
     assert!(
-        text.starts_with("clank check-in: declared work \"sleeper\""),
+        text.starts_with("Check-in: declared work \"sleeper\"")
+            && text.contains("clank attend sleeper --expect 2m"),
         "{text}"
     );
     assert!(

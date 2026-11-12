@@ -378,28 +378,25 @@ pub(crate) fn duty_line(item: &WaitItem) -> Option<String> {
             };
             let finish = if item.requires_reply.unwrap_or(false) {
                 format!(
-                    "read it (`clank events read {s}`), then `clank events ack {s} --reply <text>`. \
-                     A reply is required, and waiting on anyone or anything does not waive it: \
-                     say in the reply what you are waiting on, and follow up when it arrives"
+                    "`clank events read {s}`, then `clank events ack {s} --reply <text>`. \
+                     Waiting does not waive the required reply; explain the dependency and follow up"
                 )
             } else {
                 format!(
-                    "read it (`clank events read {s}`), reply if its source asks for one \
-                     (`clank events reply {s} -m <text>`), then `clank events ack {s}`. If it \
-                     waits on anyone or anything, answer or ack it now saying so, and follow up \
-                     when that arrives"
+                    "`clank events read {s}`; reply if requested \
+                     (`clank events reply {s} -m <text>`), then `clank events ack {s}`. \
+                     If waiting, report the dependency now and follow up"
                 )
             };
-            format!("- {what}: you MUST handle this before ending your turn: {finish}.")
+            format!("- {what}: handle before ending your turn: {finish}.")
         }
         Duty::Step => {
             let Discharge::Until(until) = discharge else {
                 return None;
             };
             let block = if item.plan.is_some() {
-                " If this step genuinely depends on a person, record that with `clank block \
-                 ask <name> -m \"<question>\"`: it pauses this plan's review work and \
-                 discharges nothing else."
+                " Needs human input? `clank block ask <name> -m \"<question>\"` pauses \
+                 review; it discharges nothing else."
             } else {
                 ""
             };
@@ -503,7 +500,7 @@ pub(crate) fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, rol
     use clank_core::wait::WaitKind as K;
     let mut out = String::new();
     out.push_str(&format!(
-        "Clank wait returned work for `{label}` ({role}). Items:\n",
+        "Clank: work for `{label}` ({role})\n",
         label = label.as_str(),
         role = role.as_str(),
     ));
@@ -536,8 +533,14 @@ pub(crate) fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, rol
             K::Reviewer => out.push_str(&format!("  - reviewer: review {plan} @ {short}\n")),
             K::Master => {
                 let next = item.next.as_deref().unwrap_or("?");
-                let reason = item.raw_reason();
-                out.push_str(&format!("  - master: {next} {plan} @ {short} ({reason})\n"));
+                // Known reasons are expressed by the action and discharge
+                // condition below. Preserve a newer binary's unknown reason.
+                let reason = if item.reason.as_ref().is_some_and(|r| r.known().is_none()) {
+                    format!(" ({})", item.raw_reason())
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!("  - master: {next} {plan} @ {short}{reason}\n"));
             }
             K::Idle => {
                 let prompt = item.prompt.as_deref().unwrap_or("");
@@ -692,7 +695,6 @@ pub(crate) fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, rol
         out.push_str(&discharge_suffix(item.wake_kind(), item.wake_reason()));
         out.push_str(&read_hint(item));
     }
-    out.push_str("\nAct on these items now.");
     out
 }
 
@@ -847,8 +849,8 @@ pub(crate) const ARM_WAIT: &str = "Run `clank wait` as one background terminal t
 /// no context. It must not read as an error or as work, and every value in
 /// its recipe is filled in, so it can be pasted.
 ///
-/// A deadline is not an end: the check-in claims nothing finished, and
-/// says what does end each kind of entry.
+/// A deadline is not an end: this requests inspection and conditional renewal,
+/// without claiming failure or completion. Attendance semantics live in skills.
 fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> String {
     use crate::shell_quote::shell_quote;
     let each: Vec<String> = lines
@@ -859,27 +861,20 @@ fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> String {
                 .unwrap_or(&line.name);
             let again = crate::cli::attend::duration_arg((line.expect / 1000).saturating_mul(2));
             let (what, keep) = if line.run {
-                ("the `clank run`", "give it longer")
+                ("run", "still running")
             } else {
-                ("declared work", "if it needs longer, renew it")
+                ("declared work", "still active")
             };
             format!(
-                "{what} \"{subject}\" has been going for {} — you expected {}; {keep} with \
-                 `clank attend {} --expect {again}`",
+                "Check-in: {what} \"{subject}\" — {} elapsed (expected {}).\n\
+                 Inspect output; if {keep}: `clank attend {} --expect {again}`.",
                 crate::age::short((line.elapsed / 1000) as i64),
                 crate::cli::attend::duration_arg(line.expect / 1000),
                 shell_quote(&line.name),
             )
         })
         .collect();
-    format!(
-        "clank check-in: {}. Nothing has been cancelled and nothing has failed. This is a \
-         check-in, not a task: look at its output so far, renew what needs longer, and end your \
-         turn. Your harness tells you when a `clank run` ends. A declaration stands until your \
-         harness stops listing that work and anything it left running, or you `clank attend \
-         --clear` it; clank itself never wakes you when declared work finishes.",
-        each.join("; ")
-    )
+    each.join("\n")
 }
 
 #[cfg(test)]
@@ -927,9 +922,8 @@ mod tests {
 
     /// One check-in names every entry due with it, each with a renewal
     /// that is one shell-safe line however its name reads: user text must
-    /// arrive as the same letters, not run. Only a run's end is said to be
-    /// reported, by the harness; a declaration is told what ends it, and
-    /// nothing claims it finished.
+    /// arrive as the same letters, not run. Runs and declarations remain
+    /// distinct, with conditional renewal and no claim of completion.
     #[test]
     fn one_check_in_names_each_due_entry_with_a_shell_safe_renewal() {
         let text = check_in_text(&[
@@ -942,24 +936,20 @@ mod tests {
         );
         assert!(text.contains("clank attend sleeper --expect 1h"), "{text}");
         assert!(
-            text.contains("the `clank run` \"say it\" has been going for 12m"),
+            text.contains("Check-in: run \"say it\" — 12m elapsed (expected 5m)."),
             "{text}"
         );
         assert!(
-            text.contains("declared work \"sleeper\" has been going for 1m"),
+            text.contains("Check-in: declared work \"sleeper\" — 1m elapsed (expected 30m)."),
             "{text}"
         );
-        assert!(!text.contains("declare it again"), "{text}");
-        assert!(text.contains("check-in, not a"), "{text}");
+        assert!(text.contains("Inspect output; if still running:"), "{text}");
+        assert!(text.contains("Inspect output; if still active:"), "{text}");
+        assert_eq!(text.lines().count(), 4, "two lines per check-in: {text}");
         assert!(
-            text.contains(
-                "A declaration stands until your harness stops listing that work and anything it \
-                 left running, or you `clank attend --clear` it; clank itself never wakes you \
-                 when declared work finishes"
-            ),
+            !text.contains("finished") && !text.contains("failed"),
             "{text}"
         );
-        assert!(!text.contains("its completion still wakes you"), "{text}");
     }
 
     /// Each declaration notice names the agent's own request, shell-safe,
@@ -1246,7 +1236,7 @@ mod tests {
         .unwrap();
         let refs: Vec<&WaitItem> = items.iter().collect();
         let out = render_wait_items_ref(&refs, &AgentLabel::parse("claude").unwrap(), Role::Master);
-        assert!(out.contains("gate_continue"), "{out}");
+        assert!(out.contains("master: continue"), "{out}");
         assert!(
             out.contains("fires until"),
             "the wake says what stops it: {out}"
@@ -1603,6 +1593,70 @@ mod tests {
             out.contains("  - reviewer: review some-plan @ f6feba231685\n"),
             "got:\n{out}"
         );
+        assert_eq!(out.lines().count(), 3, "header, item, discharge: {out}");
+    }
+
+    #[test]
+    fn whole_wake_examples_keep_the_actions_and_payloads() {
+        let check = check_in_text(&[line(
+            "fixture validation",
+            "Formatting and shared Git fixture checks",
+            true,
+            600,
+            600,
+        )]);
+        assert_eq!(check.lines().count(), 2);
+        assert!(check.contains("clank attend 'fixture validation' --expect 20m"));
+
+        let item: WaitItem = serde_json::from_value(serde_json::json!({
+            "kind":"master", "plan":"test-cleanup", "sha":FULL_SHA,
+            "next":"revise", "reason":"address_commit_changes",
+        }))
+        .unwrap();
+        let work =
+            render_wait_items_ref(&[&item], &AgentLabel::parse("codex").unwrap(), Role::Master);
+        assert!(work.contains("master: revise test-cleanup @ f6feba231685"));
+        assert!(work.contains("clank feedback read --commit f6feba231685"));
+        let mixed = format!("{work}\n{check}");
+        assert_eq!(mixed.lines().count(), 7, "{mixed}");
+
+        let repeated = format!(
+            "{work}{}",
+            crate::cli::wake_repeat::escalation(
+                clank_core::turn_policy::ESCALATE_AT,
+                &[duty_line(&item).unwrap()],
+            )
+            .unwrap()
+        );
+        assert!(
+            repeated.contains("explicit pause") && repeated.contains("grants no new authority")
+        );
+        assert!(
+            repeated.contains("clank block ask") && repeated.contains("discharges nothing else")
+        );
+
+        // A completion delivered as a producer event retains its entire body,
+        // including blank lines, and its own acknowledgment selector.
+        let body = format!("build complete\n\n{}", "details ".repeat(80));
+        let completed = items_text(&[serde_json::json!({
+            "kind":"command_event", "name":"build", "event":"completed",
+            "content":body, "selector":"command-build-abcd@7",
+        })]);
+        assert!(completed.contains(&"details ".repeat(80)));
+        assert!(completed.contains("clank events ack command-build-abcd@7"));
+        let reviewed = items_text(&[serde_json::json!({
+            "kind":"reviewer", "plan":"test-cleanup", "sha":FULL_SHA,
+        })]);
+        for (name, text) in [
+            ("check-in", check),
+            ("mixed", mixed),
+            ("repeated", repeated),
+            ("completion", completed),
+            ("review", reviewed),
+        ] {
+            assert!(!text.contains("Act on these items now"), "{name}: {text}");
+            println!("EXAMPLE {name}\n{text}\nEND EXAMPLE");
+        }
     }
 
     #[test]
@@ -1767,7 +1821,7 @@ mod tests {
         let required = one(serde_json::json!({"kind":"message","handle":"request",
             "requires_reply":true,"selector":"messages@7"}));
         assert!(
-            required.contains("MUST handle this before ending your turn"),
+            required.contains("handle before ending your turn"),
             "{required}"
         );
         assert!(
@@ -1778,7 +1832,10 @@ mod tests {
             required.contains("`clank events ack messages@7 --reply <text>`"),
             "{required}"
         );
-        assert!(required.contains("does not waive it"), "{required}");
+        assert!(
+            required.contains("does not waive the required reply"),
+            "{required}"
+        );
         assert!(!required.contains("clank block"), "{required}");
         assert!(
             !required.contains("request"),
@@ -1793,7 +1850,10 @@ mod tests {
             event.contains("`clank events ack command-questions-abcd@7`."),
             "{event}"
         );
-        assert!(event.contains("answer or ack it now saying so"), "{event}");
+        assert!(
+            event.contains("report the dependency now and follow up"),
+            "{event}"
+        );
         assert!(!event.contains("clank block"), "{event}");
 
         let review = one(serde_json::json!({"kind":"adhoc_review","sha":FULL_SHA}));
@@ -1915,7 +1975,10 @@ mod tests {
             github.contains("`clank events ack github-fixture@7`"),
             "{github}"
         );
-        assert!(github.contains("MUST handle this"), "{github}");
+        assert!(
+            github.contains("handle before ending your turn"),
+            "{github}"
+        );
 
         let sha = clank_core::ids::CommitSha::parse(FULL_SHA).unwrap();
         let review = projected(I::AdHocReview {

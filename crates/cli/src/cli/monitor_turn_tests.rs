@@ -1342,10 +1342,16 @@ async fn attendances_falling_due_while_parked_are_checked_in_through_the_park() 
             .unwrap();
         let presentation = frame.presentation().expect("handed to the park").clone();
         let text = frame.rendered.unwrap_or_default();
-        assert!(text.starts_with("clank check-in: "), "{text}");
+        assert!(text.starts_with("Check-in: declared work "), "{text}");
         shown.push(
             (0..6)
                 .filter(|i| text.contains(&format!("\"review {i}\"")))
+                .inspect(|i| {
+                    assert!(
+                        text.contains(&format!("clank attend 'review {i}' --expect 2m")),
+                        "{text}"
+                    );
+                })
                 .collect::<Vec<_>>(),
         );
         assert!(
@@ -1395,7 +1401,8 @@ async fn a_check_in_reaches_the_parked_hook_and_only_its_result_spends_it() {
         let presentation = frame.presentation().expect("a presentation").clone();
         let text = frame.rendered.clone().unwrap_or_default();
         assert!(
-            text.starts_with("clank check-in: declared work \"sleeper\" has been going"),
+            text.starts_with("Check-in: declared work \"sleeper\"")
+                && text.contains("clank attend sleeper --expect 2m"),
             "{ending}: {text}"
         );
         let g = gathered(repo.path(), &author, &state);
@@ -1420,7 +1427,12 @@ async fn a_check_in_reaches_the_parked_hook_and_only_its_result_spends_it() {
         match ending {
             "emit failed" => {
                 assert_eq!(row(&mut turns).as_deref(), Some("check-in due"));
-                assert!(presented_next(&mut turns, &author, &g).starts_with("clank check-in: "));
+                let retry = presented_next(&mut turns, &author, &g);
+                assert!(retry.starts_with("Check-in: declared work \"sleeper\""));
+                assert!(
+                    retry.contains("clank attend sleeper --expect 2m"),
+                    "{retry}"
+                );
             }
             _ => {
                 assert_eq!(row(&mut turns).as_deref(), Some("checked in"));
@@ -1642,7 +1654,8 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
     assert!(
         note.contains("deliver")
             && note.contains("scheduled work")
-            && note.contains("clank check-in: declared work \\\"sleeper\\\""),
+            && note.contains("Check-in: declared work \\\"sleeper\\\"")
+            && note.contains("clank attend sleeper --expect 2m"),
         "{note}"
     );
     assert!(clients.is_empty(), "a delivery retires the parked report");

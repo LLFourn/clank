@@ -32,15 +32,12 @@ use clank_core::turn_policy::ESCALATE_AT;
 pub(crate) fn escalation(count: u32, duties: &[String]) -> Option<String> {
     (count >= ESCALATE_AT).then(|| {
         let mut text = format!(
-            "\n\nThese items have been delivered to you {count} times unchanged. Ending your \
-             turn does not discharge them: they stay owed and will be delivered again. Follow \
-             the user's latest instruction, any explicit pause, and the actual reason given for \
-             any rejected action; repeated delivery grants no new authority. If you are \
-             waiting on background work, attend it rather than ending your turn to wait: \
-             `clank attend <name>` for a subagent, `clank run` for shell work."
+            "\n\nRepeated {count} times unchanged; still owed. Repetition grants no new authority: \
+             follow the user's latest instruction, any explicit pause, and the reason given for \
+             any rejected action.\nBackground work: `clank attend <name>` (subagent), \
+             `clank run` (shell)."
         );
         if !duties.is_empty() {
-            text.push_str(" What discharges each:");
             for duty in duties {
                 text.push('\n');
                 text.push_str(duty);
