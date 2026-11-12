@@ -29,26 +29,26 @@ pub async fn run(args: super::EventsArgs) -> anyhow::Result<()> {
         }
         super::EventsCmd::Ack(a) => {
             let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
-            let rows = read_all(&dir)?;
+            let (rows, ids) = select(&dir, &a.ids)?;
             match a.reply.as_deref() {
                 Some(text) => {
                     let repo = super::resolve_repo(a.repo.as_deref())?;
-                    ack_with_reply(&repo, &dir, rows, &a.ids, text).await
+                    ack_with_reply(&repo, &dir, rows, &ids, text).await
                 }
-                None => ack(&dir, rows, &a.ids),
+                None => ack(&dir, rows, &ids),
             }
         }
         super::EventsCmd::Show(a) => {
             let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
-            let rows = read_all(&dir)?;
-            show_metadata(rows, &a.id, a.json)
+            let (rows, ids) = select(&dir, &[a.id])?;
+            show_metadata(rows, &ids[0], a.json)
         }
         super::EventsCmd::Read(a) => read::run(a).await,
         super::EventsCmd::Watch(a) => watch::run(a.command),
         super::EventsCmd::Reply(a) => {
             let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
-            let rows = read_all(&dir)?;
-            let selected = resolve(&rows, &a.id)?;
+            let (rows, ids) = select(&dir, &[a.id])?;
+            let selected = resolve(&rows, &ids[0])?;
             let repo = super::resolve_repo(a.repo.as_deref())?;
             let text = super::send::body_of(&a.message, a.file.as_deref())?;
             operation::submit(&repo, &dir, selected, &text, a.operation.as_deref(), false).await
@@ -86,7 +86,17 @@ fn events_context(
                 .collect(),
             _ => Vec::new(),
         };
-    let prompts = join_prompts(&githubs, &dir);
+    let mut prompts = join_prompts(&githubs, &dir);
+    for (id, watch) in crate::cli::watch_store::read(&repo)?.event_watches {
+        if let clank_core::agent_config::WaitEventSource::Github(g) = &watch.source
+            && let Some(prompt) = &g.prompt
+        {
+            prompts.insert(
+                crate::cli::watch_store::selector_key(id, &watch.key()),
+                prompt.clone(),
+            );
+        }
+    }
     Ok((dir, prompts))
 }
 
@@ -157,7 +167,26 @@ pub(crate) struct Sourced {
 /// log is reported and skipped — inspection must not block on it (the
 /// ingest side owns quarantine).
 pub(crate) fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
-    let mut out = Vec::new();
+    if let Some(rows) = crate::cli::watch_store::timeline_rows(dir)? {
+        return Ok(rows);
+    }
+    let context = crate::cli::watch_store::repo_of_events(dir).and_then(|repo| {
+        let author = AgentLabel::parse(dir.parent()?.file_name()?.to_str()?).ok()?;
+        Some((repo, author))
+    });
+    let mut out = match &context {
+        Some((repo, author)) => crate::cli::watch_store::rows(repo, author)?,
+        None => Vec::new(),
+    };
+    let excluded: std::collections::BTreeSet<String> = match &context {
+        Some((repo, author)) => crate::cli::watch_store::read(repo)?
+            .event_watches
+            .values()
+            .filter(|w| w.legacy_agent.as_ref() == Some(author))
+            .map(|w| w.key())
+            .collect(),
+        None => Default::default(),
+    };
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
@@ -171,6 +200,9 @@ pub(crate) fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
         let Some(stem) = name.strip_suffix(".jsonl") else {
             continue; // state/lock/corrupt/tmp sidecars
         };
+        if excluded.contains(stem) {
+            continue;
+        }
         let log = EventLog::open(dir, stem)?;
         match log.read_rows() {
             Ok(Some(read)) => out.extend(read.rows.into_iter().map(|row| Sourced {
@@ -188,6 +220,91 @@ pub(crate) fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
     // Stable display order: source, then seq.
     out.sort_by(|a, b| (&a.source, a.row.seq).cmp(&(&b.source, b.row.seq)));
     Ok(out)
+}
+
+/// Discovery follows today's recipient; an issued, qualified selector addresses
+/// durable custody independently of roster changes. Bare sequences still resolve
+/// only against the caller's inbox, with the usual ambiguity checks.
+fn select(dir: &Path, ids: &[String]) -> anyhow::Result<(Vec<Sourced>, Vec<String>)> {
+    let mut selectors = ids
+        .iter()
+        .map(|id| id.parse::<Selector>())
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut rows = if selectors.iter().any(|s| s.source.is_none()) {
+        read_all(dir)?
+    } else {
+        vec![]
+    };
+    for selector in &mut selectors {
+        if selector.source.is_none() {
+            selector.source = Some(resolve(&rows, &selector.to_string())?.source.clone());
+        }
+    }
+    for selector in &mut selectors {
+        let Some(source) = &selector.source else {
+            continue;
+        };
+        let source = durable_source(dir, source)?;
+        if !rows.iter().any(|row| row.source == source) {
+            anyhow::ensure!(
+                crate::cli::watch_store::log_exists(dir, &source),
+                "no event {selector}"
+            );
+            let read = EventLog::open(dir, &source)?
+                .read_rows()?
+                .ok_or_else(|| anyhow::anyhow!("{source} has corrupt custody; repair required"))?;
+            rows.extend(read.rows.into_iter().map(|row| Sourced {
+                source: source.clone(),
+                row,
+            }));
+        }
+        selector.source = Some(source);
+    }
+    Ok((rows, selectors.iter().map(ToString::to_string).collect()))
+}
+
+fn durable_source(dir: &Path, source: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !source.is_empty() && source != "." && source != ".." && !source.contains(['/', '\\']),
+        "invalid event source"
+    );
+    if source.starts_with("watch:") {
+        // Validates the registered ID and backend key, including removed watches.
+        crate::cli::watch_store::log_location(dir, source)?;
+        return Ok(source.to_owned());
+    }
+    let Some(repo) = crate::cli::watch_store::repo_of_events(dir) else {
+        return Ok(source.to_owned());
+    };
+    let config = crate::cli::watch_store::read(&repo)?;
+    let author = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    let candidates: Vec<_> = config
+        .event_watches
+        .iter()
+        .filter(|(_, w)| w.legacy_agent.is_some() && w.key() == source)
+        .collect();
+    if let Some((id, _)) = candidates
+        .iter()
+        .find(|(_, w)| w.legacy_agent.as_ref().map(|a| a.as_str()) == author)
+    {
+        return Ok(crate::cli::watch_store::selector_key(**id, source));
+    }
+    // An unrelated local source keeps its own address, even if another agent
+    // transferred a same-named legacy watch.
+    if dir.join(format!("{source}.jsonl")).is_file() || candidates.is_empty() {
+        return Ok(source.to_owned());
+    }
+    anyhow::ensure!(
+        candidates.len() == 1,
+        "ambiguous legacy source {source}; use a watch:<id>:{source} selector"
+    );
+    Ok(crate::cli::watch_store::selector_key(
+        *candidates[0].0,
+        source,
+    ))
 }
 
 /// How an event is ADDRESSED: `[source@]seq[#N]`.

@@ -631,7 +631,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see Extra wake sources) |
 | `run` | Run a long command under clank, so clank knows it is in hand (see below) |
 | `attend` | Tell clank which subagent you are waiting on, by name; several can be attended at once (see below) |
-| `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply`; the agent's standing wake sources: `watch list` / `watch add` / `watch remove` (see below) |
+| `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply`; standing wake sources: `watch list` / `watch add` / `watch remove` / `watch transfer` (see below) |
 | `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo; `--interrupt` also tries to interrupt) |
 | `nudge` | Interrupt an agent and type a message into its terminal, for when `send` cannot be delivered |
 | `user-command` | Deliver a person's site-signed command into the asking agent's terminal as `! <command>`: `trust-key` / `untrust-key` / `keys` / `submit` / `status` (see below) |
@@ -1283,27 +1283,44 @@ for every repo (`~/.clank/config.json`); a repo value shadows the global one.
 
 ## Extra wake sources
 
-An agent's standing wake sources (`wait_events` in its config) are managed
-with `clank events watch`:
+Standing wake sources are managed with `clank events watch`. By default they
+belong to the **master role**, including when added from an unbound human shell
+or a reviewer's session:
 
 ```sh
 clank events watch add '{"kind":"github","repo":"o/r","watch":[{"pr":{"events":["ci_passed","ci_failed"]}}]}'
-clank events watch list          # numbered from 1; -j prints the config JSON
+clank events watch list          # master scope, numbered from 1
+clank events watch list --all    # every target and current recipient
 clank events watch remove 2
+clank events watch add --author worker '{"kind":"command","name":"build","command":["build-events"]}'
+clank events watch transfer --from-author claude 1  # legacy watch -> master role
 ```
 
-`add` takes one source in the JSON shape `clank wait --event` takes, and
-`--author <label>` names another agent than the session's own. A source an
-arm would refuse, beside the ones already configured, is refused with the
-arm's message and nothing is written; so is an exact duplicate. `remove`
-removes the entry `list` numbers, whatever the state of the others, so it
-can repair a config an arm refuses. The edit takes the same lock as every
-other write of the agent's config. There is no edit in place: remove and add
-again. Whether the source keeps its log then follows its identity, not the
-removal: a command source is its `name`, so a new argv under the same name
-keeps its history; a github watch is its repo and what it admits, so
-changing only its `prompt` or `poll_interval` keeps its log,
-while changing its events, scope or `include_own_actions` starts a fresh one.
+`add` takes the same source JSON as `clank wait --event`. `--author <label>`
+explicitly pins a watch to a named agent; `--author master` means the agent
+literally named `master`, not the role. `list` and `remove` default to the same
+master scope. `list -j` returns objects with `n`, `target`, `recipient` and
+`source`; an unassigned recipient is `null`. Invalid or duplicate sources in
+the target scope are refused without a config write. New named targets must
+be on the roster. An unknown entry number is refused; use `list` in that scope.
+
+`transfer N` moves an existing watch to the master role; `--from-author` selects
+its old named scope, even after that agent left the roster, and `--author`
+selects a pinned destination instead. Transfer retains the source definition,
+log, acknowledgments, GitHub cursor and baseline, and timer progress. Legacy
+per-agent `wait_events` stay pinned until explicitly transferred. Repository
+watch targets live in `.clank/config.json` and use the roster's transaction lock.
+Removing a repository watch retains its history; adding it again creates a new
+watch with fresh state. Use transfer to change recipients without losing state.
+
+A master change routes pending and subsequent work to the new master without
+restarting unchanged producers. Already handed-off work cannot be recalled:
+the old agent may finish its action or acknowledgment while the new agent sees
+the same pending row. Both acknowledge the same log, so an acknowledgment is
+shared, but external actions are **at least once**, not exactly once. An
+in-flight producer still appends to that same log. With no master, ingestion
+continues and pending events wait; status and the TUI show the unassigned watch.
+Messages and temporary `clank wait --event` sources keep their existing routing.
 
 ### Scheduled and recurring events
 
@@ -1358,8 +1375,9 @@ generation, pending work and bounded recent display history. Removed generations
 keep small coverage tombstones so restoring them cannot replay completed work;
 the number of distinct historical definitions can therefore grow storage.
 
-Configured timers belong to their named agent across roster role changes. A timer
-does not automatically follow whoever becomes master. An invocation-only
+Timers added without `--author` follow the master role across roster changes.
+Timers explicitly assigned with `--author`, and legacy per-agent timers, stay
+with that named agent unless transferred. An invocation-only
 `clank wait --event '<timer JSON>'` has a separate identity for each wait call and
 applies only to that invocation. `clank wait --peek` reports accepted work without
 arming or ingesting a future or overdue definition.

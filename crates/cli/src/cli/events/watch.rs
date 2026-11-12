@@ -1,46 +1,192 @@
-//! `clank events watch`: an agent's standing wake sources
-//! (`wait_events`), edited under the binding lock and refused by the
-//! same validation an arm runs.
+//! `clank events watch`: repository-owned sources target the master role by
+//! default; explicit authors and legacy wait_events remain pinned.
 
 use std::path::Path;
 
 use clank_core::agent_config::{WaitEventSource, WatchClause};
 use clank_core::ids::AgentLabel;
 
+#[cfg(test)]
 use crate::cli::event_source::SourceOrigin;
+
+use crate::cli::watch_store::{self, Target};
+
+#[derive(Clone)]
+enum Entry {
+    Legacy {
+        agent: AgentLabel,
+        n: usize,
+        source: clank_core::agent_config::WaitEventSource,
+    },
+    Repository {
+        id: u64,
+        watch: watch_store::Watch,
+    },
+}
+impl Entry {
+    fn source(&self) -> &clank_core::agent_config::WaitEventSource {
+        match self {
+            Self::Legacy { source, .. } => source,
+            Self::Repository { watch, .. } => &watch.source,
+        }
+    }
+}
+
+fn target(t: &crate::cli::EventsWatchTarget) -> anyhow::Result<(std::path::PathBuf, Target)> {
+    Ok((
+        crate::cli::resolve_repo(t.repo.as_deref())?,
+        named_target(t.author.as_deref())?,
+    ))
+}
+
+fn named_target(author: Option<&str>) -> anyhow::Result<Target> {
+    Ok(match author {
+        Some(name) => Target::Agent {
+            name: AgentLabel::parse(name).map_err(anyhow::Error::msg)?,
+        },
+        None => Target::Master,
+    })
+}
+
+fn entries(repo: &Path, target: &Target) -> anyhow::Result<Vec<Entry>> {
+    let config = watch_store::read(repo)?;
+    let mut entries = vec![];
+    if let Target::Agent { name } = target {
+        entries.extend(
+            list(repo, name)?
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, source)| {
+                    (!watch_store::transferred(&config, name, &source)).then(|| Entry::Legacy {
+                        agent: name.clone(),
+                        n: i + 1,
+                        source,
+                    })
+                }),
+        );
+    }
+    entries.extend(
+        config
+            .event_watches
+            .into_iter()
+            .filter(|(_, watch)| !watch.removed && &watch.target == target)
+            .map(|(id, watch)| Entry::Repository { id, watch }),
+    );
+    Ok(entries)
+}
+
+fn selected(repo: &Path, target: &Target, n: usize) -> anyhow::Result<Entry> {
+    let entries = entries(repo, target)?;
+    n.checked_sub(1)
+        .and_then(|i| entries.get(i).cloned())
+        .ok_or_else(|| anyhow::anyhow!("{target} has no watch {n}; see `clank events watch list`"))
+}
 
 pub(super) fn run(cmd: crate::cli::EventsWatchCmd) -> anyhow::Result<()> {
     use crate::cli::EventsWatchCmd;
     match cmd {
         EventsWatchCmd::List(a) => {
-            let (repo, author) = target(&a.target)?;
-            let sources = list(&repo, &author)?;
-            if a.json {
-                println!("{}", serde_json::to_string_pretty(&sources)?);
-            } else if sources.is_empty() {
-                println!("{author} has no wake sources");
-            } else {
-                for (i, s) in sources.iter().enumerate() {
-                    println!("{}", entry_line(i + 1, s));
+            let (repo, target) = target(&a.target)?;
+            let config = watch_store::read(&repo)?;
+            let mut targets = vec![target];
+            if a.all {
+                targets = vec![Target::Master];
+                let mut agents: std::collections::BTreeSet<_> =
+                    config.agents.keys().cloned().collect();
+                if let Ok(dirs) = std::fs::read_dir(crate::agent_store::agents_root(&repo)) {
+                    for dir in dirs.flatten() {
+                        if let Some(name) = dir
+                            .file_name()
+                            .to_str()
+                            .and_then(|s| AgentLabel::parse(s).ok())
+                        {
+                            agents.insert(name);
+                        }
+                    }
                 }
+                agents.extend(
+                    config
+                        .event_watches
+                        .values()
+                        .filter_map(|w| match &w.target {
+                            Target::Agent { name } => Some(name.clone()),
+                            Target::Master => None,
+                        }),
+                );
+                targets.extend(agents.into_iter().map(|name| Target::Agent { name }));
+            }
+            let mut rows = vec![];
+            for target in targets {
+                let recipient = target.recipient(&config);
+                for (i, entry) in entries(&repo, &target)?.iter().enumerate() {
+                    if a.json {
+                        rows.push(serde_json::json!({"n":i+1, "target":target,
+                            "recipient":recipient, "source":entry.source()}));
+                    } else {
+                        println!(
+                            "{} -> {}: {}",
+                            target,
+                            recipient
+                                .as_ref()
+                                .map(AgentLabel::as_str)
+                                .unwrap_or("unassigned"),
+                            entry_line(i + 1, entry.source())
+                        );
+                    }
+                }
+            }
+            if a.json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
             }
         }
         EventsWatchCmd::Add(a) => {
-            let (repo, author) = target(&a.target)?;
-            let (n, source) = add(&repo, &author, &a.source)?;
-            println!("{}", entry_line(n, &source));
+            let (repo, target) = target(&a.target)?;
+            let source = crate::cli::wait::parse_wait_event_source(&a.source)?;
+            watch_store::add(&repo, target.clone(), source.clone())?;
+            println!(
+                "{target}: {}",
+                entry_line(entries(&repo, &target)?.len(), &source)
+            );
         }
         EventsWatchCmd::Remove(a) => {
-            let (repo, author) = target(&a.target)?;
-            let removed = remove(&repo, &author, a.n)?;
-            println!("removed {}", entry_line(a.n, &removed));
+            let (repo, target) = target(&a.target)?;
+            match selected(&repo, &target, a.n)? {
+                Entry::Legacy { agent, n, source } => {
+                    crate::agent_store::repo_config::transact(&repo, |config| {
+                        anyhow::ensure!(
+                            !watch_store::transferred(config, &agent, &source),
+                            "watch moved; list its scope again"
+                        );
+                        crate::agent_store::try_update_agent_config(&repo, &agent, |cfg| {
+                            anyhow::ensure!(
+                                cfg.wait_events.get(n - 1) == Some(&source),
+                                "watch changed; list its scope again"
+                            );
+                            cfg.wait_events.remove(n - 1);
+                            Ok(())
+                        })
+                    })?;
+                }
+                Entry::Repository { id, .. } => watch_store::remove(&repo, id, &target)?,
+            }
+            println!("removed {target} watch {}", a.n);
+        }
+        EventsWatchCmd::Transfer(a) => {
+            let (repo, target) = target(&a.target)?;
+            let from = named_target(a.from_author.as_deref())?;
+            match selected(&repo, &from, a.n)? {
+                Entry::Legacy { agent, n, source } => {
+                    watch_store::transfer_legacy(&repo, &agent, n, target.clone(), Some(&source))?;
+                }
+                Entry::Repository { id, .. } => watch_store::retarget(&repo, id, target.clone())?,
+            }
+            println!(
+                "transferred {from} watch {} to {target}; durable state retained",
+                a.n
+            );
         }
     }
     Ok(())
-}
-
-fn target(t: &crate::cli::EventsWatchTarget) -> anyhow::Result<(std::path::PathBuf, AgentLabel)> {
-    super::resolve_author(t.repo.as_deref(), t.author.as_deref())
 }
 
 pub(crate) fn list(repo: &Path, author: &AgentLabel) -> anyhow::Result<Vec<WaitEventSource>> {
@@ -53,6 +199,7 @@ pub(crate) fn list(repo: &Path, author: &AgentLabel) -> anyhow::Result<Vec<WaitE
 /// source. Refused, leaving the config untouched, for a source an arm
 /// would refuse alongside the ones already configured, or one already
 /// configured.
+#[cfg(test)]
 pub(crate) fn add(
     repo: &Path,
     author: &AgentLabel,
@@ -74,6 +221,7 @@ pub(crate) fn add(
 /// Remove entry `n` (from 1, as [`list`] numbers them) and return it.
 /// The entries left are not validated: removal is how a config holding
 /// a source an arm refuses gets repaired.
+#[cfg(test)]
 pub(crate) fn remove(
     repo: &Path,
     author: &AgentLabel,
@@ -89,6 +237,7 @@ pub(crate) fn remove(
     })
 }
 
+#[cfg(test)]
 fn validate(sources: &[WaitEventSource]) -> anyhow::Result<()> {
     let configured: Vec<_> = sources
         .iter()
@@ -167,6 +316,52 @@ fn numbers(prs: &[u64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_defaults_to_the_role_and_keeps_literal_master_pinned() {
+        use crate::cli::command::{Cli, Command};
+        use crate::cli::{EventsArgs, EventsCmd, EventsWatchArgs};
+        use clap::Parser;
+        let repo = tempfile::tempdir().unwrap();
+        let invoke = |args: &[&str]| {
+            let mut argv = vec!["clank", "events", "watch"];
+            argv.extend(args);
+            argv.extend(["--repo", repo.path().to_str().unwrap()]);
+            let Command::Events(EventsArgs {
+                command: EventsCmd::Watch(EventsWatchArgs { command }),
+            }) = Cli::try_parse_from(argv).unwrap().command
+            else {
+                panic!("watch command");
+            };
+            run(command)
+        };
+        // No roster, binding, or agent config is needed to create role work.
+        invoke(&["add", TIMER]).unwrap();
+        assert_eq!(entries(repo.path(), &Target::Master).unwrap().len(), 1);
+        assert!(!crate::agent_store::agents_root(repo.path()).exists());
+        crate::agent_store::repo_config::transact(repo.path(), |cfg| {
+            cfg.agents = serde_json::from_value(serde_json::json!({
+                "master":{"tool":"codex","role":"commit"},
+                "lead":{"tool":"codex","role":"master"}
+            }))
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        invoke(&["add", "--author", "master", COMMAND]).unwrap();
+        invoke(&["add", GITHUB]).unwrap();
+        let config = watch_store::read(repo.path()).unwrap();
+        let lead = AgentLabel::parse("lead").unwrap();
+        let named_master = AgentLabel::parse("master").unwrap();
+        assert_eq!(watch_store::assigned(&config, &lead).len(), 2);
+        assert_eq!(watch_store::assigned(&config, &named_master).len(), 1);
+        invoke(&["transfer", "--from-author", "master", "1"]).unwrap();
+        assert_eq!(entries(repo.path(), &Target::Master).unwrap().len(), 3);
+        invoke(&["remove", "1"]).unwrap();
+        assert_eq!(entries(repo.path(), &Target::Master).unwrap().len(), 2);
+        assert!(invoke(&["remove", "0"]).is_err());
+        assert!(invoke(&["add", "--author", "missing", TIMER]).is_err());
+    }
 
     const GITHUB: &str = r#"{"kind":"github","repo":"o/r","watch":[{"pr":{"numbers":[7],"events":["ci_passed","ci_failed"]}}],"prompt":"Merge it when green."}"#;
     const COMMAND: &str = r#"{"kind":"command","name":"ci","command":["sh","-c","tail -f log"],"receipt_command":["true"]}"#;

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>clank events watch list | The clank book</title>
-<meta name="description" content="Show the agent&#39;s wake sources, numbered from 1">
+<meta name="description" content="Show the target&#39;s watches, numbered from 1">
 <script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
 <link rel="stylesheet" href="../book.css">
 </head>
@@ -18,7 +18,7 @@
   <article class="page">
 <p class="chapter-no"><a href="index.html">Command reference</a> / <a href="clank-events.html">clank events</a> / <a href="clank-events-watch.html">clank events watch</a></p>
 <h1>clank events watch list</h1>
-<p class="lede">Show the agent&#39;s wake sources, numbered from 1</p>
+<p class="lede">Show the target&#39;s watches, numbered from 1</p>
 <h2 id="usage">Usage</h2>
 <p class="usage"><samp>clank events watch list [OPTIONS]</samp></p>
 <h2 id="options">Options</h2>
@@ -29,11 +29,15 @@
   </dd>
   <dt id="option-author"><code>--author &lt;AGENT&gt;</code></dt>
   <dd>
-<p>Agent whose wake sources these are (default: the session&#39;s binding)</p>
+<p>Pin to this named agent. Omit to target the master role</p>
   </dd>
   <dt id="option-json"><code>-j, --json</code></dt>
   <dd>
-<p>Print the sources as their config JSON</p>
+<p>Print JSON entries with n, target, recipient and source</p>
+  </dd>
+  <dt id="option-all"><code>--all</code></dt>
+  <dd>
+<p>Show every target, including agents no longer on the roster</p>
   </dd>
   <dt id="option-help"><code>-h, --help</code></dt>
   <dd>

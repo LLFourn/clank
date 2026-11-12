@@ -103,6 +103,7 @@ pub mod wait;
 mod wake_receipt;
 pub(crate) mod wake_render;
 pub(crate) mod wake_repeat;
+pub(crate) mod watch_store;
 pub(crate) mod web;
 pub(crate) mod zellij_endpoint;
 
@@ -789,7 +790,7 @@ pub enum EventsCmd {
     Show(EventsShowArgs),
     /// Read an event's content and record delivery to your bound agent.
     Read(EventsShowArgs),
-    /// List, add and remove the agent's standing wake sources.
+    /// Manage standing watches (default target: whoever is master).
     Watch(EventsWatchArgs),
 }
 
@@ -801,7 +802,7 @@ pub struct EventsWatchArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum EventsWatchCmd {
-    /// Show the agent's wake sources, numbered from 1.
+    /// Show the target's watches, numbered from 1.
     List(EventsWatchListArgs),
     /// Add one wake source, in the JSON shape of `clank wait`'s `--event`
     ///
@@ -809,6 +810,8 @@ pub enum EventsWatchCmd {
     Add(EventsWatchAddArgs),
     /// Remove the wake source `watch list` numbers N.
     Remove(EventsWatchRemoveArgs),
+    /// Change a watch's target while retaining its state.
+    Transfer(EventsWatchTransferArgs),
 }
 
 #[derive(Args, Debug)]
@@ -816,7 +819,7 @@ pub struct EventsWatchTarget {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Agent whose wake sources these are (default: the session's binding).
+    /// Pin to this named agent. Omit to target the master role.
     #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
 }
@@ -825,9 +828,24 @@ pub struct EventsWatchTarget {
 pub struct EventsWatchListArgs {
     #[command(flatten)]
     pub target: EventsWatchTarget,
-    /// Print the sources as their config JSON.
+    /// Print JSON entries with n, target, recipient and source.
     #[arg(short = 'j', long)]
     pub json: bool,
+    /// Show every target, including agents no longer on the roster.
+    #[arg(long, conflicts_with = "author")]
+    pub all: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct EventsWatchTransferArgs {
+    #[command(flatten)]
+    pub target: EventsWatchTarget,
+    /// Source agent (including a removed agent); omit for the master scope.
+    #[arg(long, value_name = "AGENT")]
+    pub from_author: Option<String>,
+    /// Entry number from watch list in the source scope.
+    #[arg(value_name = "N")]
+    pub n: usize,
 }
 
 #[derive(Args, Debug)]

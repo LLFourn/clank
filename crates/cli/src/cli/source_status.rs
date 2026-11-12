@@ -11,7 +11,9 @@ use crate::cli::github::timeline::{Backend, MergedEvent};
 /// each have a source of the same name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredSource {
-    pub(crate) agent: AgentLabel,
+    pub(crate) agent: String,
+    pub(crate) target: Option<crate::cli::watch_store::Target>,
+    pub(crate) recipient: Option<AgentLabel>,
     pub(crate) key: String,
     pub(crate) backend: Backend,
     pub(crate) name: String,
@@ -55,7 +57,9 @@ impl ConfiguredSource {
             _ => (None, None),
         };
         Self {
-            agent: agent.clone(),
+            agent: agent.to_string(),
+            target: None,
+            recipient: Some(agent.clone()),
             key,
             backend,
             name,
@@ -116,6 +120,46 @@ pub(crate) fn configured(repo: &std::path::Path) -> anyhow::Result<Vec<Configure
                 .collect::<Vec<_>>()
         })
         .collect();
+    let watches = crate::cli::watch_store::read(repo)?;
+    sources.retain(|source| {
+        !watches.event_watches.values().any(|watch| {
+            watch
+                .legacy_agent
+                .as_ref()
+                .is_some_and(|a| a.as_str() == source.agent)
+                && watch.key() == source.key
+        })
+    });
+    for (id, watch) in &watches.event_watches {
+        if watch.removed {
+            continue;
+        }
+        let recipient = watch.target.recipient(&watches);
+        let label = recipient
+            .clone()
+            .unwrap_or_else(|| AgentLabel::parse("unassigned").unwrap());
+        let mut source = ConfiguredSource::of(&label, &watch.source);
+        source.agent = crate::cli::watch_store::Owner::Watch(*id).to_string();
+        source.target = Some(watch.target.clone());
+        source.recipient = recipient.clone();
+        source.name = format!(
+            "{} → {} ({})",
+            source.name,
+            watch.target,
+            recipient
+                .as_ref()
+                .map(AgentLabel::as_str)
+                .unwrap_or("awaiting recipient")
+        );
+        if let WaitEventSource::Timer(t) = &watch.source {
+            let state = crate::cli::timer_source::inspect(&watch.directory(repo, *id), t);
+            if state == crate::cli::timer_source::TimerState::Fired {
+                continue;
+            }
+            source.timer = Some(state);
+        }
+        sources.push(source);
+    }
     sources.sort_by(|a, b| {
         (&a.name, a.agent.as_str(), &a.key).cmp(&(&b.name, b.agent.as_str(), &b.key))
     });

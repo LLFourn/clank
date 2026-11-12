@@ -10,9 +10,9 @@ const SESSION: &str = "session-handshake";
 
 /// A timer event no log keeps: the monitor holds it for its author until
 /// a presentation of it is delivered.
-fn transient(author: &AgentLabel) -> Vec<(AgentLabel, WaitItem)> {
+fn transient(author: &AgentLabel) -> Vec<(SourceOwner, WaitItem)> {
     vec![(
-        author.clone(),
+        author.clone().into(),
         WaitItem::TimerEvent {
             presentation: None,
             name: "transient-probe".into(),
@@ -29,7 +29,7 @@ fn gathered_with(
     repo: &std::path::Path,
     author: &AgentLabel,
     state: &crate::repo_state::RepoState,
-    pending: &[(AgentLabel, WaitItem)],
+    pending: &[(SourceOwner, WaitItem)],
 ) -> crate::cli::turn_custody::Gathered {
     gather(
         repo,
@@ -97,6 +97,7 @@ async fn a_failed_emit_keeps_unlogged_work_owed() {
                     panic!("expected a result");
                 };
                 let settled = settle_result(
+                    repo.path(),
                     &mut turns,
                     &mut pending,
                     &author,
@@ -205,7 +206,7 @@ async fn a_delivery_discharges_the_transient_work_it_presented() {
             .contains("UNLOGGED-PAYLOAD")
     );
     let arrived = (
-        author.clone(),
+        SourceOwner::Agent(author.clone()),
         WaitItem::TimerEvent {
             presentation: None,
             name: "arrived-in-flight".into(),
@@ -224,6 +225,7 @@ async fn a_delivery_discharges_the_transient_work_it_presented() {
         panic!("expected a result");
     };
     let settled = settle_result(
+        repo.path(),
         &mut turns,
         &mut pending,
         &author,
@@ -999,7 +1001,7 @@ async fn recovery_after_a_lost_park(later: Later) {
     let parked = turns.answer(&author, 2, &stop_report(), true, &g).unwrap();
     assert_eq!(parked.verdict, WireVerdict::Park);
 
-    type Pending = [(AgentLabel, WaitItem)];
+    type Pending = [(SourceOwner, WaitItem)];
     let facts = |state: &crate::repo_state::RepoState, pending: &Pending, turns: &mut Turns| {
         let [facts] = recovery_facts(
             repo.path(),

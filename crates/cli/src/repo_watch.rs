@@ -33,6 +33,7 @@ pub const CLANK_WAKE_DIRS: &[&str] = &[
     "agents", // agents/<label>/feedback — the gate signal
     "finished",
     "config.json",
+    "watch-events",
 ];
 
 /// Under `.clank/`, what the status panel shows but no gate reads: a
@@ -325,7 +326,7 @@ fn handler<M: Clone + Send + Sync + 'static>(
 
 /// A timer's log under an agent's directory, or an ancestor of one.
 fn is_timer_inventory(path: &Path, clank: &Path) -> bool {
-    path.starts_with(clank.join("agents"))
+    (path.starts_with(clank.join("agents")) || path.starts_with(clank.join("watch-events")))
         && (path.extension().is_none()
             || (path.extension().is_some_and(|ext| ext == "jsonl")
                 && path
@@ -337,6 +338,9 @@ fn is_timer_inventory(path: &Path, clank: &Path) -> bool {
 /// Event custody or inventory changed; ordinary git/config/feedback changes do
 /// not initiate interruption. Ancestor-directory changes conservatively rescan.
 fn is_event_invalidation(path: &Path, clank: &Path) -> bool {
+    if path.starts_with(clank.join("watch-events")) {
+        return path.extension().is_none() || path.extension().is_some_and(|ext| ext == "jsonl");
+    }
     let Ok(relative) = path.strip_prefix(clank.join("agents")) else {
         return false;
     };

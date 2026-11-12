@@ -1251,6 +1251,8 @@ pub(crate) fn resolve_wait_event_sources(
         .into_iter()
         .map(|s| (s, SourceOrigin::Config))
         .collect();
+    let watches = crate::cli::watch_store::read(repo)?;
+    sources.retain(|(source, _)| !crate::cli::watch_store::transferred(&watches, author, source));
     for raw in cli_items {
         let item = parse_wait_event_source(raw).map_err(|e| e.context("invalid --event"))?;
         sources.push((item, SourceOrigin::Cli));
@@ -5168,7 +5170,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
             while let Some((who, at, instance, state)) = heard.recv().await {
                 assert_eq!(instance, 1);
-                assert_eq!((&who, at.as_str()), (&author, key.as_str()));
+                assert_eq!((who, at.as_str()), (author.clone().into(), key.as_str()));
                 let backing_off = matches!(state, Lifecycle::BackingOff { .. });
                 states.push(state);
                 if backing_off {

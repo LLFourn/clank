@@ -29,9 +29,9 @@
 </figure>
 
 <h2 id="sources">Wake sources</h2>
-<p>An agent’s wake sources live in its own config, <code>.clank/agents/<var>label</var>/config.json</code>, as a <code>wait_events</code> list. The repo’s monitor hosts them for as long as it runs, and every event they produce lands in that agent’s <a href="#inbox">inbox</a> before it wakes anyone. There are three kinds.</p>
+<p>Add standing sources with <code>clank events watch add</code> and a source JSON object. By default a watch targets the master role, following whoever becomes master. This also works from an unbound human shell. Pass <code>--author worker</code> to pin the named agent instead; even <code>--author master</code> means that literal agent name. <code>clank events watch list --all</code> shows every target and current recipient. List and remove without <code>--author</code> address the master scope. There are three kinds.</p>
 
-<h3 id="timers">Timers</h3>
+<p>Existing per-agent <code>wait_events</code> stay pinned. Use <code>clank events watch transfer --from-author claude 1</code> to move the entry numbered by that agent’s watch list to the master role, even if the agent left the roster. Transfer preserves its filters, prompt, log, cursor, baseline and timer progress. Add <code>--author worker</code> to pin the destination instead. Removing a repository watch retains history; adding it again creates fresh state.</p><p>Changing master keeps unchanged producers running. Pending and subsequent events go to the new master. With no master, ingestion continues and events wait; status shows the watch as unassigned. A wake already handed to the old master cannot be recalled, and its acknowledgment still closes the shared row. Coordinate external actions during handover: delivery is at least once.</p><h3 id="timers">Timers</h3>
 <pre><code>{
   "wait_events": [
     {"kind": "timer", "name": "morning-sweep",
@@ -60,7 +60,7 @@
 <ul>
   <li><strong><code>prompt</code></strong> is your standing instruction for that watch. It is shown with every event the watch produces, telling the agent what reacting means.</li>
   <li><strong>Your own actions don’t wake you</strong>, unless you set <code>"include_own_actions": true</code>. The exception is <code>review_submitted</code>, which is never filtered, because a submitted review is the thing a team waits on.</li>
-  <li><strong>CI conclusions are read, not received.</strong> <code>ci_passed</code> and <code>ci_failed</code> come from asking each watched PR’s head what its checks say. The repo’s monitor reads them for every agent on the roster, whether or not that agent is waiting, and a conclusion it sees stays in the inbox until acknowledged. What it never sees is lost: a red build that turned green between two reads, or while no monitor was running, is simply gone.</li>
+  <li><strong>CI conclusions are read, not received.</strong> <code>ci_passed</code> and <code>ci_failed</code> come from asking each watched PR’s head what its checks say. The repo’s monitor reads them for each configured watch, whether or not its recipient is waiting, and a conclusion it sees stays in the inbox until acknowledged. What it never sees is lost: a red build that turned green between two reads, or while no monitor was running, is simply gone.</li>
 </ul>
 <p>Every source polls GitHub: once when it starts, then every 60 seconds. Set <code>"poll_interval": "5m"</code> to change that; GitHub’s own <code>X-Poll-Interval</code> wins when it is longer. GitHub has no subscription API, so there is nothing to listen to instead, and an unchanged feed costs no rate limit. A read that fails is retried with backoff, and polling never stops while the monitor hosts the source.</p>
 <p>How timely an event is depends on where it comes from. PRs, comments and reviews come from GitHub’s repository events feed, which GitHub documents as lagging by 30 seconds to six hours; the poll adds at most one interval. CI conclusions are read from each PR’s checks, so they arrive within about one interval of GitHub reporting them.</p>
@@ -68,7 +68,7 @@
 <p>The <code>clank-github</code> skill carries the full vocabulary and catch-up rules. Agents load it when GitHub events wake them.</p>
 
 <h2 id="inbox">The inbox: react, then ack</h2>
-<p>Every event a source delivers, and every message <code>clank send</code> delivers, goes into the recipient’s inbox, a log under its agent directory in <code>.clank/agents/</code>. It stays unhandled, and keeps waking its agent each time a wait is armed, until the agent acknowledges it. Delivery is therefore at least once. An event that fires while the agent is offline is waiting when it comes back, and one it half-handled before a crash comes round again.</p>
+<p>Every event a source delivers, and every message <code>clank send</code> delivers, goes into an inbox. Repository watches retain one shared log across recipient changes; messages and legacy watches use per-agent logs under <code>.clank/agents/</code>. It stays unhandled, and keeps waking its agent each time a wait is armed, until the agent acknowledges it. Delivery is therefore at least once. An event that fires while the agent is offline is waiting when it comes back, and one it half-handled before a crash comes round again.</p>
 <pre><code>clank events list
 clank events read <var>id</var>
 clank events ack <var>id</var></code></pre>

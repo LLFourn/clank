@@ -186,13 +186,18 @@ pub(crate) fn record(
         groups.entry(&key.source).or_default().push(key.clone());
     }
     let mut failures = 0;
-    for (source, keys) in groups {
+    for (source, mut keys) in groups {
         if !current() {
             break;
         }
         // Removed custody is never recreated by a late presentation.
-        if !dir.join(format!("{source}.jsonl")).is_file() {
+        if !super::watch_store::log_exists(&dir, source) {
             continue;
+        }
+        if let Ok((_, physical_key)) = super::watch_store::log_location(&dir, source) {
+            for key in &mut keys {
+                key.source = physical_key.clone();
+            }
         }
         let result = super::github::log::EventLog::open(&dir, source).and_then(|log| {
             log.under(permit)

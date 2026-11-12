@@ -62,8 +62,18 @@ watched repos collide — the error message shows the qualified forms).
 ## Saying what to watch
 
 Add a watch with `clank events watch add '<json>'`; `clank events
-watch list` numbers your sources and `clank events watch remove <n>`
-removes one. Never edit `config.json` by hand: `add` refuses, with
+watch list` numbers master-role sources and `clank events watch remove <n>`
+removes one. The default follows whoever becomes master, regardless of the
+invoking session. `--author <agent>` pins a named agent instead (even the literal
+name `master`). `watch list --all` shows every target and current recipient;
+`-j` includes `n`, `target`, `recipient` and `source`.
+Transfer an old pinned watch with `watch transfer --from-author <agent> <n>`:
+removed agents are supported, and logs, baselines, cursors, prompts and acks
+stay intact. Pending work follows the new master; already delivered work may
+still be acted on by the old master. Both share acknowledgments, but external
+actions remain at least once. Ingestion continues while there is no master;
+events wait until one is assigned. Legacy watches stay pinned until transferred.
+Never edit `config.json` by hand: `add` refuses, with
 nothing written, anything your next arm would refuse. The JSON is a
 github source in one of two shapes. The flat one names kinds and scopes them with `prs` /
 `branches`:

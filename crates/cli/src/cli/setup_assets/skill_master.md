@@ -109,9 +109,14 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 ### Extra wake sources (controller repos)
 
 Beyond this repo's own state, `clank wait` can wake you on EXTERNAL
-events — for a "controller" repo that manages OTHER repos. Add them to
-this agent's `.clank/agents/<label>/config.json` under `wait_events`
-(or pass `--event '<json>'` ad hoc, same shape):
+events — for a "controller" repo that manages OTHER repos. Add them with
+`clank events watch add '<json>'`. The default target is the master role,
+following whoever becomes master; `--author <agent>` explicitly pins one.
+`watch list --all` shows every target and recipient. Transfer a legacy watch
+with `watch transfer --from-author <old-agent> <n>`; this works for removed
+agents and preserves its log, cursor and acknowledgments. Omit `--from-author`
+to transfer from the master scope; add `--author` to pin the destination.
+Temporary `--event '<json>'` sources remain specific to that wait:
 
 - `{"kind":"github","repo":"owner/name","events":["pr_opened",
   "pr_updated","pr_merged","pr_comment","review_submitted",
@@ -173,8 +178,11 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
 React to a `github_event` / `command_event` / `timer_event` like any
 other work item: do the triage (`gh` for PRs/issues, your own tools for
 the rest), then STOP as your work loop above says. These events land in
-a per-agent INBOX first (`.clank/agents/<label>/events/`) and re-wake
-you until you mark them handled: `clank events list` shows the
+an INBOX first and re-wake you until you mark them handled. Role watches keep
+one shared log across master changes, and pending work moves to the new master.
+Ingestion continues without a master; delivery waits. Already delivered work
+may still be acted on by the old master, so coordinate external actions during
+handover; acknowledgments affect the shared log. `clank events list` shows the
 unhandled backlog, `clank events ack <id>` closes an item out — react,
 then ack, every time.
 Sources run in the repo's monitor whether or not you are waiting, so

@@ -105,18 +105,26 @@ pub(super) async fn submit(
         "reply text must not be empty or whitespace-only"
     );
     let repo = dunce::canonicalize(repo)?;
-    let author = AgentLabel::parse(
-        dir.parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow::anyhow!("cannot identify replying author"))?,
-    )
-    .map_err(anyhow::Error::msg)?;
+    let author = crate::cli::watch_store::inbox_author(&repo, dir)?;
+    let expected = crate::agent_store::agents_root(&repo)
+        .join(author.as_str())
+        .join("events");
+    let agent_inbox = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|s| s == author.as_str());
+    // A repository watch can be an agent's first inbox item; it lives in the
+    // shared watch store, so the ordinary agent events directory may not exist.
+    if agent_inbox {
+        std::fs::create_dir_all(dir)?;
+    }
+    let (physical, _) = crate::cli::watch_store::log_location(dir, &selected.source)?;
     anyhow::ensure!(
-        dunce::canonicalize(dir)?
-            == crate::agent_store::agents_root(&repo)
-                .join(author.as_str())
-                .join("events"),
+        if agent_inbox {
+            dunce::canonicalize(dir)? == expected
+        } else {
+            physical != dir
+        },
         "reply author directory does not match the selected repository"
     );
     let (transport, saved_route, _lease) = match &selected.row.item {

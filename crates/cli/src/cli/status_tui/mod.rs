@@ -1243,6 +1243,21 @@ fn event_prompts(
     let mut pairs: BTreeSet<(String, String)> = Default::default();
     for m in &event.members {
         let map = per_agent.entry(m.key.agent.clone()).or_insert_with(|| {
+            if let Ok(crate::cli::watch_store::Owner::Watch(id)) =
+                crate::cli::watch_store::Owner::parse(&m.key.agent)
+                && let Ok(config) = crate::cli::watch_store::read(repo)
+                && let Some(watch) = config.event_watches.get(&id)
+            {
+                return match &watch.source {
+                    clank_core::agent_config::WaitEventSource::Github(g) => g
+                        .prompt
+                        .as_ref()
+                        .map(|p| [(watch.key(), p.clone())].into_iter().collect())
+                        .unwrap_or_default(),
+                    _ => Default::default(),
+                };
+            }
+
             let dir = crate::agent_store::agents_root(repo)
                 .join(&m.key.agent)
                 .join("events");

@@ -42,6 +42,15 @@ pub(super) async fn ack_with_reply(
     else {
         anyhow::bail!("this event's backend does not support --reply");
     };
+    let replying_author = crate::cli::watch_store::inbox_author(repo, dir)?;
+    let (physical_dir, physical_key) =
+        crate::cli::watch_store::log_location(dir, &selected.source)?;
+    let selected = Sourced {
+        source: physical_key,
+        row: selected.row.clone(),
+    };
+    let selected = &selected;
+    let dir = physical_dir.as_path();
     let repo = dunce::canonicalize(repo)?;
     let dir = dunce::canonicalize(dir)?;
     // Full persisted routing separates same-named sources owned by different
@@ -73,20 +82,13 @@ pub(super) async fn ack_with_reply(
             }
             reply.clone()
         }
-        None => {
-            let author = dir
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| anyhow::anyhow!("cannot identify this event's author"))?;
-            EventReply {
-                id: id.clone(),
-                text: text.into(),
-                author: author.into(),
-                idempotency_key: key,
-                route,
-            }
-        }
+        None => EventReply {
+            id: id.clone(),
+            text: text.into(),
+            author: replying_author.to_string(),
+            idempotency_key: key,
+            route,
+        },
     };
     if reply
         .route
@@ -161,6 +163,9 @@ pub(super) fn backend_lease(
     source: &str,
     route: &clank_core::wait::CommandReplyRoute,
 ) -> anyhow::Result<(IngestLease, PathBuf)> {
+    let alias_dir = crate::agent_store::agents_root(repo).join("inbox/events");
+    let (_, canonical_source) = crate::cli::watch_store::log_location(&alias_dir, source)?;
+    let source = canonical_source.as_str();
     let owner_identity = serde_json::to_vec(&("clank-reply-owner-v1", repo, source, Some(route)))?;
     let owner_key = blake3::hash(&owner_identity).to_hex().to_string();
     let lease = IngestLease::try_acquire(
@@ -185,12 +190,21 @@ fn copies_of(
     route: Option<&clank_core::wait::CommandReplyRoute>,
 ) -> anyhow::Result<Vec<Copy>> {
     let mut copies = Vec::new();
-    for entry in std::fs::read_dir(crate::agent_store::agents_root(repo))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+    let mut directories = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(crate::agent_store::agents_root(repo)) {
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                directories.insert(entry.path().join("events"));
+            }
         }
-        let dir = entry.path().join("events");
+    }
+    for (id, watch) in crate::cli::watch_store::read(repo)?.event_watches {
+        if watch.key() == source {
+            directories.insert(watch.directory(repo, id));
+        }
+    }
+    for dir in directories {
         if !dir.is_dir() {
             continue;
         }

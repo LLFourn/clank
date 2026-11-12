@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>clank events watch | The clank book</title>
-<meta name="description" content="List, add and remove the agent&#39;s standing wake sources">
+<meta name="description" content="Manage standing watches (default target: whoever is master)">
 <script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
 <link rel="stylesheet" href="../book.css">
 </head>
@@ -18,7 +18,7 @@
   <article class="page">
 <p class="chapter-no"><a href="index.html">Command reference</a> / <a href="clank-events.html">clank events</a></p>
 <h1>clank events watch</h1>
-<p class="lede">List, add and remove the agent&#39;s standing wake sources</p>
+<p class="lede">Manage standing watches (default target: whoever is master)</p>
 <h2 id="usage">Usage</h2>
 <p class="usage"><samp>clank events watch &lt;COMMAND&gt;</samp></p>
 <h2 id="commands">Commands</h2>
@@ -27,8 +27,9 @@
   <thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
   <tbody>
     <tr><td><a href="clank-events-watch-add.html"><code>add</code></a></td><td>Add one wake source, in the JSON shape of <code>clank wait</code>&#39;s <code>--event</code></td></tr>
-    <tr><td><a href="clank-events-watch-list.html"><code>list</code></a></td><td>Show the agent&#39;s wake sources, numbered from 1</td></tr>
+    <tr><td><a href="clank-events-watch-list.html"><code>list</code></a></td><td>Show the target&#39;s watches, numbered from 1</td></tr>
     <tr><td><a href="clank-events-watch-remove.html"><code>remove</code></a></td><td>Remove the wake source <code>watch list</code> numbers N</td></tr>
+    <tr><td><a href="clank-events-watch-transfer.html"><code>transfer</code></a></td><td>Change a watch&#39;s target while retaining its state</td></tr>
   </tbody>
 </table>
 </div>

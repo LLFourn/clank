@@ -367,6 +367,9 @@ impl From<ReviewKind> for RosterRole {
 /// field — the roster is self-contained.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RepoConfigFile {
+    /// Stable repository watches; delivery follows their explicit target.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub event_watches: BTreeMap<u64, crate::cli::watch_store::Watch>,
     /// The operating roster: agents-with-roles. Exactly one entry
     /// should have `role == Master` (validated at resolve, not
     /// deserialize).

@@ -69,6 +69,9 @@ const DECLARED: &[&str] = &[
     // would admit a second holder.
     "config.lock",
     "agents",
+    // Repository watch WALs, cursors and backend state survive processes and
+    // master changes; ownership belongs to the watch rather than an agent.
+    "watch-events",
     "plans",
     "finished",
     "queue",

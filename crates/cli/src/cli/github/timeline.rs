@@ -632,26 +632,40 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
     let mut copies: Vec<Copy> = Vec::new();
     let mut notices: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let agents_root = crate::agent_store::agents_root(repo);
-    let Ok(agents) = std::fs::read_dir(&agents_root) else {
-        return TimelineSnapshot::default();
-    };
+    let watches = crate::cli::watch_store::read(repo).unwrap_or_default();
     let mut nudges: Vec<Nudge> = Vec::new();
-    for agent in agents.flatten() {
-        let label = agent.file_name().to_string_lossy().into_owned();
-        nudges.extend(
-            crate::cli::nudge_log::read(&agent.path())
-                .into_iter()
-                .map(|record| Nudge {
-                    agent: label.clone(),
-                    record,
-                }),
-        );
-        // Source key -> glyph, from this agent's CURRENT config. The
-        // glyph is presentation config, never stored in the WAL, so
-        // it is joined here exactly as a watch's prompt is
-        // (github-watch-prompts).
-        let glyphs = command_glyphs(repo, &label);
-        let events_dir = agent.path().join("events");
+    let mut directories = Vec::new();
+    if let Ok(agents) = std::fs::read_dir(&agents_root) {
+        for agent in agents.flatten() {
+            let label = agent.file_name().to_string_lossy().into_owned();
+            nudges.extend(
+                crate::cli::nudge_log::read(&agent.path())
+                    .into_iter()
+                    .map(|record| Nudge {
+                        agent: label.clone(),
+                        record,
+                    }),
+            );
+            directories.push((label, agent.path().join("events"), None));
+        }
+    }
+    for (id, watch) in &watches.event_watches {
+        directories.push((
+            crate::cli::watch_store::Owner::Watch(*id).to_string(),
+            watch.directory(repo, *id),
+            Some(watch.key()),
+        ));
+    }
+    for (label, events_dir, only_key) in directories {
+        let mut glyphs = command_glyphs(repo, &label);
+        if let Ok(crate::cli::watch_store::Owner::Watch(id)) =
+            crate::cli::watch_store::Owner::parse(&label)
+            && let Some(watch) = watches.event_watches.get(&id)
+            && let clank_core::agent_config::WaitEventSource::Command(c) = &watch.source
+            && let Some(glyph) = &c.glyph
+        {
+            glyphs.insert(watch.key(), glyph.clone());
+        }
         let Ok(files) = std::fs::read_dir(&events_dir) else {
             continue;
         };
@@ -663,6 +677,12 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
             let Some(stem) = name.strip_suffix(".jsonl") else {
                 continue;
             };
+            if only_key.as_ref().is_some_and(|key| key != stem) {
+                continue;
+            }
+            if only_key.is_none() && crate::cli::watch_store::claimed_key(&events_dir, stem) {
+                continue;
+            }
             let Ok(log) = EventLog::open(&events_dir, stem) else {
                 continue;
             };

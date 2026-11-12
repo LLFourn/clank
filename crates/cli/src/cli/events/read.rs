@@ -1,5 +1,7 @@
 //! Explicit CLI presentation: a checked content write, not an acknowledgement.
-use super::{Sourced, events_context, read_all, render_full, resolve};
+#[cfg(test)]
+use super::read_all;
+use super::{Sourced, events_context, render_full, resolve, select};
 use crate::agent_env::{Ambient, Process};
 use clank_core::{
     AgentLabel, SessionId, Tool,
@@ -42,8 +44,8 @@ pub(super) async fn run(args: crate::cli::EventsShowArgs) -> anyhow::Result<()> 
     let repo = crate::cli::resolve_repo(args.repo.as_deref())?;
     let reader = Reader::capture(&repo, args.author.as_deref(), &Process)?;
     let (dir, prompts) = events_context(Some(&repo), Some(reader.author.as_str()))?;
-    let rows = read_all(&dir)?;
-    let selected = resolve(&rows, &args.id)?;
+    let (rows, ids) = select(&dir, &[args.id])?;
+    let selected = resolve(&rows, &ids[0])?;
     let selector = super::Selector::qualified(&selected.source, selected.row.seq).to_string();
     let prepared = crate::cli::wake_receipt::prepare(
         &repo,
@@ -75,7 +77,7 @@ pub(super) async fn run(args: crate::cli::EventsShowArgs) -> anyhow::Result<()> 
             &reader,
             &rows,
             &prompts,
-            &args.id,
+            &ids[0],
             args.json,
             &mut stdout.lock(),
         )?;

@@ -62,7 +62,7 @@ type Report = Arc<dyn Fn(&str, Lifecycle) + Send + Sync>;
 
 /// What a reporting sink tells its host: whose source, its storage key,
 /// the instance of the task that reported, and the state.
-pub(crate) type LifecycleReport = (AgentLabel, String, u64, Lifecycle);
+pub(crate) type LifecycleReport = (crate::cli::watch_store::Owner, String, u64, Lifecycle);
 
 /// Success means the delivery owner's queue already holds the emission.
 /// Metadata transformations run within the send, with no private buffer or task.
@@ -79,6 +79,26 @@ pub(crate) struct EmissionSink {
     reason = "the error is tokio's SendError, handing the unsent emission back"
 )]
 impl EmissionSink {
+    #[cfg(test)]
+    pub(crate) fn for_owner(
+        tx: UnboundedSender<(crate::cli::watch_store::Owner, Emission)>,
+        owner: crate::cli::watch_store::Owner,
+    ) -> Self {
+        Self::routed(tx, move |_| owner.clone())
+    }
+    pub(crate) fn routed(
+        tx: UnboundedSender<(crate::cli::watch_store::Owner, Emission)>,
+        owner: impl Fn(&WaitItem) -> crate::cli::watch_store::Owner + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            send: Arc::new(move |emission| {
+                tx.send((owner(&emission.0), emission))
+                    .map_err(|e| SendError(e.0.1))
+            }),
+            report: None,
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn for_author(
         tx: UnboundedSender<(AgentLabel, Emission)>,
         author: AgentLabel,
@@ -98,9 +118,10 @@ impl EmissionSink {
     pub(crate) fn reporting(
         mut self,
         tx: UnboundedSender<LifecycleReport>,
-        author: AgentLabel,
+        author: impl Into<crate::cli::watch_store::Owner>,
         instance: u64,
     ) -> Self {
+        let author = author.into();
         self.report = Some(Arc::new(move |key, state| {
             let _ = tx.send((author.clone(), key.to_string(), instance, state));
         }));
@@ -237,7 +258,7 @@ pub(crate) fn owed_from_sources(
     let events_dir = crate::agent_store::agents_root(repo)
         .join(author.as_str())
         .join("events");
-    let mut owed = Vec::new();
+    let mut owed = crate::cli::watch_store::owed(repo, author, shown);
     if !events_dir.is_dir() {
         return owed;
     }
@@ -255,6 +276,9 @@ pub(crate) fn owed_from_sources(
                 g.prompt.clone(),
             ),
         };
+        if crate::cli::watch_store::claimed_key(&events_dir, &key) {
+            continue;
+        }
         if !events_dir.join(format!("{key}.jsonl")).is_file() {
             continue;
         }

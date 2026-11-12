@@ -956,6 +956,9 @@ impl EventLog {
     /// source's identity (repo + config); the caller owns that
     /// derivation.
     pub(crate) fn open(events_dir: &Path, source_key: &str) -> std::io::Result<Self> {
+        let (events_dir, source_key) =
+            crate::cli::watch_store::log_location(events_dir, source_key)?;
+        let events_dir = events_dir.as_path();
         std::fs::create_dir_all(events_dir)?;
         Ok(Self {
             log_path: events_dir.join(format!("{source_key}.jsonl")),

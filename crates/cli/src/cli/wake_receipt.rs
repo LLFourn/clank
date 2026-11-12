@@ -22,6 +22,24 @@ pub(crate) struct Route {
     pub state_dir: PathBuf,
 }
 impl Route {
+    fn capture_selector(
+        source: &CommandSource,
+        key: &str,
+        cwd: &Path,
+        agent_dir: &Path,
+    ) -> anyhow::Result<Option<Self>> {
+        let (events, physical_key) =
+            super::watch_store::log_location(&agent_dir.join("events"), key)?;
+        let owner = events
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("missing source owner"))?;
+        let mut route = Self::capture(source, &physical_key, cwd, owner)?;
+        if let Some(route) = &mut route {
+            route.key = key.to_owned();
+        }
+        Ok(route)
+    }
+
     pub(crate) fn capture(
         source: &CommandSource,
         key: &str,
@@ -247,9 +265,9 @@ pub(crate) fn prepare<'a>(
     if candidates.peek().is_none() {
         return prepared;
     }
-    let config = match crate::agent_store::load_agent_config(repo, author) {
+    let mut config = match crate::agent_store::load_agent_config(repo, author) {
         Ok(Some(config)) => config,
-        Ok(None) => return prepared,
+        Ok(None) => Default::default(),
         Err(error) => {
             let _ = writeln!(
                 prepared.diagnostics,
@@ -258,6 +276,11 @@ pub(crate) fn prepare<'a>(
             return prepared;
         }
     };
+    let watches = crate::cli::watch_store::read(repo).unwrap_or_default();
+    config
+        .wait_events
+        .retain(|s| !crate::cli::watch_store::transferred(&watches, author, s));
+    let assigned = crate::cli::watch_store::assigned(&watches, author);
     let agent_dir = crate::agent_store::agents_root(repo).join(author.as_str());
     // Borrow existing selected identities; neither whole WALs nor oversized
     // producer IDs are cloned into a second collection for receipts.
@@ -269,11 +292,19 @@ pub(crate) fn prepare<'a>(
         if !sequence.parse::<u64>().is_ok_and(|seq| seq > 0) {
             continue;
         }
-        let Some(source) = config.wait_events.iter().find_map(|source| match source {
+        let repository_source = assigned.iter().find_map(|(id, watch)| {
+            (crate::cli::watch_store::selector_key(*id, &watch.key()) == key)
+                .then_some(&watch.source)
+        });
+        let selected_source = repository_source.or_else(|| {
+            config
+                .wait_events
+                .iter()
+                .find(|source| crate::cli::watch_store::source_key(source) == key)
+        });
+        let Some(source) = selected_source.into_iter().find_map(|source| match source {
             WaitEventSource::Command(source)
-                if source.receipt_command.is_some()
-                    && source.name == candidate.source
-                    && source.source_key() == key =>
+                if source.receipt_command.is_some() && source.name == candidate.source =>
             {
                 Some(source)
             }
@@ -318,7 +349,7 @@ pub(crate) fn prepare<'a>(
                 );
                 continue;
             }
-            None => match Route::capture(source, key, cwd, &agent_dir) {
+            None => match Route::capture_selector(source, key, cwd, &agent_dir) {
                 Ok(Some(route)) => {
                     routes.push(route);
                     routes.len() - 1
@@ -658,6 +689,87 @@ mod tests {
         .unwrap()
         .unwrap()
     }
+    #[test]
+    fn repository_receipts_use_the_selected_watch_and_its_persistent_state() {
+        use super::super::watch_store::{self, Target};
+        use clank_core::agent_config::WaitEventSource;
+        let fixture = fixtures::Fixture::new();
+        crate::agent_store::repo_config::transact(&fixture.repo, |config| {
+            config.agents = serde_json::from_value(serde_json::json!({
+                "codex": {"tool":"codex", "role":"master"}
+            }))
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        // A pinned legacy source has the same display name, but a different
+        // callback. Only the exact repository selector chooses this route.
+        let mut source = fixture.source.clone();
+        source.receipt_command = Some(vec!["repository-receipt".into()]);
+        let id = watch_store::add(
+            &fixture.repo,
+            Target::Master,
+            WaitEventSource::Command(source.clone()),
+        )
+        .unwrap();
+        let key = watch_store::selector_key(id, &source.source_key());
+        let selector = format!("{key}@1");
+        let prepared = prepare(
+            &fixture.repo,
+            &fixture.author,
+            std::iter::once(Candidate {
+                source: &source.name,
+                id: "selected",
+                selector: &selector,
+                cwd: Some(&fixture.cwd),
+            }),
+        );
+        assert_eq!(prepared.batches.len(), 1);
+        let route = &prepared.batches[0].route;
+        assert_eq!(route.argv, vec!["repository-receipt"]);
+        assert_eq!(route.key, key);
+        let config = watch_store::read(&fixture.repo).unwrap();
+        let events = config.event_watches[&id].directory(&fixture.repo, id);
+        assert_eq!(
+            route.state_dir,
+            super::super::command_source::backend_state_dir(
+                events.parent().unwrap(),
+                &source.source_key()
+            )
+        );
+
+        let transferred = watch_store::transfer_legacy(
+            &fixture.repo,
+            &fixture.author,
+            1,
+            Target::Agent {
+                name: fixture.author.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let alias = format!("{}@1", watch_store::selector_key(transferred, &fixture.key));
+        let prepared = prepare(
+            &fixture.repo,
+            &fixture.author,
+            std::iter::once(Candidate {
+                source: &fixture.source.name,
+                id: "legacy",
+                selector: &alias,
+                cwd: Some(&fixture.cwd),
+            }),
+        );
+        assert_eq!(prepared.batches.len(), 1);
+        assert_eq!(
+            prepared.batches[0].route.state_dir,
+            super::super::command_source::backend_state_dir(
+                &crate::agent_store::agents_root(&fixture.repo).join(fixture.author.as_str()),
+                &fixture.key
+            )
+        );
+        assert_ne!(prepared.batches[0].route.state_dir, route.state_dir);
+    }
+
     #[test]
     fn prepare_checks_exact_source_scope_and_snapshots_selected_identity_routing() {
         let mut fixture = fixtures::Fixture::new();
