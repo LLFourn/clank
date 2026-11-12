@@ -105,15 +105,11 @@ impl PlanStateLookup for FsPlanStateLookup<'_> {
         // plan; the plan key no longer selects among them.
         crate::cli::block::scan_blocks(self.repo)
             .into_iter()
-            .filter(|b| b.answer.is_none())
-            .filter_map(|b| {
-                clank_core::ids::AgentLabel::parse(&b.agent)
-                    .ok()
-                    .map(|creator| PlanBlock {
-                        creator,
-                        name: b.name,
-                        message: b.question,
-                    })
+            .filter(|b| b.pending())
+            .map(|b| PlanBlock {
+                creator: b.creator,
+                name: b.name,
+                message: b.question,
             })
             .collect()
     }

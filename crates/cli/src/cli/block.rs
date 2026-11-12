@@ -12,165 +12,74 @@ pub async fn run(args: BlockArgs) -> anyhow::Result<()> {
         BlockCmd::Answer(a) => run_unblock(a).await,
         BlockCmd::Clean(a) => run_clean(a).await,
         BlockCmd::Migrate(a) => run_migrate(a).await,
+        BlockCmd::List(a) => list(a.repo.as_deref()),
     }
 }
 
-/// Flatten `blocks/<plan>/<name>.md` to `blocks/<name>.md`.
-///
-/// A legacy plan-scoped block is INVISIBLE to the flat reader, so
-/// leaving one behind silently drops a pending question rather than
-/// parking on it. That cuts both ways: a block whose plan is gone must
-/// be reported as it is dropped, never removed quietly — the human is
-/// entitled to see the question they are losing.
-///
-/// A question and its answer move as ONE unit, and the whole plan is
-/// preflighted before anything is touched. Migrating the two halves
-/// independently can land an answer flat while its question stays
-/// scoped, which silently marks an UNRELATED flat question answered —
-/// the fabricated-answer failure this layout change exists to prevent.
+mod migration;
+
+fn root(repo: &Path) -> PathBuf {
+    repo.join(".clank")
+}
+
+fn hold_roster(repo: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(root(repo))?;
+    crate::agent_store::exclusive_lock(&root(repo).join("config.lock"))
+}
+
 async fn run_migrate(args: BlockMigrateArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
-    let root = agents_root(&repo);
-    let Ok(agents) = std::fs::read_dir(&root) else {
-        println!("no agents dir; nothing to migrate");
-        return Ok(());
-    };
+    let _lock = raw_lock(&repo)?;
+    migration::run(&repo, args.dry)
+}
 
-    let active = |plan: &str| repo.join(crate::init_facts::plan_md_rel(plan)).exists();
-    let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
-    // Destinations claimed by moves planned SO FAR. Checking only the
-    // filesystem misses collisions between two planned moves: two
-    // active plans each holding `q.md` both see no flat `q.md`, both
-    // queue the same destination, and the apply loop silently
-    // overwrites the first with the second.
-    let mut reserved: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut drops: Vec<(PathBuf, String)> = Vec::new();
-    let mut conflicts: Vec<String> = Vec::new();
-
-    let mut agent_dirs: Vec<PathBuf> = agents
-        .flatten()
-        .filter(|a| a.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|a| a.path())
-        .collect();
-    agent_dirs.sort();
-
-    for agent in agent_dirs {
-        let blocks = agent.join("blocks");
-        let unblocks = agent.join("unblocks");
-        let mut plan_dirs: Vec<PathBuf> = std::fs::read_dir(&blocks)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| e.path())
-            .collect();
-        plan_dirs.sort();
-
-        for dir in plan_dirs {
-            let Some(plan) = dir.file_name().and_then(|s| s.to_str()).map(str::to_owned) else {
-                continue;
-            };
-            let mut names: Vec<String> = std::fs::read_dir(&dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| {
-                    e.file_name()
-                        .to_str()
-                        .and_then(|s| s.strip_suffix(".md"))
-                        .map(str::to_owned)
-                })
-                .collect();
-            names.sort();
-
-            for name in names {
-                let src_q = dir.join(format!("{name}.md"));
-                let src_a = unblocks.join(&plan).join(format!("{name}.md"));
-                let dst_q = blocks.join(format!("{name}.md"));
-                let dst_a = unblocks.join(format!("{name}.md"));
-
-                if !active(&plan) {
-                    drops.push((src_q.clone(), format!("blocks/{plan}/{name}.md")));
-                    if src_a.exists() {
-                        drops.push((src_a, format!("unblocks/{plan}/{name}.md")));
-                    }
-                    continue;
-                }
-                // The destination PAIR must be entirely free, on disk
-                // AND among the moves already planned. A flat answer
-                // sitting at `dst_a` would attach to this question the
-                // moment it lands.
-                let taken = dst_q.exists()
-                    || dst_a.exists()
-                    || reserved.contains(&dst_q)
-                    || reserved.contains(&dst_a);
-                if taken {
-                    conflicts.push(format!(
-                        "`{name}` (agent `{}`, plan `{plan}`) — another block or answer already \
-                         claims that flat name",
-                        agent.file_name().and_then(|s| s.to_str()).unwrap_or("?")
-                    ));
-                    continue;
-                }
-                // Both halves are reserved even when only the question
-                // exists, so a later plan's ANSWER cannot claim `dst_a`.
-                reserved.insert(dst_q.clone());
-                reserved.insert(dst_a.clone());
-                moves.push((src_q, dst_q));
-                if src_a.exists() {
-                    moves.push((src_a, dst_a));
-                }
+/// No identity is needed to inspect repository decisions, including received
+/// answers kept for a successor until explicit cleanup.
+fn list(repo: Option<&Path>) -> anyhow::Result<()> {
+    let repo = resolve_repo(repo)?;
+    let _lock = lock(&repo)?;
+    for name in question_names(&root(&repo)) {
+        if let Some(pair) = Pair::read(&root(&repo), &name) {
+            println!("{name}: {}", pair.question);
+            if let Some(answer) = &pair.answer {
+                println!("  answer: {answer}");
             }
-        }
-    }
-
-    for (src, dst) in &moves {
-        println!("move {} -> {}", src.display(), dst.display());
-    }
-    for (path, label) in &drops {
-        let body = std::fs::read_to_string(path).unwrap_or_default();
-        let first = body.lines().next().unwrap_or("").trim();
-        println!("DROP {label} — its plan is not active\n     {first}");
-    }
-    for c in &conflicts {
-        println!("CONFLICT {c}");
-    }
-
-    if !conflicts.is_empty() {
-        anyhow::bail!(
-            "{} name collision(s); nothing was changed — resolve them by hand and re-run",
-            conflicts.len()
-        );
-    }
-
-    let verb = if args.dry { "would " } else { "" };
-    println!("{verb}move {}, {verb}drop {}", moves.len(), drops.len());
-    if args.dry {
-        return Ok(());
-    }
-
-    for (src, dst) in &moves {
-        std::fs::rename(src, dst)?;
-    }
-    for (path, _) in &drops {
-        std::fs::remove_file(path)?;
-    }
-    // Leaving the emptied `<plan>/` dirs behind would make a migrated
-    // repo look unmigrated on the next run.
-    for kind in ["blocks", "unblocks"] {
-        for agent in std::fs::read_dir(&root).into_iter().flatten().flatten() {
-            for sub in std::fs::read_dir(agent.path().join(kind))
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                if sub.file_type().is_ok_and(|t| t.is_dir()) {
-                    let _ = std::fs::remove_dir(sub.path());
-                }
+            if let Some(why) = pair.damage() {
+                println!("  unresolved: {why}");
             }
         }
     }
     Ok(())
+}
+
+pub(crate) fn master(repo: &Path) -> anyhow::Result<clank_core::AgentLabel> {
+    let cfg = crate::agent_store::repo_config::read(repo)?.unwrap_or_default();
+    super::watch_store::Target::Master
+        .recipient(&cfg)
+        .ok_or_else(|| anyhow::anyhow!("the repository has no unique master"))
+}
+
+/// Delivery evidence, not block ownership. A new attempt must capture the
+/// current master's bound session; old evidence never confirms a new session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Destination {
+    pub agent: clank_core::AgentLabel,
+    pub tool: clank_core::Tool,
+    pub session: clank_core::SessionId,
+}
+
+fn destination(repo: &Path) -> anyhow::Result<Destination> {
+    let agent = master(repo)?;
+    let cfg = crate::agent_store::load_agent_config(repo, &agent)?
+        .ok_or_else(|| anyhow::anyhow!("the master has no bound session"))?;
+    let session = cfg
+        .session
+        .ok_or_else(|| anyhow::anyhow!("the master has no bound session"))?;
+    Ok(Destination {
+        agent,
+        tool: session.tool,
+        session: session.id,
+    })
 }
 
 /// The user's `blocked` hook may page someone and wait on the answer.
@@ -178,18 +87,8 @@ const BLOCK_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 
 async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
-    let author = match args.author.as_deref() {
-        Some(raw) => clank_core::ids::AgentLabel::parse(raw)
-            .map_err(|e| anyhow::anyhow!("invalid --author `{raw}`: {e}"))?,
-        None => crate::agent_env::resolve_identity_from_env(&repo)?,
-    };
-
-    // Every block halts the whole repo until it is answered; say so
-    // on stderr, which survives the caller capturing stdout.
-    eprintln!(
-        "BLOCK: this parks every wait item for `{}` until the block is answered",
-        author.as_str()
-    );
+    let author = crate::agent_env::resolve_identity_from_env(&repo).ok();
+    eprintln!("BLOCK: this pauses the repository review cycle until the question is answered");
     let kind = if args.permission {
         let suggestion = match (args.suggest, args.suggest_file) {
             (Some(text), _) => Some(text),
@@ -206,7 +105,7 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
     } else {
         Kind::Plain
     };
-    let path = ask_with(&repo, &author, &args.name, &args.message, &kind)?;
+    let path = ask_with(&repo, author.as_ref(), &args.name, &args.message, &kind)?;
 
     let config = crate::cli::config::load(&repo).map_err(|e| {
         anyhow::anyhow!("the block is raised, but its `hooks.blocked` command was not run: {e:#}")
@@ -218,7 +117,7 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
                 .arg("-c")
                 .arg(cmd)
                 .env("CLANK_EVENT", "blocked")
-                .env("CLANK_AGENT", author.as_str())
+                .env("CLANK_AGENT", author.as_ref().map_or("", |a| a.as_str()))
                 .env("CLANK_BLOCK_NAME", &args.name)
                 .env("CLANK_REPO", &*repo.to_string_lossy())
                 .stdin(Stdin::Inherit)
@@ -228,8 +127,7 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
     }
 
     println!(
-        "blocked {} as {}",
-        author.as_str(),
+        "blocked repository as {}",
         path.strip_prefix(&repo).unwrap_or(&path).display()
     );
     Ok(())
@@ -248,19 +146,13 @@ pub async fn run_unblock(args: UnblockArgs) -> anyhow::Result<()> {
         By::Unattested
     };
     let resolved = if args.delivered {
-        resolve(&repo, &args.agent, &args.name, None, by, How::Delivered)?
+        resolve(&repo, &args.name, None, by, How::Delivered)?
     } else if args.nudge {
-        let to = clank_core::ids::AgentLabel::parse(&args.agent)
-            .map_err(|e| anyhow::anyhow!("invalid agent label: {e}"))?;
         let text = text()?;
-        let mut pane = crate::cli::nudge::Pane {
-            repo: &repo,
-            to: &to,
-        };
+        let mut pane = crate::cli::nudge::Pane { repo: &repo };
         crate::cli::event_interrupt::blocking(|| {
             resolve(
                 &repo,
-                &args.agent,
                 &args.name,
                 None,
                 by,
@@ -272,24 +164,16 @@ pub async fn run_unblock(args: UnblockArgs) -> anyhow::Result<()> {
             )
         })?
     } else {
-        resolve(
-            &repo,
-            &args.agent,
-            &args.name,
-            None,
-            by,
-            How::Plain(text()?),
-        )?
+        resolve(&repo, &args.name, None, by, How::Plain(text()?))?
     };
-    let path = resolved.into_answer(&args.agent, &args.name)?;
+    let path = resolved.into_answer(&args.name)?;
     let verb = if args.nudge || args.delivered {
         "unblocked by nudge"
     } else {
         "unblocked"
     };
     println!(
-        "{verb} {} as {}",
-        args.agent,
+        "{verb} repository as {}",
         path.strip_prefix(&repo).unwrap_or(&path).display()
     );
     Ok(())
@@ -416,9 +300,15 @@ fn stamp_question(occurrence: &str, kind: &Kind, body: &str) -> anyhow::Result<S
     Ok(stamp(occurrence, meta.as_deref(), body))
 }
 
-fn stamp_nudged(occurrence: &str, attempt: &str, body: &str) -> anyhow::Result<String> {
+fn stamp_nudged(
+    occurrence: &str,
+    attempt: &str,
+    body: &str,
+    destination: Option<Destination>,
+) -> anyhow::Result<String> {
     let meta = serde_json::to_string(&Disposition::Nudged {
         attempt: attempt.to_string(),
+        destination,
     })?;
     Ok(stamp(occurrence, Some(&meta), body))
 }
@@ -460,7 +350,11 @@ impl Kind {
 enum Disposition {
     /// Typed into the agent's terminal by the attempt it names. The agent
     /// has already seen it, so it is received the moment it is written.
-    Nudged { attempt: String },
+    Nudged {
+        attempt: String,
+        #[serde(default)]
+        destination: Option<Destination>,
+    },
 }
 
 /// A fresh ask or attempt identity. Random rather than counted, so no
@@ -497,6 +391,7 @@ struct Files {
     answer: PathBuf,
     marker: PathBuf,
     attempt: PathBuf,
+    creator: PathBuf,
 }
 
 fn files(agent_dir: &Path, name: &str) -> Files {
@@ -505,6 +400,7 @@ fn files(agent_dir: &Path, name: &str) -> Files {
         answer: agent_dir.join("unblocks").join(format!("{name}.md")),
         marker: agent_dir.join("unblocks").join(format!("{name}.received")),
         attempt: agent_dir.join("blocks").join(format!("{name}.attempt")),
+        creator: agent_dir.join("blocks").join(format!("{name}.creator")),
     }
 }
 
@@ -515,6 +411,33 @@ struct Marker {
     occurrence: String,
     question_digest: String,
     answer_digest: String,
+    #[serde(default)]
+    destination: Option<Destination>,
+}
+
+/// Missing is the only state with no receipt evidence. A file that cannot be
+/// read or parsed may record a completed delivery, so it needs repair first.
+fn read_marker(path: &Path) -> Option<Stored<Marker>> {
+    match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && absent(path) => None,
+        Err(e) => Some(Stored::Unreadable(format!(
+            "its receipt `{}` cannot be read: {e}",
+            path.display()
+        ))),
+        Ok(bytes) => Some(serde_json::from_slice(&bytes).map_or_else(
+            |e| {
+                Stored::Unreadable(format!(
+                    "its receipt `{}` is malformed: {e}",
+                    path.display()
+                ))
+            },
+            Stored::Valid,
+        )),
+    }
+}
+
+fn absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// A claimed nudge answering one ask, kept while it is unsettled. It
@@ -533,6 +456,8 @@ pub struct Attempt {
     /// Why the outcome is unknown, once a delivery returned unable to say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+    #[serde(default)]
+    pub(crate) destination: Option<Destination>,
 }
 
 impl Attempt {
@@ -596,6 +521,7 @@ struct Pair {
     /// The answer belonging to this ask, never a leftover from another.
     answer: Option<String>,
     disposition: Stored<Option<Disposition>>,
+    marker: Option<Stored<Marker>>,
     received: bool,
     attempt: AttemptState,
 }
@@ -631,21 +557,19 @@ impl Pair {
             ),
         };
         let nudged_by = match &disposition {
-            Stored::Valid(Some(Disposition::Nudged { attempt })) => Some(attempt.as_str()),
+            Stored::Valid(Some(Disposition::Nudged { attempt, .. })) => Some(attempt.as_str()),
             _ => None,
         };
+        let marker = read_marker(&f.marker);
         let received = nudged_by.is_some()
             || match (occurrence, &answer) {
-                (Some(occurrence), Some(answer)) => std::fs::read(&f.marker)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Marker>(&bytes).ok())
-                    .is_some_and(|m| {
-                        m == Marker {
-                            occurrence: occurrence.to_string(),
-                            question_digest: digest(q.body),
-                            answer_digest: digest(answer),
-                        }
-                    }),
+                (Some(occurrence), Some(answer)) => {
+                    marker.as_ref().and_then(Stored::valid).is_some_and(|m| {
+                        m.occurrence == occurrence
+                            && m.question_digest == digest(q.body)
+                            && m.answer_digest == digest(answer)
+                    })
+                }
                 _ => false,
             };
         let attempt = match read_attempt(&f.attempt) {
@@ -670,6 +594,7 @@ impl Pair {
             },
             answer,
             disposition,
+            marker,
             received,
             attempt,
         })
@@ -681,6 +606,7 @@ impl Pair {
         let reasons: Vec<&str> = [
             self.kind.unreadable(),
             self.disposition.unreadable(),
+            self.marker.as_ref().and_then(Stored::unreadable),
             match &self.attempt {
                 AttemptState::Unreadable(why) => Some(why.as_str()),
                 _ => None,
@@ -699,9 +625,8 @@ impl Pair {
         }
     }
 
-    fn carries(&self, agent: &clank_core::AgentLabel, name: &str) -> Option<AnswerRef> {
+    fn carries(&self, name: &str) -> Option<AnswerRef> {
         Some(AnswerRef {
-            agent: agent.clone(),
             name: name.to_string(),
             occurrence: self.occurrence.clone(),
             question_digest: digest(&self.question),
@@ -728,12 +653,17 @@ fn question_names(agent_dir: &Path) -> Vec<String> {
     names
 }
 
-/// Serializes every read-compare-write of `agent`'s blocks: ask, answer,
+/// Serializes every read-compare-write of repository blocks: ask, answer,
 /// clean and receive.
-pub(crate) fn lock(repo: &Path, agent: &clank_core::AgentLabel) -> anyhow::Result<std::fs::File> {
-    let dir = agents_root(repo).join(agent.as_str());
-    std::fs::create_dir_all(&dir)?;
-    crate::agent_store::exclusive_lock(&dir.join("blocks.lock"))
+fn raw_lock(repo: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(root(repo))?;
+    crate::agent_store::exclusive_lock(&root(repo).join("blocks.lock"))
+}
+
+pub(crate) fn lock(repo: &Path) -> anyhow::Result<std::fs::File> {
+    let guard = raw_lock(repo)?;
+    migration::run(repo, false)?;
+    Ok(guard)
 }
 
 fn publish(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -768,6 +698,35 @@ fn remove_if_present(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_master(repo: &Path, fallback: &clank_core::AgentLabel) {
+    if master(repo).is_err() {
+        crate::agent_store::repo_config::transact(repo, |cfg| {
+            cfg.agents.insert(
+                fallback.clone(),
+                serde_json::from_value(serde_json::json!({"tool":"codex", "role":"master"}))
+                    .unwrap(),
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+    let agent = master(repo).unwrap();
+    if crate::agent_store::load_agent_config(repo, &agent)
+        .unwrap()
+        .and_then(|c| c.session)
+        .is_none()
+    {
+        crate::agent_store::bind_session_to_agent(
+            repo,
+            &agent,
+            clank_core::Tool::Codex,
+            &clank_core::SessionId::parse(&format!("block-test-{agent}")).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 /// Ask `question` as a new plain occurrence of `name`.
 #[cfg(test)]
 pub(crate) fn ask(
@@ -776,24 +735,48 @@ pub(crate) fn ask(
     name: &str,
     question: &str,
 ) -> anyhow::Result<PathBuf> {
-    ask_with(repo, author, name, question, &Kind::Plain)
+    test_master(repo, author);
+    ask_with(repo, Some(author), name, question, &Kind::Plain)
 }
 
-/// Ask `question` as a new occurrence of `name`, of `kind`. Whatever
-/// answer or receipt an earlier ask of the name left is discarded, never
-/// inherited; an earlier ask's attempt record is left inert.
+/// Ask a new repository occurrence. Reuse is allowed only after the current
+/// master received the earlier answer and no attempt remains unsettled.
 pub(crate) fn ask_with(
     repo: &Path,
-    author: &clank_core::AgentLabel,
+    author: Option<&clank_core::AgentLabel>,
     name: &str,
     question: &str,
     kind: &Kind,
 ) -> anyhow::Result<PathBuf> {
     validate_name(name)?;
-    let _lock = lock(repo, author)?;
-    let f = files(&agents_root(repo).join(author.as_str()), name);
+    nonempty(question)?;
+    let _roster = hold_roster(repo)?;
+    let _lock = lock(repo)?;
+    let current = destination(repo).ok();
+    let _binding = current
+        .as_ref()
+        .map(|to| crate::agent_store::hold_binding(repo, &to.agent))
+        .transpose()?;
+    let dir = root(repo);
+    if let Some(pair) = Pair::read(&dir, name) {
+        anyhow::ensure!(
+            pair.received
+                && received_here(repo, &pair)
+                && pair.damage().is_none()
+                && pair.live_attempt().is_none(),
+            "block `{name}` is still open or its answer is owed; use another name"
+        );
+    }
+    let f = files(&dir, name);
     remove_if_present(&f.answer)?;
     remove_if_present(&f.marker)?;
+    remove_if_present(&f.attempt)?;
+    match author {
+        Some(a) => publish(&f.creator, a.as_str().as_bytes())?,
+        None => {
+            remove_if_present(&f.creator)?;
+        }
+    }
     publish(
         &f.question,
         stamp_question(&mint_id()?, kind, question)?.as_bytes(),
@@ -813,12 +796,12 @@ pub(crate) struct Shown<'a> {
 pub(crate) trait Nudger {
     /// Only `Submitted` says the text arrived and `Refused` that nothing
     /// was typed; any other outcome may have landed.
-    fn nudge(&mut self, text: &str) -> Outcome;
+    fn nudge(&mut self, text: &str, destination: &Destination) -> Outcome;
 }
 
 #[cfg(test)]
 impl<F: FnMut(&str) -> Outcome> Nudger for F {
-    fn nudge(&mut self, text: &str) -> Outcome {
+    fn nudge(&mut self, text: &str, _destination: &Destination) -> Outcome {
         self(text)
     }
 }
@@ -858,16 +841,16 @@ pub(crate) enum Resolved {
 
 impl Resolved {
     /// The answer's path, or the outcome as an error naming what to run.
-    pub(crate) fn into_answer(self, agent: &str, name: &str) -> anyhow::Result<PathBuf> {
+    pub(crate) fn into_answer(self, name: &str) -> anyhow::Result<PathBuf> {
         match self {
             Resolved::Answered(path) => Ok(path),
             Resolved::NotSent(why) => {
-                anyhow::bail!("nothing was typed, so `{agent}/{name}` stays open: {why}")
+                anyhow::bail!("nothing was typed, so `{name}` stays open: {why}")
             }
             Resolved::Unknown(why) => anyhow::bail!(
-                "nudge outcome unknown: {why}. `{agent}/{name}` stays unresolved and nothing \
-                 will be resent. If the text arrived: `clank block answer {agent} {name} \
-                 --delivered`; if it did not: `clank block answer {agent} {name} --nudge \
+                "nudge outcome unknown: {why}. `{name}` stays unresolved and nothing \
+                 will be resent. If the text arrived: `clank block answer {name} \
+                 --delivered`; if it did not: `clank block answer {name} --nudge \
                  --resend -m …` (a permission block also needs \
                  `--override-permission-classifier`, passed by a person)"
             ),
@@ -890,20 +873,11 @@ pub(crate) enum By {
 /// A plain, unattested answer: [`resolve`] with [`How::Plain`].
 pub(crate) fn answer_block(
     repo: &Path,
-    agent: &str,
     name: &str,
     message: &str,
     shown: Option<Shown<'_>>,
 ) -> anyhow::Result<PathBuf> {
-    resolve(
-        repo,
-        agent,
-        name,
-        shown,
-        By::Unattested,
-        How::Plain(message),
-    )?
-    .into_answer(agent, name)
+    resolve(repo, name, shown, By::Unattested, How::Plain(message))?.into_answer(name)
 }
 
 /// The one way every answerer resolves a block. `shown` is captured by a
@@ -913,64 +887,84 @@ pub(crate) fn answer_block(
 /// ask, and at most one delivery is made per ask without `resend`.
 pub(crate) fn resolve(
     repo: &Path,
-    agent: &str,
     name: &str,
     shown: Option<Shown<'_>>,
     by: By,
     how: How<'_>,
 ) -> anyhow::Result<Resolved> {
     use anyhow::Context as _;
-    let agent = clank_core::ids::AgentLabel::parse(agent)
-        .map_err(|e| anyhow::anyhow!("invalid agent label: {e}"))?;
     validate_name(name)?;
-    let dir = agents_root(repo).join(agent.as_str());
+    let dir = root(repo);
     let f = files(&dir, name);
     match how {
         How::Plain(text) => {
             let text = nonempty(text)?;
-            let _lock = lock(repo, &agent)?;
-            let open = open_pair(&dir, &f, &agent, name, shown)?;
+            let _lock = lock(repo)?;
+            let open = open_pair(&dir, &f, name, shown)?;
             if let Kind::Permission { .. } = open.kind {
                 anyhow::bail!(
-                    "`{agent}/{name}` is a permission block: only the person's own message in \
+                    "`{name}` is a permission block: only the person's own message in \
                      the agent's terminal lifts the refusal, so a person answers it with `clank \
-                     block answer {agent} {name} --nudge --override-permission-classifier -m \
+                     block answer {name} --nudge --override-permission-classifier -m \
                      \"…\"`"
                 );
             }
             if let Some(a) = open.pair.live_attempt() {
-                return Err(outstanding(&agent, name, a));
+                return Err(outstanding(name, a));
             }
             let occurrence = stamped(&f, &open)?;
             publish(&f.answer, stamp(&occurrence, None, text).as_bytes())
-                .with_context(|| format!("recording answer for `{agent}/{name}`"))?;
+                .with_context(|| format!("recording answer for `{name}`"))?;
             Ok(Resolved::Answered(f.answer))
         }
         How::Delivered => {
-            let _lock = lock(repo, &agent)?;
-            let open = open_pair(&dir, &f, &agent, name, shown)?;
-            attested(&open, by, &agent, name)?;
+            let _roster = hold_roster(repo)?;
+            let _lock = lock(repo)?;
+            let open = open_pair(&dir, &f, name, shown)?;
+            attested(&open, by, name)?;
             let Some(a) = open.pair.live_attempt() else {
                 anyhow::bail!(
-                    "no nudge answering `{agent}/{name}` is outstanding, so there is nothing \
+                    "no nudge answering `{name}` is outstanding, so there is nothing \
                      to settle as delivered"
                 );
             };
+            let _binding = a
+                .destination
+                .as_ref()
+                .map(|to| crate::agent_store::hold_binding(repo, &to.agent))
+                .transpose()?;
+            anyhow::ensure!(
+                a.destination.is_some() && a.destination == destination(repo).ok(),
+                "the outstanding attempt belongs to another or unknown master session; it cannot confirm delivery here; use --nudge --resend for the current master"
+            );
             publish(
                 &f.answer,
-                stamp_nudged(&a.occurrence, &a.attempt, &a.text)?.as_bytes(),
+                stamp_nudged(&a.occurrence, &a.attempt, &a.text, a.destination.clone())?.as_bytes(),
             )
-            .with_context(|| format!("recording answer for `{agent}/{name}`"))?;
+            .with_context(|| format!("recording answer for `{name}`"))?;
             // The nudged answer already makes the record inert.
             let _ = remove_if_present(&f.attempt);
             Ok(Resolved::Answered(f.answer))
         }
         How::Nudge { text, resend, via } => {
             let text = nonempty(text)?;
-            let claimed = claim(repo, &agent, &dir, &f, name, shown, by, text, resend)?;
-            let outcome = via.nudge(text);
+            let claimed = claim(repo, &dir, &f, name, shown, by, text, resend)?;
+            let outcome = via.nudge(
+                text,
+                claimed
+                    .destination
+                    .as_ref()
+                    .expect("new claim has destination"),
+            );
             let _ = crate::cli::nudge_log::append(
-                &dir,
+                &agents_root(repo).join(
+                    claimed
+                        .destination
+                        .as_ref()
+                        .expect("new claim has destination")
+                        .agent
+                        .as_str(),
+                ),
                 &crate::cli::nudge_log::Record {
                     at: crate::cli::recovery::unix_now(),
                     attempt: claimed.attempt.clone(),
@@ -981,7 +975,7 @@ pub(crate) fn resolve(
                     outcome: outcome.clone(),
                 },
             );
-            settle(repo, &agent, &dir, &f, name, &claimed, outcome)
+            settle(repo, &dir, &f, name, &claimed, outcome)
         }
     }
 }
@@ -994,12 +988,12 @@ fn nonempty(text: &str) -> anyhow::Result<&str> {
     Ok(text)
 }
 
-fn outstanding(agent: &clank_core::AgentLabel, name: &str, a: &Attempt) -> anyhow::Error {
+fn outstanding(name: &str, a: &Attempt) -> anyhow::Error {
     anyhow::anyhow!(
-        "a nudge answering `{agent}/{name}` is outstanding ({}; started {} ago, typing {:?}), and \
-         nothing resends it automatically. If the text arrived: `clank block answer {agent} \
+        "a nudge answering `{name}` is outstanding ({}; started {} ago, typing {:?}), and \
+         nothing resends it automatically. If the text arrived: `clank block answer \
          {name} --delivered`. If it did not, or a duplicate is acceptable: `clank block answer \
-         {agent} {name} --nudge --resend -m …`. A permission block also needs \
+         {name} --nudge --resend -m …`. A permission block also needs \
          `--override-permission-classifier`, passed by a person",
         a.unknown_reason(),
         crate::age::duration(crate::cli::recovery::unix_now().saturating_sub(a.started)),
@@ -1017,24 +1011,18 @@ struct Open {
 /// Under the lock: the pair as an answerer must find it, asked, the ask it
 /// saw, wholly readable, and unanswered. An inert attempt record is
 /// removed on the way.
-fn open_pair(
-    dir: &Path,
-    f: &Files,
-    agent: &clank_core::AgentLabel,
-    name: &str,
-    shown: Option<Shown<'_>>,
-) -> anyhow::Result<Open> {
+fn open_pair(dir: &Path, f: &Files, name: &str, shown: Option<Shown<'_>>) -> anyhow::Result<Open> {
     let Some(pair) = Pair::read(dir, name) else {
-        anyhow::bail!("`{agent}` has no pending block named `{name}`");
+        anyhow::bail!("the repository has no pending block named `{name}`");
     };
     if shown
         .is_some_and(|s| s.question != pair.question || s.occurrence != pair.occurrence.as_deref())
     {
-        anyhow::bail!("the question for `{agent}/{name}` changed; read it again before answering");
+        anyhow::bail!("the question for `{name}` changed; read it again before answering");
     }
     if let Some(why) = pair.damage() {
         anyhow::bail!(
-            "`{agent}/{name}` has stored state clank cannot read, so nothing answers or retries \
+            "`{name}` has stored state clank cannot read, so nothing answers or retries \
              it until a person repairs it: {why}"
         );
     }
@@ -1045,18 +1033,18 @@ fn open_pair(
         remove_if_present(&f.attempt)?;
     }
     if pair.answer.is_some() {
-        anyhow::bail!("`{agent}/{name}` was already answered");
+        anyhow::bail!("`{name}` was already answered");
     }
     Ok(Open { pair, kind })
 }
 
 /// A permission block is resolved only by a person.
-fn attested(open: &Open, by: By, agent: &clank_core::AgentLabel, name: &str) -> anyhow::Result<()> {
+fn attested(open: &Open, by: By, name: &str) -> anyhow::Result<()> {
     if let Kind::Permission { .. } = open.kind
         && by != By::Person
     {
         anyhow::bail!(
-            "`{agent}/{name}` is a permission block: answering it lifts a refusal the agent's \
+            "`{name}` is a permission block: answering it lifts a refusal the agent's \
              permission classifier made, so it must be run by a person, who passes \
              `--override-permission-classifier`"
         );
@@ -1082,7 +1070,6 @@ fn stamped(f: &Files, open: &Open) -> anyhow::Result<String> {
 #[allow(clippy::too_many_arguments)]
 fn claim(
     repo: &Path,
-    agent: &clank_core::AgentLabel,
     dir: &Path,
     f: &Files,
     name: &str,
@@ -1091,13 +1078,14 @@ fn claim(
     text: &str,
     resend: bool,
 ) -> anyhow::Result<Attempt> {
-    let _lock = lock(repo, agent)?;
-    let open = open_pair(dir, f, agent, name, shown)?;
-    attested(&open, by, agent, name)?;
+    let _roster = hold_roster(repo)?;
+    let _lock = lock(repo)?;
+    let open = open_pair(dir, f, name, shown)?;
+    attested(&open, by, name)?;
     if let Some(a) = open.pair.live_attempt()
         && !resend
     {
-        return Err(outstanding(agent, name, a));
+        return Err(outstanding(name, a));
     }
     let claimed = Attempt {
         occurrence: stamped(f, &open)?,
@@ -1105,6 +1093,7 @@ fn claim(
         text: text.to_string(),
         started: crate::cli::recovery::unix_now(),
         diagnostic: None,
+        destination: Some(destination(repo)?),
     };
     publish(&f.attempt, &serde_json::to_vec(&claimed)?)?;
     Ok(claimed)
@@ -1115,7 +1104,6 @@ fn claim(
 /// this attempt's to settle, update or remove.
 fn settle(
     repo: &Path,
-    agent: &clank_core::AgentLabel,
     dir: &Path,
     f: &Files,
     name: &str,
@@ -1123,14 +1111,25 @@ fn settle(
     outcome: Outcome,
 ) -> anyhow::Result<Resolved> {
     use anyhow::Context as _;
-    let _lock = lock(repo, agent)?;
+    let _roster = hold_roster(repo)?;
+    let _lock = lock(repo)?;
+    let _binding = claimed
+        .destination
+        .as_ref()
+        .map(|to| crate::agent_store::hold_binding(repo, &to.agent))
+        .transpose()?;
     let owned = claimed.owns(read_attempt(&f.attempt).as_ref());
     match outcome {
         Outcome::Submitted => {
+            if claimed.destination.is_none() || claimed.destination != destination(repo).ok() {
+                return Ok(Resolved::Unknown(
+                    "master session changed during delivery; the attempt remains unsettled".into(),
+                ));
+            }
             if !owned {
                 return Ok(Resolved::Superseded(format!(
-                    "the text was delivered to `{agent}`, but this attempt's claim on \
-                     `{agent}/{name}` was replaced (a --resend or --delivered) before it settled, \
+                    "the text was delivered to the master, but this attempt's claim on \
+                     `{name}` was replaced (a --resend or --delivered) before it settled, \
                      so nothing was recorded for it"
                 )));
             }
@@ -1138,9 +1137,9 @@ fn settle(
                 .filter(|p| p.occurrence.as_deref() == Some(claimed.occurrence.as_str()));
             if let Some(why) = pair.as_ref().and_then(Pair::damage) {
                 anyhow::bail!(
-                    "the text was delivered to `{agent}`, but `{agent}/{name}` has stored state \
+                    "the text was delivered to the master, but `{name}` has stored state \
                      clank cannot read, so no answer was recorded: {why}. Once it is repaired \
-                     and you have seen the text arrive, run `clank block answer {agent} {name} \
+                     and you have seen the text arrive, run `clank block answer {name} \
                      --delivered --override-permission-classifier`"
                 );
             }
@@ -1148,14 +1147,19 @@ fn settle(
                 Some(p) if p.answer.is_none() => {
                     publish(
                         &f.answer,
-                        stamp_nudged(&claimed.occurrence, &claimed.attempt, &claimed.text)?
-                            .as_bytes(),
+                        stamp_nudged(
+                            &claimed.occurrence,
+                            &claimed.attempt,
+                            &claimed.text,
+                            claimed.destination.clone(),
+                        )?
+                        .as_bytes(),
                     )
                     .with_context(|| {
                         format!(
-                            "the text was delivered to `{agent}`, but recording the answer for \
-                             `{agent}/{name}` failed; once you have seen it arrive, run `clank \
-                             block answer {agent} {name} --delivered`"
+                            "the text was delivered to the master, but recording the answer for \
+                             `{name}` failed; once you have seen it arrive, run `clank \
+                             block answer {name} --delivered`"
                         )
                     })?;
                     // The nudged answer already makes the record inert.
@@ -1165,7 +1169,7 @@ fn settle(
                 _ => {
                     remove_if_present(&f.attempt)?;
                     Ok(Resolved::Superseded(format!(
-                        "the text was delivered to `{agent}` for a question `{name}` that has \
+                        "the text was delivered to the master for a question `{name}` that has \
                          since been asked again, answered or withdrawn; nothing was recorded, \
                          and any new ask stays open"
                     )))
@@ -1215,25 +1219,24 @@ pub(crate) enum Receipt {
 pub(crate) fn receive(
     repo: &Path,
     carries: &AnswerRef,
+    delivered: &Destination,
     current: impl Fn() -> bool,
     permit: &crate::upgrade::Permit,
 ) -> anyhow::Result<Receipt> {
     validate_name(&carries.name)?;
-    let _lock = lock(repo, &carries.agent)?;
-    let _binding = crate::agent_store::hold_binding(repo, &carries.agent)?;
-    if !current() {
+    let _roster = hold_roster(repo)?;
+    let _lock = lock(repo)?;
+    let _binding = crate::agent_store::hold_binding(repo, &delivered.agent)?;
+    if !current() || destination(repo).ok().as_ref() != Some(delivered) {
         return Ok(Receipt::Unauthorized);
     }
-    let dir = agents_root(repo).join(carries.agent.as_str());
+    let dir = root(repo);
     let pair = Pair::read(&dir, &carries.name);
-    let now = pair
-        .as_ref()
-        .and_then(|p| p.carries(&carries.agent, &carries.name));
+    let now = pair.as_ref().and_then(|p| p.carries(&carries.name));
     let Some(pair) = pair.filter(|_| now.as_ref() == Some(carries)) else {
         eprintln!(
-            "clank: received nothing for block `{}/{}`: it carried occurrence {} (question {}, \
+            "clank: received nothing for block `{}`: it carried occurrence {} (question {}, \
              answer {}), and the block now holds {}",
-            carries.agent,
             carries.name,
             carries.occurrence.as_deref().unwrap_or("none"),
             carries.question_digest,
@@ -1250,9 +1253,7 @@ pub(crate) fn receive(
     if pair.damage().is_some() {
         return Ok(Receipt::Stale);
     }
-    if pair.received {
-        return Ok(Receipt::Retired);
-    }
+
     let Stored::Valid(kind) = &pair.kind else {
         unreachable!("an unreadable kind is damage");
     };
@@ -1277,6 +1278,7 @@ pub(crate) fn receive(
         occurrence,
         question_digest: carries.question_digest.clone(),
         answer_digest: carries.answer_digest.clone(),
+        destination: Some(delivered.clone()),
     };
     publish_under(&f.marker, &serde_json::to_vec(&marker)?, permit)?;
     Ok(Receipt::Retired)
@@ -1284,18 +1286,23 @@ pub(crate) fn receive(
 
 async fn run_clean(args: super::BlockCleanArgs) -> anyhow::Result<()> {
     let repo = super::resolve_repo(args.repo.as_deref())?;
-    let author = crate::agent_env::resolve_identity_from_env(&repo)?;
-    let removed = clean(&repo, &author)?;
+    let removed = clean(&repo)?;
     println!("cleaned {removed} file(s)");
     Ok(())
 }
 
-/// Remove `author`'s received pairs and every answer, receipt or attempt
+/// Remove the repository's received pairs and every answer, receipt or attempt
 /// record no current ask owns. Housekeeping only: it never decides what
 /// is owed, and never removes an outstanding attempt.
-pub(crate) fn clean(repo: &Path, author: &clank_core::AgentLabel) -> anyhow::Result<usize> {
-    let _lock = lock(repo, author)?;
-    let dir = agents_root(repo).join(author.as_str());
+pub(crate) fn clean(repo: &Path) -> anyhow::Result<usize> {
+    let _roster = hold_roster(repo)?;
+    let _lock = lock(repo)?;
+    let current = destination(repo).ok();
+    let _binding = current
+        .as_ref()
+        .map(|to| crate::agent_store::hold_binding(repo, &to.agent))
+        .transpose()?;
+    let dir = root(repo);
     let mut removed = 0;
     let mut live = std::collections::BTreeSet::new();
     let mut live_attempts = std::collections::BTreeSet::new();
@@ -1309,10 +1316,10 @@ pub(crate) fn clean(repo: &Path, author: &clank_core::AgentLabel) -> anyhow::Res
             live_attempts.insert(f.attempt);
             continue;
         }
-        if pair.received {
+        if pair.received && received_here(repo, &pair) && pair.live_attempt().is_none() {
             // The question first: a leftover answer or marker names a
             // dead occurrence, which no reader takes for a live one.
-            for path in [&f.question, &f.answer, &f.marker, &f.attempt] {
+            for path in [&f.question, &f.answer, &f.marker, &f.attempt, &f.creator] {
                 removed += usize::from(remove_if_present(path)?);
             }
             continue;
@@ -1353,7 +1360,7 @@ pub(crate) fn clean(repo: &Path, author: &clank_core::AgentLabel) -> anyhow::Res
 
 #[derive(Debug, Clone)]
 pub struct BlockEntry {
-    pub agent: String,
+    pub creator: String,
     pub name: String,
     /// The ask this question is; `None` before asks carried one.
     pub occurrence: Option<String>,
@@ -1369,6 +1376,9 @@ pub struct BlockEntry {
 }
 
 impl BlockEntry {
+    pub(crate) fn pending(&self) -> bool {
+        self.answer.is_none() || self.unreadable.is_some() || self.nudge.is_some()
+    }
     /// `plain`, `permission`, or `unreadable` when its kind cannot be read.
     pub fn kind_name(&self) -> &'static str {
         self.kind.valid().map_or("unreadable", Kind::name)
@@ -1394,31 +1404,39 @@ impl Stored<Attempt> {
 }
 
 /// Every block not yet received, pending or answered, and every one
-/// whose state cannot be read. Read-only: it
-/// never stamps, receives or removes anything.
+/// whose state cannot be read. Migrates legacy custody first; otherwise it
+/// neither receives answers nor removes questions.
 pub fn scan_blocks(repo: &Path) -> Vec<BlockEntry> {
-    let root = agents_root(repo);
-    let Ok(agents) = std::fs::read_dir(&root) else {
+    // Inspecting an ordinary Git repo must not initialize Clank storage.
+    if !root(repo).exists() {
         return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in agents.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
+    }
+    let _lock = match lock(repo) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return vec![BlockEntry {
+                creator: String::new(),
+                name: "block-storage".into(),
+                occurrence: None,
+                kind: Stored::Unreadable(e.to_string()),
+                question: format!("Block storage needs repair: {e:#}"),
+                answer: None,
+                nudge: None,
+                unreadable: Some(e.to_string()),
+            }];
         }
-        let Some(agent) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let dir = entry.path();
-        for name in question_names(&dir) {
-            let Some(pair) =
-                Pair::read(&dir, &name).filter(|p| !p.received || p.damage().is_some())
-            else {
-                continue;
-            };
+    };
+    let dir = root(repo);
+    question_names(&dir)
+        .into_iter()
+        .filter_map(|name| {
+            let pair = Pair::read(&dir, &name)?;
+            if pair.received && pair.damage().is_none() && received_here(repo, &pair) {
+                return None;
+            }
             let unreadable = pair.damage();
-            out.push(BlockEntry {
-                agent: agent.clone(),
+            Some(BlockEntry {
+                creator: std::fs::read_to_string(files(&dir, &name).creator).unwrap_or_default(),
                 name,
                 occurrence: pair.occurrence,
                 kind: pair.kind,
@@ -1427,60 +1445,85 @@ pub fn scan_blocks(repo: &Path) -> Vec<BlockEntry> {
                 nudge: match pair.attempt {
                     AttemptState::Live(a) => Some(Stored::Valid(a)),
                     AttemptState::Unreadable(why) => Some(Stored::Unreadable(why)),
-                    AttemptState::Absent | AttemptState::Inert => None,
+                    _ => None,
                 },
                 unreadable,
-            });
-        }
+            })
+        })
+        .collect()
+}
+
+fn received_here(repo: &Path, pair: &Pair) -> bool {
+    if pair.damage().is_some() {
+        return false;
     }
-    out.sort_by(|a, b| a.agent.cmp(&b.agent).then(a.name.cmp(&b.name)));
-    out
+    let marker = pair.marker.as_ref().and_then(Stored::valid);
+    // Pre-upgrade receipts already settled this occurrence. Preserve their
+    // disposition; migration does not invent a new delivery or permission.
+    if pair.received
+        && (marker.as_ref().is_some_and(|m| m.destination.is_none())
+            || matches!(
+                pair.disposition,
+                Stored::Valid(Some(Disposition::Nudged {
+                    destination: None,
+                    ..
+                }))
+            ))
+    {
+        return true;
+    }
+    let Ok(now) = destination(repo) else {
+        return false;
+    };
+    if let Stored::Valid(Some(Disposition::Nudged {
+        destination: Some(to),
+        ..
+    })) = &pair.disposition
+        && to == &now
+    {
+        return true;
+    }
+    marker.is_some_and(|m| pair.received && m.destination.as_ref() == Some(&now))
 }
 
-/// How a block is named wherever one is said to withhold work.
-pub(crate) fn key(agent: &str, name: &str) -> String {
-    format!("{agent}/{name}")
+pub(crate) fn key(name: &str) -> String {
+    name.to_owned()
 }
 
-/// When each block that has stopped withholding work from `author` did
-/// so, by [`key`], in unix seconds: another agent's block when it was
-/// answered, `author`'s own when the answer was received. Read from the
-/// answer and receipt files' own times, so it is the same whoever asks and
-/// whenever. A block cleaned away is not here: its end cannot be dated.
 pub(crate) fn ended(
     repo: &Path,
     author: &clank_core::AgentLabel,
 ) -> std::collections::BTreeMap<String, u64> {
-    let written = |path: &Path| {
-        let at = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-        Some(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
+    let Ok(_lock) = lock(repo) else {
+        return Default::default();
     };
-    let mut out = std::collections::BTreeMap::new();
-    for entry in std::fs::read_dir(agents_root(repo))
+    let dir = root(repo);
+    let is_master = master(repo).ok().as_ref() == Some(author);
+    question_names(&dir)
         .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let Some(agent) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let dir = entry.path();
-        for name in question_names(&dir) {
-            let Some(pair) = Pair::read(&dir, &name).filter(|p| p.damage().is_none()) else {
-                continue;
-            };
+        .filter_map(|name| {
+            let pair = Pair::read(&dir, &name).filter(|p| p.damage().is_none())?;
             let f = files(&dir, &name);
-            let at = match (agent == author.as_str(), pair.received, &pair.answer) {
-                (true, true, _) => written(&f.marker),
-                (false, _, Some(_)) => written(&f.answer),
-                _ => None,
+            let path = if is_master {
+                if !received_here(repo, &pair) {
+                    return None;
+                }
+                if f.marker.exists() {
+                    f.marker
+                } else {
+                    f.answer
+                }
+            } else {
+                pair.answer.as_ref()?;
+                f.answer
             };
-            if let Some(at) = at {
-                out.insert(key(&agent, &name), at);
-            }
-        }
-    }
-    out
+            let at = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+            Some((
+                key(&name),
+                at.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs(),
+            ))
+        })
+        .collect()
 }
 
 /// An answer `agent` is owed: answered and not yet received.
@@ -1489,21 +1532,27 @@ pub(crate) struct OwedAnswer {
     pub(crate) carries: AnswerRef,
 }
 
-/// `agent`'s owed answers, by name. Read-only, like [`scan_blocks`].
-/// A nudged answer is never owed: the agent saw it typed. Nor is one
-/// whose disposition cannot be read: it may have been.
+/// Decisions owed to the current master, by name. Legacy custody is migrated
+/// first. Delivery to a different session never proves this one received it;
+/// unreadable disposition stays unresolved rather than being delivered again.
 pub(crate) fn owed_answers(repo: &Path, agent: &clank_core::AgentLabel) -> Vec<OwedAnswer> {
-    let dir = agents_root(repo).join(agent.as_str());
-    question_names(&dir)
-        .into_iter()
-        .filter_map(|name| {
-            let pair = Pair::read(&dir, &name).filter(|p| !p.received && p.damage().is_none())?;
-            Some(OwedAnswer {
-                carries: pair.carries(agent, &name)?,
-                answer: pair.answer?,
-            })
-        })
-        .collect()
+    if master(repo).ok().as_ref() != Some(agent) {
+        return vec![];
+    }
+    let Ok(_lock) = lock(repo) else {
+        return vec![];
+    };
+    let dir = root(repo);
+    question_names(&dir).into_iter().filter_map(|name| {
+        let pair = Pair::read(&dir, &name).filter(|p| p.damage().is_none())?;
+        if received_here(repo, &pair) { return None; }
+        let carries = pair.carries(&name)?;
+        let mut answer = pair.answer?;
+        if matches!(pair.kind, Stored::Valid(Kind::Permission { .. })) {
+            answer = format!("Prior human decision (not permission approval for this session; obtain any approval your harness requires): {answer}");
+        }
+        Some(OwedAnswer { answer, carries })
+    }).collect()
 }
 
 #[cfg(test)]
@@ -1524,29 +1573,24 @@ mod tests {
         );
         let blocks = scan_blocks(dir.path());
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].agent, "alice");
+        assert_eq!(blocks[0].creator, "alice");
         assert_eq!(blocks[0].name, "fix-api");
         assert_eq!(blocks[0].question, "What should the return type be?");
         assert!(blocks[0].answer.is_none());
     }
 
     #[test]
-    fn scan_ignores_legacy_plan_scoped_subdir() {
-        // The reader is flat-only. A pre-migration `blocks/<plan>/`
-        // file is therefore INVISIBLE — which is exactly why the
-        // migration is mandatory rather than optional: leaving one
-        // behind silently drops a pending question instead of
-        // parking on it.
+    fn scan_migrates_legacy_plan_scoped_questions_without_losing_them() {
+        // Even an old plan-scoped question survives the ownership migration.
         let dir = tempfile::tempdir().unwrap();
         write(
             &dir.path()
                 .join(".clank/agents/bob/blocks/auth/need-creds.md"),
             "Which OAuth provider?",
         );
-        assert!(
-            scan_blocks(dir.path()).is_empty(),
-            "legacy plan-scoped blocks must not be read; migrate them"
-        );
+        let blocks = scan_blocks(dir.path());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name, "need-creds");
     }
 
     #[test]
@@ -1573,11 +1617,11 @@ mod tests {
             &repo.join(".clank/agents/alice/blocks/why.md"),
             "Which option?",
         );
-        assert!(answer_block(repo, "alice", "why", " ", None).is_err());
-        assert!(answer_block(repo, "alice", "../why", "yes", None).is_err());
-        assert!(answer_block(repo, "alice", "missing", "yes", None).is_err());
+        assert!(answer_block(repo, "why", " ", None).is_err());
+        assert!(answer_block(repo, "../why", "yes", None).is_err());
+        assert!(answer_block(repo, "missing", "yes", None).is_err());
         assert!(
-            answer_block(repo, "alice", "why", "yes", Some(legacy("Old question")))
+            answer_block(repo, "why", "yes", Some(legacy("Old question")))
                 .unwrap_err()
                 .to_string()
                 .contains("changed")
@@ -1585,14 +1629,13 @@ mod tests {
         assert!(scan_blocks(repo)[0].answer.is_none());
         answer_block(
             repo,
-            "alice",
             "why",
             "  first answer  ",
             Some(legacy("Which option?")),
         )
         .unwrap();
         assert!(
-            answer_block(repo, "alice", "why", "second answer", None)
+            answer_block(repo, "why", "second answer", None)
                 .unwrap_err()
                 .to_string()
                 .contains("already answered")
@@ -1608,7 +1651,6 @@ mod tests {
             command: crate::cli::BlockCmd::Ask(crate::cli::BlockCreateArgs {
                 name: "pause".into(),
                 message: "held for review".into(),
-                author: Some("claude".into()),
                 repo: Some(root.to_path_buf()),
                 permission: false,
                 suggest: None,
@@ -1623,12 +1665,11 @@ mod tests {
         assert_eq!(pending[0].name, "pause");
         assert!(pending[0].answer.is_none());
         assert!(
-            root.join(".clank/agents/claude/blocks/pause.md").exists(),
+            root.join(".clank/blocks/pause.md").exists(),
             "written FLAT, where the reader looks"
         );
 
         run_unblock(crate::cli::UnblockArgs {
-            agent: "claude".into(),
             name: "pause".into(),
             message: Some("carry on".into()),
             nudge: false,
@@ -1644,7 +1685,7 @@ mod tests {
         assert_eq!(after.len(), 1, "the pair stays, now answered");
         assert_eq!(after[0].answer.as_deref(), Some("carry on"));
         assert!(
-            root.join(".clank/agents/claude/unblocks/pause.md").exists(),
+            root.join(".clank/unblocks/pause.md").exists(),
             "the answer must land flat too, or it never pairs"
         );
     }
@@ -1666,7 +1707,6 @@ mod tests {
         }
 
         run_unblock(crate::cli::UnblockArgs {
-            agent: "claude".into(),
             name: "first".into(),
             message: Some("answered just this one".into()),
             nudge: false,
@@ -1684,221 +1724,10 @@ mod tests {
         assert_eq!(answered[0].name, "first");
         let open: Vec<_> = blocks.iter().filter(|b| b.answer.is_none()).collect();
         assert_eq!(open.len(), 1, "the other agent's question stays open");
-        assert_eq!(open[0].agent, "codex");
+        assert_eq!(open[0].creator, "codex");
         assert!(
             !root.join(".clank/agents/codex/unblocks/second.md").exists(),
             "no canned answer written under the untouched question"
-        );
-    }
-
-    #[tokio::test]
-    async fn migrate_flattens_active_drops_inactive_and_refuses_conflicts() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        // `live` is an active plan; `gone` is not (no plan file).
-        write(&root.join(".clank/plans/live.md"), "# live");
-        write(
-            &root.join(".clank/agents/alice/blocks/live/q.md"),
-            "keep me",
-        );
-        write(
-            &root.join(".clank/agents/alice/unblocks/live/q.md"),
-            "answered",
-        );
-        write(
-            &root.join(".clank/agents/alice/blocks/gone/stale.md"),
-            "drop me",
-        );
-
-        let args = crate::cli::BlockMigrateArgs {
-            dry: false,
-            repo: Some(root.to_path_buf()),
-        };
-        run_migrate(args).await.unwrap();
-
-        // Active plan: block AND its answer both flatten. Moving one
-        // without the other leaves the pair unmatched, which parks the
-        // repo permanently.
-        assert!(root.join(".clank/agents/alice/blocks/q.md").exists());
-        assert!(root.join(".clank/agents/alice/unblocks/q.md").exists());
-        // Inactive plan: dropped, not silently flattened into a
-        // repo-wide park on a stale question.
-        assert!(!root.join(".clank/agents/alice/blocks/stale.md").exists());
-        assert!(
-            !root
-                .join(".clank/agents/alice/blocks/gone/stale.md")
-                .exists()
-        );
-
-        let blocks = scan_blocks(root);
-        assert_eq!(blocks.len(), 1, "only the migrated pair survives");
-        assert_eq!(blocks[0].name, "q");
-        assert_eq!(blocks[0].answer.as_deref(), Some("answered"));
-    }
-
-    #[tokio::test]
-    async fn migrate_never_lands_an_answer_whose_question_stayed_scoped() {
-        // The pair-splitting regression: `q` exists flat AND as a
-        // scoped question+answer pair. Migrating the halves
-        // independently refuses the question but moves the answer,
-        // which marks the UNRELATED flat `q` answered.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write(&root.join(".clank/plans/live.md"), "# live");
-        write(
-            &root.join(".clank/agents/alice/blocks/q.md"),
-            "unrelated flat question",
-        );
-        write(
-            &root.join(".clank/agents/alice/blocks/live/q.md"),
-            "scoped question",
-        );
-        write(
-            &root.join(".clank/agents/alice/unblocks/live/q.md"),
-            "scoped answer",
-        );
-
-        let args = crate::cli::BlockMigrateArgs {
-            dry: false,
-            repo: Some(root.to_path_buf()),
-        };
-        assert!(
-            run_migrate(args).await.is_err(),
-            "a collision must fail the run"
-        );
-
-        assert!(
-            !root.join(".clank/agents/alice/unblocks/q.md").exists(),
-            "the answer must NOT land flat while its question stays scoped"
-        );
-        let blocks = scan_blocks(root);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].question, "unrelated flat question");
-        assert!(
-            blocks[0].answer.is_none(),
-            "the unrelated flat question must not have acquired an answer"
-        );
-        // The scoped pair stays intact for the human to resolve.
-        assert!(root.join(".clank/agents/alice/blocks/live/q.md").exists());
-        assert!(root.join(".clank/agents/alice/unblocks/live/q.md").exists());
-    }
-
-    #[tokio::test]
-    async fn migrate_refuses_two_active_plans_claiming_one_flat_name() {
-        // Neither `q` collides with anything ON DISK, so a
-        // filesystem-only preflight queues both to the same flat
-        // destination and the apply loop overwrites the first.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write(&root.join(".clank/plans/one.md"), "# one");
-        write(&root.join(".clank/plans/two.md"), "# two");
-        write(
-            &root.join(".clank/agents/alice/blocks/one/q.md"),
-            "question from plan one",
-        );
-        write(
-            &root.join(".clank/agents/alice/unblocks/one/q.md"),
-            "answer for plan one",
-        );
-        write(
-            &root.join(".clank/agents/alice/blocks/two/q.md"),
-            "question from plan two",
-        );
-
-        let args = crate::cli::BlockMigrateArgs {
-            dry: false,
-            repo: Some(root.to_path_buf()),
-        };
-        assert!(
-            run_migrate(args).await.is_err(),
-            "two sources claiming one flat name must fail preflight"
-        );
-
-        // Both scoped pairs survive intact, and nothing landed flat.
-        assert_eq!(
-            std::fs::read_to_string(root.join(".clank/agents/alice/blocks/one/q.md")).unwrap(),
-            "question from plan one"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join(".clank/agents/alice/unblocks/one/q.md")).unwrap(),
-            "answer for plan one"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join(".clank/agents/alice/blocks/two/q.md")).unwrap(),
-            "question from plan two"
-        );
-        assert!(!root.join(".clank/agents/alice/blocks/q.md").exists());
-        assert!(!root.join(".clank/agents/alice/unblocks/q.md").exists());
-    }
-
-    #[tokio::test]
-    async fn migrate_conflict_leaves_every_other_agent_untouched() {
-        // Preflight is repo-wide: one collision aborts the whole run,
-        // so a partially-migrated repo can never be observed.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write(&root.join(".clank/plans/live.md"), "# live");
-        write(&root.join(".clank/agents/alice/blocks/q.md"), "flat");
-        write(&root.join(".clank/agents/alice/blocks/live/q.md"), "scoped");
-        write(&root.join(".clank/agents/bob/blocks/live/ok.md"), "movable");
-
-        let args = crate::cli::BlockMigrateArgs {
-            dry: false,
-            repo: Some(root.to_path_buf()),
-        };
-        assert!(run_migrate(args).await.is_err());
-        assert!(
-            root.join(".clank/agents/bob/blocks/live/ok.md").exists(),
-            "bob's block must not move when alice's collides"
-        );
-        assert!(!root.join(".clank/agents/bob/blocks/ok.md").exists());
-    }
-
-    #[tokio::test]
-    async fn migrate_refuses_to_clobber_an_existing_flat_block() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write(&root.join(".clank/plans/live.md"), "# live");
-        write(
-            &root.join(".clank/agents/alice/blocks/q.md"),
-            "flat question",
-        );
-        write(
-            &root.join(".clank/agents/alice/blocks/live/q.md"),
-            "scoped question",
-        );
-
-        let args = crate::cli::BlockMigrateArgs {
-            dry: false,
-            repo: Some(root.to_path_buf()),
-        };
-        assert!(
-            run_migrate(args).await.is_err(),
-            "a name collision must fail loudly, not destroy one of two real questions"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join(".clank/agents/alice/blocks/q.md")).unwrap(),
-            "flat question",
-            "the pre-existing flat block is untouched"
-        );
-        assert!(root.join(".clank/agents/alice/blocks/live/q.md").exists());
-    }
-
-    #[tokio::test]
-    async fn migrate_dry_changes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write(&root.join(".clank/agents/alice/blocks/gone/stale.md"), "q");
-
-        let args = crate::cli::BlockMigrateArgs {
-            dry: true,
-            repo: Some(root.to_path_buf()),
-        };
-        run_migrate(args).await.unwrap();
-        assert!(
-            root.join(".clank/agents/alice/blocks/gone/stale.md")
-                .exists(),
-            "--dry-run must not delete the question it reports"
         );
     }
 
@@ -1914,6 +1743,7 @@ mod tests {
     }
 
     fn owed(repo: &Path) -> Vec<AnswerRef> {
+        test_master(repo, &alice());
         owed_answers(repo, &alice())
             .into_iter()
             .map(|o| o.carries)
@@ -1921,12 +1751,12 @@ mod tests {
     }
 
     fn marker(repo: &Path, name: &str) -> PathBuf {
-        repo.join(format!(".clank/agents/alice/unblocks/{name}.received"))
+        repo.join(format!(".clank/unblocks/{name}.received"))
     }
 
     fn asked_and_answered(repo: &Path, name: &str, q: &str, a: &str) -> AnswerRef {
         ask(repo, &alice(), name, q).unwrap();
-        answer_block(repo, "alice", name, a, None).unwrap();
+        answer_block(repo, name, a, None).unwrap();
         let carries = owed(repo);
         assert_eq!(carries.len(), 1, "{carries:?}");
         carries[0].clone()
@@ -1958,10 +1788,10 @@ mod tests {
         );
 
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
-        written_at(&repo.join(".clank/agents/alice/unblocks/q.md"), 7000);
+        written_at(&repo.join(".clank/unblocks/q.md"), 7000);
         assert_eq!(
             ended(repo, &bob),
-            [(key("alice", "q"), 7000)].into(),
+            [(key("q"), 7000)].into(),
             "for another agent, at the answer"
         );
         assert!(
@@ -1970,14 +1800,21 @@ mod tests {
         );
 
         assert_eq!(
-            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            receive(
+                repo,
+                &a,
+                &destination(repo).unwrap(),
+                || true,
+                &crate::upgrade::process().settling()
+            )
+            .unwrap(),
             Receipt::Retired
         );
         written_at(&marker(repo, "q"), 7600);
-        assert_eq!(ended(repo, &alice()), [(key("alice", "q"), 7600)].into());
-        assert_eq!(ended(repo, &bob)[&key("alice", "q")], 7000);
+        assert_eq!(ended(repo, &alice()), [(key("q"), 7600)].into());
+        assert_eq!(ended(repo, &bob)[&key("q")], 7000);
 
-        clean(repo, &alice()).unwrap();
+        clean(repo).unwrap();
         assert!(ended(repo, &alice()).is_empty(), "cleaned away: undatable");
         assert!(ended(repo, &bob).is_empty());
     }
@@ -2001,11 +1838,18 @@ mod tests {
             format!("{refused:#}").contains(crate::upgrade::STALE_BADGE),
             "{refused:#}"
         );
-        assert!(answer_block(repo, "alice", "q", "no", None).is_err());
-        assert!(!repo.join(".clank/agents/alice/blocks/later.md").exists());
+        assert!(answer_block(repo, "q", "no", None).is_err());
+        assert!(!repo.join(".clank/blocks/later.md").exists());
 
         assert_eq!(
-            receive(repo, &shown, || true, &authority.settling()).unwrap(),
+            receive(
+                repo,
+                &shown,
+                &destination(repo).unwrap(),
+                || true,
+                &authority.settling()
+            )
+            .unwrap(),
             Receipt::Retired
         );
         assert!(marker(repo, "q").exists());
@@ -2018,13 +1862,19 @@ mod tests {
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
         assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("yes"));
         assert_eq!(
-            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            receive(
+                repo,
+                &a,
+                &destination(repo).unwrap(),
+                || true,
+                &crate::upgrade::process().settling()
+            )
+            .unwrap(),
             Receipt::Retired
         );
         assert!(marker(repo, "q").exists());
         assert!(
-            repo.join(".clank/agents/alice/blocks/q.md").exists()
-                && repo.join(".clank/agents/alice/unblocks/q.md").exists(),
+            repo.join(".clank/blocks/q.md").exists() && repo.join(".clank/unblocks/q.md").exists(),
             "receipt deletes nothing"
         );
         assert!(owed(repo).is_empty(), "not presented again");
@@ -2048,14 +1898,14 @@ mod tests {
             };
             let authorized = AtomicBool::new(true);
             let (observed, seen) = std::sync::mpsc::channel();
-            let held = lock(repo, &alice()).unwrap();
+            let held = lock(repo).unwrap();
             std::thread::scope(|s| {
                 s.spawn(|| {
                     crate::cli::presentation::record_delivered(
                         repo,
                         &alice(),
-                        clank_core::Tool::Claude,
-                        "s1",
+                        clank_core::Tool::Codex,
+                        "block-test-alice",
                         &carried,
                         || {
                             let _ = observed.send(());
@@ -2089,6 +1939,7 @@ mod tests {
             receive(
                 repo,
                 &a,
+                &destination(repo).unwrap(),
                 || {
                     rebind.get_or_init(|| {
                         s.spawn(|| {
@@ -2114,16 +1965,30 @@ mod tests {
         let repo = dir.path();
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
         assert_eq!(
-            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            receive(
+                repo,
+                &a,
+                &destination(repo).unwrap(),
+                || true,
+                &crate::upgrade::process().settling()
+            )
+            .unwrap(),
             Receipt::Retired
         );
         let first = std::fs::read(marker(repo, "q")).unwrap();
         assert_eq!(
-            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            receive(
+                repo,
+                &a,
+                &destination(repo).unwrap(),
+                || true,
+                &crate::upgrade::process().settling()
+            )
+            .unwrap(),
             Receipt::Retired
         );
         assert_eq!(std::fs::read(marker(repo, "q")).unwrap(), first);
-        let markers = std::fs::read_dir(repo.join(".clank/agents/alice/unblocks"))
+        let markers = std::fs::read_dir(repo.join(".clank/unblocks"))
             .unwrap()
             .flatten()
             .filter(|e| e.path().extension().is_some_and(|x| x == "received"))
@@ -2158,12 +2023,20 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let repo = dir.path();
             let first = asked_and_answered(repo, "q", "Proceed?", "yes");
+            receive(
+                repo,
+                &first,
+                &destination(repo).unwrap(),
+                || true,
+                &crate::upgrade::process().settling(),
+            )
+            .unwrap();
             if interleave == "clean" {
-                clean(repo, &alice()).unwrap();
+                clean(repo).unwrap();
             }
             let second = asked_and_answered(repo, "q", "Proceed?", "yes");
             if interleave == "clean" {
-                clean(repo, &alice()).unwrap();
+                clean(repo).unwrap();
             }
             let late: AnswerRef = match interleave {
                 "restart" => serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap(),
@@ -2176,7 +2049,14 @@ mod tests {
             );
             assert_ne!(first.occurrence, second.occurrence, "{interleave}");
             assert_eq!(
-                receive(repo, &late, || true, &crate::upgrade::process().settling()).unwrap(),
+                receive(
+                    repo,
+                    &late,
+                    &destination(repo).unwrap(),
+                    || true,
+                    &crate::upgrade::process().settling()
+                )
+                .unwrap(),
                 Receipt::Stale,
                 "{interleave}"
             );
@@ -2190,19 +2070,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
-        receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap();
+        receive(
+            repo,
+            &a,
+            &destination(repo).unwrap(),
+            || true,
+            &crate::upgrade::process().settling(),
+        )
+        .unwrap();
         ask(repo, &alice(), "q", "Proceed?").unwrap();
-        assert!(!repo.join(".clank/agents/alice/unblocks/q.md").exists());
+        assert!(!repo.join(".clank/unblocks/q.md").exists());
         assert!(!marker(repo, "q").exists());
         let blocks = scan_blocks(repo);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].answer, None, "owed to the human again");
         assert!(owed(repo).is_empty(), "no old answer is rendered for it");
         assert_eq!(
-            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            receive(
+                repo,
+                &a,
+                &destination(repo).unwrap(),
+                || true,
+                &crate::upgrade::process().settling()
+            )
+            .unwrap(),
             Receipt::Stale
         );
-        answer_block(repo, "alice", "q", "no", None).unwrap();
+        answer_block(repo, "q", "no", None).unwrap();
         assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("no"));
     }
 
@@ -2213,18 +2107,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
-        receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap();
-        let answer = std::fs::read(repo.join(".clank/agents/alice/unblocks/q.md")).unwrap();
+        receive(
+            repo,
+            &a,
+            &destination(repo).unwrap(),
+            || true,
+            &crate::upgrade::process().settling(),
+        )
+        .unwrap();
+        let answer = std::fs::read(repo.join(".clank/unblocks/q.md")).unwrap();
         let receipt = std::fs::read(marker(repo, "q")).unwrap();
         ask(repo, &alice(), "q", "Proceed?").unwrap();
         write(
-            &repo.join(".clank/agents/alice/unblocks/q.md"),
+            &repo.join(".clank/unblocks/q.md"),
             std::str::from_utf8(&answer).unwrap(),
         );
         write(&marker(repo, "q"), std::str::from_utf8(&receipt).unwrap());
         assert_eq!(scan_blocks(repo)[0].answer, None);
         assert!(owed(repo).is_empty());
-        answer_block(repo, "alice", "q", "no", None).unwrap();
+        answer_block(repo, "q", "no", None).unwrap();
         assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("no"));
     }
 
@@ -2235,8 +2136,8 @@ mod tests {
     fn a_legacy_pair_is_owed_until_received_and_keeps_its_answer() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        let q = repo.join(".clank/agents/alice/blocks/q.md");
-        let a = repo.join(".clank/agents/alice/unblocks/q.md");
+        let q = repo.join(".clank/blocks/q.md");
+        let a = repo.join(".clank/unblocks/q.md");
         write(&q, "Proceed?");
         write(&a, "yes");
         let carries = owed(repo);
@@ -2254,6 +2155,7 @@ mod tests {
             receive(
                 repo,
                 &carries[0],
+                &destination(repo).unwrap(),
                 || true,
                 &crate::upgrade::process().settling()
             )
@@ -2276,9 +2178,9 @@ mod tests {
     fn a_half_stamped_legacy_pair_stays_answered() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        write(&repo.join(".clank/agents/alice/blocks/q.md"), "Proceed?");
+        write(&repo.join(".clank/blocks/q.md"), "Proceed?");
         write(
-            &repo.join(".clank/agents/alice/unblocks/q.md"),
+            &repo.join(".clank/unblocks/q.md"),
             &stamp("0123456789abcdef0123456789abcdef", None, "yes"),
         );
         let carries = owed(repo);
@@ -2288,6 +2190,7 @@ mod tests {
             receive(
                 repo,
                 &carries[0],
+                &destination(repo).unwrap(),
                 || true,
                 &crate::upgrade::process().settling()
             )
@@ -2301,9 +2204,9 @@ mod tests {
     fn answering_a_legacy_question_stamps_it() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        let q = repo.join(".clank/agents/alice/blocks/q.md");
+        let q = repo.join(".clank/blocks/q.md");
         write(&q, "Proceed?");
-        answer_block(repo, "alice", "q", "yes", Some(legacy("Proceed?"))).unwrap();
+        answer_block(repo, "q", "yes", Some(legacy("Proceed?"))).unwrap();
         let raw = std::fs::read_to_string(&q).unwrap();
         assert!(unstamp(&raw).occurrence.is_some(), "{raw}");
         let carries = owed(repo);
@@ -2316,14 +2219,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let done = asked_and_answered(repo, "done", "Proceed?", "yes");
-        receive(repo, &done, || true, &crate::upgrade::process().settling()).unwrap();
+        receive(
+            repo,
+            &done,
+            &destination(repo).unwrap(),
+            || true,
+            &crate::upgrade::process().settling(),
+        )
+        .unwrap();
         let owed_now = asked_and_answered(repo, "owed", "Which?", "B");
         ask(repo, &alice(), "pending", "Why?").unwrap();
         write(
-            &repo.join(".clank/agents/alice/unblocks/orphan.md"),
+            &repo.join(".clank/unblocks/orphan.md"),
             &stamp("0123456789abcdef0123456789abcdef", None, "stale"),
         );
-        assert_eq!(clean(repo, &alice()).unwrap(), 4);
+        assert_eq!(clean(repo).unwrap(), 5);
         let left: Vec<_> = scan_blocks(repo)
             .into_iter()
             .map(|b| (b.name, b.answer))
@@ -2333,14 +2243,36 @@ mod tests {
             [("owed".into(), Some("B".into())), ("pending".into(), None)]
         );
         assert_eq!(owed(repo), [owed_now]);
-        assert!(!repo.join(".clank/agents/alice/blocks/done.md").exists());
-        assert!(!repo.join(".clank/agents/alice/unblocks/orphan.md").exists());
+        assert!(!repo.join(".clank/blocks/done.md").exists());
+        assert!(!repo.join(".clank/unblocks/orphan.md").exists());
     }
 
     fn permission(repo: &Path, name: &str, suggestion: Option<&str>) {
+        test_master(repo, &alice());
+        let f = files(&root(repo), name);
+        if f.question.exists() {
+            // Inject a replacement occurrence to test late claims, which must
+            // remain safe even when storage was replaced outside the CLI.
+            publish(
+                &f.question,
+                stamp_question(
+                    &mint_id().unwrap(),
+                    &Kind::Permission {
+                        suggestion: suggestion.map(str::to_owned),
+                    },
+                    "git push fork was refused; I need it to publish the repro",
+                )
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+            remove_if_present(&f.answer).unwrap();
+            remove_if_present(&f.marker).unwrap();
+            return;
+        }
         ask_with(
             repo,
-            &alice(),
+            Some(&alice()),
             name,
             "git push fork was refused; I need it to publish the repro",
             &Kind::Permission {
@@ -2358,7 +2290,6 @@ mod tests {
     ) -> anyhow::Result<Resolved> {
         resolve(
             repo,
-            "alice",
             name,
             None,
             By::Person,
@@ -2378,7 +2309,6 @@ mod tests {
     ) -> anyhow::Result<Resolved> {
         resolve(
             repo,
-            "alice",
             name,
             None,
             By::Person,
@@ -2391,15 +2321,15 @@ mod tests {
     }
 
     fn delivered(repo: &Path, name: &str) -> anyhow::Result<Resolved> {
-        resolve(repo, "alice", name, None, By::Person, How::Delivered)
+        resolve(repo, name, None, By::Person, How::Delivered)
     }
 
     fn attempt_path(repo: &Path, name: &str) -> PathBuf {
-        repo.join(format!(".clank/agents/alice/blocks/{name}.attempt"))
+        repo.join(format!(".clank/blocks/{name}.attempt"))
     }
 
     fn answer_path(repo: &Path, name: &str) -> PathBuf {
-        repo.join(format!(".clank/agents/alice/unblocks/{name}.md"))
+        repo.join(format!(".clank/unblocks/{name}.md"))
     }
 
     fn record(repo: &Path, name: &str) -> Option<Attempt> {
@@ -2440,7 +2370,7 @@ mod tests {
         let Stored::Valid(disposition) = s.disposition() else {
             panic!("an unreadable disposition: {raw}");
         };
-        let attempt = disposition.map(|Disposition::Nudged { attempt }| attempt);
+        let attempt = disposition.map(|Disposition::Nudged { attempt, .. }| attempt);
         (s.occurrence.map(str::to_owned), attempt, s.body.to_string())
     }
 
@@ -2450,7 +2380,7 @@ mod tests {
         let repo = dir.path();
         let id = "0123456789abcdef0123456789abcdef";
         write(
-            &repo.join(".clank/agents/alice/blocks/q.md"),
+            &repo.join(".clank/blocks/q.md"),
             &format!("occurrence: {id}\nWhich option?\nsecond line"),
         );
         write(&answer_path(repo, "q"), &format!("occurrence: {id}\nB"));
@@ -2463,8 +2393,7 @@ mod tests {
         assert_eq!(owed(repo).len(), 1, "a plain answer is still owed");
 
         ask(repo, &alice(), "fresh", "Proceed?").unwrap();
-        let raw =
-            std::fs::read_to_string(repo.join(".clank/agents/alice/blocks/fresh.md")).unwrap();
+        let raw = std::fs::read_to_string(repo.join(".clank/blocks/fresh.md")).unwrap();
         let (header, body) = raw.split_once('\n').unwrap();
         assert!(
             header.starts_with(STAMP) && is_occurrence(&header[STAMP.len()..]),
@@ -2493,7 +2422,6 @@ mod tests {
                 command: crate::cli::BlockCmd::Ask(crate::cli::BlockCreateArgs {
                     name: name.into(),
                     message: "git push fork was refused".into(),
-                    author: Some("alice".into()),
                     repo: Some(repo.to_path_buf()),
                     permission: true,
                     suggest: inline.map(str::to_owned),
@@ -2538,18 +2466,13 @@ mod tests {
             .is_ok()
         );
         assert!(parse(&["block", "ask", "q", "-m", "x", "--suggest", "yes"]).is_err());
-        assert!(parse(&["block", "answer", "alice", "q", "--nudge", "-m", "yes"]).is_ok());
+        assert!(parse(&["block", "answer", "q", "--nudge", "-m", "yes"]).is_ok());
+        assert!(parse(&["block", "answer", "q", "--nudge", "--resend", "-m", "yes"]).is_ok());
+        assert!(parse(&["block", "answer", "q", "--resend", "-m", "yes"]).is_err());
+        assert!(parse(&["block", "answer", "q", "--delivered"]).is_ok());
+        assert!(parse(&["block", "answer", "q", "--delivered", "-m", "x"]).is_err());
         assert!(
-            parse(&[
-                "block", "answer", "alice", "q", "--nudge", "--resend", "-m", "yes"
-            ])
-            .is_ok()
-        );
-        assert!(parse(&["block", "answer", "alice", "q", "--resend", "-m", "yes"]).is_err());
-        assert!(parse(&["block", "answer", "alice", "q", "--delivered"]).is_ok());
-        assert!(parse(&["block", "answer", "alice", "q", "--delivered", "-m", "x"]).is_err());
-        assert!(
-            parse(&["block", "answer", "alice", "q"]).is_err(),
+            parse(&["block", "answer", "q"]).is_err(),
             "-m is still required"
         );
     }
@@ -2561,7 +2484,6 @@ mod tests {
         let repo = dir.path();
         permission(repo, "push", Some("yes"));
         let cli = run_unblock(crate::cli::UnblockArgs {
-            agent: "alice".into(),
             name: "push".into(),
             message: Some("yes".into()),
             nudge: false,
@@ -2576,7 +2498,6 @@ mod tests {
         let shown = the_block(repo);
         let form = answer_block(
             repo,
-            "alice",
             "push",
             "yes",
             Some(Shown {
@@ -2655,14 +2576,7 @@ mod tests {
         let mut plain = None;
         nudge(repo, "push", "first", &mut |_: &str| {
             second = Some(nudge(repo, "push", "second", &mut never));
-            plain = Some(resolve(
-                repo,
-                "alice",
-                "push",
-                None,
-                By::Person,
-                How::Plain("plain"),
-            ));
+            plain = Some(resolve(repo, "push", None, By::Person, How::Plain("plain")));
             submitted()
         })
         .unwrap();
@@ -2672,7 +2586,7 @@ mod tests {
         assert_eq!(written(repo, "push").2, "first");
 
         for kind in [Kind::Plain, Kind::Permission { suggestion: None }] {
-            ask_with(repo, &alice(), "race", "Proceed?", &kind).unwrap();
+            ask_with(repo, Some(&alice()), "race", "Proceed?", &kind).unwrap();
             let reached = std::sync::atomic::AtomicUsize::new(0);
             let start = std::sync::Barrier::new(2);
             let results: Vec<_> = std::thread::scope(|s| {
@@ -2710,7 +2624,6 @@ mod tests {
         permission(repo, "push", None);
         let err = resolve(
             repo,
-            "alice",
             "push",
             Some(Shown {
                 occurrence: old.occurrence.as_deref(),
@@ -2802,7 +2715,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         permission(repo, "push", None);
-        let unblocks = repo.join(".clank/agents/alice/unblocks");
+        let unblocks = repo.join(".clank/unblocks");
         let err = nudge(repo, "push", "yes", &mut |_: &str| {
             let _ = std::fs::remove_dir_all(&unblocks);
             std::fs::write(&unblocks, "not a directory").unwrap();
@@ -2972,7 +2885,7 @@ mod tests {
         assert!(!attempt_path(repo, "push").exists(), "recovery removed it");
         assert_eq!(std::fs::read(answer_path(repo, "push")).unwrap(), answer);
         for how in [How::Delivered, How::Plain("again")] {
-            assert!(resolve(repo, "alice", "push", None, By::Person, how).is_err());
+            assert!(resolve(repo, "push", None, By::Person, how).is_err());
         }
         assert_eq!(std::fs::read(answer_path(repo, "push")).unwrap(), answer);
         assert_eq!(
@@ -3000,9 +2913,7 @@ mod tests {
 
         ask(repo, &alice(), "q", "Which?").unwrap();
         nudge(repo, "q", "B", &mut |_: &str| unknown()).unwrap();
-        let err = answer_block(repo, "alice", "q", "C", None)
-            .unwrap_err()
-            .to_string();
+        let err = answer_block(repo, "q", "C", None).unwrap_err().to_string();
         assert!(err.contains("outstanding"), "{err}");
         assert!(matches!(
             delivered(repo, "q").unwrap(),
@@ -3010,7 +2921,7 @@ mod tests {
         ));
 
         ask(repo, &alice(), "q", "Which?").unwrap();
-        answer_block(repo, "alice", "q", "C", None).unwrap();
+        answer_block(repo, "q", "C", None).unwrap();
         assert_eq!(
             written(repo, "q"),
             (the_block(repo).occurrence, None, "C".into())
@@ -3030,7 +2941,7 @@ mod tests {
         let orphan = std::fs::read(attempt_path(repo, "live")).unwrap();
         std::fs::write(attempt_path(repo, "gone"), orphan).unwrap();
         write(&attempt_path(repo, "torn"), "{\"occurrence\":");
-        assert_eq!(clean(repo, &alice()).unwrap(), 2);
+        assert_eq!(clean(repo).unwrap(), 2);
         assert!(record(repo, "live").is_some());
         assert!(!attempt_path(repo, "stale").exists());
         assert!(!attempt_path(repo, "gone").exists());
@@ -3043,7 +2954,7 @@ mod tests {
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
     fn question_path(repo: &Path, name: &str) -> PathBuf {
-        repo.join(format!(".clank/agents/alice/blocks/{name}.md"))
+        repo.join(format!(".clank/blocks/{name}.md"))
     }
 
     /// Every How, as a person: each is refused before anything is typed.
@@ -3051,7 +2962,7 @@ mod tests {
         let tries: [(&str, anyhow::Result<Resolved>); 4] = [
             (
                 "plain",
-                resolve(repo, "alice", name, None, By::Person, How::Plain("yes")),
+                resolve(repo, name, None, By::Person, How::Plain("yes")),
             ),
             ("nudge", nudge(repo, name, "yes", &mut never)),
             ("resend", resend(repo, name, "yes", &mut never)),
@@ -3084,7 +2995,6 @@ mod tests {
             assert_eq!(b.kind_name(), "unreadable", "{meta}");
             assert!(b.unreadable.is_some() && b.answer.is_none(), "{meta}");
             let cli = run_unblock(crate::cli::UnblockArgs {
-                agent: "alice".into(),
                 name: "push".into(),
                 message: Some("yes".into()),
                 nudge: false,
@@ -3113,7 +3023,7 @@ mod tests {
         let b = the_block(repo);
         assert!(b.kind.unreadable().is_some());
         every_answer_refused(repo, "push");
-        clean(repo, &alice()).unwrap();
+        clean(repo).unwrap();
         assert!(record(repo, "push").is_some(), "never removed");
     }
 
@@ -3141,7 +3051,7 @@ mod tests {
             assert!(b.unreadable.is_some(), "{meta}");
             assert!(owed(repo).is_empty(), "{meta}");
             every_answer_refused(repo, "q");
-            assert_eq!(clean(repo, &alice()).unwrap(), 0, "{meta}");
+            assert_eq!(clean(repo).unwrap(), 0, "{meta}");
             assert!(answer_path(repo, "q").exists(), "{meta}");
         }
     }
@@ -3161,7 +3071,6 @@ mod tests {
             let b = the_block(repo);
             assert!(b.kind.unreadable().is_some(), "{header}: {:?}", b.kind);
             let cli = run_unblock(crate::cli::UnblockArgs {
-                agent: "alice".into(),
                 name: "push".into(),
                 message: Some("yes".into()),
                 nudge: false,
@@ -3173,7 +3082,7 @@ mod tests {
             .await;
             assert!(cli.is_err(), "{header}");
             every_answer_refused(repo, "push");
-            clean(repo, &alice()).unwrap();
+            clean(repo).unwrap();
             assert_eq!(
                 std::fs::read_to_string(question_path(repo, "push")).unwrap(),
                 header,
@@ -3194,7 +3103,7 @@ mod tests {
         assert!(b.unreadable.is_some());
         assert!(owed(repo).is_empty());
         every_answer_refused(repo, "q");
-        assert_eq!(clean(repo, &alice()).unwrap(), 0);
+        assert_eq!(clean(repo).unwrap(), 0);
         assert_eq!(
             std::fs::read_to_string(answer_path(repo, "q")).unwrap(),
             torn
@@ -3238,7 +3147,7 @@ mod tests {
             );
             assert!(b.unreadable.is_some() && b.answer.is_none(), "{damage}");
             every_answer_refused(repo, "push");
-            clean(repo, &alice()).unwrap();
+            clean(repo).unwrap();
             assert!(path.exists(), "{damage}: never removed");
         }
     }
@@ -3305,6 +3214,7 @@ mod tests {
             receive(
                 repo,
                 &carries,
+                &destination(repo).unwrap(),
                 || true,
                 &crate::upgrade::process().settling()
             )
@@ -3326,7 +3236,7 @@ mod tests {
         let b = the_block(repo);
         assert_eq!(b.answer.as_deref(), Some("yes"));
         assert!(b.unreadable.is_some());
-        assert_eq!(clean(repo, &alice()).unwrap(), 0);
+        assert_eq!(clean(repo).unwrap(), 0);
         assert!(question_path(repo, "push").exists() && attempt_path(repo, "push").exists());
     }
 
@@ -3337,7 +3247,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         permission(repo, "push", None);
-        let unattested = |how: How<'_>| resolve(repo, "alice", "push", None, By::Unattested, how);
+        let unattested = |how: How<'_>| resolve(repo, "push", None, By::Unattested, how);
         for how in [
             How::Nudge {
                 text: "yes",
@@ -3369,7 +3279,6 @@ mod tests {
         let mut typed = 0;
         let ordinary = resolve(
             repo,
-            "alice",
             "q",
             None,
             By::Unattested,
@@ -3385,7 +3294,7 @@ mod tests {
         .unwrap();
         assert!(matches!(ordinary, Resolved::Unknown(_)));
         assert_eq!(typed, 1);
-        let settled = resolve(repo, "alice", "q", None, By::Unattested, How::Delivered).unwrap();
+        let settled = resolve(repo, "q", None, By::Unattested, How::Delivered).unwrap();
         assert!(matches!(settled, Resolved::Answered(_)));
     }
 
@@ -3399,7 +3308,6 @@ mod tests {
         nudge(repo, "push", "yes", &mut |_: &str| unknown()).unwrap();
         let settle = |flag: bool| {
             run_unblock(crate::cli::UnblockArgs {
-                agent: "alice".into(),
                 name: "push".into(),
                 message: None,
                 nudge: false,
@@ -3418,7 +3326,6 @@ mod tests {
         ask(repo, &alice(), "q", "Which?").unwrap();
         nudge(repo, "q", "B", &mut |_: &str| unknown()).unwrap();
         run_unblock(crate::cli::UnblockArgs {
-            agent: "alice".into(),
             name: "q".into(),
             message: None,
             nudge: false,
@@ -3432,18 +3339,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_returns_sorted_by_agent_then_name() {
+    fn scan_returns_sorted_by_repository_name() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join(".clank/agents/bob/blocks/z.md"), "q");
-        write(&dir.path().join(".clank/agents/alice/blocks/b.md"), "q");
-        write(&dir.path().join(".clank/agents/alice/blocks/a.md"), "q");
+        write(&dir.path().join(".clank/blocks/b.md"), "q");
+        write(&dir.path().join(".clank/blocks/a.md"), "q");
         let blocks = scan_blocks(dir.path());
         assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].agent, "alice");
         assert_eq!(blocks[0].name, "a");
-        assert_eq!(blocks[1].agent, "alice");
         assert_eq!(blocks[1].name, "b");
-        assert_eq!(blocks[2].agent, "bob");
+        assert_eq!(blocks[2].creator, "bob");
     }
 
     #[test]
@@ -3453,3 +3358,25 @@ mod tests {
         assert!(blocks.is_empty());
     }
 }
+
+// Test fixtures consume an actual answer before legally reusing its name.
+#[cfg(test)]
+pub(crate) fn test_receive(repo: &Path, name: &str) {
+    let target = destination(repo).unwrap();
+    let pair = Pair::read(&root(repo), name).unwrap();
+    let carries = pair.carries(name).unwrap();
+    assert_eq!(
+        receive(
+            repo,
+            &carries,
+            &target,
+            || true,
+            &crate::upgrade::process().settling()
+        )
+        .unwrap(),
+        Receipt::Retired
+    );
+}
+
+#[cfg(test)]
+mod repo_tests;

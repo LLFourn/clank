@@ -57,7 +57,7 @@ use clank_core::wait::WaitItem;
 // and this build cannot decode.
 // 22 owns repository watches independently of their current recipient. An
 // older monitor ignores these declarations and cannot deliver their selectors.
-pub(crate) const PROTO: u32 = 22;
+pub(crate) const PROTO: u32 = 23;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -4746,7 +4746,11 @@ fn recovery_facts(
         facts.push(crate::cli::recovery::Facts {
             agent_dir: dir,
             work: identities(&owed),
-            blocked_on: crate::cli::wait::own_block(repo, &author),
+            blocked_on: ledger
+                .owed()
+                .is_empty()
+                .then(|| crate::cli::wait::repo_block(repo))
+                .flatten(),
             author,
             session,
             auto,
@@ -4992,13 +4996,13 @@ fn due_gate(
 
 /// Whether a due recovery attempt may go ahead now, from the agent as it
 /// is at this moment rather than at the last fold: never over its own
-/// pending question or block, an attendance that quiets all of `owed`, a
+/// pending harness question, an attendance that quiets all of `owed`, a
 /// presentation still with its carrier or a report not yet answered, and
 /// never once a new binding or auto mode turned off has made it someone
 /// else's call. `owed` is what the agent is owed now, never a stand-in.
 ///
-/// Another agent's block is not asked about: what it withholds is not in
-/// `owed`. Nor is a wait that is merely registered: one that has been
+/// Repository blocks already withhold review work from `owed`; unrelated
+/// events remain recoverable. Nor is a wait that is merely registered: one that has been
 /// answered and holds none of `owed` is not delivering it.
 fn recovery_gate(
     repo: &std::path::Path,
@@ -5030,7 +5034,9 @@ fn recovery_gate(
         matches!(&c.who, Served::Agent { author: a } if a == author)
             && c.report.as_ref().is_some_and(|r| !r.stepped)
     });
-    if unanswered || turns.presenting(author) || crate::cli::wait::own_block(repo, author).is_some()
+    if unanswered
+        || turns.presenting(author)
+        || (owed.is_empty() && crate::cli::wait::repo_block(repo).is_some())
     {
         return Gate::Hold;
     }
@@ -8887,7 +8893,11 @@ mod recovery_tests {
                 Transport::Typed => c.may_type(&clients, screen.as_deref()).await,
                 _ => c.may_start(&clients).await,
             };
-            assert!(!allowed, "{route:?}: {change}");
+            assert_eq!(
+                allowed,
+                change == "block",
+                "{route:?}: {change}: a repo block never withholds a timer event"
+            );
         }
     }
 
@@ -9602,7 +9612,7 @@ mod recovery_tests {
         assert_eq!(count(), Some(4));
         facts();
         assert_eq!(count(), Some(4), "an unchanged fold keeps the count");
-        std::fs::remove_file(dir.join("blocks/mic.md")).unwrap();
+        std::fs::remove_file(repo.path().join(".clank/blocks/mic.md")).unwrap();
         facts();
         assert_eq!(count(), None, "the block was answered");
         bind(clank_core::Tool::Codex, "session-two");
@@ -9797,9 +9807,8 @@ mod recovery_tests {
         );
         assert_eq!(gate(&[]), Gate::Go);
 
-        // Another agent's block withholds review work from what is owed
-        // and holds nothing else back; the agent's own is its own question
-        // to a person.
+        // Every repository block holds an otherwise idle agent; unrelated
+        // work still wakes it regardless of who asked the question.
         let blocks = |who: &str| {
             let dir = crate::agent_store::agents_root(repo.path())
                 .join(who)
@@ -9809,7 +9818,7 @@ mod recovery_tests {
         };
         std::fs::write(blocks("claude").join("stork.md"), "Which take?").unwrap();
         assert!(crate::cli::wait::blocked(repo.path(), &codex));
-        assert_eq!(gate(&[]), Gate::Go, "another agent's block");
+        assert_eq!(gate(&[]), Gate::Hold, "the repository waits for the human");
         std::fs::write(blocks("codex").join("mine.md"), "Which way?").unwrap();
         assert_eq!(gate(&[]), Gate::Hold, "its own block");
     }
@@ -10209,10 +10218,15 @@ mod recovery_tests {
         assert_eq!(withheld.ledger.entries.len(), 1, "the promotion, withheld");
 
         let answer =
-            crate::cli::block::answer_block(repo.path(), "artist", "takes", "the third", None)
-                .unwrap();
+            crate::cli::block::answer_block(repo.path(), "takes", "the third", None).unwrap();
         let answered = crate::cli::recovery::unix_now() - 40 * 60;
         written_at(&answer, answered);
+        // The master receives the repo decision before review work is released.
+        crate::cli::block::test_receive(repo.path(), "takes");
+        written_at(
+            &repo.path().join(".clank/unblocks/takes.received"),
+            answered,
+        );
         let restart = answered + 40 * 60;
 
         let released = facts().await;

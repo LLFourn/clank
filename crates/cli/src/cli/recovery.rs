@@ -1656,9 +1656,8 @@ pub(crate) struct Facts {
     pub(crate) stall: Option<Stall>,
     /// Work it attends quiets everything it is owed and has received.
     pub(crate) attended: bool,
-    /// The pending block it raised itself, by name: its own question to a
-    /// person. Another agent's block is not here; what that withholds is
-    /// in the ledger.
+    /// The repository question holding an otherwise idle agent. When unrelated
+    /// work is owed, the ledger governs recovery and this is absent.
     pub(crate) blocked_on: Option<String>,
     /// The agent is waiting on a question it asked: its record is read for
     /// what ends it, whether or not the agent owes anything. A cancelled

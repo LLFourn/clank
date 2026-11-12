@@ -558,7 +558,7 @@ impl serde::Serialize for Answerable<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let crate::cli::block::BlockEntry {
-            agent,
+            creator,
             name,
             occurrence,
             kind: _,
@@ -568,14 +568,14 @@ impl serde::Serialize for Answerable<'_> {
             unreadable,
         } = self.0;
         let mut m = s.serialize_map(Some(10))?;
-        m.serialize_entry("agent", agent)?;
+        m.serialize_entry("creator", creator)?;
         m.serialize_entry("name", name)?;
         m.serialize_entry("occurrence", occurrence)?;
         m.serialize_entry("kind", self.0.kind_name())?;
         m.serialize_entry("suggestion", &self.0.suggestion())?;
         m.serialize_entry("question", question)?;
         m.serialize_entry("answer", answer)?;
-        m.serialize_entry("pending", &answer.is_none())?;
+        m.serialize_entry("pending", &self.0.pending())?;
         m.serialize_entry("nudge", &nudge.as_ref().map(Unsettled))?;
         m.serialize_entry("unreadable", unreadable)?;
         m.end()
@@ -600,6 +600,7 @@ impl serde::Serialize for Unsettled<'_> {
                 text,
                 started,
                 diagnostic,
+                ..
             }) => {
                 m.serialize_entry("diagnostic", diagnostic)?;
                 m.serialize_entry("attempt", attempt)?;
@@ -1051,14 +1052,13 @@ impl StatusSnapshot {
             let _ = writeln!(out, "blocks:");
             for b in &self.blocks {
                 let who = match b.kind_name() {
-                    "plain" => b.agent.clone(),
-                    kind => format!("{}, {kind}", b.agent),
+                    "plain" => b.name.clone(),
+                    kind => format!("{}, {kind}", b.name),
                 };
-                if let Some(ref answer) = b.answer {
-                    let _ = writeln!(out, "  UNBLOCKED ({who}): {}", b.question);
+                let state = if b.pending() { "BLOCKED" } else { "UNBLOCKED" };
+                let _ = writeln!(out, "  {state} ({who}): {}", b.question);
+                if let Some(answer) = &b.answer {
                     let _ = writeln!(out, "    answer: {answer}");
-                } else {
-                    let _ = writeln!(out, "  BLOCKED ({who}): {}", b.question);
                 }
                 if let Some(suggestion) = b.suggestion() {
                     let _ = writeln!(out, "    suggested: {suggestion}");
@@ -2708,7 +2708,7 @@ fn select_plan_and_finished(
 
 pub(crate) fn waiting_actor(w: &WaitingOn) -> String {
     match w {
-        WaitingOn::Blocked { block } => block.creator.as_str().to_string(),
+        WaitingOn::Blocked { .. } => "human".to_string(),
         WaitingOn::ReviewerApprovalsMissing { missing }
         | WaitingOn::GateReviewersMissing { missing } => missing
             .iter()
@@ -5293,7 +5293,7 @@ pub(crate) mod dirty_and_wake_tests {
             }),
             last_finished: None,
             blocks: vec![crate::cli::block::BlockEntry {
-                agent: "codex".to_string(),
+                creator: "codex".to_string(),
                 name: "q".to_string(),
                 question: "why?".to_string(),
                 answer: None,
@@ -5361,9 +5361,10 @@ pub(crate) mod dirty_and_wake_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let codex = clank_core::AgentLabel::parse("codex").unwrap();
+        crate::cli::block::test_master(repo, &codex);
         crate::cli::block::ask_with(
             repo,
-            &codex,
+            Some(&codex),
             "push",
             "git push fork was refused",
             &crate::cli::block::Kind::Permission {
@@ -5377,7 +5378,7 @@ pub(crate) mod dirty_and_wake_tests {
         assert_eq!(
             snap.to_json()["blocks"],
             serde_json::json!([{
-                "agent": "codex",
+                "creator": "codex",
                 "name": "push",
                 "occurrence": occurrence,
                 "kind": "permission",
@@ -5392,7 +5393,6 @@ pub(crate) mod dirty_and_wake_tests {
 
         crate::cli::block::resolve(
             repo,
-            "codex",
             "push",
             None,
             crate::cli::block::By::Person,
@@ -5419,7 +5419,7 @@ pub(crate) mod dirty_and_wake_tests {
         assert!(nudge["started"].as_u64().is_some() && nudge["attempt"].is_string());
         let text = snap.to_human();
         assert!(
-            text.contains("BLOCKED (codex, permission): git push fork was refused")
+            text.contains("BLOCKED (push, permission): git push fork was refused")
                 && text.contains("suggested: yes: push it")
                 && text.contains("nudge outcome unknown: the prompt was not confirmed"),
             "{text}"
@@ -5436,13 +5436,13 @@ pub(crate) mod dirty_and_wake_tests {
         let codex = clank_core::AgentLabel::parse("codex").unwrap();
         crate::cli::block::ask_with(
             repo,
-            &codex,
+            Some(&codex),
             "push",
             "git push fork was refused",
             &crate::cli::block::Kind::Permission { suggestion: None },
         )
         .unwrap();
-        std::fs::write(repo.join(".clank/agents/codex/blocks/push.attempt"), "torn").unwrap();
+        std::fs::write(repo.join(".clank/blocks/push.attempt"), "torn").unwrap();
         let mut snap = minimal_snapshot();
         snap.blocks = crate::cli::block::scan_blocks(repo);
         let block = &snap.to_json()["blocks"][0];
@@ -5489,7 +5489,7 @@ pub(crate) mod dirty_and_wake_tests {
             },
             "last_finished": null,
             "blocks": [{
-                "agent": "codex",
+                "creator": "codex",
                 "name": "q",
                 "occurrence": null,
                 "kind": "plain",

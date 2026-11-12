@@ -81,7 +81,6 @@ pub(crate) struct WaitItem {
     name: Option<String>,
     id: Option<String>,
     priority: Option<u64>,
-    agent: Option<String>,
     answer: Option<String>,
     carries: Option<clank_core::wait::AnswerRef>,
     // External wake payloads (external-wake-hints-carry-payload):
@@ -574,11 +573,10 @@ pub(crate) fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, rol
                 out.push_str(&format!("  - promote: {name} (priority {priority:03})\n"));
             }
             K::Blocked => {
-                let agent = item.agent.as_deref().unwrap_or("?");
                 let name = item.name.as_deref().unwrap_or("?");
                 let scope = item.plan.as_deref().unwrap_or("repo");
                 out.push_str(&format!(
-                    "  - blocked: {agent}/{name} on {scope} (awaiting human)\n"
+                    "  - blocked: {name} on {scope} (awaiting human)\n"
                 ));
             }
             K::Unblocked => {
@@ -1737,7 +1735,7 @@ mod tests {
                                "plan": "foo", "question": "?"}),
             serde_json::json!({"kind": "promote_from_queue", "name": "next-up", "priority": 42}),
         ]);
-        assert!(out.contains("  - blocked: claude/q on foo (awaiting human)\n"));
+        assert!(out.contains("  - blocked: q on foo (awaiting human)\n"));
         assert!(out.contains("  - promote: next-up (priority 042)\n"));
     }
 

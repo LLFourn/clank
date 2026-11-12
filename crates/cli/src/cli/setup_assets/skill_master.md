@@ -99,8 +99,10 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   always repo-wide: while one is pending the review cycle pauses (no
   promote, review or finish work), though messages and events still
   wake you. Raise one only when you genuinely cannot proceed.
-  The human's answer arrives in your next wake, and that wake is its
-  receipt: there is nothing to acknowledge or clean.
+  The human answers with `clank block answer <name> -m "answer"`, without
+  an agent name. Questions and answers belong to the repository and follow
+  whoever becomes master. Your wake records receipt; `clank block list`
+  keeps decisions available until explicit repository cleanup.
   When something you need was refused by a permission check, raise it
   with `--permission` (and `--suggest "<the message that would lift it>"`):
   the human answers by typing into your terminal, so the answer arrives as

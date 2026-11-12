@@ -168,7 +168,6 @@ impl RepoSession {
                 }
             }
             BrowserRequest::BlockAnswer {
-                agent,
                 name,
                 occurrence,
                 question,
@@ -180,7 +179,6 @@ impl RepoSession {
                         .run(move || {
                             crate::cli::block::answer_block(
                                 &repo,
-                                &agent,
                                 &name,
                                 &answer,
                                 Some(crate::cli::block::Shown {
@@ -733,7 +731,7 @@ mod tests {
         let claude = AgentLabel::parse("claude").unwrap();
         crate::cli::block::ask_with(
             repo.path(),
-            &claude,
+            Some(&claude),
             "push",
             "git push fork was refused",
             &crate::cli::block::Kind::Permission { suggestion: None },
@@ -744,7 +742,6 @@ mod tests {
         let reply = ask(
             &backend,
             BrowserRequest::BlockAnswer {
-                agent: "claude".into(),
                 name: "push".into(),
                 occurrence: shown.occurrence,
                 question: shown.question,
@@ -766,7 +763,6 @@ mod tests {
         std::fs::write(&question, "Which option?").unwrap();
         let backend = backend(repo.path(), None);
         let answer = |question: &str, answer: &str| BrowserRequest::BlockAnswer {
-            agent: "claude".into(),
             name: "why".into(),
             occurrence: None,
             question: question.into(),
@@ -815,7 +811,6 @@ mod tests {
         };
         let answer =
             |(occurrence, question): (Option<String>, String)| BrowserRequest::BlockAnswer {
-                agent: "claude".into(),
                 name: "why".into(),
                 occurrence,
                 question,
@@ -823,6 +818,8 @@ mod tests {
             };
         crate::cli::block::ask(repo.path(), &claude, "why", "Which option?").unwrap();
         let first = shown();
+        crate::cli::block::answer_block(repo.path(), "why", "previous decision", None).unwrap();
+        crate::cli::block::test_receive(repo.path(), "why");
         crate::cli::block::ask(repo.path(), &claude, "why", "Which option?").unwrap();
         let second = shown();
         assert_eq!(first.1, second.1, "the same question text");

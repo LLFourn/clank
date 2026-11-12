@@ -148,15 +148,18 @@ pub(crate) fn record_delivered(
     }
     record(repo, author, &carried.events, &current, permit);
     for answer in &carried.answers {
-        // A presentation speaks for its own agent's blocks only.
-        if &answer.agent != author {
+        let Ok(session) = clank_core::SessionId::parse(session) else {
             continue;
-        }
-        if let Err(e) = super::block::receive(repo, answer, &current, permit) {
+        };
+        let delivered = super::block::Destination {
+            agent: author.clone(),
+            tool,
+            session,
+        };
+        if let Err(e) = super::block::receive(repo, answer, &delivered, &current, permit) {
             eprintln!(
-                "clank: wake delivered; could not receive the answer to `{}/{}`, so it stays \
-                 owed: {e:#}",
-                answer.agent, answer.name
+                "clank: wake delivered; could not receive answer to `{}`, so it stays owed: {e:#}",
+                answer.name
             );
         }
     }

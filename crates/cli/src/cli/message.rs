@@ -156,7 +156,7 @@ mod tests {
                 "-",
             ],
             vec!["block", "ask", "q", "-m", "-"],
-            vec!["block", "answer", "rev", "q", "-m", "-"],
+            vec!["block", "answer", "q", "-m", "-"],
         ] {
             assert_eq!(
                 resolved(&args, body),

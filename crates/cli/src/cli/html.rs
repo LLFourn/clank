@@ -1184,8 +1184,7 @@ fn render_index(
         out.push_str("  <div class=\"blocks\">blocks:\n    <ul>\n");
         for b in status.blocks {
             out.push_str(&format!(
-                "      <li><code>{}</code>/{} — {}</li>\n",
-                esc(&b.agent),
+                "      <li><code>{}</code> — {}</li>\n",
                 esc(&b.name),
                 esc(&b.question)
             ));
@@ -1734,7 +1733,7 @@ fn verdict_gate_label(g: clank_core::vocab::CommitGateState) -> &'static str {
 fn waiting_on_label(w: &clank_core::plan_view::WaitingOn) -> String {
     use clank_core::plan_view::WaitingOn as W;
     match w {
-        W::Blocked { block } => format!("blocked ({})", block.creator.as_str()),
+        W::Blocked { .. } => "blocked (human)".to_string(),
         W::ReviewerApprovalsMissing { missing } => {
             let mut names: Vec<String> = missing
                 .as_slice()

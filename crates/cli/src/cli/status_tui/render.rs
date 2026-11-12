@@ -1876,7 +1876,7 @@ pub(super) struct AskLine {
 pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<AskLine> {
     let width = cols.max(1);
     let mut lines = Vec::new();
-    for b in snap.blocks.iter().filter(|b| b.answer.is_none()) {
+    for b in snap.blocks.iter().filter(|b| b.pending()) {
         let ask = std::sync::Arc::new(super::block_page::Ask::of(b));
         for line in wrap(b.question.trim(), width) {
             lines.push(AskLine {
@@ -1909,10 +1909,9 @@ pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<AskLine
 pub(super) fn block_notes(b: &crate::cli::block::BlockEntry) -> Vec<String> {
     let mut notes = Vec::new();
     if b.is_permission() {
-        notes.push(format!(
-            "permission: answered by typing your text into {}'s terminal",
-            b.agent
-        ));
+        notes.push(
+            "permission: answered by typing your text into the current master terminal".into(),
+        );
     }
     if let Some(s) = b.suggestion() {
         notes.push(format!("suggested: {s}"));
@@ -4892,10 +4891,7 @@ pub(super) fn block_page_layout(
         &page.ask.kind
     {
         question.push(String::new());
-        let mut notes = vec![format!(
-            "permission block: your answer is typed into {}'s terminal as your own message",
-            page.ask.agent
-        )];
+        let mut notes = vec!["permission block: your answer is typed into the current master terminal as your own message".to_owned()];
         notes.extend(suggestion.iter().map(|s| format!("suggested: {s}")));
         for note in notes {
             for line in wrap(&note, width) {
@@ -4913,10 +4909,7 @@ pub(super) fn block_page_layout(
         push_input_line(&mut controls, &page.draft, cols);
         let hint = match page.ask.kind {
             crate::cli::block::Stored::Valid(crate::cli::block::Kind::Permission { .. }) => {
-                format!(
-                    "  ⏎ type into {}'s terminal · esc back to the buttons",
-                    page.ask.agent
-                )
+                "  ⏎ type into the master terminal · esc back to the buttons".to_owned()
             }
             _ => "  ⏎ send · esc back to the buttons".to_string(),
         };
@@ -4966,13 +4959,7 @@ pub(super) fn render_block_page(
 ) -> (Vec<String>, usize) {
     let layout = block_page_layout(page, standing, rows, cols);
     let mut out = vec![
-        region_rule_with_note(
-            "block",
-            &format!("{}/{}", page.ask.agent, page.ask.name),
-            "",
-            true,
-            cols,
-        ),
+        region_rule_with_note("block", &page.ask.name, "", true, cols),
         String::new(),
     ];
     let off = page.scroll.min(layout.max_scroll());
@@ -5405,7 +5392,7 @@ mod tests {
         REVERSE, agent_row, cand, line_with, plan_state, reviewer_missing, snap, two_agent_snap,
         visible, visible_untrimmed,
     };
-    use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
+    use crate::lifecycle::{CommitSha, PlanKey};
     use clank_core::plan_view::WaitingOn;
 
     // ── tui-plan-actions-page: page renderers ──
@@ -5865,7 +5852,7 @@ mod tests {
         let mut s = snap(None, vec![]);
         s.blocks = vec![
             crate::cli::block::BlockEntry {
-                agent: "claude".into(),
+                creator: "claude".into(),
                 name: "a".into(),
                 question: "first question".into(),
                 answer: None,
@@ -5875,7 +5862,7 @@ mod tests {
                 unreadable: None,
             },
             crate::cli::block::BlockEntry {
-                agent: "codex".into(),
+                creator: "codex".into(),
                 name: "b".into(),
                 question: "second question".into(),
                 answer: None,
@@ -5903,7 +5890,7 @@ mod tests {
     fn a_long_question_is_held_once_across_its_wrapped_lines() {
         let mut s = snap(None, vec![]);
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "long".into(),
             question: "word ".repeat(13_000),
             answer: None,
@@ -5926,7 +5913,7 @@ mod tests {
     fn an_answered_block_contributes_no_ask_line() {
         let mut s = snap(None, vec![]);
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "a".into(),
             question: "already answered".into(),
             answer: Some("yes".into()),
@@ -5947,7 +5934,7 @@ mod tests {
         use crate::cli::status_tui::block_page::{Ask, BlockPage, Origin};
         let mut s = snap(None, vec![]);
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "codex".into(),
+            creator: "codex".into(),
             name: "scope".into(),
             question: question.into(),
             answer: None,
@@ -5976,7 +5963,7 @@ mod tests {
         let lines = block_page_frame("should this ship?", |_| {}, 24, 80);
         let text = lines.join("\n");
         assert!(text.contains("BLOCK"), "{text}");
-        assert!(text.contains("codex/scope"), "{text}");
+        assert!(text.contains("BLOCK · scope"), "{text}");
         let question = line_of(&lines, "should this ship?").expect("the question");
         let answer = line_of(&lines, "answer").expect("the answer button");
         assert!(line_of(&lines, "back").is_some(), "{text}");
@@ -6988,7 +6975,7 @@ mod tests {
                         clank_core::vocab::CommitGateState::Finished;
                 }
                 4 => idle.blocks.push(crate::cli::block::BlockEntry {
-                    agent: "claude".into(),
+                    creator: "claude".into(),
                     name: "decision".into(),
                     question: "choose".into(),
                     answer: None,
@@ -8129,7 +8116,7 @@ mod tests {
         // (🙋 … blocked), NOT the promote lamp.
         let mut s = snap(None, vec!["simctl-up"]);
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "simctl-up-design-decisions".into(),
             question: "which sims?".into(),
             answer: None,
@@ -8150,7 +8137,7 @@ mod tests {
         // or the human is invited to take work the agent will refuse.
         let mut s = snap(None, vec!["blocked-plan", "free-plan"]);
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "q".into(),
             question: "?".into(),
             answer: None,
@@ -8271,7 +8258,7 @@ mod tests {
                 "foo",
                 WaitingOn::Blocked {
                     block: PlanBlock {
-                        creator: AgentLabel::parse("claude").unwrap(),
+                        creator: "claude".into(),
                         name: "q".into(),
                         message: "is this right?\nmore detail".into(),
                     },
@@ -8280,7 +8267,7 @@ mod tests {
             vec![],
         );
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "q".into(),
             question: "is this right?\nmore detail".into(),
             answer: None,
@@ -8324,7 +8311,7 @@ mod tests {
             vec![],
         );
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "q".into(),
             question: q.into(),
             answer: None,
@@ -13264,7 +13251,7 @@ mod tests {
     fn block_reason_wraps_across_rows_within_width() {
         let mut s = snap(None, vec![]);
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "q".into(),
             question: "the first line is long enough to wrap\nsecond paragraph".into(),
             answer: None,

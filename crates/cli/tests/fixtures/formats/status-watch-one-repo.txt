@@ -11,7 +11,7 @@ plan: foo
   reason:            gate continued (not FINISHED) — continue work or ask a reviewer to mark FINISHED
 
 blocks:
-  BLOCKED (codex): why?
+  BLOCKED (q): why?
 
 repo:   /repo
 branch: main
@@ -26,4 +26,4 @@ plan: foo
   reason:            gate continued (not FINISHED) — continue work or ask a reviewer to mark FINISHED
 
 blocks:
-  BLOCKED (codex): why?
+  BLOCKED (q): why?

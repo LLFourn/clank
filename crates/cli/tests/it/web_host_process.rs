@@ -637,7 +637,6 @@ async fn feature_parity() {
             serde_json::json!({"agent":"grok","name":"question",
                 "occurrence":"0123456789abcdef0123456789abcdef","question":"expected?","answer":"yes"}),
             BrowserRequest::BlockAnswer {
-                agent: "grok".into(),
                 name: "question".into(),
                 occurrence: Some("0123456789abcdef0123456789abcdef".into()),
                 question: "expected?".into(),

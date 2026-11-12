@@ -123,7 +123,6 @@ impl EventPresentation {
 /// it rendered. Receipt retires only a pair that still matches all of it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AnswerRef {
-    pub agent: AgentLabel,
     pub name: String,
     /// `None` for a pair asked before asks carried an occurrence.
     pub occurrence: Option<String>,
@@ -314,11 +313,9 @@ pub enum WaitItem {
         sha: CommitSha,
     },
     ForBlocked {
-        agent: String,
         name: String,
     },
     Blocked {
-        agent: String,
         name: String,
         question: String,
     },
@@ -1278,15 +1275,10 @@ impl RepoState {
             // empty-reviewable early return.
             let mut pending_blocks = reviews.blocks_for(key);
             if !pending_blocks.is_empty() {
-                // Lexicographic tie-breaker by (creator, name)
+                // Lexicographic order by repository block name
                 // matches scan_blocks's sort order. The first
                 // pending block surfaces on the gate line.
-                pending_blocks.sort_by(|a, b| {
-                    a.creator
-                        .as_str()
-                        .cmp(b.creator.as_str())
-                        .then_with(|| a.name.cmp(&b.name))
-                });
+                pending_blocks.sort_by(|a, b| a.name.cmp(&b.name));
                 let block = pending_blocks.into_iter().next().unwrap();
                 let reviewable = ps.reviewable_shas();
                 let sha = reviewable.last().cloned();
@@ -2788,7 +2780,7 @@ mod tests {
 
     fn mkblock(creator: &str, name: &str, msg: &str) -> PlanBlock {
         PlanBlock {
-            creator: label(creator),
+            creator: creator.to_owned(),
             name: name.to_string(),
             message: msg.to_string(),
         }
@@ -3374,7 +3366,7 @@ mod tests {
 
     #[test]
     fn derive_status_picks_first_pending_block_when_multiple() {
-        // Tie-breaker pinned in Phase 2: lex-first by (creator, name)
+        // Repository names alone determine the order
         // matches scan_blocks's sort. The first pending block surfaces
         // on the gate line.
         let mut state = RepoState::default();
@@ -3401,15 +3393,15 @@ mod tests {
             WaitingOn::Blocked { block } => block.name.clone(),
             _ => unreachable!(),
         };
-        // Lex by (creator, name): claude < codex, so claude/yak wins.
-        assert_eq!(block_creator, "claude");
-        assert_eq!(block_name, "yak");
+        // Attribution does not affect repository name ordering.
+        assert_eq!(block_creator, "codex");
+        assert_eq!(block_name, "alpha");
     }
 
     #[test]
     fn work_for_blocked_plan_emits_no_master_or_reviewer_items() {
         // Phase 5 pin: blocked plans emit no work for any role.
-        // Block-creator clears the block out-of-band.
+        // The human answers the repository question out-of-band.
         let mut state = RepoState::default();
         state.active_plan = Some(crate::repo_state::ActivePlan {
             key: plan("foo"),

@@ -36,7 +36,6 @@ pub enum BrowserRequest {
     },
     AgentCandidates,
     BlockAnswer {
-        agent: String,
         name: String,
         /// The ask the form showed; `None` for one asked before asks had one.
         occurrence: Option<String>,

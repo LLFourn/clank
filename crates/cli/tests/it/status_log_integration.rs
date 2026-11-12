@@ -33,7 +33,11 @@ fn snapshot_carries_recent_oneline_log_with_reviews() {
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
-    write(repo, ".clank/.gitignore", "/cache/\n/agents/\n/shelved/\n");
+    write(
+        repo,
+        ".clank/.gitignore",
+        &clank::init_facts::clank_gitignore_body(),
+    );
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro = {
@@ -87,7 +91,7 @@ fn legacy_cache_rebuild_and_warm_resume_share_one_accepted_plan() {
     write(
         repo,
         ".clank/.gitignore",
-        "/cache/\n/agents/\n/config.json\n/shelved/\n",
+        &clank::init_facts::clank_gitignore_body(),
     );
     write(repo, ".clank/plans/accepted.md", "# accepted\n");
     commit(repo, "[accepted] intro");

@@ -588,7 +588,6 @@ fn every_item_names_itself() {
     assert_eq!(what(&review()).as_deref(), Some("review of 0000000"));
     assert_eq!(kind(&review()), "review");
     let blocked = WaitItem::Blocked {
-        agent: "claude".into(),
         name: "stork".into(),
         question: "?".into(),
     };

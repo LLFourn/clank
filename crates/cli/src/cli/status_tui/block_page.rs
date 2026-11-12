@@ -13,7 +13,7 @@ pub(super) const PAUSE: &str = "pause";
 /// never looks an ask up by its place in that list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Ask {
-    pub(super) agent: String,
+    pub(super) creator: String,
     pub(super) name: String,
     pub(super) occurrence: Option<String>,
     pub(super) kind: Stored<Kind>,
@@ -23,7 +23,7 @@ pub(super) struct Ask {
 impl Ask {
     pub(super) fn of(b: &BlockEntry) -> Self {
         Self {
-            agent: b.agent.clone(),
+            creator: b.creator.clone(),
             name: b.name.clone(),
             occurrence: b.occurrence.clone(),
             kind: b.kind.clone(),
@@ -68,7 +68,7 @@ impl Standing {
             ),
             Standing::Unsettled => Some(
                 "a nudge answering this is outstanding and its outcome is unknown; if the text \
-                 arrived, settle it with `clank block answer <agent> <name> --delivered`, and if \
+                 arrived, settle it with `clank block answer <name> --delivered`, and if \
                  not, `--nudge --resend -m …`",
             ),
             Standing::Replaced => Some(
@@ -82,10 +82,7 @@ impl Standing {
 /// The opened ask's standing in `live`, judged by its occurrence, never
 /// by its name alone or its position.
 pub(super) fn standing(ask: &Ask, live: &[BlockEntry]) -> Standing {
-    match live
-        .iter()
-        .find(|b| b.agent == ask.agent && b.name == ask.name)
-    {
+    match live.iter().find(|b| b.name == ask.name) {
         None => Standing::Gone,
         Some(b) if b.occurrence != ask.occurrence || b.question != ask.question => {
             Standing::Replaced
@@ -265,7 +262,7 @@ pub(super) fn from_log(seq: &[super::scroll::Seg<'_>], cursor: usize) -> Option<
 /// make the master an asking agent.
 pub(super) fn from_agent(label: &str, live: &[BlockEntry]) -> Option<BlockPage> {
     live.iter()
-        .find(|b| b.agent == label && b.answer.is_none() && b.name != PAUSE)
+        .find(|b| b.creator == label && b.pending() && b.name != PAUSE)
         .map(|b| BlockPage::open(Ask::of(b), Origin::Agent(label.to_owned())))
 }
 
@@ -291,21 +288,14 @@ pub(super) fn answer_in_store(
         }
     };
     // The answer is a keypress in the person's own TUI.
-    crate::cli::block::resolve(
-        repo,
-        &ask.agent,
-        &ask.name,
-        Some(ask.shown()),
-        By::Person,
-        how,
-    )?
-    .into_answer(&ask.agent, &ask.name)
-    .map(|_| ())
+    crate::cli::block::resolve(repo, &ask.name, Some(ask.shown()), By::Person, how)?
+        .into_answer(&ask.name)
+        .map(|_| ())
 }
 
 /// Whether the repo is paused: its pause block is asked and unanswered.
 pub(super) fn repo_paused(live: &[BlockEntry]) -> bool {
-    live.iter().any(|b| b.answer.is_none() && b.name == PAUSE)
+    live.iter().any(|b| b.pending() && b.name == PAUSE)
 }
 
 #[cfg(test)]
@@ -320,7 +310,7 @@ mod tests {
 
     fn entry(agent: &str, name: &str, occurrence: &str, question: &str) -> BlockEntry {
         BlockEntry {
-            agent: agent.into(),
+            creator: agent.into(),
             name: name.into(),
             occurrence: Some(occurrence.into()),
             kind: crate::cli::block::Stored::Valid(Default::default()),
@@ -481,6 +471,8 @@ mod tests {
             let mut slot = opened_from_log(&s, 0);
             let mut store = |a: &Ask, t: &str| answer_in_store(repo, a, t, &mut never);
             press(&mut slot, &s, &typed("yes"), &mut store);
+            crate::cli::block::answer_block(repo, "scope", "earlier decision", None).unwrap();
+            crate::cli::block::test_receive(repo, "scope");
             crate::cli::block::ask(repo, &codex, "scope", "Ship it?").unwrap();
             if refreshed {
                 s.blocks = crate::cli::block::scan_blocks(repo);
@@ -510,7 +502,7 @@ mod tests {
         let mut slot = opened_from_log(&s, 0);
         let mut calls = Vec::new();
         press(&mut slot, &s, &typed("yes"), &mut recorder(&mut calls));
-        crate::cli::block::answer_block(repo, "codex", "scope", "from the browser", None).unwrap();
+        crate::cli::block::answer_block(repo, "scope", "from the browser", None).unwrap();
         s.blocks = crate::cli::block::scan_blocks(repo);
         let step = press(
             &mut slot,
@@ -589,9 +581,10 @@ mod tests {
     fn permission_store(suggestion: Option<&str>) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let codex = clank_core::AgentLabel::parse("codex").unwrap();
+        crate::cli::block::test_master(dir.path(), &codex);
         crate::cli::block::ask_with(
             dir.path(),
-            &codex,
+            Some(&codex),
             "push",
             "git push fork was refused",
             &Kind::Permission {
@@ -639,7 +632,7 @@ mod tests {
             text.contains("permission block") && text.contains("suggested: yes: push it"),
             "{text}"
         );
-        assert!(text.contains("type into codex's terminal"), "{text}");
+        assert!(text.contains("type into the master terminal"), "{text}");
     }
 
     /// The page's answer to a permission block is always a nudge: the
@@ -698,7 +691,6 @@ mod tests {
         let repo = dir.path();
         crate::cli::block::resolve(
             repo,
-            "codex",
             "push",
             None,
             crate::cli::block::By::Person,
@@ -735,7 +727,7 @@ mod tests {
     fn an_unreadable_block_refuses_the_answer_button_and_says_why() {
         let dir = permission_store(None);
         let repo = dir.path();
-        std::fs::write(repo.join(".clank/agents/codex/blocks/push.attempt"), "torn").unwrap();
+        std::fs::write(repo.join(".clank/blocks/push.attempt"), "torn").unwrap();
         let mut s = two_agent_snap();
         s.blocks = crate::cli::block::scan_blocks(repo);
         let mut slot = opened_from_log(&s, 0);

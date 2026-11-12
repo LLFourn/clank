@@ -443,7 +443,6 @@ struct ReopenInput {
 }
 #[derive(Deserialize)]
 struct BlockInput {
-    agent: String,
     name: String,
     occurrence: Option<String>,
     question: String,
@@ -493,7 +492,6 @@ fn parse_action(path: &str, bytes: &[u8]) -> anyhow::Result<BrowserRequest> {
         "blocks/answer" => {
             let input: BlockInput = serde_json::from_slice(bytes)?;
             BrowserRequest::BlockAnswer {
-                agent: input.agent,
                 name: input.name,
                 occurrence: input.occurrence,
                 question: input.question,

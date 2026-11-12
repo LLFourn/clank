@@ -685,33 +685,17 @@ async fn submit_plan_input(
 /// must be raisable when no plan is open or none exists.
 async fn submit_pause_question(
     buf: &str,
-    snapshot: &StatusSnapshot,
+    _snapshot: &StatusSnapshot,
     repo: &std::path::Path,
 ) -> InputSubmit {
     let text = buf.trim();
     if text.is_empty() {
         return InputSubmit::Stay;
     }
-    let Some(master) = snapshot
-        .agents
-        .iter()
-        .find(|a| matches!(a.role, crate::cli::teams_config::RosterRole::Master))
-    else {
-        return InputSubmit::Failed(
-            "block failed".into(),
-            "no master agent on the roster to author the block".into(),
-        );
-    };
-    // Same core as `clank block ask` (the Blocked hook
-    // fires identically); authored as the MASTER because
-    // blocks live under an agent dir. Fixed name `pause`
-    // keeps re-block idempotent, and blocks are repo-wide,
-    // so there is exactly one.
     let res = crate::cli::block::run(crate::cli::BlockArgs {
         command: crate::cli::BlockCmd::Ask(crate::cli::BlockCreateArgs {
             name: block_page::PAUSE.to_string(),
             message: text.to_string(),
-            author: Some(master.label.clone()),
             repo: Some(repo.to_path_buf()),
             permission: false,
             suggest: None,
@@ -819,10 +803,9 @@ async fn resume_from_pause(
     for b in snapshot
         .blocks
         .iter()
-        .filter(|b| b.answer.is_none() && b.name == block_page::PAUSE)
+        .filter(|b| b.pending() && b.name == block_page::PAUSE)
     {
         crate::cli::block::run_unblock(crate::cli::UnblockArgs {
-            agent: b.agent.clone(),
             name: b.name.clone(),
             message: Some("resumed from clank tui".to_string()),
             nudge: false,
@@ -2597,7 +2580,7 @@ pub(crate) struct Stashed {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct PendingBlock {
-    pub(crate) agent: String,
+    pub(crate) creator: String,
     pub(crate) name: String,
     /// Returned with an answer, so it lands only on the ask shown.
     pub(crate) occurrence: Option<String>,
@@ -2760,9 +2743,9 @@ pub(crate) fn web_facts(
         blocks: snap
             .blocks
             .iter()
-            .filter(|b| b.answer.is_none())
+            .filter(|b| b.pending())
             .map(|b| PendingBlock {
-                agent: b.agent.clone(),
+                creator: b.creator.clone(),
                 name: b.name.clone(),
                 occurrence: b.occurrence.clone(),
                 question: b.question.clone(),
@@ -4117,12 +4100,7 @@ pub(crate) async fn run_tui(
                             rows as usize,
                             cols as usize,
                             |ask, text| {
-                                let to = crate::lifecycle::AgentLabel::parse(&ask.agent)
-                                    .map_err(|e| anyhow::anyhow!("invalid agent label: {e}"))?;
-                                let mut pane = crate::cli::nudge::Pane {
-                                    repo: &repo,
-                                    to: &to,
-                                };
+                                let mut pane = crate::cli::nudge::Pane { repo: &repo };
                                 crate::cli::event_interrupt::blocking(|| {
                                     block_page::answer_in_store(&repo, ask, text, &mut pane)
                                 })
@@ -7900,7 +7878,7 @@ pub(crate) mod tests {
         let mut snap = crate::cli::status_tui::fixtures::snap(None, vec![]);
         snap.blocks = vec![
             crate::cli::block::BlockEntry {
-                agent: "claude".into(),
+                creator: "claude".into(),
                 name: "which".into(),
                 question: "Which option?".into(),
                 answer: None,
@@ -7910,7 +7888,7 @@ pub(crate) mod tests {
                 unreadable: None,
             },
             crate::cli::block::BlockEntry {
-                agent: "codex".into(),
+                creator: "codex".into(),
                 name: "done".into(),
                 question: "Why?".into(),
                 answer: Some("Because".into()),
@@ -7924,7 +7902,7 @@ pub(crate) mod tests {
         assert_eq!(
             facts.ledger.blocks,
             vec![PendingBlock {
-                agent: "claude".into(),
+                creator: "claude".into(),
                 name: "which".into(),
                 occurrence: None,
                 question: "Which option?".into(),

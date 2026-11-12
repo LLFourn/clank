@@ -651,7 +651,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `stash` | Set a plan's commits aside (bare or `push`, like `git stash`) / `pop` restores / `show` / `drop` / `list` |
 | `pick` | Copy plans (commits + files) from another branch (`--from`) |
 | `purge` | Strip a plan's `.clank/` artifacts from history (`--drop` = all of it) |
-| `block` | Questions only the human can answer: an agent's `block ask` (`--permission` for a refused permission, see *Permission blocks*), the human's `block answer` (`--nudge` types the answer into the agent's terminal), and `block clean` to tidy away delivered ones. The wake carrying an answer is its receipt; the agent acknowledges nothing |
+| `block` | Questions only the human can answer: an agent's `block ask` (`--permission` for a refused permission, see *Permission blocks*), the human's `block answer` (`--nudge` types the answer into the agent's terminal), `block list` to inspect decisions, and `block clean` to tidy away delivered ones. The wake carrying an answer is its receipt; the agent acknowledges nothing |
 | `config` | Read/write typed config values (repo or `--global`): `review.adhoc_feedback`, `review.plan_feedback`, `review.require_commit_prefix`, `hooks.blocked`, `diff.editor.command`, `diff.wait`, `finish.autosquash`, `recovery.blind_nudge`, `recovery.stall_warn`, `recovery.stall_nudge` |
 | `export` | Dump the repo's roster config as JSON |
 
@@ -694,6 +694,19 @@ Three levels, for three situations:
   acknowledged, but each attempt and its outcome (`submitted`, refused, or
   indeterminate) is kept in the agent's nudge history.
 
+Blocks belong to the repository. The master asks with
+`clank block ask <name> -m "question"`; the human answers with
+`clank block answer <name> -m "answer"`. Reviewers raise `REQUEST_CHANGES`
+when progress needs to stop; the master decides whether to ask the human.
+A block pauses the repo's review cycle, while messages and events still arrive.
+
+Names are unique across the repository. The original asker is attribution only.
+Answers follow the current master, survive its removal or replacement, and stay
+readable with `clank block list` until `clank block clean` removes settled state.
+Without a master, questions and answers remain stored. Legacy agent-owned blocks
+are migrated with their answers and delivery records; name collisions receive
+stable suffixes, and migration reports the new names.
+
 ### Permission blocks
 
 Some refusals are lifted only by your own message in the agent's terminal:
@@ -706,7 +719,7 @@ turn. A permission block is answered by typing your answer there for you.
   suggestion is the agent's guess at the message that would lift the
   refusal ("yes: push repro-ci-experiment to the fork"). It is stored and
   shown, and never sent unless a person sends it.
-- `clank block answer <agent> <name> --nudge --override-permission-classifier
+- `clank block answer <name> --nudge --override-permission-classifier
   -m "<text>"` types the text
   into the agent's pane as your message, through the same pane discovery,
   input path and nudge history as `clank nudge`, and records the answer
@@ -730,7 +743,7 @@ turn. A permission block is answered by typing your answer there for you.
   block unresolved: `status`, the TUI and `status -j` show "nudge outcome
   unknown: <reason>" with the text and when it was typed. Nothing resends
   it, and every other answer is refused until you settle it:
-  `clank block answer <agent> <name> --delivered` if you saw the text
+  `clank block answer <name> --delivered` if you saw the text
   arrive (it is recorded, nothing is typed), or `--nudge --resend -m
   "<text>"` if it did not, or a duplicate is acceptable (each with
   `--override-permission-classifier` on a permission block).
@@ -1236,12 +1249,10 @@ whether a pending block withholds it, since when it has been owed, and
 whether it reached the session bound now. An agent that is owed something is
 always in one of four cases, and `clank status` says which:
 
-1. **Hands off, with the reason.** Auto-mode is off, the agent's own
-   question or block is pending, it is attending work, its turn was
-   interrupted, or clank has no nudge to send (`not nudged: …`, `waiting
-   for you`). Another agent's block is not a reason: it withholds the
-   review cycle from what is owed, and an event or message is owed all the
-   same.
+1. **Hands off, with the reason.** Auto-mode is off, the agent has an open
+   harness question, it is attending work, its turn was interrupted, or clank
+   has no nudge to send (`not nudged: …`, `waiting for you`). A repository
+   block withholds review work; unrelated events and messages remain owed.
 2. **Being delivered.** A wake has been handed to the agent's hook, which
    has a minute to answer for it. After that it was not delivered.
 3. **Working.** Its turn has not ended and has been silent for less than

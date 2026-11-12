@@ -1382,7 +1382,6 @@ fn an_answered_block_never_holds_finish() {
             command: clank::cli::BlockCmd::Ask(clank::cli::BlockCreateArgs {
                 name: name.into(),
                 message: "Which API shape?".into(),
-                author: Some("claude".into()),
                 repo: Some(repo.to_path_buf()),
                 permission: false,
                 suggest: None,
@@ -1393,7 +1392,6 @@ fn an_answered_block_never_holds_finish() {
     };
     let answer = |name: &str| {
         block_on(clank::cli::block::run_unblock(clank::cli::UnblockArgs {
-            agent: "claude".into(),
             name: name.into(),
             message: Some("the second".into()),
             nudge: false,

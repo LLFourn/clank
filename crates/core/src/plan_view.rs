@@ -24,7 +24,7 @@ pub struct WorktreeFacts {
 /// agent that CREATED the block, not "an agent" generically.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanBlock {
-    pub creator: AgentLabel,
+    pub creator: String,
     pub name: String,
     pub message: String,
 }

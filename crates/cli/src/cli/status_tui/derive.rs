@@ -36,7 +36,7 @@ pub(super) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
         .active_plan
         .as_ref()
         .is_some_and(|v| matches!(v.waiting_on, WaitingOn::Blocked { .. }))
-        || snap.blocks.iter().any(|b| b.answer.is_none());
+        || snap.blocks.iter().any(|b| b.pending());
     if blocked {
         return AttentionState::Blocked;
     }
@@ -251,7 +251,7 @@ pub(super) fn work_projection(snap: &StatusSnapshot) -> clank_core::wait::WorkSt
 /// unless a pending block stops it. Blocks are repo-wide, so one pending
 /// block stops the whole queue.
 pub(super) fn promotable(snap: &StatusSnapshot) -> Option<&crate::cli::status::QueueItemView> {
-    if snap.active_plan.is_some() || snap.blocks.iter().any(|b| b.answer.is_none()) {
+    if snap.active_plan.is_some() || snap.blocks.iter().any(|b| b.pending()) {
         return None;
     }
     snap.queue.first()
@@ -459,7 +459,7 @@ mod tests {
         );
         assert_eq!(owes(&s, "codex").text(), None);
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "codex".into(),
+            creator: "codex".into(),
             name: "scope".into(),
             occurrence: Some("01".into()),
             kind: crate::cli::block::Stored::Valid(Default::default()),
@@ -697,7 +697,7 @@ mod tests {
         // Blocked: an unanswered block dominates even with no plans.
         let mut s = snap(None, vec!["queued"]);
         s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "q".into(),
             question: "halt?".into(),
             answer: None,
@@ -720,7 +720,7 @@ mod tests {
     fn rendered_branches() -> Vec<(&'static str, StatusSnapshot)> {
         let mut blocked = snap(None, vec!["queued"]);
         blocked.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "q".into(),
             question: "halt?".into(),
             answer: None,
@@ -851,7 +851,7 @@ mod tests {
         // ...but a human block still outranks the correction.
         let mut blocked = s;
         blocked.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
+            creator: "claude".into(),
             name: "q".into(),
             question: "halt?".into(),
             answer: None,

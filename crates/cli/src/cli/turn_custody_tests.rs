@@ -1531,7 +1531,7 @@ fn a_grok_handoff_is_answered_without_waiting_for_a_fold() {
 
 fn ask_and_answer(repo: &Path, who: &str, name: &str, question: &str, answer: &str) {
     crate::cli::block::ask(repo, &label(who), name, question).unwrap();
-    crate::cli::block::answer_block(repo, who, name, answer, None).unwrap();
+    crate::cli::block::answer_block(repo, name, answer, None).unwrap();
 }
 
 /// What the monitor would owe `who` from its blocks right now.
@@ -1539,8 +1539,8 @@ fn owed_blocks(repo: &Path, who: &str) -> Vec<clank_core::wait::WaitItem> {
     crate::cli::wait::block_items(repo, &label(who))
 }
 
-fn receipt_marker(repo: &Path, who: &str, name: &str) -> PathBuf {
-    crate::agent_store::agents_root(repo).join(format!("{who}/unblocks/{name}.received"))
+fn receipt_marker(repo: &Path, name: &str) -> PathBuf {
+    repo.join(format!(".clank/unblocks/{name}.received"))
 }
 
 fn idle_stop() -> Report {
@@ -1572,7 +1572,7 @@ async fn a_delivered_answer_is_received_and_not_presented_again() {
     assert!(text.contains("unblocked: q: yes"), "{text}");
     assert!(!text.contains("block clean"), "{text}");
     commit.expect("a delivery commits").run(repo.path()).await;
-    assert!(receipt_marker(repo.path(), "claude", "q").exists());
+    assert!(receipt_marker(repo.path(), "q").exists());
     assert!(owed_blocks(repo.path(), "claude").is_empty());
 
     let mut restarted = Turns::new(repo.path().to_path_buf());
@@ -1608,7 +1608,7 @@ async fn an_answer_whose_presentation_failed_stays_owed() {
     let unanswered = turns.answer(&author, 2, &idle_stop(), true, &g).unwrap();
     assert!(unanswered.presentation().is_some());
     turns.closed(&author, 2, &g);
-    assert!(!receipt_marker(repo.path(), "claude", "q").exists());
+    assert!(!receipt_marker(repo.path(), "q").exists());
     let again = owed_blocks(repo.path(), "claude");
     assert!(
         matches!(
@@ -1636,7 +1636,7 @@ async fn an_answer_delivered_to_a_replaced_session_stays_owed() {
     )
     .unwrap();
     commit.unwrap().run(repo.path()).await;
-    assert!(!receipt_marker(repo.path(), "claude", "q").exists());
+    assert!(!receipt_marker(repo.path(), "q").exists());
     assert_eq!(owed_blocks(repo.path(), "claude").len(), 1);
 }
 
@@ -1654,8 +1654,8 @@ async fn only_the_presented_answer_is_received() {
         "{text}"
     );
     commit.unwrap().run(repo.path()).await;
-    assert!(receipt_marker(repo.path(), "claude", "first").exists());
-    assert!(!receipt_marker(repo.path(), "claude", "second").exists());
+    assert!(receipt_marker(repo.path(), "first").exists());
+    assert!(!receipt_marker(repo.path(), "second").exists());
     let (frame, _) = present_owed(&mut turns, repo.path(), 2);
     assert!(frame.rendered.unwrap().contains("unblocked: second: no"));
 }
@@ -1673,11 +1673,13 @@ async fn a_late_receipt_after_identical_reuse_receives_nothing() {
         let first_owed = owed_blocks(repo.path(), "claude");
         let (_, commit) = present_owed(&mut turns, repo.path(), 1);
         let late = commit.expect("delivered");
+        // Another delivery receives the first occurrence before its name is reused.
+        crate::cli::block::test_receive(repo.path(), "q");
 
         ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
         match interleave {
             "clean" => {
-                crate::cli::block::clean(repo.path(), &label("claude")).unwrap();
+                crate::cli::block::clean(repo.path()).unwrap();
             }
             "restart" => turns = Turns::new(repo.path().to_path_buf()),
             _ => {}
@@ -1693,10 +1695,7 @@ async fn a_late_receipt_after_identical_reuse_receives_nothing() {
         );
 
         late.run(repo.path()).await;
-        assert!(
-            !receipt_marker(repo.path(), "claude", "q").exists(),
-            "{interleave}"
-        );
+        assert!(!receipt_marker(repo.path(), "q").exists(), "{interleave}");
         assert_eq!(
             owed_blocks(repo.path(), "claude"),
             second_owed,

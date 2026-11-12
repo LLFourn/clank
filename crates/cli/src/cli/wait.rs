@@ -795,8 +795,8 @@ struct ObserverBaseline {
     head: Option<CommitSha>,
     /// Every (plan, finalize sha) pair already in history.
     finalized: std::collections::BTreeSet<(PlanKey, CommitSha)>,
-    /// Unanswered (agent, name) blocks already pending.
-    unanswered_blocks: std::collections::BTreeSet<(String, String)>,
+    /// Unanswered repository block names already pending.
+    unanswered_blocks: std::collections::BTreeSet<String>,
 }
 
 impl ObserverBaseline {
@@ -809,8 +809,8 @@ impl ObserverBaseline {
             .collect();
         let unanswered_blocks = scan_blocks(repo)
             .into_iter()
-            .filter(|b| b.answer.is_none())
-            .map(|b| (b.agent, b.name))
+            .filter(|b| b.pending())
+            .map(|b| b.name)
             .collect();
         Self {
             head: state.head.clone(),
@@ -854,15 +854,8 @@ fn observe_events(
             }
             if event == WaitFor::Stopped {
                 for b in scan_blocks(repo) {
-                    if b.answer.is_none()
-                        && !baseline
-                            .unanswered_blocks
-                            .contains(&(b.agent.clone(), b.name.clone()))
-                    {
-                        items.push(WaitItem::ForBlocked {
-                            agent: b.agent,
-                            name: b.name,
-                        });
+                    if b.pending() && !baseline.unanswered_blocks.contains(&b.name) {
+                        items.push(WaitItem::ForBlocked { name: b.name });
                     }
                 }
             }
@@ -1219,12 +1212,11 @@ pub(crate) fn admitted_for(
     })
 }
 
-/// The pending block `author` itself raised, by name: its own question to
-/// a person.
-pub(crate) fn own_block(repo: &Path, author: &AgentLabel) -> Option<String> {
+/// A repository question still awaiting the human.
+pub(crate) fn repo_block(repo: &Path) -> Option<String> {
     scan_blocks(repo)
         .into_iter()
-        .find(|b| b.answer.is_none() && b.agent == author.as_str())
+        .find(|b| b.pending())
         .map(|b| b.name)
 }
 
@@ -2500,11 +2492,10 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     };
 
     for b in &scan_blocks(repo) {
-        if b.answer.is_some() {
+        if !b.pending() {
             continue;
         }
         result.items.push(WaitItem::Blocked {
-            agent: b.agent.clone(),
             name: b.name.clone(),
             question: b.question.clone(),
         });
@@ -2648,11 +2639,8 @@ fn admit(br: BlockResult, owed: impl FnOnce() -> Owed) -> Vec<Admitted> {
         .items
         .iter()
         .filter_map(|i| match i {
-            WaitItem::Blocked { agent, name, .. } => Some(crate::cli::block::key(agent, name)),
-            WaitItem::Unblocked { carries, .. } => Some(crate::cli::block::key(
-                carries.agent.as_str(),
-                &carries.name,
-            )),
+            WaitItem::Blocked { name, .. } => Some(crate::cli::block::key(name)),
+            WaitItem::Unblocked { carries, .. } => Some(crate::cli::block::key(&carries.name)),
             _ => None,
         })
         .collect();
@@ -2883,13 +2871,9 @@ pub(crate) enum WaitJsonItem<'a> {
         sha: &'a str,
     },
     #[serde(rename = "for_blocked")]
-    ForBlocked { agent: &'a str, name: &'a str },
+    ForBlocked { name: &'a str },
     #[serde(rename = "blocked")]
-    Blocked {
-        agent: &'a str,
-        name: &'a str,
-        question: &'a str,
-    },
+    Blocked { name: &'a str, question: &'a str },
     #[serde(rename = "unblocked")]
     Unblocked {
         name: &'a str,
@@ -3041,16 +3025,8 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             plan_path: plan_path(plan),
             sha: sha.as_str(),
         },
-        WaitItem::ForBlocked { agent, name } => WaitJsonItem::ForBlocked { agent, name },
-        WaitItem::Blocked {
-            agent,
-            name,
-            question,
-        } => WaitJsonItem::Blocked {
-            agent,
-            name,
-            question,
-        },
+        WaitItem::ForBlocked { name } => WaitJsonItem::ForBlocked { name },
+        WaitItem::Blocked { name, question } => WaitJsonItem::Blocked { name, question },
         WaitItem::Unblocked { answer, carries } => WaitJsonItem::Unblocked {
             name: &carries.name,
             answer,
@@ -3237,17 +3213,16 @@ fn render_human(item: &WaitItem) -> String {
                 sha = short(sha),
             )
         }
-        WaitItem::ForBlocked { agent, name } => {
-            format!("for-blocked   {agent}/{name}  (awaiting human)")
+        WaitItem::ForBlocked { name } => {
+            format!("for-blocked   {name}  (awaiting human)")
         }
         WaitItem::Blocked {
-            agent,
             name,
             // The question is for the HUMAN (who reads the block
             // elsewhere); the woken agent only needs "not your
             // move". It stays a json field.
             question: _,
-        } => format!("blocked  {agent}/{name}  (awaiting human)"),
+        } => format!("blocked  {name}  (awaiting human)"),
         WaitItem::Unblocked { answer, carries } => {
             format!("answer   {}  {answer}", carries.name)
         }
@@ -4781,7 +4756,6 @@ mod tests {
         clank_core::wait::WaitItem::Unblocked {
             answer: answer.into(),
             carries: clank_core::wait::AnswerRef {
-                agent: clank_core::AgentLabel::parse("claude").unwrap(),
                 name: name.into(),
                 occurrence: Some("0123456789abcdef0123456789abcdef".into()),
                 question_digest: "qd".into(),
@@ -6766,7 +6740,6 @@ mod tests {
     fn a_block_withholds_the_review_cycle_and_delivers_the_events() {
         let blocked = || BlockResult {
             items: vec![WaitItem::Blocked {
-                agent: "m".into(),
                 name: "q".into(),
                 question: "why?".into(),
             }],
@@ -7008,7 +6981,6 @@ mod tests {
         let out = decide(
             BlockResult {
                 items: vec![WaitItem::Blocked {
-                    agent: "m".into(),
                     name: "q".into(),
                     question: "why?".into(),
                 }],
@@ -7183,7 +7155,7 @@ mod tests {
         assert!(
             matches!(
                 br.items.as_slice(),
-                [WaitItem::Blocked { agent, name, .. }] if agent == "claude" && name == "q"
+                [WaitItem::Blocked { name, .. }] if name == "q"
             ),
             "expected the pending block surfaced as context, got {:?}",
             br.items
@@ -7194,6 +7166,7 @@ mod tests {
     fn answered_block_returns_unblocked_and_stops_there() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
+        crate::cli::block::test_master(repo, &AgentLabel::parse("claude").unwrap());
         let agent = repo.join(".clank/agents/claude");
         std::fs::create_dir_all(agent.join("blocks")).unwrap();
         std::fs::create_dir_all(agent.join("unblocks")).unwrap();
@@ -7206,7 +7179,7 @@ mod tests {
         // The flat answer path: written where the flat reader looks.
         // A split landing (reader flat, writer scoped) would leave the
         // pair unmatched and park the repo forever.
-        crate::cli::block::answer_block(repo, "claude", "q", "because", None).unwrap();
+        crate::cli::block::answer_block(repo, "q", "because", None).unwrap();
 
         let br = check_blocks(repo, &AgentLabel::parse("claude").unwrap());
 
@@ -7246,7 +7219,7 @@ mod tests {
         .unwrap();
         crate::agent_store::set_auto_mode(dir.path(), &author, clank_core::AutoMode::On).unwrap();
         crate::cli::block::ask(dir.path(), &author, "q", "Proceed?").unwrap();
-        crate::cli::block::answer_block(dir.path(), "grok", "q", "yes", None).unwrap();
+        crate::cli::block::answer_block(dir.path(), "q", "yes", None).unwrap();
         let binding = WaitBinding(
             Some((clank_core::Tool::Grok, session)),
             WaitPolicy::AutomaticGrok { home: None },
@@ -7255,7 +7228,7 @@ mod tests {
     }
 
     fn received(repo: &Path) -> bool {
-        repo.join(".clank/agents/grok/unblocks/q.received").exists()
+        repo.join(".clank/unblocks/q.received").exists()
     }
 
     struct Broken;
@@ -7527,7 +7500,6 @@ mod tests {
         .unwrap();
         assert_eq!(j["sha"].as_str().unwrap().len(), 40, "full sha in json");
         let j = serde_json::to_value(render_json(&WaitItem::Blocked {
-            agent: "claude".into(),
             name: "q".into(),
             question: "should we?".into(),
         }))
@@ -7701,14 +7673,12 @@ mod tests {
             ),
             (
                 serde_json::to_value(render_json(&WaitItem::Blocked {
-                    agent: "claude".into(),
                     name: "q".into(),
                     question: "should we?".into(),
                 }))
                 .unwrap(),
                 serde_json::json!({
                     "kind": "blocked",
-                    "agent": "claude",
                     "name": "q",
                     "question": "should we?",
                 }),
@@ -7720,7 +7690,6 @@ mod tests {
                     "name": "q",
                     "answer": "yes",
                     "carries": {
-                        "agent": "claude",
                         "name": "q",
                         "occurrence": "0123456789abcdef0123456789abcdef",
                         "question_digest": "qd",
@@ -7775,18 +7744,12 @@ mod tests {
             format!("for-finished  foo  {}", short(&sha("abc")))
         );
 
-        let blocked = WaitItem::ForBlocked {
-            agent: "codex".into(),
-            name: "q".into(),
-        };
+        let blocked = WaitItem::ForBlocked { name: "q".into() };
         assert_eq!(
             serde_json::to_value(render_json(&blocked)).unwrap(),
-            serde_json::json!({ "kind": "for_blocked", "agent": "codex", "name": "q" })
+            serde_json::json!({ "kind": "for_blocked", "name": "q" })
         );
-        assert_eq!(
-            render_human(&blocked),
-            "for-blocked   codex/q  (awaiting human)"
-        );
+        assert_eq!(render_human(&blocked), "for-blocked   q  (awaiting human)");
     }
 
     #[test]

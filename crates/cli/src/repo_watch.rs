@@ -30,6 +30,8 @@ pub const CLANK_WAKE_DIRS: &[&str] = &[
     "plans",
     "queue",
     "blocks",
+    "unblocks",
+    "block-migration.json",
     "agents", // agents/<label>/feedback — the gate signal
     "finished",
     "config.json",

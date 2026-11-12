@@ -275,7 +275,6 @@ async fn inspecting_an_answer_receives_nothing() {
         command: clank::cli::BlockCmd::Ask(clank::cli::BlockCreateArgs {
             name: "current".into(),
             message: "and this?".into(),
-            author: Some("master".into()),
             repo: Some(repo.to_path_buf()),
             permission: false,
             suggest: None,
@@ -285,7 +284,6 @@ async fn inspecting_an_answer_receives_nothing() {
     .await
     .unwrap();
     clank::cli::block::run_unblock(clank::cli::UnblockArgs {
-        agent: "master".into(),
         name: "current".into(),
         message: Some("no".into()),
         nudge: false,

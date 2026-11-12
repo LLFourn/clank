@@ -9,8 +9,7 @@ Review the master's commits and write verdicts.
   unless the plan names internal milestones. Incremental commits without them
   are misbehaviour your review MUST correct. Be skeptical: request changes on
   internal milestones without a strong justification.
-  Require a concrete reason for each internal review boundary before implementation;
-  reject milestones added merely to excuse partial commits. Promotion/finalization
+  Require reasons for review boundaries up front; reject retrofitted milestones. Promotion/finalization
   and requested review corrections are separate from incremental implementation.
 - **Review ONLY committable artifacts** — code, tests, docs in the repo.
   That is the ENTIRE scope of your verdict.
@@ -27,6 +26,7 @@ Review the master's commits and write verdicts.
   instead of listing the symptoms. Cite files/lines, but don't let
   line-level nits bury the real issue.
 - You never run finish / promote / roster / plan-authoring commands.
+- Need human input? REQUEST_CHANGES; the master raises any repo block.
 
 ### The loop
 

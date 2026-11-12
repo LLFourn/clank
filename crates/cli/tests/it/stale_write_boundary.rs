@@ -76,11 +76,6 @@ const UNGATED: &[(&str, &str, &str)] = &[
         "OWN: opens the roster lock file; the roster is saved through repo_config, which asks",
     ),
     (
-        "cli/block.rs",
-        "run_migrate",
-        "ONE-SHOT: `clank block migrate`",
-    ),
-    (
         "cli/claude_trust.rs",
         "*",
         "ONE-SHOT: launch-time trust of Claude's own config, under its own lock",

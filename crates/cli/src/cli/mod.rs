@@ -1848,11 +1848,13 @@ pub struct BlockArgs {
 pub enum BlockCmd {
     /// Ask the human a question, and wait for the answer
     Ask(BlockCreateArgs),
-    /// Answer an agent's question
+    /// Answer a repository question
     Answer(UnblockArgs),
-    /// Tidy away this agent's received answers and leftover answer files.
+    /// Tidy away settled repository questions and leftover answer files.
     Clean(BlockCleanArgs),
-    /// Flatten legacy plan-scoped blocks to the repo-wide layout.
+    /// Read repository questions and answers, including received decisions.
+    List(BlockCleanArgs),
+    /// Migrate legacy agent and plan-scoped blocks to repository storage.
     #[command(hide = true)]
     Migrate(BlockMigrateArgs),
 }
@@ -1873,9 +1875,6 @@ pub struct BlockCreateArgs {
     /// Question or reason for the block. `-m -` reads it from stdin.
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
-    /// Agent label. Resolved from env when omitted.
-    #[arg(long, value_name = "AGENT")]
-    pub author: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// A permission block: something you need was refused, and only the
@@ -1971,8 +1970,6 @@ pub struct AttendArgs {
 
 #[derive(Args, Debug)]
 pub struct UnblockArgs {
-    /// Agent that is blocked.
-    pub agent: String,
     /// Block name to answer.
     pub name: String,
     /// Answer message. `-m -` reads it from stdin.
