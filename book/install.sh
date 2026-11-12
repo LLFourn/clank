@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://llfourn.github.io/clank/install.sh | sh
 #
-# CLANK_VERSION=0.1.0 installs that release instead of the latest.
+# CLANK_VERSION=0.2.0 installs that release instead of the latest.
 # CLANK_INSTALL_DIR=<dir> installs there instead of ~/.local/bin.
 #
 # Test-only, for the installer's own tests: CLANK_RELEASE_BASE and

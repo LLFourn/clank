@@ -12,8 +12,8 @@ include = ["/src/**", "/assets/**", "/LICENSE"]
 test-support = []
 
 [dependencies]
-clank-web = { path = "../web", version = "0.1.0" }
-clank-user-config = { path = "../user-config", version = "0.1.0" }
+clank-web = { path = "../web", version = "0.2.0" }
+clank-user-config = { path = "../user-config", version = "0.2.0" }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"

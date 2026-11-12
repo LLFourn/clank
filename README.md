@@ -79,7 +79,7 @@ curl -fsSL https://llfourn.github.io/clank/install.sh | sh
 It verifies the archive against the release's `SHA256SUMS` before it
 installs anything, and puts `clank` and `clank-web-cloudflare` in
 `~/.local/bin` (`CLANK_INSTALL_DIR` overrides it), saying so if that
-directory is not on your `$PATH`. `CLANK_VERSION=0.1.0` pins a release;
+directory is not on your `$PATH`. `CLANK_VERSION=0.2.0` pins a release;
 otherwise it installs the latest. Release binaries exist for:
 
 - macOS on Apple silicon (`aarch64-apple-darwin`) and Intel

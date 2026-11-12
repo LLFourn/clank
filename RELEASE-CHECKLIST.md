@@ -1,320 +1,89 @@
 # Release checklist
 
-What has to happen before clank's first public release. Verified against
-the source and `clank --help` at `5681c4bc`, 2026-10-27. Every unchecked
-item is queueable as written: plan name, problem, shape of the fix.
-"Unverified" means nobody ran the check; it is not evidence either way.
+Current preparation: **v0.2.0**, 2026-11-12. This is the first published release;
+0.1.0 was a development version, not a published tag. Earlier planning details
+and implementation evidence remain in `.clank/finished/`.
 
-## 0. Decisions (made by Lloyd, 2026-11-05)
+## Release policy
 
-- **Channels.** These two:
-  - prebuilt binaries on GitHub Releases;
-  - a `curl | sh` installer served from the website, which fetches
-    those binaries.
+- Publish prebuilt binaries on GitHub Releases; serve the checksum-verifying
+  installer from GitHub Pages at `llfourn.github.io/clank/install.sh`.
+- Ship macOS and Linux, arm64 and x86_64, with both `clank` and its sibling
+  `clank-web-cloudflare`. Linux uses static musl and requires Linux 5.3 or newer.
+- No Windows, crates.io or Homebrew release. The crates.io name belongs to an
+  unrelated project; installing this checkout through Cargo remains supported.
+- Licence: 0BSD. macOS binaries are unsigned and not notarized; README installation
+  guidance explains the Gatekeeper distinction for browser downloads.
+- Publish a plain `vMAJOR.MINOR.PATCH` tag once, at the exact reviewed commit whose
+  CI passed. Never move a published version tag to repair a failed release.
 
-  No Homebrew yet. The website is GitHub Pages
-  (`llfourn.github.io/clank`), built from `book/`; no custom domain yet.
-- **Platforms.** macOS and Linux binaries, for arm64 and x86_64 on each.
-  Windows is a non-goal: the code is unix-only, with `cfg(not(unix))`
-  stubs.
-- **Licence.** 0BSD (§1 `license-and-attribution`).
-- **Supported harness versions.** Claude Code, Codex, Grok and OpenCode.
-  The versions claimed are the ones the first-run walk passes (see the
-  table in §1 `first-run-walk-per-harness`).
-- **Hidden aliases.** Removed before the first release
-  (§1 `retire-hidden-aliases`).
-- **The book.** Hosted as the website on GitHub Pages. It rebuilds only
-  when `book/` changes, and carries a CLI reference generated from the
-  clap definitions (§2 `website-on-github-pages`).
+## Implemented release infrastructure
 
-## 1. Release blockers: every channel
+- [x] **Licence and attribution.** Workspace licence/repository metadata,
+  `LICENSE`, `THIRD-PARTY-NOTICES.md` and generated Rust dependency notices ship
+  with the binaries. CI checks licences and notice freshness.
+- [x] **Linux CI.** Pushes and pull requests run formatting, strict Clippy,
+  fixture-based tests, maintenance tests, workflow linting and licence checks.
+  Each test run isolates its runtime and clears inherited session identities.
+  A separate job checks the release validator from a production-only Cargo cache.
+- [x] **Versions and changelog.** Workspace and internal dependencies use 0.2.0.
+  `scripts/release-check.sh` requires matching tag, Cargo version, binary version
+  and changelog section. The release notes come from `CHANGELOG.md`.
+- [x] **Durable configuration and upgrades.** Versioned config boundaries reject
+  malformed or unsupported documents instead of silently applying defaults.
+  Monitors and other long-lived processes retire on build replacement. Repository
+  blocks migrate legacy state with occurrence and delivery evidence preserved.
+- [x] **Post-rewrite hooks.** Init and doctor share Git's effective hook location;
+  plain hooks can be chained, managed/symlinked hooks are left alone.
+- [x] **Security work.** `SECURITY.md` documents the threat model and residual
+  risks. Remote tokens use the macOS keychain or a private Linux file, with
+  conflict-aware migration; the remote remains opt-in. Same-user processes are
+  not a security boundary, and external event text remains untrusted input.
+- [x] **Website and reference.** The Pages workflow publishes `book/`, including
+  the installer. Generated CLI reference freshness is checked by tests.
+- [x] **Release binaries and installer.** The Release workflow builds and
+  smoke-tests the four targets natively, checks versions, packages both binaries,
+  requires the complete archive set, creates `SHA256SUMS`, and publishes last.
+  Installer fixtures cover platform selection, checksums and custom destinations.
+- [x] **Runtime exercised during development.** Event-driven local monitoring,
+  attended background work, master-following event sources, repo-wide blocks and
+  test-fixture cleanup have passed their plan reviews. This is development and
+  automated-test evidence, not a substitute for the clean-account walks below.
 
-- [x] **`license-and-attribution`** — done 2026-11-05:
-  - `LICENSE` is 0BSD, "Copyright (c) 2026 Lloyd Fourn". Every
-    `crates/*/Cargo.toml` takes `license` and `repository` from
-    `[workspace.package]` and has its own `description`
-    (`it/workspace_licence.rs` reads them from `cargo metadata`).
-  - `crates/cli/notices/rust-dependencies.txt` is generated by
-    cargo-about 0.9.3 (`scripts/notices/`), offline from `Cargo.lock`,
-    for the four release targets, normal dependencies only: 365
-    packages, each with its crates.io source, declared licence, the
-    branch used, and its licence texts with their copyright lines.
-    It carries `cloudflare-quick-tunnel`'s `THIRD_PARTY_NOTICES.md`
-    and the MPL-2.0 source URL for `uluru`. `wincode` and
-    `wincode-derive` ship no licence file, so they get the standard
-    Apache-2.0 text.
-  - `THIRD-PARTY-NOTICES.md` copies the licence of every vendored asset
-    in `crates/web/assets/vendor/`, `book/fonts/` and
-    `book/vendor/asciinema-player/`.
-  - The hidden `clank licenses` prints `LICENSE` and both notices,
-    embedded in the binary. `cli::licenses` tests check every vendored
-    file against the notice, plus Tokio's MIT copyright,
-    `unicode-ident`'s `MIT AND Unicode-3.0`, and `uluru`'s MPL-2.0 text
-    and source URL.
-  - CI installs pinned cargo-deny 0.20.2 and cargo-about, then runs
-    `cargo deny --locked check licenses` (`deny.toml`, the same allow
-    list as `about.toml`) and `scripts/notices/check.sh`
-    (`it/ci_workflow.rs` requires both steps and the pinned cargo-about
-    install). `check.sh` fails when a
-    package is dropped from the notice, and when a scratch
-    `Cargo.lock` bumps `smallvec` 1.16.1 → 1.16.4 (an allowed licence).
-  - `cargo package -p clank --list` includes `LICENSE`,
-    `THIRD-PARTY-NOTICES.md` and `notices/rust-dependencies.txt`
-    (`it/workspace_licence.rs`);
-    `clank-web` and `clank-web-cloudflare` include `LICENSE`.
+## Verification not claimed
 
-- [ ] **`ci-gates-every-push`** — split by platform:
-  - [x] **Linux workflow implemented** (`.github/workflows/ci.yml`): one
-    `ubuntu-latest` x86_64 job on push and pull request. It provisions
-    git, Node and a C compiler (`rquickjs`, a dev-dependency in
-    crates/cli/Cargo.toml), installs the toolchain pinned in
-    `rust-toolchain.toml`, caches the registry and `target/`, and runs
-    `cargo fmt --all --check`, `cargo clippy --locked --workspace
-    --all-targets -- -D warnings`, `cargo test --locked -p clank --lib`,
-    `cargo test --locked -p clank --test it` and `cargo test --locked
-    --workspace --exclude clank`.
-  - [x] **Linux validated.** Green on 9dfe92be, 2026-10-28:
-    https://github.com/LLFourn/clank/actions/runs/40639544610. The first
-    three runs found what only Linux showed: two fixtures with no git
-    identity, two tests reading the developer's `~/.clank/config.json` or
-    PATH, and a monitor hang-up that Linux delivers as a reset.
-  - [ ] macOS and other platforms: no CI job (macOS runners cost about
-    10x as much).
+- [ ] **Clean first run per harness.** The procedure is
+  `docs/first-run-walk.md`; results live in `docs/harness-support.toml`.
+  No clean-account walk or complete native acceptance set is recorded as passed
+  for Claude Code, Codex, Grok or OpenCode. OpenCode has no native acceptance test
+  yet. The README therefore says "not yet tested" for each harness.
+- [ ] **Full macOS CI matrix.** Routine automated CI runs on Linux. macOS is used
+  for development and local checks; release runners build and smoke-test the
+  executables, rather than running the full suite on all four targets.
+- [ ] **macOS signing/notarization.** Not provided for this release.
+- [ ] **Real keychain reinstall prompt behavior.** Tests use isolated stores;
+  whether macOS asks again after a reinstall remains unverified.
 
-  Rules the workflow keeps:
-  - No silent green. `opencode_plugin_lifecycle.rs:14-24` fails when Node
-    is missing unless `CLANK_SKIP_NODE_HARNESS=1` is set. CI provisions
-    Node and never sets that variable (`it/ci_workflow.rs` fails if the
-    workflow names it).
-  - Every test step unsets each variable in
-    `agent_env::SESSION_IDENTITY_VARS`. The harness reads them and fails
-    ownership checks when they are set. `it/ci_workflow.rs` holds the
-    workflow's list to the Rust one.
-  - `#[ignore]` tests are deliberate opt-outs and do not run in this job:
-    the live tunnel tests (`web-cloudflare/src/tunnel.rs:1068,1232,1262`)
-    and the installed-harness acceptance tests
-    (`it/claude_question_protocol.rs:7`, `it/codex_question_protocol.rs:337`,
-    `cli/grok_setup_tests.rs:338`, `cli/grok_launch_tests.rs:342`,
-    `cli/web/claude_questions.rs:805`). The job summary lists every
-    ignored test as not run; it never counts them as passed.
-  - Excluded from CI, run by hand in the release step instead:
-    `scripts/book/test_record.py` tests the book's screencast recorder,
-    a release tool for `book/` rather than clank itself; and
-    `scripts/check-timeline-ui.cjs` needs Playwright and a Chromium
-    download, which this job does not provision.
-  - The toolchain is pinned (`rust-toolchain.toml`, 1.99.1) and every
-    manifest declares `rust-version = "1.96"`. 1.96 is the dependency
-    floor (`kstring` 2.0.5, `oxc_*` 0.151 declare it); the whole
-    workspace, all targets, checks on 1.96.0, and 1.95.0 is refused
-    (2026-10-28).
+Ignored live tunnel and installed-harness tests are reported as not run, never
+counted as passes. These limitations remain documented in the release notes and
+support record; they do not become successful checks merely because a tag exists.
 
-- [x] **`version-tags-and-changelog`** — done 2026-11-05:
-  - Releases are tagged `v<semver>`, and the first is `v0.1.0`.
-  - Every crate takes `version` from `[workspace.package]` (0.1.0), and
-    the inter-crate path dependencies carry `version = "0.1.0"`.
-  - `CHANGELOG.md` is in Keep a Changelog form, with `Unreleased` above
-    `0.1.0`.
-  - `scripts/release-check.sh <tag> [binary]`:
-    - accepts only a plain `vMAJOR.MINOR.PATCH` tag;
-    - requires the tag to equal the version the `clank` crate declares;
-    - builds clank unless given a binary, taking the executable path from
-      Cargo's own artifact report, so `CARGO_TARGET_DIR` and a configured
-      target directory are honoured;
-    - requires `clank --version` to print exactly `clank <version>`;
-    - requires `CHANGELOG.md` to have that version's section.
-  - Tests: `it/release_check.rs` covers a tag the crate doesn't declare,
-    an off-tag build, a dirty build, malformed tags and tags with a
-    development suffix, a missing changelog section, and a stale binary
-    at the default path while Cargo builds elsewhere. The build-stamp
-    tests cover a `v0.1.0` tag.
+## v0.2.0 publication run
 
-- [ ] **`durable-formats-survive-upgrade`** — the formats that live across
-  releases: `.clank/config.json` and `~/.clank/config.json`, the
-  `.clank/` tree (plans, finished, agents/*/feedback, inbox, events,
-  blocks), installed hooks and skills, and running monitors. Some of this
-  is handled already:
-  - Monitors retire when a different build is installed
-    (`cli/monitor_keeper.rs:3`, a5004481). `clank monitor upgrade`
-    (hidden) moves monitors that predate retirement.
-  - The monitor protocol is versioned (`cli/monitor.rs:47`, `PROTO = 19`),
-    and so is the state cache (`state_cache.rs:163`).
-  - Agent launch repairs missing or older setup (d30bfc34).
+These operations follow review/finalization of the preparation commit. Record
+actual results in the release handoff, rather than checking them off in advance.
 
-  Still missing:
-  - The config files have no schema version.
-  - A config layer that fails to parse is skipped with a warning on
-    stderr (`cli/config.rs:413-418`; shown by default through the
-    `clank=info,warn` filter in `main.rs:23-31`), and the command carries
-    on. After an upgrade an invalid layer leaves inherited or default
-    settings in effect while the command succeeds. Shape: a layer that
-    fails to parse fails the command, and `clank doctor` reports it.
-  - Migrations are one-offs: `inbox::migrate` (`inbox.rs:360`), the hidden
-    `block migrate`, `migrate_claude_perms` (`cli/init.rs:417`), and
-    setup's hook migration.
+- [ ] Push the reviewed commit to `origin/master` without rewriting history.
+- [ ] Require successful CI for that exact commit before pushing `v0.2.0`.
+- [ ] Confirm the Release workflow built all four archives and published the
+  release with the expected changelog notes and `SHA256SUMS`.
+- [ ] Verify asset checksums and exercise the v0.2.0 installer with a temporary
+  destination, leaving the developer's installed binaries untouched.
+- [ ] Report the GitHub release URL and the observed build/install results.
 
-  Shape: put a version in each durable format, migrate on read, keep a
-  fixture of the previous release's bytes for each format, and make a
-  config that fails to parse a loud error (`doctor` reports it as a
-  failure). Say in the README which sessions survive an upgrade.
+## Follow-up work
 
-- [x] **`post-rewrite-hook-chaining`** — done 2026-11-05. One resolver
-  (`git_io::post_rewrite_slot`) finds the hook git runs, `core.hooksPath`
-  included, for both `clank init` and `doctor`. Init installs into an empty
-  slot and chains a plain foreign hook behind a wrapper that hands both
-  consumers git's stream; it writes nothing to a disabled, symlinked or
-  managed (husky, lefthook, pre-commit) hook. `doctor` reports Wired,
-  Delegated, Unwired (with the owner's recipe) or Off. The overwrite flag
-  is gone.
-
-- [ ] **`first-run-walk-per-harness`** — walk a clean user account
-  (empty `~/.clank`, no skills installed): install → `clank setup` →
-  `clank agent add` (the first roster write initializes the repo,
-  ba44b1cf) or `clank init --team <name>` → `clank open` → one plan
-  through review → `clank finish`. Do it once per harness. Every rough
-  edge becomes its own plan. None of these harnesses was launched for this
-  checklist, so compatibility is unverified. What the source requires,
-  next to the versions installed here on 2026-10-27 (`--version`):
-
-  | harness | floor in source | installed 2026-10-27 |
-  |---|---|---|
-  | Claude Code | ≥ 2.1.223 for async-rewake hooks, else legacy loop (`cli/setup.rs:1574`) | 2.1.308 |
-  | Codex CLI | no version gate | 0.164.0 |
-  | OpenCode | major ≥ 2 (`cli/setup.rs:362`); version read only from Homebrew/npm installs, else "unknown" (`cli/setup.rs:395-415`) | 2.1.4 |
-  | Grok | 1.x ≥ 1.0.46 with an advertised Stop gate (`cli/grok_setup.rs:100-110`) | 1.0.70 |
-  | zellij | needs `override-layout`; 0.45 lacks it (`cli/doctor.rs:388-396`) | 0.46.0 |
-
-  The walk also runs the `#[ignore]` acceptance tests above against each
-  installed harness and records the versions that passed. That record is
-  what the README states as supported.
-
-  The procedure is `docs/first-run-walk.md`, the clean environment
-  `scripts/first-run/env.sh`, and the evidence record
-  `docs/harness-support.toml`, which every harness enters as not run.
-  The `harness_support` gate (`it/harness_support.rs`) holds the README's
-  harness table to that record, so the README says "not yet tested" for
-  each harness. Still open: the live walks, one per harness, and their
-  native acceptance runs. OpenCode has no native acceptance test, so it
-  cannot be claimed as tested until one exists.
-
-- [x] **`docs-match-the-release`** — README, every book chapter, the
-  installed skills, `--help`, setup's and doctor's text and the Grok
-  contract were read against the source and corrected. Resolved:
-  - `clank setup`'s summary names Claude, Codex, Grok and OpenCode, and
-    its run summary always reports OpenCode
-    (`cli::command::tests::setup_summary_names_every_tool_it_installs_for`).
-  - `open-worktree.sh` is deleted, and with it the hidden `open dry` and
-    its inspector, which nothing else called.
-  - `GROK-INTEGRATION.md` moved to `docs/grok-integration.md`, with the
-    retired-adapter history cut.
-  - `docs/cli-audit.md` and its tests are deleted: every follow-up it
-    named had finished (`.clank/finished/cli-*.md` keep the record).
-  - `scripts/migrate-feedback-to-agents.sh` is deleted.
-  - The README Install section documents the one channel that exists
-    (clone + `cargo install --locked`), the version floors the source
-    checks, and that no installed-harness run is verified.
-
-- [ ] **`security-review-for-release`** — what is known from the source:
-  - Listeners bind to 127.0.0.1 only (`web-cloudflare/src/host.rs:89`).
-  - The remote is off until someone turns it on in the TUI, and the book
-    states that Cloudflare terminates its TLS (`book/remote.html:75-91`).
-  - Remote sessions and links are stored hashed
-    (`web-cloudflare/src/door.rs:25-26,76-81`).
-  - Diagnostics redact bearer tokens (`cli/source_diagnostic.rs:303`).
-  - GitHub credentials come from `GH_TOKEN`/`GITHUB_TOKEN` or
-    `gh auth token` (`cli/github/session.rs:11`).
-  - The `hooks.blocked` command runs through `sh -c` (`cli/block.rs:192`),
-    but only from untracked config (`.clank/.gitignore` tracks only
-    `plans/`, `finished/` and `.gitignore`).
-
-  Open questions:
-  - The remote token is stored in plaintext in `~/.clank/config.json`
-    (`door.rs:297`), which any agent running as the user can read.
-  - GitHub event bodies from third parties reach agent context, a
-    prompt-injection path: automatically, because a wake carries the
-    whole event body (`cli/wait.rs:3029-3069`), and through
-    `clank events read`.
-  - Is anything sensitive written into `clank html` output?
-
-  Shape: a short SECURITY.md that names the threat model and these
-  exposures, plus a fix or a documented acceptance for each one.
-
-- [x] **`retire-hidden-aliases`** — done 2026-11-05. Every hidden older
-  spelling of a command, flag or config key is removed, along with the
-  README's list of them. The kept hidden commands are internal entry
-  points (hooks, monitor, rewire, licences, block migrate). The pane
-  matcher still recognises the old TUI pane command, so sessions opened
-  before the rename are found. The inventory is in the plan's As-landed
-  note.
-
-## 2. Release blockers: per channel (only for the channels chosen in §0)
-
-### crates.io
-
-Dropped (Lloyd, 2026-11-05). The name `clank` is taken by an unrelated,
-abandoned 2025 crate, and publishing would mean renaming all five
-packages to `clank-agents-*`. The installer and GitHub Releases cover
-installation. A checkout's `cargo install --path crates/cli --locked`
-still works for building from source.
-
-### Website
-
-- [ ] **`website-on-github-pages`** — a Pages workflow that deploys
-  `book/` only when `book/**` changes. It carries a CLI reference
-  generated from clap, checked in and kept fresh by CI, and serves
-  `install.sh`, which downloads from GitHub Releases.
-
-### Prebuilt binaries
-
-- [ ] **`release-binaries-and-installer`** — a workflow, triggered by a
-  tag, that builds `clank` and `clank-web-cloudflare` for each target
-  chosen in §0. The TUI runs the second as a sibling process, so the two
-  ship together (crates/cli/Cargo.toml `[[bin]]`). The workflow runs §1's
-  gates on each target, checks `--version` against the tag, and attaches
-  the archives and checksums. A `curl | sh` installer picks the right
-  archive and puts both binaries on `$PATH`. macOS binaries also need a
-  signing and notarization decision.
-
-## 3. After the first release
-
-- [ ] **`zellij-focus-follower`** — it is hard to see which agent is
-  acting. Nothing follows focus today: `focus-pane-id` in
-  `cli/open_zellij.rs` only places panes and restores focus. Shape: a watcher that maps the monitor's "whose
-  turn" to `zellij action` focus or tab changes, built on what `clank tui`
-  already reads.
-- [ ] **`harness-acceptance-job`** — the `#[ignore]` acceptance tests run
-  only by hand. Shape: a scheduled job, with pinned harness versions and
-  credentials, that runs them and publishes which versions passed.
-
-
-## Done (evidence)
-
-- `help-output-beauty`: bd470f4a (one-line summaries in sections),
-  74d7a8e5 (long help says what a command is for).
-- `readme-rewrite`: the pitch, mental model and demo moved into the book
-  (3d379512). README.md:7-9 sends newcomers there, and the README is the
-  reference; Quickstart is in README.md.
-- `tutorial-screencast-content`: six casts recorded from real runs
-  (`book/casts/*.js`, `scripts/book/scenarios/`), 3d379512.
-- core/cli boundary holds: `crates/core/Cargo.toml` depends only on
-  serde, serde_json and an optional wincode, and nothing in
-  `crates/core/src` uses `std::fs`, `std::process` or `std::net`. The
-  claim that it "compiles to wasm32" is unverified: there is no wasm32
-  target or CI.
-- The fold stays pure: it lives in `crates/core/src/repo_state.rs`. The
-  cli wrapper (`crates/cli/src/repo_state.rs:1`) adds only identity, and
-  the I/O is in `crates/cli/src/rebuild.rs`.
-- Reviewers are no longer woken on finish:
-  `.clank/finished/finish-does-not-wake-reviewers.md` and
-  `gate-reviewers-only-plan-change-and-finish.md`.
-- Bare `clank init` adopts the `default` team (`clank init --help`;
-  `.clank/finished/bare-init-uses-the-default-team.md`).
-- `clank tui` and zellij layout chrome (`clank tui` in `--help`;
-  `clank_agents` in `cli/open_zellij.rs`;
-  `.clank/finished/zellij-layout-config-around-agent-panes.md`).
-- Control-work wake items are one-line hints
-  (`.clank/finished/wfw-output-is-a-minimal-hint.md`,
-  `claude-stop-hook-minimal-hint.md`). Event wakes deliberately carry the
-  whole event content, a multiline body on indented follow-on lines
-  (`cli/wait.rs:3029-3069`, `.clank/finished/tui-github-event-content.md`).
-- Version string: 8d05d296. `--locked` install: 32c162f3. Monitors follow
-  the installed build: a5004481.
+- Record real clean-account harness walks and native acceptance results.
+- Add native OpenCode acceptance coverage and, if practical, a scheduled harness
+  acceptance job with pinned versions.
+- Revisit macOS signing/notarization and additional routine platform CI.

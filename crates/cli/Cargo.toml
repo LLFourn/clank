@@ -65,10 +65,10 @@ flate2 = "1"
 dunce = "1"
 
 # Shared core types (closed-vocab enums, identifiers, response DTOs).
-clank-core = { path = "../core", version = "0.1.0", features = ["cache-encoding"] }
-clank-web = { path = "../web", version = "0.1.0" }
-clank-web-cloudflare = { path = "../web-cloudflare", version = "0.1.0" }
-clank-user-config = { path = "../user-config", version = "0.1.0" }
+clank-core = { path = "../core", version = "0.2.0", features = ["cache-encoding"] }
+clank-web = { path = "../web", version = "0.2.0" }
+clank-web-cloudflare = { path = "../web-cloudflare", version = "0.2.0" }
+clank-user-config = { path = "../user-config", version = "0.2.0" }
 wincode = { version = "0.5", features = ["derive"] }
 
 # JSON
@@ -203,8 +203,8 @@ http-body-util = "0.1"
 # test-only: the root set clank's rustls clients bundle, read by the
 # tls_trust gate so an incident root cannot return unnoticed.
 webpki-roots = "1.0.10"
-clank-web-cloudflare = { path = "../web-cloudflare", version = "0.1.0", features = ["test-support"] }
-clank-user-config = { path = "../user-config", version = "0.1.0", features = ["test-hooks"] }
+clank-web-cloudflare = { path = "../web-cloudflare", version = "0.2.0", features = ["test-support"] }
+clank-user-config = { path = "../user-config", version = "0.2.0", features = ["test-hooks"] }
 # Itself, so every test build -- the binary the integration tests spawn
 # included -- has the logical timer clock, and no installed build does.
 clank = { path = ".", features = ["test-clock", "test-runtime"] }
