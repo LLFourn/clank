@@ -990,10 +990,12 @@ fn a_runtime_shutdown_leaves_no_zombie() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(run(spec, Duration::from_secs(30)));
     let pid = read_pid(&leader);
+    // Establish the whole fixture before shutdown can kill its writer.
+    let descendant_pid = read_pid(&descendant);
     drop(runtime);
     assert!(gone(pid));
     assert!(echild(pid));
-    assert!(gone(read_pid(&descendant)));
+    assert!(gone(descendant_pid));
 }
 
 // ── exec ──────────────────────────────────────────────────────────
