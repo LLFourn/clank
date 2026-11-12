@@ -136,45 +136,38 @@ pub(crate) fn load(agent_dir: &Path) -> Option<State> {
 /// it only settles the projection on the binding. An unreadable record or
 /// binding leaves the record as it is.
 pub(crate) fn observe(agent_dir: &Path, observations: impl IntoIterator<Item = Observation>) {
-    let Ok(_permit) = crate::upgrade::writing() else {
-        return;
-    };
-    if std::fs::create_dir_all(agent_dir).is_err() {
-        return;
+    if let Err(e) = try_observe(agent_dir, observations) {
+        tracing::debug!(%e, "question evidence was not recorded");
     }
-    let Ok(lock) = std::fs::OpenOptions::new()
+}
+
+/// Control requests acknowledge persistence only after the write succeeds.
+pub(crate) fn try_observe(
+    agent_dir: &Path,
+    observations: impl IntoIterator<Item = Observation>,
+) -> anyhow::Result<()> {
+    let _permit = crate::upgrade::writing()?;
+    std::fs::create_dir_all(agent_dir)?;
+    let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(agent_dir.join("question.lock"))
-    else {
-        return;
-    };
-    if rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).is_err() {
-        return;
-    }
-    let Ok(binding) = crate::agent_store::binding_in(agent_dir) else {
-        return;
-    };
+        .open(agent_dir.join("question.lock"))?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+    let binding = crate::agent_store::binding_in(agent_dir)?;
     let bound = binding
         .filter(|s| s.tool == clank_core::vocab::Tool::Claude)
         .map(|s| s.id.as_str().to_string());
-    let Some(state) = load(agent_dir) else {
-        return;
-    };
+    let state = load(agent_dir).ok_or_else(|| anyhow::anyhow!("question state is unreadable"))?;
     let next = observations
         .into_iter()
         .fold(rebind(state.clone(), bound.as_deref()), apply);
     if next != state {
         let tmp = path(agent_dir).with_extension("json.tmp");
-        if serde_json::to_vec(&next)
-            .ok()
-            .and_then(|bytes| std::fs::write(&tmp, bytes).ok())
-            .is_some()
-        {
-            let _ = std::fs::rename(&tmp, path(agent_dir));
-        }
+        std::fs::write(&tmp, serde_json::to_vec(&next)?)?;
+        std::fs::rename(&tmp, path(agent_dir))?;
     }
+    Ok(())
 }
 
 /// The question the agent is waiting on in `session`, if one is pending.

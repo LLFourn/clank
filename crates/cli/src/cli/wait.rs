@@ -1011,6 +1011,9 @@ where
                         &mut || Ok(()),
                     )
                 });
+                if let Some(Ok(crate::agent_store::Announcement::Undelivered(e))) = &announced {
+                    tracing::debug!(%e, "outage diagnostic was not delivered");
+                }
                 if !matches!(
                     announced,
                     Some(Ok(crate::agent_store::Announcement::Suppressed))
@@ -3811,30 +3814,55 @@ mod shared_tests {
         assert!(told());
     }
 
-    /// A session's hook and its background wait that reach the notice
-    /// together wake it once: the wait gets there while the hook's child
-    /// is still writing, finds the session told, and goes on trying.
+    /// A hook diagnostic does not spend the background wait's outage notice,
+    /// even when the wait announces while the hook is still writing.
     #[test]
-    fn a_hook_and_a_background_wait_announce_one_outage_once() {
+    fn a_hook_diagnostic_leaves_the_background_waits_outage_notice_available() {
         use crate::cli::monitor::Attempt;
-        use crate::cli::turn_child::tests::{HookPipe, announcements, handoff_child, repo_with};
+        use crate::cli::turn_child::tests::{handoff_child, repo_with, told};
+
+        struct HeldDiagnostic {
+            bytes: Vec<u8>,
+            writing: Option<std::sync::mpsc::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl std::io::Write for HeldDiagnostic {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some(writing) = self.writing.take() {
+                    writing.send(()).unwrap();
+                    self.release
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("the wait finishes while the diagnostic is held");
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         let (repo, author) = repo_with(clank_core::Tool::Grok, false);
         let session = clank_core::SessionId::parse(crate::cli::turn_child::tests::SESSION).unwrap();
         let binding = WaitBinding(Some((clank_core::Tool::Grok, session)), WaitPolicy::Manual);
+        let config = crate::agent_store::agent_config_path(repo.path(), &author);
+        let before = std::fs::read(&config).unwrap();
         let (writing, began) = std::sync::mpsc::channel();
-        let mut hook = HookPipe {
+        let (release, released) = std::sync::mpsc::channel();
+        let mut hook = HeldDiagnostic {
             bytes: Vec::new(),
-            hold: std::time::Duration::from_secs(1),
             writing: Some(writing),
-            broken: false,
+            release: released,
         };
-        let waited = std::thread::scope(|scope| {
+        let (waited, after_wait) = std::thread::scope(|scope| {
             scope.spawn(|| handoff_child(repo.path(), &author, &mut hook));
             began
                 .recv_timeout(std::time::Duration::from_secs(30))
-                .expect("the hook's child reaches its notice");
+                .expect("the hook's child reaches its diagnostic");
+            assert_eq!(std::fs::read(&config).unwrap(), before);
+            assert!(!told(repo.path(), &author));
             let attempts = std::sync::atomic::AtomicUsize::new(0);
-            tokio::runtime::Builder::new_current_thread()
+            let waited = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .start_paused(true)
                 .build()
@@ -3858,12 +3886,37 @@ mod shared_tests {
                             }
                         }
                     },
-                ))
+                ));
+            let after_wait = std::fs::read(&config).unwrap();
+            release.send(()).unwrap();
+            (waited, after_wait)
         });
-        assert_eq!(announcements(&hook), 1);
+        let frames: Vec<crate::cli::turn_wire::Frame> = String::from_utf8(hook.bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert!(
-            waited.is_ok(),
-            "the wait must not announce the outage a second time: {waited:?}"
+            matches!(
+                frames.as_slice(),
+                [crate::cli::turn_wire::Frame {
+                    verdict: crate::cli::turn_wire::WireVerdict::Diagnostic { .. },
+                    ..
+                }]
+            ),
+            "the hook emits only a diagnostic: {frames:?}"
+        );
+        assert_eq!(
+            waited
+                .expect_err("the wait still owns its outage notice")
+                .to_string(),
+            "clank cannot start its monitor: starting one failed: no binary"
+        );
+        assert!(told(repo.path(), &author));
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            after_wait,
+            "finishing the hook cannot clear or change the wait's policy state"
         );
     }
 

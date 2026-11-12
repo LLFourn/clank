@@ -44,6 +44,7 @@ pub(crate) struct Gathered {
     /// The monitor holds a live registration of this agent's session's
     /// background `clank wait`. Never true without a monitor.
     waiter: bool,
+    outage_session: Option<SessionId>,
 }
 
 impl Gathered {
@@ -87,6 +88,11 @@ impl Gathered {
             blocked: super::wait::blocked(repo, author),
             owed: owed.map(|(items, cwd)| owed_items(items, cwd)),
             waiter: false,
+            outage_session: config
+                .ok()
+                .flatten()
+                .and_then(|c| c.outage_notified)
+                .map(|n| n.session),
         }
     }
 
@@ -95,20 +101,6 @@ impl Gathered {
     pub(crate) fn waiting(mut self, registered: bool) -> Self {
         self.waiter = registered;
         self
-    }
-
-    /// What a hook with no monitor says to `session`: `notice`, unless
-    /// clank does not drive it.
-    pub(crate) fn unmonitored_verdict(
-        &self,
-        session: &SessionId,
-        notice: clank_core::turn_policy::Notice,
-    ) -> Verdict {
-        clank_core::turn_policy::unmonitored_verdict(
-            session,
-            &facts(self, None, &[], &Process),
-            notice,
-        )
     }
 
     /// Grok's native Stop for `session`, as the monitor would answer it
@@ -130,7 +122,7 @@ impl Gathered {
         Handoff {
             session: session.clone(),
             wait_registered: self.waiter,
-            continued,
+            continued: continued && self.outage_session.as_ref() != Some(session),
             tasks,
             hook_started,
         }

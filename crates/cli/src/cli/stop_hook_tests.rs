@@ -378,11 +378,10 @@ async fn a_live_owner_lets_the_verdict_through() {
     assert!(matches!(got, Ok((ref frame, _)) if frame == &delivered()));
 }
 
-/// With no verdict by its deadline the hook frames the one its tool takes
-/// at the deadline, so a slow monitor never puts an agent to sleep and
-/// OpenCode's plugin renews instead of spinning a turn.
+/// A local deadline diagnoses failure. Only OpenCode can renew transport
+/// without starting a model turn.
 #[tokio::test(start_paused = true)]
-async fn the_deadline_re_arms_without_spinning_opencode() {
+async fn a_local_deadline_never_starts_a_model_turn() {
     for tool in [Tool::Claude, Tool::Codex] {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let got = await_verdict_under_deadline(
@@ -395,10 +394,10 @@ async fn the_deadline_re_arms_without_spinning_opencode() {
         )
         .await;
         let Err(frame) = got else {
-            panic!("{tool:?} must re-arm at the deadline");
+            panic!("{tool:?} must diagnose the deadline");
         };
         assert!(
-            matches!(frame.outcome(), HookOutcome::Continue { ref reason } if reason == crate::cli::wake_render::REARM_REASON),
+            matches!(frame.verdict, WireVerdict::Diagnostic { .. }),
             "{tool:?}: {frame:?}"
         );
     }
@@ -415,10 +414,9 @@ async fn the_deadline_re_arms_without_spinning_opencode() {
     assert!(matches!(got, Err(ref f) if f.outcome() == HookOutcome::RenewWait));
 }
 
-/// The pre-check: the deadline gone before anything was armed. It re-arms
-/// too, and arms nothing it cannot await.
+/// A deadline already gone cannot authorize a turn or arm an exchange.
 #[tokio::test(start_paused = true)]
-async fn the_pre_check_exit_re_arms_without_arming_a_wait() {
+async fn an_expired_deadline_never_arms_a_wait() {
     let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let armed = std::cell::Cell::new(false);
     let got = await_verdict_under_deadline(
@@ -434,8 +432,8 @@ async fn the_pre_check_exit_re_arms_without_arming_a_wait() {
     )
     .await;
     assert!(
-        matches!(got, Err(ref f) if matches!(f.outcome(), HookOutcome::Continue { .. })),
-        "the pre-check must re-arm too"
+        matches!(got, Err(ref f) if matches!(f.verdict, WireVerdict::Diagnostic { .. })),
+        "the pre-check must diagnose failure too"
     );
     assert!(!armed.get(), "it must short-circuit BEFORE arming");
     let got = await_verdict_under_deadline(
@@ -471,7 +469,7 @@ async fn a_verdict_arriving_before_the_deadline_survives_the_seam() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn consecutive_expiries_each_re_arm() {
+async fn consecutive_expiries_remain_diagnostics() {
     for period in 0..2 {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let got = await_verdict_under_deadline(
@@ -484,8 +482,8 @@ async fn consecutive_expiries_each_re_arm() {
         )
         .await;
         assert!(
-            matches!(got, Err(ref f) if matches!(f.outcome(), HookOutcome::Continue { .. })),
-            "period {period} must re-arm"
+            matches!(got, Err(ref f) if matches!(f.verdict, WireVerdict::Diagnostic { .. })),
+            "period {period} must remain a diagnostic"
         );
     }
 }
@@ -523,53 +521,42 @@ fn stop_report() -> Report {
 
 /// Exercise the real parent exchange with an in-memory carrier that never
 /// answers. Both an expired pre-arm deadline and a deadline during the wait
-/// must reach Grok as a supported notice, with no work receipt invented.
+/// must reach Grok as a diagnostic, with no work receipt invented.
 #[tokio::test(start_paused = true)]
-async fn groks_own_deadline_announces_once_and_preserves_pending_work() {
+async fn groks_own_deadline_reports_failure_without_a_model_turn() {
     use crate::cli::turn_child::tests::{SESSION, handoff, repo_with, told};
     for budget in [
         std::time::Duration::ZERO,
         std::time::Duration::from_secs(10),
     ] {
         let (repo, author) = repo_with(Tool::Grok, true);
+        let before =
+            std::fs::read(crate::agent_store::agent_config_path(repo.path(), &author)).unwrap();
         let carrier = Fed::new(String::new(), vec![]);
-        let report = handoff();
-        let first = answer_with(
-            &carrier,
-            repo.path(),
-            &author,
-            SESSION,
-            report.clone(),
-            budget,
-            |frame| {
-                assert!(frame.presentation().is_none());
-                let (out, err) = crate::cli::grok_hook::wire(frame);
-                assert_eq!(err, None);
-                let block: serde_json::Value = serde_json::from_str(&out.unwrap()).unwrap();
-                assert_eq!(block["decision"], "block");
-                assert_eq!(block["reason"], crate::cli::wake_render::MONITOR_UNANSWERED);
-                assert!(!block["reason"].as_str().unwrap().contains("scheduled work"));
-                Some(Ok(()))
-            },
-        )
-        .await;
-        assert_eq!(first.verdict, WireVerdict::Notify);
-        assert!(told(repo.path(), &author));
-        let second = answer_with(
-            &carrier,
-            repo.path(),
-            &author,
-            SESSION,
-            report,
-            budget,
-            |frame| {
-                assert_eq!(crate::cli::grok_hook::wire(frame).0, None);
-                None
-            },
-        )
-        .await;
-        assert!(matches!(second.verdict, WireVerdict::Diagnostic { .. }));
-        // The outage marker does not consume the actual event.
+        for _ in 0..2 {
+            let frame = answer_with(
+                &carrier,
+                repo.path(),
+                &author,
+                SESSION,
+                handoff(),
+                budget,
+                |frame| {
+                    assert!(frame.presentation().is_none());
+                    let (out, err) = crate::cli::grok_hook::wire(frame);
+                    assert!(out.is_none());
+                    assert!(err.unwrap().contains("not answered"));
+                    None
+                },
+            )
+            .await;
+            assert!(matches!(frame.verdict, WireVerdict::Diagnostic { .. }));
+        }
+        assert!(!told(repo.path(), &author));
+        assert_eq!(
+            std::fs::read(crate::agent_store::agent_config_path(repo.path(), &author)).unwrap(),
+            before
+        );
         let items = crate::cli::wait::items(crate::cli::WaitArgs {
             repo: Some(repo.path().to_path_buf()),
             author: Some(author.to_string()),
@@ -614,13 +601,13 @@ async fn groks_deadline_does_not_record_an_unwritten_notice() {
             },
         )
         .await;
-        assert_eq!(frame.verdict, WireVerdict::Notify);
+        assert!(matches!(frame.verdict, WireVerdict::Diagnostic { .. }));
         assert!(!told(repo.path(), &author));
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn groks_deadline_respects_manual_mode_and_replaced_bindings() {
+async fn groks_deadline_needs_no_policy_or_current_binding_to_diagnose_failure() {
     use crate::cli::turn_child::tests::{SESSION, handoff, repo_with, told};
     for replaced in [false, true] {
         let (repo, author) = repo_with(Tool::Grok, true);
@@ -638,12 +625,12 @@ async fn groks_deadline_respects_manual_mode_and_replaced_bindings() {
             handoff(),
             std::time::Duration::ZERO,
             |frame| {
-                assert_eq!(crate::cli::grok_hook::wire(frame), (None, None));
+                assert!(crate::cli::grok_hook::wire(frame).0.is_none());
                 None
             },
         )
         .await;
-        assert!(matches!(frame.verdict, WireVerdict::Silent { .. }));
+        assert!(matches!(frame.verdict, WireVerdict::Diagnostic { .. }));
         assert!(!told(repo.path(), &author));
     }
 }
@@ -653,8 +640,8 @@ async fn groks_deadline_respects_manual_mode_and_replaced_bindings() {
 /// The paused clock tests the ceiling itself without an actual slow process.
 #[tokio::test(start_paused = true)]
 async fn groks_installed_timeout_covers_the_exchange_cleanup_and_emission() {
-    use crate::cli::turn_child::tests::{handoff, repo_with};
-    let (repo, author) = repo_with(Tool::Grok, true);
+    use crate::cli::turn_child::tests::repo_with;
+    let (repo, _author) = repo_with(Tool::Grok, true);
     let path = repo.path().join("hooks.json");
     crate::cli::setup::install_grok_hooks(&path, false, &mut vec![]).unwrap();
     let installed: serde_json::Value =
@@ -684,14 +671,13 @@ async fn groks_installed_timeout_covers_the_exchange_cleanup_and_emission() {
         assert!(matches!(got, Err(ref frame) if frame.verdict == WireVerdict::Park));
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));
         tokio::time::sleep(std::time::Duration::from_secs(1)).await; // framing/filesystem margin
-        let frame =
-            crate::cli::turn_child::unanswered(repo.path(), &author, &handoff(), &mut |frame| {
-                let (out, err) = crate::cli::grok_hook::wire(frame);
-                assert_eq!(err, None);
-                assert!(out.unwrap().contains("block"));
-                Some(Ok(()))
-            });
-        assert_eq!(frame.verdict, WireVerdict::Notify);
+        let frame = crate::cli::turn_child::unanswered(&mut |frame| {
+            let (out, err) = crate::cli::grok_hook::wire(frame);
+            assert!(err.is_some());
+            assert!(out.is_none());
+            Some(Ok(()))
+        });
+        assert!(matches!(frame.verdict, WireVerdict::Diagnostic { .. }));
     })
     .await
     .expect("the native runner must receive the decision before its ceiling");
@@ -999,51 +985,25 @@ async fn a_failed_or_partial_flush_is_a_failed_emit() {
     }
 }
 
-/// The notices a child with no monitor prints really wake, through each
-/// adapter's own wire: Claude's continuation exit, Codex's block decision,
-/// and OpenCode's prompt rather than its renewal. Each is the child's own
-/// frame, carries no presentation and none of the work its repo owes, and
-/// is answered with no result, so it earns no receipt.
+/// Actual carrier diagnostics remain quiet through every provider adapter.
 #[tokio::test(start_paused = true)]
-async fn the_childs_no_monitor_notices_wake_through_each_adapter() {
+async fn no_monitor_diagnostics_wake_nobody_on_any_adapter() {
     use crate::cli::turn_child::tests::outage_frame;
     for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
-        for (frame, says) in [(
-            outage_frame(tool).await,
-            "clank cannot start its monitor: starting one failed: no binary.",
-        )] {
-            assert!(frame.presentation().is_none(), "{tool:?}: {frame:?}");
-            let text = frame.rendered.clone().expect("the notice has its text");
-            assert!(text.starts_with(says), "{tool:?}: {text}");
-            assert!(!text.contains("scheduled work"), "{tool:?}: {text}");
-            let answered = Answered::default();
-            let mut stdout = Writer::new();
-            let mut stderr = Writer::new();
-            let code = emit_turn(turn_of(frame, &answered), tool, &mut stdout, &mut stderr).await;
-            assert_eq!(answered.got(), Some(None), "{tool:?}: no result to credit");
-            match tool {
-                Tool::Claude => {
-                    assert_eq!(code, CLAUDE_CONTINUATION_EXIT);
-                    assert!(stdout.bytes.is_empty());
-                    assert_eq!(stderr.bytes, format!("{text}\n").into_bytes());
-                }
-                Tool::Codex => {
-                    assert_eq!(code, HOOK_OK_EXIT);
-                    let value: serde_json::Value = serde_json::from_slice(&stdout.bytes).unwrap();
-                    assert_eq!(value["decision"], "block");
-                    assert_eq!(value["reason"], text);
-                }
-                _ => {
-                    assert_eq!(code, HOOK_OK_EXIT);
-                    assert_eq!(stdout.bytes, format!("{text}\n").into_bytes());
-                    assert_ne!(
-                        stdout.bytes,
-                        format!("{OPENCODE_RENEW_WAIT_WIRE}\n").into_bytes(),
-                        "a prompt for the model, not a renewal the plugin swallows"
-                    );
-                }
-            }
-        }
+        let frame = outage_frame(tool).await;
+        assert!(frame.presentation().is_none());
+        let answered = Answered::default();
+        let mut stdout = Writer::new();
+        let mut stderr = Writer::new();
+        let code = emit_turn(turn_of(frame, &answered), tool, &mut stdout, &mut stderr).await;
+        assert_eq!(answered.got(), Some(None));
+        assert_eq!(code, HOOK_OK_EXIT);
+        assert!(stdout.bytes.is_empty());
+        assert!(
+            String::from_utf8(stderr.bytes)
+                .unwrap()
+                .contains("monitor is unavailable")
+        );
     }
 }
 

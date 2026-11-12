@@ -1881,6 +1881,11 @@ first 32 hex characters of BLAKE3 over the canonical repo path bytes. This file 
 only diagnostic evidence, never acknowledgement, completion or retry authority.
 No existing source is opted in automatically.
 
+Hook adapters report evidence; the monitor owns turn policy. If it cannot answer,
+hooks emit a diagnostic and leave pending work intact rather than generating a
+model wake. Automatic progress can stop until a monitor is available and a new
+hook/wait runs. See [hook ownership](docs/hook-boundary.md) for the full boundary.
+
 ## Troubleshooting
 
 `clank doctor` is the first stop — per-section OK / WARN / FAIL with

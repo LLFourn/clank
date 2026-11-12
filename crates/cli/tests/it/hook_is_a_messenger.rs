@@ -8,8 +8,9 @@
 //! itself: no auto-mode or role resolution, no recovery transport choice,
 //! no record or episode writes.
 //!
-//! The Alone fallback answers as the monitor would, through the monitor's
-//! own fact gathering, which this gate does not scan.
+//! An unavailable monitor yields a transport diagnostic, never local policy.
+//! Shared binding helpers are checked separately below; broker code executes
+//! in the broker, not in the thin question adapter.
 
 use crate::common::{Production, crates_dir, rs_files, strip_test_code};
 
@@ -19,6 +20,8 @@ const HOOK_FILES: &[&str] = &[
     "grok_hook.rs",
     "recovery_hook.rs",
     "hook_owner.rs",
+    "hook_handoff.rs",
+    "question_hook.rs",
     "turn_child.rs",
 ];
 
@@ -54,6 +57,14 @@ fn line_violation(line: &str) -> Option<&'static str> {
         ("transport_for(", "recovery's transport choice"),
         ("retry_announcement(", "recovery's transport choice"),
         ("resolve_effective_auto_mode", "an auto-mode decision"),
+        (
+            "resolve_identity_from_env",
+            "the general CLI config resolver",
+        ),
+        ("Gathered::", "monitor fact gathering in a hook process"),
+        ("unmonitored_verdict", "local outage policy"),
+        ("announce_outage", "local outage wake authorization"),
+        ("outage_served", "monitor recovery state"),
         ("load_agent_config", "an agent's config, read for policy"),
         ("AutoMode::", "an auto-mode decision"),
         ("resolve_role", "a role decision"),
@@ -140,4 +151,78 @@ fn scanner_flags_prod_and_exempts_test_code() {
     );
     let test_mod = "#[cfg(test)]\nmod tests {\n    fn f() { std::fs::write(d.join(\"attending\"), \"\"); }\n}\n";
     assert_eq!(count(test_mod), 0, "test code is exempt");
+}
+
+#[test]
+fn shared_hook_identity_paths_cannot_parse_monitor_policy() {
+    let root = crates_dir().join("cli/src");
+    let identity =
+        strip_test_code(&std::fs::read_to_string(root.join("agent_store/identity.rs")).unwrap());
+    for forbidden in [
+        "AgentConfig",
+        "resolve_role",
+        "resolve_effective_auto_mode",
+        "try_resolve_via_team",
+        "load_repo_config",
+    ] {
+        assert!(
+            !identity.contains(forbidden),
+            "binding projection uses {forbidden}"
+        );
+    }
+    for (file, names) in [
+        (
+            "agent_env.rs",
+            vec![
+                "resolve_identity_for_hook_in",
+                "bound_agent",
+                "session_start",
+            ],
+        ),
+        (
+            "agent_store.rs",
+            vec![
+                "binding_in",
+                "binding_matches",
+                "bind_session_to_agent",
+                "release_binding",
+                "resume_checked_in",
+                "record_transcript",
+            ],
+        ),
+    ] {
+        let src = std::fs::read_to_string(root.join(file)).unwrap();
+        for name in names {
+            let start = src.find(&format!("fn {name}(")).unwrap();
+            let end = src[start..].find("\n}").unwrap() + start;
+            let body = &src[start..end];
+            for forbidden in [
+                "AgentConfig",
+                "load_agent_config",
+                "load_all_agent_configs",
+                "mutate_locked",
+                "resolve_role",
+                "resolve_tool",
+            ] {
+                assert!(!body.contains(forbidden), "{file}::{name} uses {forbidden}");
+            }
+        }
+    }
+}
+
+#[test]
+fn opencode_plugin_carries_native_events_without_config_access() {
+    let src =
+        std::fs::read_to_string(crates_dir().join("cli/src/cli/setup_assets/opencode_plugin.js"))
+            .unwrap();
+    for forbidden in [
+        "node:fs",
+        "readFile",
+        "config.json",
+        "auto_mode",
+        "question.json",
+        "state.json",
+    ] {
+        assert!(!src.contains(forbidden), "OpenCode plugin uses {forbidden}");
+    }
 }

@@ -9,12 +9,9 @@
 //! the only one the monitor will credit with it.
 //!
 //! It never decides anything about work. A monitor that goes away is
-//! followed, every time, through the ordinary attach-or-spawn. When none
-//! can be had within [`super::monitor::OUTAGE_BUDGET`] or the report's
-//! deadline, it wakes the agent with a notice that says so and carries no
-//! work: nothing is presented and no receipt is earned. An outage is
-//! announced to a session once: until a monitor answers it, later
-//! children go on trying and end as an uneventful park does.
+//! followed through the ordinary attach-or-spawn. If none can be had within
+//! the outage budget or report deadline, the child emits a diagnostic. It
+//! never gathers policy, creates a model wake or changes recovery state.
 //!
 //! A child of a build that is no longer the installed one says none of
 //! that. Its hook is about to become the installed build and start the
@@ -26,8 +23,7 @@ use std::path::Path;
 
 use clank_core::AgentLabel;
 
-use crate::agent_store::Announcement;
-use clank_core::turn_policy::{Notice, PresentationId};
+use clank_core::turn_policy::PresentationId;
 
 use super::monitor::{Attempt, Note, OUTAGE_RETRY_CAP, Outage, Unserved, Who};
 use super::turn_wire::{Frame, Report, TurnResult, WireVerdict};
@@ -89,7 +85,7 @@ pub(crate) async fn run(args: super::WaitArgs) -> anyhow::Result<()> {
     let repo = super::resolve_repo(args.repo.as_deref())?;
     let author = match args.author.as_deref() {
         Some(raw) => AgentLabel::parse(raw)?,
-        None => crate::agent_env::resolve_identity_from_env(&repo)?,
+        None => anyhow::bail!("a hook carrier requires its routed --author"),
     };
     let owner = Owner::reading(std::io::stdin());
     let attach =
@@ -163,11 +159,6 @@ pub(crate) async fn carry(
     // monitor that follows.
     let mut retiring = false;
     let mut why = "no monitor answered before the wait's deadline".to_string();
-    let answered = || {
-        if let Err(e) = crate::agent_store::outage_served(repo, author, report.session()) {
-            tracing::debug!(%e, "the outage's notice could not be cleared");
-        }
-    };
     loop {
         let who = Who::Agent {
             author: author.to_string(),
@@ -185,35 +176,16 @@ pub(crate) async fn carry(
         };
         let unserved = match attempt.served(repo) {
             Ok(conn) => {
-                let hand = shared(
-                    conn,
-                    &report,
-                    &mut owner,
-                    out,
-                    &mut outage,
-                    &answered,
-                    answer_by,
-                );
+                let hand = shared(conn, &report, &mut owner, out, &mut outage, answer_by);
                 match hand.await {
                     Hand::Done => return,
                     Hand::Lost(why) => Unserved::Failed(why),
                     Hand::Unanswered if report.parks() => {
-                        emit_final(
-                            out,
-                            &super::turn_custody::Turns::deadline_frame(report.tool()),
-                        );
+                        emit_final(out, &super::turn_wire::expired_wait(report.tool()));
                         return;
                     }
                     Hand::Unanswered => {
-                        // A monitor of a replaced build answers nothing
-                        // new while it settles what it handed out: that
-                        // silence is the upgrade, and no news to an agent.
-                        if !report.reaches_agent()
-                            || super::monitor::outgoing(repo)
-                            || !told_once(repo, author, &report, Notice::MonitorUnanswered, out)
-                        {
-                            emit_final(out, &still("the monitor has not answered"));
-                        }
+                        emit_final(out, &still("the monitor has not answered"));
                         return;
                     }
                 }
@@ -239,10 +211,10 @@ pub(crate) async fn carry(
         let pause = match outage.lost(tokio::time::Instant::now(), &unserved) {
             Some(pause) => pause,
             None if stale || !report.reaches_agent() => OUTAGE_RETRY_CAP,
-            None => match told_once(repo, author, &report, outage_of(&why), out) {
-                true => return,
-                false => OUTAGE_RETRY_CAP,
-            },
+            None => {
+                emit_final(out, &unavailable(&why));
+                return;
+            }
         };
         tokio::select! {
             biased;
@@ -251,131 +223,33 @@ pub(crate) async fn carry(
             () = tokio::time::sleep(pause) => {}
         }
     }
-    // A park's deadline is not an outage: its hook arms the next park,
-    // whose child follows with a budget of its own. Only a report whose
-    // hook gives up here has this as its one chance to be told.
+    // Local expiry can renew OpenCode's transport, but cannot start a
+    // model turn on any provider. A healthy monitor owns deadline wakes.
     if report.parks() {
-        emit_final(
-            out,
-            &super::turn_custody::Turns::deadline_frame(report.tool()),
-        );
-    } else if stale
-        || retiring
-        || !report.reaches_agent()
-        || !told_once(repo, author, &report, outage_of(&why), out)
-    {
+        emit_final(out, &super::turn_wire::expired_wait(report.tool()));
+    } else if stale || retiring || !report.reaches_agent() {
         emit_final(out, &still(&format!("clank still has no monitor: {why}")));
+    } else {
+        emit_final(out, &unavailable(&why));
     }
 }
 
-fn outage_of(why: &str) -> Notice {
-    Notice::MonitorOutage {
-        why: why.to_string(),
-    }
+fn unavailable(why: &str) -> Frame {
+    still(&format!("the monitor is unavailable: {why}"))
 }
 
-/// What a report that never parks ends with when its session was already
-/// told of the trouble: a diagnostic, which wakes nobody.
 fn still(what: &str) -> Frame {
     Frame::bare(WireVerdict::Diagnostic {
         message: format!("hook: {what}"),
     })
 }
 
-/// What the hook is told in place of a monitor's verdict: `notice`, or
-/// nothing for a session clank does not drive.
-fn unmonitored(repo: &Path, author: &AgentLabel, report: &Report, notice: Notice) -> Frame {
-    let gathered = super::turn_custody::Gathered::of(repo, author, None);
-    super::turn_custody::frame_of(gathered.unmonitored_verdict(report.session(), notice))
-}
-
-/// Give `notice` of having no monitor's verdict, unless this session was
-/// already told of this outage. `false` when it was, and nothing was said.
-fn told_once(
-    repo: &Path,
-    author: &AgentLabel,
-    report: &Report,
-    notice: Notice,
-    out: &mut impl Write,
-) -> bool {
-    announce_once(repo, author, report, notice, &mut |frame| emit(out, frame))
-}
-
-/// The hook's own deadline won before its carrier answered. Use the same
-/// gated, once-per-outage notice as the carrier, and record only a successful
-/// write to the harness. A late carrier and its hook share the binding lock.
-pub(super) fn unanswered(
-    repo: &Path,
-    author: &AgentLabel,
-    report: &Report,
-    emit: &mut dyn FnMut(&Frame) -> Option<std::io::Result<()>>,
-) -> Frame {
-    let mut sent = None;
-    if !super::monitor::outgoing(repo) {
-        announce_once(
-            repo,
-            author,
-            report,
-            Notice::MonitorUnanswered,
-            &mut |frame| {
-                sent = Some(frame.clone());
-                emit(frame).unwrap_or_else(|| {
-                    if frame.verdict == WireVerdict::Notify {
-                        Err(std::io::Error::other("the notice was not written"))
-                    } else {
-                        Ok(())
-                    }
-                })
-            },
-        );
-    }
-    sent.unwrap_or_else(|| {
-        let frame = still("the monitor has not answered");
-        emit(&frame);
-        frame
-    })
-}
-
-fn announce_once(
-    repo: &Path,
-    author: &AgentLabel,
-    report: &Report,
-    notice: Notice,
-    deliver: &mut dyn FnMut(&Frame) -> std::io::Result<()>,
-) -> bool {
-    let frame = unmonitored(repo, author, report, notice);
-    if frame.verdict != WireVerdict::Notify {
-        let _ = deliver(&frame);
-        return true;
-    }
-    let mut attempted = false;
-    let announced = crate::agent_store::announce_outage(
-        repo,
-        author,
-        report.session(),
-        time::OffsetDateTime::now_utc(),
-        &mut || {
-            attempted = true;
-            deliver(&frame)
-        },
-    );
-    match announced {
-        Ok(Announcement::Suppressed) => false,
-        Ok(Announcement::Delivered) => true,
-        Ok(Announcement::Undelivered(e)) => {
-            tracing::debug!(%e, "the hook was gone before its notice");
-            true
-        }
-        // Whether it was told cannot be known, and waking twice is the
-        // cheaper mistake.
-        Err(e) => {
-            tracing::debug!(%e, "the outage's notice could not be recorded");
-            if !attempted {
-                let _ = deliver(&frame);
-            }
-            true
-        }
-    }
+/// An unavailable authority cannot authorize a model turn. These diagnostics
+/// use transport evidence only: no role, auto-mode, block or question reads.
+pub(super) fn unanswered(emit: &mut dyn FnMut(&Frame) -> Option<std::io::Result<()>>) -> Frame {
+    let frame = still("the monitor has not answered");
+    emit(&frame);
+    frame
 }
 
 /// How long before a report's deadline the child gives its own last word,
@@ -433,7 +307,6 @@ async fn shared(
     owner: &mut Owner,
     out: &mut impl Write,
     outage: &mut Outage,
-    answered: &(dyn Fn() + Sync),
     by: Option<tokio::time::Instant>,
 ) -> Hand {
     let socket = match conn.cancellation_socket() {
@@ -445,7 +318,6 @@ async fn shared(
         Err(e) => return Hand::Lost(e.to_string()),
     };
     let mut why = "its connection closed".to_string();
-    let mut heard = false;
     loop {
         tokio::select! {
             // A verdict already in hand outranks the deadline it beat.
@@ -457,13 +329,6 @@ async fn shared(
             note = notes.recv() => {
                 if matches!(note, Some(Ok(_))) {
                     outage.answered();
-                }
-                // Any note proves the monitor there, not that it answers:
-                // only a verdict ends what the session was told of.
-                if matches!(note, Some(Ok(Note::Verdict(_))))
-                    && !std::mem::replace(&mut heard, true)
-                {
-                    answered();
                 }
                 match note {
                 Some(Ok(Note::Verdict(frame))) => {

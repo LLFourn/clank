@@ -1318,43 +1318,6 @@ async fn a_session_starts_receipt_follows_only_claudes_context() {
     }
 }
 
-/// With no monitor, an attendance quiets nothing: the notice still wakes
-/// the session clank drives, and only that session.
-#[test]
-fn a_no_monitor_notice_ignores_attendance_and_honours_the_drive_gate() {
-    let repo = repo_with("claude", Tool::Claude, "session-one");
-    let author = label("claude");
-    let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "claude", &[]);
-    attend_name(&mut turns, "claude", "session-one", &g);
-    turns
-        .answer(
-            &author,
-            1,
-            &stop(Tool::Claude, "session-one", None),
-            true,
-            &g,
-        )
-        .unwrap();
-    let notice = || clank_core::turn_policy::Notice::MonitorOutage {
-        why: "no binary".into(),
-    };
-    let unmonitored = Gathered::of(repo.path(), &author, None);
-    assert_eq!(
-        unmonitored.unmonitored_verdict(&sid("session-one"), notice()),
-        Verdict::Notify(vec![notice()])
-    );
-    assert_eq!(
-        unmonitored.unmonitored_verdict(&sid("someone-else-entirely"), notice()),
-        Verdict::Silent(SilentWhy::StaleBinding)
-    );
-    crate::agent_store::set_auto_mode(repo.path(), &author, AutoMode::Off).unwrap();
-    assert_eq!(
-        Gathered::of(repo.path(), &author, None).unmonitored_verdict(&sid("session-one"), notice()),
-        Verdict::Silent(SilentWhy::AutoOff)
-    );
-}
-
 /// A receipt callback that fails leaves the delivery evidence in place and
 /// replaces only Claude's bounded diagnostic file.
 #[tokio::test]

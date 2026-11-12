@@ -5,10 +5,10 @@ use super::{
     native_questions::{Delivery, Request, Window},
     transcript::questions,
 };
+use crate::cli::question_hook::{Frame, Hook, HookReply};
 use anyhow::{Result, ensure};
 use clank_core::{Tool, ids::AgentLabel};
 use clank_web::request::{BrowserReply, QuestionAnswer};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -20,17 +20,6 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct Hook {
-    pub cwd: String,
-    pub session_id: String,
-    pub prompt_id: String,
-    pub hook_event_name: String,
-    pub tool_name: String,
-    pub tool_input: Value,
-    pub tool_use_id: Option<String>,
-    pub tool_response: Option<Value>,
-}
 struct Output {
     value: Value,
     written: oneshot::Sender<bool>,
@@ -663,123 +652,13 @@ impl Drop for Held {
         }
     }
 }
-#[derive(Deserialize, Serialize)]
-struct Frame {
-    proto: u32,
-    input: Hook,
-}
-#[derive(Deserialize, Serialize)]
-struct HookReply {
-    proto: u32,
-    output: Value,
-}
-
-/// Native command adapter. Missing/stale/unsupported brokers immediately leave
-/// the ordinary terminal flow alone; this command never starts a broker.
-/// Record what this hook says about a bound agent's question, before any
-/// broker is asked, so the question is known with no viewer attached.
-fn record(hook: &Hook) {
-    use crate::cli::question_state::{Key, Observation, input_hash, observe};
-    let Ok(repo) = crate::cli::resolve_cwd_repo(Path::new(&hook.cwd)) else {
-        return;
-    };
-    let Ok(session) = clank_core::ids::SessionId::parse(&hook.session_id) else {
-        return;
-    };
-    let Ok(label) = crate::agent_env::resolve_identity_for_hook_in(&repo, Tool::Claude, &session)
-    else {
-        return;
-    };
-    let key = |tool_use: &String| Key {
-        session: hook.session_id.clone(),
-        prompt: hook.prompt_id.clone(),
-        tool_use: tool_use.clone(),
-    };
-    let observation = match (hook.hook_event_name.as_str(), &hook.tool_use_id) {
-        ("PreToolUse", Some(id)) => Observation::Asked {
-            key: key(id),
-            header: header_of(&hook.tool_input),
-            input: input_hash(&hook.tool_input),
-        },
-        ("PostToolUse" | "PostToolUseFailure", Some(id)) => Observation::Result { key: key(id) },
-        // PermissionRequest carries no tool call id and changes nothing
-        // already recorded; anything without an id cannot be keyed.
-        _ => return,
-    };
-    observe(
-        &crate::agent_store::agents_root(&repo).join(label.as_str()),
-        [observation],
-    );
-}
-
-/// One line saying what is asked: the first question's header, or else its
-/// first line.
-fn header_of(input: &Value) -> String {
-    let first = input.pointer("/questions/0");
-    let pick = |key: &str| {
-        first
-            .and_then(|q| q.get(key))
-            .and_then(|v| v.as_str())
-            .map(|s| s.lines().next().unwrap_or_default().trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-    pick("header")
-        .or_else(|| pick("question"))
-        .unwrap_or_else(|| "a question".into())
-}
-
-pub(crate) async fn run() -> Result<()> {
-    let input = std::io::read_to_string(std::io::stdin())?;
-    if let Ok(hook) = serde_json::from_str::<Hook>(&input) {
-        record(&hook);
-    }
-    let result = async {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let hook: Hook = serde_json::from_str(&input)?;
-        let repo = crate::cli::resolve_cwd_repo(Path::new(&hook.cwd))?;
-        let path = crate::cli::monitor::runtime_path(&repo, "claude-questions.sock");
-        let meta = std::fs::symlink_metadata(&path)?;
-        ensure!(
-            meta.file_type().is_socket() && meta.uid() == rustix::process::geteuid().as_raw(),
-            "untrusted question socket"
-        );
-        let parked = hook.hook_event_name == "PermissionRequest";
-        let frame = Frame {
-            proto: 1,
-            input: hook,
-        };
-        let mut socket = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::net::UnixStream::connect(path),
-        )
-        .await??;
-        let mut bytes = serde_json::to_vec(&frame)?;
-        bytes.push(b'\n');
-        tokio::time::timeout(std::time::Duration::from_secs(10), socket.write_all(&bytes))
-            .await??;
-        let mut reader = BufReader::new(socket);
-        let mut line = String::new();
-        if parked {
-            reader.read_line(&mut line).await?;
-        } else {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                reader.read_line(&mut line),
-            )
-            .await??;
-        }
-        let reply: HookReply = serde_json::from_str(&line)?;
-        ensure!(reply.proto == 1, "unsupported question reply");
-        Ok::<_, anyhow::Error>(reply.output)
-    }
-    .await;
-    println!("{}", result.unwrap_or_else(|_| json!({})));
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    fn record(hook: &Hook) {
+        if let Ok(Some((repo, request))) = crate::cli::question_hook::evidence(hook) {
+            let _ = crate::cli::monitor::question_control(&repo, &request);
+        }
+    }
     use super::*;
     use crate::cli::teams_config::{AgentDescription, RosterRole};
     use clank_core::ids::SessionId;

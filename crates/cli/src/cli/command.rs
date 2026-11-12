@@ -508,7 +508,7 @@ pub async fn dispatch_with(
         Command::Remote(args) => crate::cli::remote_control::run(args).await,
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,
-        Command::QuestionHook => crate::cli::web::claude_questions::run().await,
+        Command::QuestionHook => crate::cli::question_hook::run().await,
         Command::Licenses => crate::cli::licenses::run(),
         Command::Docs(args) => crate::cli::docs::run(args),
         Command::StopHook(args) => {

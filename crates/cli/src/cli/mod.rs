@@ -64,6 +64,7 @@ mod presentation;
 pub(crate) mod prompt_record;
 pub mod purge;
 pub(crate) mod purge_drop;
+pub(crate) mod question_hook;
 pub(crate) mod question_state;
 pub mod queue;
 pub(crate) mod recovery;

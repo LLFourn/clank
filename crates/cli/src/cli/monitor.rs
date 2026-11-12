@@ -187,6 +187,11 @@ pub(crate) enum Who {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "do", rename_all = "snake_case")]
 pub(crate) enum Control {
+    Questions {
+        author: String,
+        session: clank_core::SessionId,
+        observation: super::question_state::Observation,
+    },
     /// Restart one of `author`'s command sources, if what the monitor
     /// runs for it is still the configuration `accepted` fingerprints.
     Restart {
@@ -4113,6 +4118,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                     }
                                 }
                                 restarted.map_err(refused)
+                            }
+                            Control::Questions { .. } => {
+                                question_control(&repo, &request).map_err(refused)
                             }
                             Control::Observe { .. } | Control::RecoveryReply { .. } => {
                                 let (answered, acts) = match recovery_control(
@@ -8232,6 +8240,14 @@ fn serve_reports(
             keep.push(client);
             continue;
         };
+        // Resolve legacy outage continuations before clearing the marker. A
+        // verdict refused by the delivery queue has not served this session.
+        let session = reporting.report.session().clone();
+        let clear_outage = || {
+            if first && let Err(e) = crate::agent_store::outage_served(repo, &author, &session) {
+                tracing::debug!(%e, "could not clear the served outage");
+            }
+        };
         reporting.stepped = true;
         let parks = reporting.report.parks();
         if !frame.terminal(parks) {
@@ -8241,6 +8257,7 @@ fn serve_reports(
                 Note::Beat
             };
             if send_note(&client, &note) {
+                clear_outage();
                 keep.push(client);
             } else if let Some(writer) = client.writer {
                 leaving.push(writer);
@@ -8250,7 +8267,9 @@ fn serve_reports(
         let presents = frame.presentation().is_some();
         // Nothing reached the carrier, so nothing can answer for the
         // presentation: it fails now, and what it held stays owed.
-        if !send_note(&client, &Note::Verdict(frame)) && presents {
+        if send_note(&client, &Note::Verdict(frame)) {
+            clear_outage();
+        } else if presents {
             turns.closed(&author, client.conn, &g);
         }
         if let Some(writer) = client.writer {
@@ -8364,6 +8383,45 @@ fn report_deadline(clients: &[Client]) -> Option<u64> {
         .min()
 }
 
+/// Question evidence is persisted only by the monitor, without requiring a
+/// remote viewer. Recheck the session at consumption, not just in the adapter.
+pub(crate) fn question_control(
+    repo: &std::path::Path,
+    request: &Control,
+) -> Result<String, String> {
+    let Control::Questions {
+        author,
+        session,
+        observation,
+    } = request
+    else {
+        return Err("not a question observation".into());
+    };
+    let author = AgentLabel::parse(author).map_err(|e| e.to_string())?;
+    if !crate::agent_store::binding_matches(
+        repo,
+        &author,
+        clank_core::Tool::Claude,
+        session.as_str(),
+    ) {
+        return Err("this session no longer holds the label".into());
+    }
+    use super::question_state::Observation;
+    let observed_session = match observation {
+        Observation::Asked { key, .. } | Observation::Result { key } => &key.session,
+        _ => return Err("not a native question observation".into()),
+    };
+    if observed_session != session.as_str() {
+        return Err("question session does not match sender".into());
+    }
+    super::question_state::try_observe(
+        &crate::agent_store::agents_root(repo).join(author.as_str()),
+        [observation.clone()],
+    )
+    .map_err(|e| format!("question evidence could not be recorded: {e:#}"))?;
+    Ok("recorded".into())
+}
+
 /// Carry out a recovery transport's request: record a turn the harness
 /// reported, or apply a helper's answer, for a session still bound. What
 /// to tell the requester, and what recovery decided.
@@ -8463,7 +8521,10 @@ fn turn_control(
                 which: which.clone(),
             },
         ),
-        Control::Restart { .. } | Control::Observe { .. } | Control::RecoveryReply { .. } => {
+        Control::Questions { .. }
+        | Control::Restart { .. }
+        | Control::Observe { .. }
+        | Control::RecoveryReply { .. } => {
             return Err(refused("not a turn request".into()));
         }
     };

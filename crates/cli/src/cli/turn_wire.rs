@@ -32,7 +32,8 @@ pub(crate) enum Report {
     /// anything the hook saw.
     Handoff {
         session: SessionId,
-        /// This Stop continues the turn that was asked to arm the wait.
+        /// Grok's raw stopHookActive flag. The monitor distinguishes a
+        /// wait-arm continuation from a legacy outage continuation.
         continued: bool,
         /// Grok's `backgroundTasks`, read only for declarations.
         #[serde(default)]
@@ -206,4 +207,18 @@ impl TurnResult {
             | TurnResult::EmitFailed { presentation, .. } => presentation,
         }
     }
+}
+
+/// A local timeout is transport failure, not permission for a model turn.
+/// OpenCode can renew its socket wait without involving the model.
+pub(crate) fn expired_wait(tool: Tool) -> Frame {
+    Frame::bare(if tool == Tool::OpenCode {
+        WireVerdict::RenewWait
+    } else {
+        WireVerdict::Diagnostic {
+            message:
+                "hook: the monitor did not answer before the deadline; pending work remains intact"
+                    .into(),
+        }
+    })
 }

@@ -103,20 +103,6 @@ fn remaining_budget(elapsed: std::time::Duration) -> std::time::Duration {
     HANDOFF_BUDGET.saturating_sub(elapsed)
 }
 
-/// Grok's flag means any Stop block continued the turn, not necessarily
-/// an ArmWait. Capture the outage marker before the carrier receives the
-/// healthy monitor's answer and clears it. Only a genuine arm continuation
-/// suppresses another wait request when no wait has registered yet.
-fn continued_wait(repo: &Path, label: &AgentLabel, input: &Input) -> Result<bool> {
-    if !input.stop_hook_active {
-        return Ok(false);
-    }
-    let outage = crate::agent_store::load_agent_config(repo, label)?
-        .and_then(|config| config.outage_notified)
-        .is_some_and(|notice| notice.session == input.session_id);
-    Ok(!outage)
-}
-
 pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
     let started = std::time::Instant::now();
     let hook_started = super::turn_custody::now_ms();
@@ -138,7 +124,7 @@ pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
         let Some(label) = route(&input, &repo, &Process)? else {
             return Ok(None);
         };
-        let continued = continued_wait(&repo, &label, &input)?;
+        let continued = input.stop_hook_active;
         Ok(Some((repo, label, report(input, hook_started, continued))))
     })();
     match routed {

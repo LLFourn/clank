@@ -1083,7 +1083,7 @@ fn an_unversioned_role_less_roster_is_the_old_schema_init_recreates() {
 }
 
 #[test]
-fn an_agent_config_it_cannot_read_stops_every_writer() {
+fn an_agent_config_it_cannot_read_stops_policy_writers() {
     for body in [MALFORMED, TOO_NEW, BAD_AGENT_SETTING] {
         let repo = tempfile::tempdir().unwrap();
         let l = label("claude");
@@ -1091,7 +1091,6 @@ fn an_agent_config_it_cannot_read_stops_every_writer() {
             &crate::agent_store::agent_config_path(repo.path(), &l),
             body,
         );
-        let session = SessionId::parse(SESSION).unwrap();
         refused(
             "update_agent_config",
             body,
@@ -1106,20 +1105,62 @@ fn an_agent_config_it_cannot_read_stops_every_writer() {
             &path,
             crate::agent_store::set_auto_mode(repo.path(), &l, AutoMode::Off),
         );
-        refused(
-            "bind",
+    }
+}
+
+#[test]
+fn an_unreadable_identity_stops_identity_writers_without_changing_bytes() {
+    for body in [
+        MALFORMED,
+        TOO_NEW,
+        r#"{"version": 1, "session": false}"#,
+        r#"{"version": 1, "resume_pending": false}"#,
+    ] {
+        let repo = tempfile::tempdir().unwrap();
+        let l = label("claude");
+        let path = place(
+            &crate::agent_store::agent_config_path(repo.path(), &l),
             body,
-            &path,
+        );
+        let session = SessionId::parse(SESSION).unwrap();
+        let rejected = |what: &str, result: anyhow::Result<()>| {
+            if body == MALFORMED || body == TOO_NEW {
+                refused(what, body, &path, result);
+            } else {
+                result.expect_err(what);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), body, "{what}");
+            }
+        };
+        rejected(
+            "bind",
             crate::agent_store::bind_session_to_agent(repo.path(), &l, Tool::Claude, &session)
                 .map(|_| ()),
         );
-        refused(
+        rejected(
             "release",
-            body,
-            &path,
             crate::agent_store::release_binding(repo.path(), &l, &session).map(|_| ()),
         );
     }
+}
+
+#[test]
+fn identity_writers_preserve_policy_they_cannot_interpret() {
+    let repo = tempfile::tempdir().unwrap();
+    let l = label("claude");
+    let path = place(
+        &crate::agent_store::agent_config_path(repo.path(), &l),
+        BAD_AGENT_SETTING,
+    );
+    let before = raw(&path);
+    let session = SessionId::parse(SESSION).unwrap();
+    crate::agent_store::bind_session_to_agent(repo.path(), &l, Tool::Claude, &session).unwrap();
+    let mut bound = raw(&path);
+    let identity = bound.as_object_mut().unwrap().remove("session").unwrap();
+    assert_eq!(identity["id"], SESSION);
+    assert_eq!(identity["tool"], "claude");
+    assert_eq!(bound, before, "binding changes only session identity");
+    assert!(crate::agent_store::release_binding(repo.path(), &l, &session).unwrap());
+    assert_eq!(raw(&path), before, "release preserves all opaque policy");
 }
 
 #[test]

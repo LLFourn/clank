@@ -15,7 +15,7 @@ use std::path::Path;
 
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::Tool;
-use clank_core::{Caller, ResolveError, bound_to, resolve_agent_identity};
+use clank_core::{Caller, ResolveError, resolve_agent_identity};
 
 use crate::agent_store::load_all_agent_configs_lossy;
 
@@ -392,25 +392,9 @@ pub(crate) fn resolve_identity_for_hook_in(
     tool: Tool,
     session_id: &SessionId,
 ) -> anyhow::Result<AgentLabel> {
-    let agent_configs = load_all_agent_configs_lossy(repo)?;
-    let caller = Caller::Session {
-        tool,
-        id: session_id,
-    };
-    resolve_agent_identity(&caller, &agent_configs).map_err(|e| match e {
-        ResolveError::NoSession => {
-            anyhow::anyhow!("hook called without a session id (internal: caller passed Some)")
-        }
-        ResolveError::NoAgentForSession {
-            session_id: id,
-            tool: t,
-        } => anyhow::anyhow!(
-            "no agent set up for {tool} session {sid} — run \
-             `clank as <label>` (inside this session) to bootstrap",
-            tool = t.as_str(),
-            sid = id.as_str(),
-        ),
-    })
+    bound_agent(repo, tool, session_id)?.ok_or_else(|| anyhow::anyhow!(
+        "no agent set up for {tool} session {session_id} — run `clank as <label>` (inside this session) to bootstrap"
+    ))
 }
 
 /// The agent bound to this session, if any.
@@ -419,11 +403,10 @@ pub(crate) fn bound_agent(
     tool: Tool,
     session_id: &SessionId,
 ) -> anyhow::Result<Option<AgentLabel>> {
-    Ok(bound_to(
-        tool,
-        session_id,
-        &load_all_agent_configs_lossy(repo)?,
-    ))
+    Ok(crate::agent_store::identity::bindings(repo, true)?
+        .into_iter()
+        .find(|(_, s)| s.tool == tool && &s.id == session_id)
+        .map(|(label, _)| label))
 }
 
 /// What a SessionStart does with its session.
@@ -457,20 +440,21 @@ pub(crate) fn session_start(
     session_id: &SessionId,
     launched_as: Option<&AgentLabel>,
 ) -> anyhow::Result<Start> {
-    let agent_configs = load_all_agent_configs_lossy(repo)?;
-    if let Some(label) = bound_to(tool, session_id, &agent_configs) {
+    let agent_configs = crate::agent_store::identity::bindings(repo, true)?;
+    if let Some(label) = agent_configs
+        .iter()
+        .find(|(_, s)| s.tool == tool && &s.id == session_id)
+        .map(|(l, _)| l.clone())
+    {
         return Ok(Start::Bound(label));
     }
-    if agent_configs
-        .iter()
-        .any(|(_, cfg)| cfg.session.as_ref().is_some_and(|s| &s.id == session_id))
-    {
+    if agent_configs.iter().any(|(_, s)| &s.id == session_id) {
         return Ok(Start::HeldElsewhere);
     }
     let Some(label) = launched_as else {
         return Ok(Start::Unbound);
     };
-    let rostered = crate::agent_store::resolve_tool(repo, label)?;
+    let rostered = crate::agent_store::identity::tool(repo, label)?;
     Ok(if rostered == tool {
         Start::Bootstrap(label.clone())
     } else {

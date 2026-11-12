@@ -31,13 +31,14 @@ fn an_outage_continuation_still_arms_a_wait_when_the_monitor_recovers() {
         &env,
     )
     .unwrap();
-    let stop = input(&repo, &session, "stop", json!([]));
-    let handoff = report(stop, 1, false);
-    let outage = crate::cli::turn_child::unanswered(&repo, &label, &handoff, &mut |frame| {
-        assert_eq!(wire(frame).1, None);
-        Some(Ok(()))
-    });
-    assert_eq!(outage.verdict, WireVerdict::Notify);
+    // Legacy releases could emit an outage continuation without asking for a wait.
+    crate::agent_store::update_agent_config(&repo, &label, |config| {
+        config.outage_notified = Some(clank_core::agent_config::OutageNotified {
+            session: session.clone(),
+            at: "2026-11-12T00:00:00Z".into(),
+        });
+    })
+    .unwrap();
     let mut continuation = input(&repo, &session, "stop", json!([]));
     continuation.stop_hook_active = true;
     assert_eq!(handle_with(&continuation, &repo, &env, true).unwrap(), None);
@@ -45,7 +46,7 @@ fn an_outage_continuation_still_arms_a_wait_when_the_monitor_recovers() {
         handle(&continuation, &repo, &env).unwrap(),
         Some(ARM.to_string())
     );
-    // The carrier clears the outage only after this healthy verdict arrives.
+    // The monitor resolves the legacy marker before clearing it.
     assert!(crate::agent_store::outage_served(&repo, &label, &session).unwrap());
     assert_eq!(
         handle(&continuation, &repo, &env).unwrap(),
@@ -69,7 +70,7 @@ fn handle_with(
     };
     let g = crate::cli::turn_custody::Gathered::of(repo, &label, None).waiting(wait_registered);
     let frame = crate::cli::turn_custody::frame_of(
-        g.handoff_verdict(&input.session_id, continued_wait(repo, &label, input)?),
+        g.handoff_verdict(&input.session_id, input.stop_hook_active),
     );
     Ok(wire(&frame).0.map(|out| {
         let block: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -407,21 +408,17 @@ fn a_check_in_blocks_groks_stop_with_its_text() {
     assert_eq!(block["reason"], "clank check-in: declared work");
 }
 
-/// The notices a child with no monitor prints for Grok's Stop block it
-/// with their reason, which is how Grok is woken: the child's own frames,
-/// with nothing of the work the repo owes.
+/// Carrier outage diagnostics reach Grok's stderr without a block decision
+/// or any pending work in their output.
 #[tokio::test(start_paused = true)]
-async fn the_childs_no_monitor_notices_block_groks_stop_with_the_reason() {
+async fn the_childs_outage_diagnostics_do_not_block_groks_stop() {
     use crate::cli::turn_child::tests::{handoff, newer, no_binary, unserved};
     for (attempt, says) in [
         (
             no_binary as fn() -> crate::cli::monitor::Attempt,
-            "clank cannot start its monitor: starting one failed: no binary.",
+            "starting one failed: no binary",
         ),
-        (
-            newer,
-            "clank cannot start its monitor: the monitor speaks a newer protocol.",
-        ),
+        (newer, "the monitor speaks a newer protocol"),
     ] {
         let [frame] = unserved(&handoff(), attempt)
             .await
@@ -429,11 +426,9 @@ async fn the_childs_no_monitor_notices_block_groks_stop_with_the_reason() {
             .expect("one frame");
         assert!(frame.presentation().is_none(), "{frame:?}");
         let (out, err) = wire(&frame);
-        assert_eq!(err, None);
-        let block: serde_json::Value = serde_json::from_str(&out.expect("a decision")).unwrap();
-        assert_eq!(block["decision"], "block");
-        let reason = block["reason"].as_str().unwrap();
-        assert!(reason.starts_with(says), "{reason}");
+        assert!(out.is_none());
+        let reason = err.expect("transport diagnostic");
+        assert!(reason.contains(says), "{reason}");
         assert!(!reason.contains("scheduled work"), "{reason}");
     }
 }
@@ -464,13 +459,6 @@ async fn a_handoff_with_no_monitor_is_told_so_before_its_hook_gives_up() {
         "the hook had {spare:?} of its wait left to read it in"
     );
     let (out, err) = wire(&frame);
-    assert_eq!(err, None);
-    let block: serde_json::Value = serde_json::from_str(&out.expect("a decision")).unwrap();
-    assert_eq!(block["decision"], "block");
-    assert!(
-        block["reason"]
-            .as_str()
-            .unwrap()
-            .starts_with("clank cannot start its monitor:")
-    );
+    assert!(out.is_none());
+    assert!(err.unwrap().contains("monitor is unavailable"));
 }

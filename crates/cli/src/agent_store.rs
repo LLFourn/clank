@@ -16,6 +16,7 @@ use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::{AutoMode, Tool};
 use clank_user_config::versioned::{self, Refusal};
 
+pub(crate) mod identity;
 pub mod repo_config;
 
 /// The newest version of an agent's `config.json` this build reads and
@@ -69,16 +70,19 @@ pub(crate) fn agent_config_document(
 
 /// The session bound to the agent whose directory is `agent_dir`.
 pub(crate) fn binding_in(agent_dir: &Path) -> anyhow::Result<Option<Session>> {
-    Ok(load_json::<AgentConfig>(&config_in(agent_dir))?.and_then(|c| c.session))
+    #[derive(serde::Deserialize)]
+    struct Binding {
+        session: Option<Session>,
+    }
+    Ok(load_json::<Binding>(&config_in(agent_dir))?.and_then(|c| c.session))
 }
 
 /// Whether the current binding still assigns this label to this tool and session.
 /// An unreadable or absent config cannot authorize a wake.
 pub(crate) fn binding_matches(repo: &Path, label: &AgentLabel, tool: Tool, session: &str) -> bool {
-    load_agent_config(repo, label)
+    identity::binding(repo, label)
         .ok()
         .flatten()
-        .and_then(|cfg| cfg.session)
         .is_some_and(|s| s.tool == tool && s.id.as_str() == session)
 }
 
@@ -518,7 +522,7 @@ pub fn release_binding(
     session: &SessionId,
 ) -> anyhow::Result<bool> {
     let guard = BindingGuard::acquire(repo, label)?;
-    mutate_locked(&guard, |cfg| {
+    identity::mutate(&guard, |cfg| {
         if cfg.session.as_ref().is_none_or(|s| &s.id != session) {
             return false;
         }
@@ -615,7 +619,7 @@ pub fn record_transcript(
     transcript: &str,
 ) -> anyhow::Result<bool> {
     let guard = BindingGuard::acquire(repo, label)?;
-    mutate_locked(&guard, |cfg| {
+    identity::mutate(&guard, |cfg| {
         let Some(bound) = cfg.session.as_mut().filter(|s| &s.id == session) else {
             return false;
         };
@@ -684,7 +688,7 @@ pub fn resume_checked_in(
     session: &SessionId,
 ) -> anyhow::Result<bool> {
     let guard = BindingGuard::acquire(repo, label)?;
-    mutate_locked(&guard, |cfg| {
+    identity::mutate(&guard, |cfg| {
         if cfg
             .resume_pending
             .as_ref()
@@ -849,12 +853,10 @@ pub fn bind_session_to_agent(
     tool: Tool,
     session_id: &SessionId,
 ) -> anyhow::Result<BindOutcome> {
-    let all = load_all_agent_configs(repo)?;
-    let stale: Vec<(AgentLabel, AgentConfig)> = all
+    let all = identity::bindings(repo, false)?;
+    let stale: Vec<(AgentLabel, Session)> = all
         .into_iter()
-        .filter(|(other_label, cfg)| {
-            other_label != label && cfg.session.as_ref().is_some_and(|s| &s.id == session_id)
-        })
+        .filter(|(other_label, cfg)| other_label != label && &cfg.id == session_id)
         .collect();
 
     // Bind the new label FIRST. Order matters: if the clear-stale
@@ -874,7 +876,7 @@ pub fn bind_session_to_agent(
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("formatting timestamp")?;
-    mutate_locked(&owned, |cfg| {
+    identity::mutate(&owned, |cfg| {
         cfg.session = Some(Session {
             id: session_id.clone(),
             tool,

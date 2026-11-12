@@ -3,7 +3,6 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::monitor::{Conn, OUTAGE_BUDGET};
-use super::super::wake_render::monitor_outage;
 
 pub(crate) const SESSION: &str = "session-unmonitored";
 
@@ -119,10 +118,7 @@ pub(crate) fn told(repo: &Path, author: &AgentLabel) -> bool {
 }
 
 fn outage_notice() -> Frame {
-    Frame::text(
-        WireVerdict::Notify,
-        monitor_outage("starting one failed: no binary"),
-    )
+    unavailable("starting one failed: no binary")
 }
 
 fn frames(out: Vec<u8>) -> Vec<Frame> {
@@ -273,27 +269,14 @@ async fn a_monitor_lost_three_times_mid_park_is_followed_three_times() {
 }
 
 /// With no monitor to be had for the whole outage budget, the agent is
-/// woken with the reason. It is not parked, not handed a diagnostic, and
-/// not presented the work the repo owes it.
+/// given a diagnostic with the reason, never presented the work owed.
 #[tokio::test(start_paused = true)]
-async fn an_outage_past_its_budget_wakes_with_the_reason_and_no_work() {
+async fn an_outage_past_its_budget_reports_a_diagnostic_and_no_work() {
     let began = tokio::time::Instant::now();
     let printed = unserved(&stop(u64::MAX), no_binary).await;
-    assert_eq!(
-        printed,
-        vec![Frame::text(
-            WireVerdict::Notify,
-            monitor_outage("starting one failed: no binary")
-        )]
-    );
+    assert_eq!(printed, vec![unavailable("starting one failed: no binary")]);
     assert!(printed[0].presentation().is_none());
-    assert!(
-        !printed[0]
-            .rendered
-            .as_deref()
-            .unwrap()
-            .contains("scheduled work")
-    );
+    assert!(printed[0].rendered.is_none());
     let took = began.elapsed();
     assert!(
         took >= OUTAGE_BUDGET && took < OUTAGE_BUDGET * 2,
@@ -320,7 +303,7 @@ async fn a_stale_child_goes_on_trying_and_tells_its_agent_nothing() {
     let printed = carried_by(repo.path(), &author, &report, &attach, &authority).await;
     assert_eq!(
         printed,
-        vec![super::super::turn_custody::Turns::deadline_frame(
+        vec![super::super::turn_wire::expired_wait(
             clank_core::Tool::Claude
         )]
     );
@@ -338,10 +321,7 @@ async fn a_newer_monitor_with_no_newer_install_is_an_outage() {
     let printed = unserved(&stop(u64::MAX), newer).await;
     assert_eq!(
         printed,
-        vec![Frame::text(
-            WireVerdict::Notify,
-            monitor_outage("the monitor speaks a newer protocol")
-        )]
+        vec![unavailable("the monitor speaks a newer protocol")]
     );
 }
 
@@ -363,10 +343,7 @@ async fn a_report_that_never_parks_is_told_at_its_deadline_of_a_retry_still_fail
 }
 
 fn re_arm() -> Frame {
-    Frame::text(
-        WireVerdict::Notify,
-        super::super::wake_render::REARM_REASON.to_string(),
-    )
+    super::super::turn_wire::expired_wait(clank_core::Tool::Claude)
 }
 
 /// A park's deadline is not an outage. A retry still failing when it
@@ -412,51 +389,32 @@ async fn a_park_that_loses_its_monitor_after_its_last_word_re_arms_and_announces
     assert!(!told(repo.path(), &author));
 }
 
-/// One outage is announced once. The Stops after it wake nobody about
-/// it: each child goes on trying for its whole park, well past the
-/// budget, and ends as an uneventful park does.
+/// Every failed exchange has a bounded transport diagnostic and leaves
+/// the agent's policy and pending work untouched.
 #[tokio::test(start_paused = true)]
-async fn a_second_and_third_stop_in_one_outage_go_on_trying_and_say_nothing_of_it() {
+async fn repeated_outages_remain_diagnostics_without_persisting_policy() {
     let (repo, author) = repo_with(clank_core::Tool::Claude, true);
-    let attempts = AtomicUsize::new(0);
-    let attach = |_: Who| -> Attaching<'_> {
-        attempts.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { no_binary() })
-    };
-    let first = carried(repo.path(), &author, &stop(u64::MAX), &attach).await;
-    assert_eq!(first, vec![outage_notice()]);
-    assert!(told(repo.path(), &author));
-
-    let park = OUTAGE_BUDGET * 5;
-    for nth in ["second", "third"] {
-        let before = attempts.load(Ordering::SeqCst);
+    let before =
+        std::fs::read(crate::agent_store::agent_config_path(repo.path(), &author)).unwrap();
+    let attach = |_: Who| -> Attaching<'_> { Box::pin(async { no_binary() }) };
+    for _ in 0..3 {
         let began = tokio::time::Instant::now();
-        let printed = carried(repo.path(), &author, &stop(within(park)), &attach).await;
         assert_eq!(
-            printed,
-            vec![Frame::text(
-                WireVerdict::Notify,
-                super::super::wake_render::REARM_REASON.to_string()
-            )],
-            "the {nth} Stop ends as a park with nothing to say does"
+            carried(repo.path(), &author, &stop(u64::MAX), &attach).await,
+            vec![outage_notice()]
         );
-        let took = began.elapsed();
-        assert!(
-            took > OUTAGE_BUDGET * 4 && took <= park,
-            "the {nth} Stop held its whole park: {took:?}"
-        );
-        assert!(
-            attempts.load(Ordering::SeqCst) - before > 30,
-            "and went on attempting throughout"
-        );
-        assert!(told(repo.path(), &author));
+        assert!(began.elapsed() < OUTAGE_BUDGET * 2);
     }
+    assert_eq!(
+        std::fs::read(crate::agent_store::agent_config_path(repo.path(), &author)).unwrap(),
+        before
+    );
 }
 
-/// A monitor's answer ends the outage, so the next one is announced
-/// again.
+/// Reconnection carries the monitor verdict, then a subsequent loss remains
+/// a diagnostic without changing the durable outage marker.
 #[tokio::test(start_paused = true)]
-async fn an_outage_after_a_monitor_answered_is_announced_again() {
+async fn a_reconnected_carrier_reports_subsequent_loss_without_waking() {
     let (repo, author) = repo_with(clank_core::Tool::Claude, true);
     let back = std::sync::atomic::AtomicBool::new(false);
     let running = std::sync::atomic::AtomicBool::new(false);
@@ -480,7 +438,7 @@ async fn an_outage_after_a_monitor_answered_is_announced_again() {
     };
     let first = carried(repo.path(), &author, &stop(u64::MAX), &attach).await;
     assert_eq!(first, vec![outage_notice()]);
-    assert!(told(repo.path(), &author));
+    assert!(!told(repo.path(), &author));
 
     back.store(true, Ordering::SeqCst);
     let park = stop(within(OUTAGE_BUDGET * 5));
@@ -495,28 +453,19 @@ async fn an_outage_after_a_monitor_answered_is_announced_again() {
         [outage_notice()],
         "and its loss is a new outage, announced after its own budget"
     );
-    assert!(told(repo.path(), &author));
+    assert!(!told(repo.path(), &author));
 }
 
 /// A handoff in an outage its session was already told of is not answered
 /// by any rule of the child's own: Grok's Stop gets a diagnostic, which
 /// blocks nothing.
 #[tokio::test(start_paused = true)]
-async fn a_handoff_in_an_outage_already_announced_blocks_nothing() {
+async fn a_handoff_without_a_monitor_never_blocks_the_provider() {
     let (repo, author) = repo_with(clank_core::Tool::Grok, false);
     let attach = |_: Who| -> Attaching<'_> { Box::pin(async { no_binary() }) };
-    let first = carried(repo.path(), &author, &handoff(), &attach).await;
-    assert_eq!(first, vec![outage_notice()]);
-    let ten = std::time::Duration::from_secs(10);
-    let second = carried(repo.path(), &author, &handoff_by(within(ten)), &attach).await;
-    assert!(
-        matches!(
-            second.as_slice(),
-            [Frame { verdict: WireVerdict::Diagnostic { message }, .. }]
-                if message.contains("still has no monitor")
-        ),
-        "{second:?}"
-    );
+    let printed = carried(repo.path(), &author, &handoff(), &attach).await;
+    assert_eq!(printed, vec![outage_notice()]);
+    assert_eq!(crate::cli::grok_hook::wire(&printed[0]).0, None);
 }
 
 /// The hook going away ends a failing retry at once, with nothing said.
@@ -569,20 +518,14 @@ async fn a_superseded_binding_ends_a_failing_retry_with_nothing_said() {
     assert_eq!(attempts.into_inner(), 1);
 }
 
-/// The notice wakes only a session clank drives: with auto off the outage
-/// ends in silence.
+/// Even manual mode is not read by an unavailable monitor's carrier.
 #[tokio::test(start_paused = true)]
-async fn an_outage_says_nothing_to_an_agent_with_auto_off() {
+async fn an_outage_diagnoses_transport_without_reading_auto_mode() {
     let (repo, author) = repo_with(clank_core::Tool::Claude, true);
     crate::agent_store::set_auto_mode(repo.path(), &author, clank_core::AutoMode::Off).unwrap();
     let attach = |_: Who| -> Attaching<'_> { Box::pin(async { no_binary() }) };
     let printed = carried(repo.path(), &author, &stop(u64::MAX), &attach).await;
-    assert_eq!(
-        printed,
-        vec![Frame::bare(WireVerdict::Silent {
-            why: clank_core::SilentReason::AutoOff
-        })]
-    );
+    assert_eq!(printed, vec![outage_notice()]);
 }
 
 /// A report that does not parse is still the diagnostic it was, which
@@ -651,10 +594,7 @@ async fn a_handoff_is_carried_to_a_monitor_and_holds_no_wait() {
     );
     assert_eq!(
         frames(out),
-        vec![Frame::text(
-            WireVerdict::Notify,
-            monitor_outage("the monitor speaks a newer protocol")
-        )]
+        vec![unavailable("the monitor speaks a newer protocol")]
     );
 }
 
@@ -663,13 +603,7 @@ async fn a_handoff_is_carried_to_a_monitor_and_holds_no_wait() {
 #[tokio::test(start_paused = true)]
 async fn a_handoff_with_no_monitor_is_told_so_and_not_asked_to_arm_a_wait() {
     let printed = unserved(&handoff(), no_binary).await;
-    assert_eq!(
-        printed,
-        vec![Frame::text(
-            WireVerdict::Notify,
-            monitor_outage("starting one failed: no binary")
-        )]
-    );
+    assert_eq!(printed, vec![unavailable("starting one failed: no binary")]);
 }
 
 /// A subagent's report with `left` to be answered in.
@@ -778,7 +712,7 @@ async fn a_childs_report_holds_no_wait_and_spends_no_announcement() {
         vec![outage_notice()],
         "the agent's own Stop is still told"
     );
-    assert!(told(repo.path(), &author));
+    assert!(!told(repo.path(), &author));
 }
 
 /// A connection whose monitor beats and never gives a verdict, with the
@@ -791,8 +725,7 @@ fn monitor_only_beating() -> (Conn, std::os::unix::net::UnixStream) {
 
 /// A handoff a monitor took and did not answer is told so before its hook
 /// gives up, like one no monitor took: being connected does not put the
-/// exchange outside the report's deadline. It is announced once; the
-/// next gets a diagnostic, which blocks nothing.
+/// exchange outside the report's deadline. Every attempt ends in a diagnostic.
 #[tokio::test(start_paused = true)]
 async fn a_handoff_a_monitor_took_and_never_answered_is_told_so_before_its_deadline() {
     let (repo, author) = repo_with(clank_core::Tool::Grok, true);
@@ -805,19 +738,16 @@ async fn a_handoff_a_monitor_took_and_never_answered_is_told_so_before_its_deadl
     let ten = std::time::Duration::from_secs(10);
     let began = tokio::time::Instant::now();
     let first = carried(repo.path(), &author, &handoff_by(within(ten)), &attach).await;
-    assert_eq!(
-        first,
-        vec![Frame::text(
-            WireVerdict::Notify,
-            super::super::wake_render::MONITOR_UNANSWERED.to_string()
-        )]
-    );
+    assert_eq!(first, vec![still("the monitor has not answered")]);
     let spare = ten.saturating_sub(began.elapsed());
     assert!(
         spare >= std::time::Duration::from_secs(1),
         "the hook had {spare:?} of its wait left to read it in"
     );
-    assert!(told(repo.path(), &author), "a beat is not an answer");
+    assert!(
+        !told(repo.path(), &author),
+        "a diagnostic writes no policy state"
+    );
 
     let second = carried(repo.path(), &author, &handoff_by(within(ten)), &attach).await;
     assert!(
@@ -834,7 +764,7 @@ async fn a_handoff_a_monitor_took_and_never_answered_is_told_so_before_its_deadl
 /// deadline ends as an uneventful park does: it is not an outage, and
 /// the monitor had the deadline itself to answer in first.
 #[tokio::test(start_paused = true)]
-async fn a_connected_park_unanswered_past_its_deadline_re_arms_and_is_no_outage() {
+async fn a_connected_park_unanswered_past_its_deadline_reports_failure() {
     let (repo, author) = repo_with(clank_core::Tool::Claude, true);
     let monitors = std::sync::Mutex::new(Vec::new());
     let attach = |_: Who| -> Attaching<'_> {
@@ -847,9 +777,8 @@ async fn a_connected_park_unanswered_past_its_deadline_re_arms_and_is_no_outage(
     let printed = carried(repo.path(), &author, &stop(within(ten)), &attach).await;
     assert_eq!(
         printed,
-        vec![Frame::text(
-            WireVerdict::Notify,
-            super::super::wake_render::REARM_REASON.to_string()
+        vec![super::super::turn_wire::expired_wait(
+            clank_core::Tool::Claude
         )]
     );
     let took = began.elapsed();
@@ -921,7 +850,7 @@ impl Write for HookPipe {
 /// One Grok Stop's child with no monitor to be had, run to its end on
 /// this thread with a clock of its own, printing into `out`. Its handoff
 /// leaves it ten seconds, so it speaks at its last word.
-pub(crate) fn handoff_child(repo: &Path, author: &AgentLabel, out: &mut HookPipe) {
+pub(crate) fn handoff_child(repo: &Path, author: &AgentLabel, out: &mut impl Write) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
@@ -953,44 +882,29 @@ pub(crate) fn announcements(out: &HookPipe) -> usize {
         .count()
 }
 
-/// Two hooks of one session whose children reach the notice together
-/// wake it once: the second starts while the first is still writing, and
-/// finds the session told.
+/// Concurrent carriers can print diagnostics, but neither can wake a model.
 #[test]
-fn two_children_reaching_the_notice_together_announce_one_outage_once() {
+fn concurrent_outage_diagnostics_never_authorize_a_turn() {
     let (repo, author) = repo_with(clank_core::Tool::Grok, false);
-    let (writing, began) = std::sync::mpsc::channel();
-    let mut first = HookPipe {
-        bytes: Vec::new(),
-        hold: std::time::Duration::from_secs(1),
-        writing: Some(writing),
-        broken: false,
-    };
-    let mut second = HookPipe {
-        bytes: Vec::new(),
-        hold: std::time::Duration::ZERO,
-        writing: None,
-        broken: false,
-    };
     std::thread::scope(|scope| {
-        scope.spawn(|| handoff_child(repo.path(), &author, &mut first));
-        began
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("the first child reaches its notice");
-        handoff_child(repo.path(), &author, &mut second);
+        for _ in 0..2 {
+            scope.spawn(|| {
+                let mut out = HookPipe {
+                    bytes: vec![],
+                    hold: std::time::Duration::ZERO,
+                    writing: None,
+                    broken: false,
+                };
+                handoff_child(repo.path(), &author, &mut out);
+                assert_eq!(announcements(&out), 0);
+                assert_eq!(frames(out.bytes), vec![outage_notice()]);
+            });
+        }
     });
-    assert_eq!(announcements(&first), 1);
-    assert_eq!(
-        announcements(&second),
-        0,
-        "{:?}",
-        String::from_utf8_lossy(&second.bytes)
-    );
-    assert!(told(repo.path(), &author));
+    assert!(!told(repo.path(), &author));
 }
 
-/// A notice that never left for a hook already gone tells nobody, so the
-/// session is not recorded as told and its next Stop is.
+/// Failed diagnostic delivery and the next attempt both leave policy untouched.
 #[test]
 fn a_notice_its_hook_never_took_leaves_the_session_untold() {
     let (repo, author) = repo_with(clank_core::Tool::Grok, false);
@@ -1008,8 +922,8 @@ fn a_notice_its_hook_never_took_leaves_the_session_untold() {
         ..gone
     };
     handoff_child(repo.path(), &author, &mut next);
-    assert_eq!(announcements(&next), 1);
-    assert!(told(repo.path(), &author));
+    assert_eq!(announcements(&next), 0);
+    assert!(!told(repo.path(), &author));
 }
 
 /// Nothing the child is made of can fold the repo or watch it.
@@ -1130,10 +1044,7 @@ async fn a_retirement_that_never_ends_is_told_at_its_own_bound() {
     let printed = unserved(&stop(u64::MAX), retiring).await;
     assert_eq!(
         printed,
-        vec![Frame::text(
-            WireVerdict::Notify,
-            monitor_outage("the retiring monitor still holds the lease")
-        )]
+        vec![unavailable("the retiring monitor still holds the lease")]
     );
     let took = began.elapsed();
     assert!(
@@ -1236,4 +1147,47 @@ async fn a_park_behind_another_clients_repair_outwaits_the_retirement() {
     assert_eq!(printed, vec![woke()]);
     assert!(began.elapsed() >= seventy);
     assert!(!told(repo.path(), &author));
+}
+
+/// The outage path must not start parsing monitor policy through a helper.
+#[tokio::test(start_paused = true)]
+async fn malformed_monitor_policy_cannot_change_a_hook_outage_into_a_wake() {
+    let (repo, author) = repo_with(clank_core::Tool::Grok, true);
+    let path = crate::agent_store::agent_config_path(repo.path(), &author);
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    doc["auto_mode"] = serde_json::json!(["invalid"]);
+    doc["wait_events"] = serde_json::json!("invalid");
+    doc["outage_notified"] = serde_json::json!(42);
+    std::fs::write(&path, doc.to_string()).unwrap();
+    // No role, block or question state can be read successfully either.
+    std::fs::write(repo.path().join(".clank/config.json"), "not json").unwrap();
+    let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
+    std::fs::write(dir.join("question.json"), "not json").unwrap();
+    let attach = |_: Who| -> Attaching<'_> { Box::pin(async { no_binary() }) };
+    assert_eq!(
+        carried(repo.path(), &author, &handoff(), &attach).await,
+        vec![outage_notice()]
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), doc.to_string());
+}
+
+#[tokio::test]
+async fn a_carrier_requires_the_hooks_routed_identity() {
+    let (repo, _) = repo_with(clank_core::Tool::Claude, false);
+    let error = run(crate::cli::WaitArgs {
+        repo: Some(repo.path().to_path_buf()),
+        author: None,
+        peek: false,
+        die_with_owner: false,
+        deliver_to_session: None,
+        turn_end: true,
+        json: false,
+        events: vec![],
+        r#for: None,
+        no_cache: false,
+    })
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("routed --author"));
 }

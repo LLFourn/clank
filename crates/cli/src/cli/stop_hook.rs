@@ -11,7 +11,7 @@
 //! # A Stop turn
 //!
 //! 1. **Route.** Repo from `--repo`, else the stdin `cwd`; label from the
-//!    environment, else the binding. If the binding no longer names this
+//!    binding of the session in stdin. If the binding no longer names this
 //!    session and this tool, be Silent: someone else is this label now.
 //! 2. **Report.** The Stop's evidence — its place in the agent's record,
 //!    what it proves about the agent's questions, and the harness's task
@@ -721,7 +721,7 @@ async fn answer_with(
         Err(frame)
             if frame.verdict == WireVerdict::Park && matches!(report, Report::Handoff { .. }) =>
         {
-            super::turn_child::unanswered(repo, label, &report, &mut emit)
+            super::turn_child::unanswered(&mut emit)
         }
         Err(frame) => {
             emit(&frame);
@@ -1101,7 +1101,7 @@ async fn await_verdict_under_deadline<W: Run>(
         })
     };
     let at_deadline = || match parks {
-        true => super::turn_custody::Turns::deadline_frame(tool),
+        true => super::turn_wire::expired_wait(tool),
         false => Frame::bare(WireVerdict::Park),
     };
     if life.gone_now() {
