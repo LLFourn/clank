@@ -147,14 +147,23 @@ impl Native {
             "Stop" => "stop",
             _ => unreachable!(),
         };
-        let matches = self.hooks[event]
+        let entries: Vec<_> = self.hooks[event]
             .as_array()
             .context("missing hook event")?
             .iter()
             .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
             .filter(|entry| entry["command"] == "clank stop-hook --tool grok")
-            .count();
-        ensure!(matches == 1, "installed hook is missing or duplicated");
+            .collect();
+        ensure!(
+            entries.len() == 1,
+            "installed hook is missing or duplicated"
+        );
+        let ceiling = Duration::from_secs(
+            entries[0]["timeout"]
+                .as_u64()
+                .context("hook timeout missing")?,
+        );
+        let started = tokio::time::Instant::now();
         let mut payload = json!({"hookEventName":native,"sessionId":self.sid,"cwd":self.cwd,"promptId":turn,"reason":"end_turn"});
         payload
             .as_object_mut()
@@ -171,7 +180,7 @@ impl Native {
         let mut output = child.take_stdout_async().unwrap();
         let mut error = child.take_stderr_async().unwrap();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let status = tokio::time::timeout(LIMIT, async {
+        let status = tokio::time::timeout_at(started + ceiling, async {
             let write = async {
                 input.write_all(&serde_json::to_vec(&payload)?).await?;
                 drop(input);

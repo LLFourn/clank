@@ -548,6 +548,84 @@ async fn resume_launch_binds_same_session_and_rearms_after_each_completion() {
     );
 }
 
+/// The durable state after an emitted outage notice must not make Grok's
+/// next native continuation look like a wait that was already launched.
+#[tokio::test]
+async fn a_native_outage_continuation_requests_one_wait_after_recovery() {
+    let f = Fixture::new();
+    f.setup().await;
+    f.bind(RESUME);
+    let pending = f.deliver(0);
+    clank::agent_store::update_agent_config(&f.root, &label(), |config| {
+        config.outage_notified = Some(clank_core::agent_config::OutageNotified {
+            session: SessionId::parse(RESUME).unwrap(),
+            at: "2026-11-12T00:00:00Z".into(),
+        });
+    })
+    .unwrap();
+    let hooks: Value =
+        serde_json::from_slice(&std::fs::read(f.grok.join("hooks/clank.json")).unwrap()).unwrap();
+    let ceiling = Duration::from_secs(
+        hooks["hooks"]["Stop"][0]["hooks"][0]["timeout"]
+            .as_u64()
+            .unwrap(),
+    );
+    for wants_wait in [true, false] {
+        let payload = json!({"hookEventName":"stop", "sessionId":RESUME, "cwd":f.root,
+            "reason":"end_turn", "stopHookActive":true, "backgroundTasks":[]});
+        let output = tokio::time::timeout(ceiling, async {
+            let mut child = f
+                .command()
+                .args(["stop-hook", "--tool", "grok"])
+                .env("GROK_SESSION_ID", RESUME)
+                .env("GROK_AGENT", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            stdin
+                .write_all(&serde_json::to_vec(&payload).unwrap())
+                .await
+                .unwrap();
+            drop(stdin);
+            child.wait_with_output().await.unwrap()
+        })
+        .await
+        .expect("native hook exceeded installed timeout");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if wants_wait {
+            let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(decision["decision"], "block");
+            assert!(
+                decision["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Run `clank wait`")
+            );
+        } else {
+            assert!(
+                output.stdout.is_empty(),
+                "a failed or still-starting wait must not be requested twice"
+            );
+        }
+        assert!(
+            f.pending(&pending).is_some(),
+            "the notice is not delivery of the pending event"
+        );
+    }
+}
+
 #[tokio::test]
 async fn fork_launch_delivers_only_in_child_repo_and_never_rebinds_source() {
     let mut f = Fixture::new();

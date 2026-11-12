@@ -77,28 +77,50 @@ fn hook_repo(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
     }
 }
 
-/// What a routed Stop reports at `now`: an omitted `backgroundTasks` is no
+/// What a routed Stop reports: an omitted `backgroundTasks` is no
 /// listing, never an empty one.
-fn report(
-    input: Input,
-    hook_started: clank_core::turn_policy::Ms,
-    now: clank_core::turn_policy::Ms,
-) -> Report {
+fn report(input: Input, hook_started: clank_core::turn_policy::Ms, continued: bool) -> Report {
     Report::Handoff {
         session: input.session_id,
-        continued: input.stop_hook_active,
+        continued,
         tasks: TaskSnapshot::listed(input.background_tasks),
         hook_started: Some(hook_started),
-        deadline: now + HANDOFF_BUDGET.as_millis() as u64,
+        deadline: hook_started.saturating_add(HANDOFF_BUDGET.as_millis() as u64),
     }
 }
 
-/// How long a Stop waits for the monitor's answer.
-const HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// Routing and the monitor exchange share this budget from hook entry.
+pub(super) const HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The runner starts its clock before this binary enters the hook. Leave
+/// ten seconds for process startup and framing, in addition to the entire
+/// exchange and its bounded cooperative child shutdown. Installation and
+/// validation use this same ceiling; a five-second runner cannot carry it.
+pub(super) const RUNNER_TIMEOUT_SECS: u64 =
+    HANDOFF_BUDGET.as_secs() + super::stop_hook::ABANDON_GRACE.as_secs() + 10;
+
+fn remaining_budget(elapsed: std::time::Duration) -> std::time::Duration {
+    HANDOFF_BUDGET.saturating_sub(elapsed)
+}
+
+/// Grok's flag means any Stop block continued the turn, not necessarily
+/// an ArmWait. Capture the outage marker before the carrier receives the
+/// healthy monitor's answer and clears it. Only a genuine arm continuation
+/// suppresses another wait request when no wait has registered yet.
+fn continued_wait(repo: &Path, label: &AgentLabel, input: &Input) -> Result<bool> {
+    if !input.stop_hook_active {
+        return Ok(false);
+    }
+    let outage = crate::agent_store::load_agent_config(repo, label)?
+        .and_then(|config| config.outage_notified)
+        .is_some_and(|notice| notice.session == input.session_id);
+    Ok(!outage)
+}
 
 pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
+    let started = std::time::Instant::now();
     let hook_started = super::turn_custody::now_ms();
-    let routed = (|| -> Result<Option<(PathBuf, AgentLabel, Input)>> {
+    let routed = (|| -> Result<Option<(PathBuf, AgentLabel, Report)>> {
         let mut bytes = Vec::new();
         std::io::stdin()
             .take(1024 * 1024 + 1)
@@ -113,18 +135,22 @@ pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
         if !repo.join(".clank").is_dir() {
             return Ok(None);
         }
-        Ok(route(&input, &repo, &Process)?.map(|label| (repo, label, input)))
+        let Some(label) = route(&input, &repo, &Process)? else {
+            return Ok(None);
+        };
+        let continued = continued_wait(&repo, &label, &input)?;
+        Ok(Some((repo, label, report(input, hook_started, continued))))
     })();
     match routed {
         Ok(None) => {}
-        Ok(Some((repo, label, input))) => {
-            let bound = input.session_id.as_str().to_string();
+        Ok(Some((repo, label, report))) => {
+            let bound = report.session().as_str().to_string();
             super::stop_hook::answer_once(
                 &repo,
                 &label,
                 &bound,
-                report(input, hook_started, super::turn_custody::now_ms()),
-                HANDOFF_BUDGET,
+                report,
+                remaining_budget(started.elapsed()),
                 |frame| print(&still_bound(&repo, &label, &bound, frame.clone())),
             )
             .await;
@@ -168,7 +194,7 @@ fn still_bound(repo: &Path, label: &AgentLabel, session: &str, frame: Frame) -> 
 /// Grok's wire for a verdict: a request for the wait, or a check-in, blocks
 /// the Stop with its reason; a diagnostic goes to stderr; anything else
 /// says nothing.
-fn wire(frame: &Frame) -> (Option<String>, Option<String>) {
+pub(super) fn wire(frame: &Frame) -> (Option<String>, Option<String>) {
     match &frame.verdict {
         WireVerdict::Notify | WireVerdict::Deliver { .. } => (
             Some(

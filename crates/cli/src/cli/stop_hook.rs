@@ -687,7 +687,7 @@ pub(super) async fn answer_once(
     session: &str,
     report: Report,
     budget: std::time::Duration,
-    emit: impl FnOnce(&Frame) -> Option<std::io::Result<()>>,
+    emit: impl FnMut(&Frame) -> Option<std::io::Result<()>>,
 ) {
     answer_with(&Spawner, repo, label, session, report, budget, emit).await;
 }
@@ -699,7 +699,7 @@ async fn answer_with(
     session: &str,
     report: Report,
     budget: std::time::Duration,
-    emit: impl FnOnce(&Frame) -> Option<std::io::Result<()>>,
+    mut emit: impl FnMut(&Frame) -> Option<std::io::Result<()>>,
 ) -> Frame {
     let tool = report.tool();
     let carried = await_verdict_under_deadline(
@@ -717,6 +717,11 @@ async fn answer_with(
             let result = result_of(&frame, emitted, "it was not written out");
             Box::new(wait).answer(result).await;
             frame
+        }
+        Err(frame)
+            if frame.verdict == WireVerdict::Park && matches!(report, Report::Handoff { .. }) =>
+        {
+            super::turn_child::unanswered(repo, label, &report, &mut emit)
         }
         Err(frame) => {
             emit(&frame);
@@ -935,7 +940,7 @@ impl OwnedWait {
 
 /// How long an abandoned child gets to finish its own shutdown before it
 /// is killed.
-const ABANDON_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const ABANDON_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How a carried report ended before its verdict was framed.
 enum Ran {

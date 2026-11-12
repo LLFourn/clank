@@ -6,6 +6,54 @@ use serde_json::json;
 
 const ARM: &str = crate::cli::wake_render::ARM_WAIT;
 
+#[test]
+fn routing_time_consumes_the_handoff_budget_instead_of_extending_it() {
+    let (_temp, repo, _, session, _) = fixture();
+    let routed = report(input(&repo, &session, "stop", json!([])), 100, false);
+    assert_eq!(routed.deadline(), 100 + HANDOFF_BUDGET.as_millis() as u64);
+    let elapsed = std::time::Duration::from_secs(3);
+    assert_eq!(remaining_budget(elapsed) + elapsed, HANDOFF_BUDGET);
+    assert_eq!(
+        remaining_budget(HANDOFF_BUDGET * 2),
+        std::time::Duration::ZERO
+    );
+}
+
+/// A notice continued the turn but asked for no wait. On recovery the
+/// first continuation asks for one; only its genuine arm continuation is
+/// quiet. A registered wait always wins, including during outage recovery.
+#[test]
+fn an_outage_continuation_still_arms_a_wait_when_the_monitor_recovers() {
+    let (_temp, repo, label, session, env) = fixture();
+    handle(
+        &input(&repo, &session, "session_start", json!([])),
+        &repo,
+        &env,
+    )
+    .unwrap();
+    let stop = input(&repo, &session, "stop", json!([]));
+    let handoff = report(stop, 1, false);
+    let outage = crate::cli::turn_child::unanswered(&repo, &label, &handoff, &mut |frame| {
+        assert_eq!(wire(frame).1, None);
+        Some(Ok(()))
+    });
+    assert_eq!(outage.verdict, WireVerdict::Notify);
+    let mut continuation = input(&repo, &session, "stop", json!([]));
+    continuation.stop_hook_active = true;
+    assert_eq!(handle_with(&continuation, &repo, &env, true).unwrap(), None);
+    assert_eq!(
+        handle(&continuation, &repo, &env).unwrap(),
+        Some(ARM.to_string())
+    );
+    // The carrier clears the outage only after this healthy verdict arrives.
+    assert!(crate::agent_store::outage_served(&repo, &label, &session).unwrap());
+    assert_eq!(
+        handle(&continuation, &repo, &env).unwrap(),
+        None,
+        "a genuine arm continuation cannot duplicate a still-starting or failed wait"
+    );
+}
+
 /// A native event as Grok is answered while the monitor does (`true`) or
 /// does not hold a registration of the session's wait: routed here,
 /// decided by the monitor's own rule, framed on Grok's wire. The reason
@@ -21,7 +69,7 @@ fn handle_with(
     };
     let g = crate::cli::turn_custody::Gathered::of(repo, &label, None).waiting(wait_registered);
     let frame = crate::cli::turn_custody::frame_of(
-        g.handoff_verdict(&input.session_id, input.stop_hook_active),
+        g.handoff_verdict(&input.session_id, continued_wait(repo, &label, input)?),
     );
     Ok(wire(&frame).0.map(|out| {
         let block: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -110,7 +158,7 @@ fn a_stop_reports_its_native_listing_and_an_omitted_one_as_none() {
     let (_temp, repo, _, session, _) = fixture();
     let subagent = json!({"id": "g1", "type": "subagent", "status": "running",
         "description": "sleeper", "agentType": "explore"});
-    let tasks = |stop: Input| match report(stop, 7, 0) {
+    let tasks = |stop: Input| match report(stop, 7, false) {
         Report::Handoff {
             tasks,
             hook_started: Some(7),
@@ -400,8 +448,8 @@ async fn the_childs_diagnostic_still_blocks_nothing() {
 }
 
 /// A handoff with no monitor is told so before its hook stops waiting:
-/// the hook gives up at the instant its report names, and a deadline it
-/// framed itself would block nothing.
+/// the hook gives up at the instant its report names. The carrier normally
+/// has enough margin to announce the outage before the hook must do so.
 #[tokio::test(start_paused = true)]
 async fn a_handoff_with_no_monitor_is_told_so_before_its_hook_gives_up() {
     use crate::cli::turn_child::tests::{handoff_by, no_binary, unserved, within};

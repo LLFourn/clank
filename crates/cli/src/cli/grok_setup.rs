@@ -200,7 +200,8 @@ pub(super) fn validate_hooks(provider: &Provider) -> Result<()> {
         ensure!(
             entry.get("type").and_then(Value::as_str) == Some("command")
                 && entry.get("command").and_then(Value::as_str) == Some(COMMAND)
-                && entry.get("timeout").and_then(Value::as_u64) == Some(5),
+                && entry.get("timeout").and_then(Value::as_u64)
+                    == Some(super::grok_hook::RUNNER_TIMEOUT_SECS),
             "native Grok {event} command/timeout drifted"
         );
         let matcher = group.get("matcher").and_then(Value::as_str);

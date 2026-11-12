@@ -1886,7 +1886,7 @@ impl HookKind for GrokHook {
         self.event
     }
     fn timeout(&self) -> u64 {
-        5
+        super::grok_hook::RUNNER_TIMEOUT_SECS
     }
 }
 

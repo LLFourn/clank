@@ -298,17 +298,66 @@ fn told_once(
     notice: Notice,
     out: &mut impl Write,
 ) -> bool {
+    announce_once(repo, author, report, notice, &mut |frame| emit(out, frame))
+}
+
+/// The hook's own deadline won before its carrier answered. Use the same
+/// gated, once-per-outage notice as the carrier, and record only a successful
+/// write to the harness. A late carrier and its hook share the binding lock.
+pub(super) fn unanswered(
+    repo: &Path,
+    author: &AgentLabel,
+    report: &Report,
+    emit: &mut dyn FnMut(&Frame) -> Option<std::io::Result<()>>,
+) -> Frame {
+    let mut sent = None;
+    if !super::monitor::outgoing(repo) {
+        announce_once(
+            repo,
+            author,
+            report,
+            Notice::MonitorUnanswered,
+            &mut |frame| {
+                sent = Some(frame.clone());
+                emit(frame).unwrap_or_else(|| {
+                    if frame.verdict == WireVerdict::Notify {
+                        Err(std::io::Error::other("the notice was not written"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            },
+        );
+    }
+    sent.unwrap_or_else(|| {
+        let frame = still("the monitor has not answered");
+        emit(&frame);
+        frame
+    })
+}
+
+fn announce_once(
+    repo: &Path,
+    author: &AgentLabel,
+    report: &Report,
+    notice: Notice,
+    deliver: &mut dyn FnMut(&Frame) -> std::io::Result<()>,
+) -> bool {
     let frame = unmonitored(repo, author, report, notice);
     if frame.verdict != WireVerdict::Notify {
-        emit_final(out, &frame);
+        let _ = deliver(&frame);
         return true;
     }
+    let mut attempted = false;
     let announced = crate::agent_store::announce_outage(
         repo,
         author,
         report.session(),
         time::OffsetDateTime::now_utc(),
-        &mut || emit(out, &frame),
+        &mut || {
+            attempted = true;
+            deliver(&frame)
+        },
     );
     match announced {
         Ok(Announcement::Suppressed) => false,
@@ -321,7 +370,9 @@ fn told_once(
         // cheaper mistake.
         Err(e) => {
             tracing::debug!(%e, "the outage's notice could not be recorded");
-            emit_final(out, &frame);
+            if !attempted {
+                let _ = deliver(&frame);
+            }
             true
         }
     }

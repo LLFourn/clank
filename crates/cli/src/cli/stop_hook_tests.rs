@@ -521,6 +521,182 @@ fn stop_report() -> Report {
     }
 }
 
+/// Exercise the real parent exchange with an in-memory carrier that never
+/// answers. Both an expired pre-arm deadline and a deadline during the wait
+/// must reach Grok as a supported notice, with no work receipt invented.
+#[tokio::test(start_paused = true)]
+async fn groks_own_deadline_announces_once_and_preserves_pending_work() {
+    use crate::cli::turn_child::tests::{SESSION, handoff, repo_with, told};
+    for budget in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(10),
+    ] {
+        let (repo, author) = repo_with(Tool::Grok, true);
+        let carrier = Fed::new(String::new(), vec![]);
+        let report = handoff();
+        let first = answer_with(
+            &carrier,
+            repo.path(),
+            &author,
+            SESSION,
+            report.clone(),
+            budget,
+            |frame| {
+                assert!(frame.presentation().is_none());
+                let (out, err) = crate::cli::grok_hook::wire(frame);
+                assert_eq!(err, None);
+                let block: serde_json::Value = serde_json::from_str(&out.unwrap()).unwrap();
+                assert_eq!(block["decision"], "block");
+                assert_eq!(block["reason"], crate::cli::wake_render::MONITOR_UNANSWERED);
+                assert!(!block["reason"].as_str().unwrap().contains("scheduled work"));
+                Some(Ok(()))
+            },
+        )
+        .await;
+        assert_eq!(first.verdict, WireVerdict::Notify);
+        assert!(told(repo.path(), &author));
+        let second = answer_with(
+            &carrier,
+            repo.path(),
+            &author,
+            SESSION,
+            report,
+            budget,
+            |frame| {
+                assert_eq!(crate::cli::grok_hook::wire(frame).0, None);
+                None
+            },
+        )
+        .await;
+        assert!(matches!(second.verdict, WireVerdict::Diagnostic { .. }));
+        // The outage marker does not consume the actual event.
+        let items = crate::cli::wait::items(crate::cli::WaitArgs {
+            repo: Some(repo.path().to_path_buf()),
+            author: Some(author.to_string()),
+            peek: true,
+            die_with_owner: false,
+            deliver_to_session: None,
+            turn_end: false,
+            json: false,
+            events: vec![],
+            r#for: None,
+            no_cache: true,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, clank_core::wait::WaitItem::TimerEvent { .. }))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn groks_deadline_does_not_record_an_unwritten_notice() {
+    use crate::cli::turn_child::tests::{SESSION, handoff, repo_with, told};
+    for unwritten in [false, true] {
+        let (repo, author) = repo_with(Tool::Grok, true);
+        let frame = answer_with(
+            &Unreachable,
+            repo.path(),
+            &author,
+            SESSION,
+            handoff(),
+            std::time::Duration::ZERO,
+            |_| {
+                if unwritten {
+                    None
+                } else {
+                    Some(Err(std::io::Error::other("closed harness")))
+                }
+            },
+        )
+        .await;
+        assert_eq!(frame.verdict, WireVerdict::Notify);
+        assert!(!told(repo.path(), &author));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn groks_deadline_respects_manual_mode_and_replaced_bindings() {
+    use crate::cli::turn_child::tests::{SESSION, handoff, repo_with, told};
+    for replaced in [false, true] {
+        let (repo, author) = repo_with(Tool::Grok, true);
+        if replaced {
+            bind_tool(repo.path(), author.as_str(), "replacement", Tool::Grok);
+        } else {
+            crate::agent_store::set_auto_mode(repo.path(), &author, clank_core::AutoMode::Off)
+                .unwrap();
+        }
+        let frame = answer_with(
+            &Unreachable,
+            repo.path(),
+            &author,
+            SESSION,
+            handoff(),
+            std::time::Duration::ZERO,
+            |frame| {
+                assert_eq!(crate::cli::grok_hook::wire(frame), (None, None));
+                None
+            },
+        )
+        .await;
+        assert!(matches!(frame.verdict, WireVerdict::Silent { .. }));
+        assert!(!told(repo.path(), &author));
+    }
+}
+
+/// The installed runner must still be alive after startup, a completely
+/// unanswered exchange, the full child cleanup grace and final emission.
+/// The paused clock tests the ceiling itself without an actual slow process.
+#[tokio::test(start_paused = true)]
+async fn groks_installed_timeout_covers_the_exchange_cleanup_and_emission() {
+    use crate::cli::turn_child::tests::{handoff, repo_with};
+    let (repo, author) = repo_with(Tool::Grok, true);
+    let path = repo.path().join("hooks.json");
+    crate::cli::setup::install_grok_hooks(&path, false, &mut vec![]).unwrap();
+    let installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let ceiling = std::time::Duration::from_secs(
+        installed["hooks"]["Stop"][0]["hooks"][0]["timeout"]
+            .as_u64()
+            .unwrap(),
+    );
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::time::timeout(ceiling, async {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await; // process startup
+        let got = await_verdict_under_deadline(
+            (tokio::time::Instant::now() + crate::cli::grok_hook::HANDOFF_BUDGET).into_std(),
+            Tool::Grok,
+            false,
+            &mut Lifetime::Unbound,
+            &mut crate::upgrade::Replacing::never(),
+            || {
+                Ok(SlowShutdown {
+                    shutdown: ABANDON_GRACE,
+                    done: done.clone(),
+                })
+            },
+        )
+        .await;
+        assert!(matches!(got, Err(ref frame) if frame.verdict == WireVerdict::Park));
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await; // framing/filesystem margin
+        let frame =
+            crate::cli::turn_child::unanswered(repo.path(), &author, &handoff(), &mut |frame| {
+                let (out, err) = crate::cli::grok_hook::wire(frame);
+                assert_eq!(err, None);
+                assert!(out.unwrap().contains("block"));
+                Some(Ok(()))
+            });
+        assert_eq!(frame.verdict, WireVerdict::Notify);
+    })
+    .await
+    .expect("the native runner must receive the decision before its ceiling");
+}
+
 /// The owner handle is held for the whole wait: anything that closed the
 /// child's stdin early would give every carried report instant EOF.
 #[tokio::test]
