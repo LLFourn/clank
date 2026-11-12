@@ -1,79 +1,11 @@
-//! Enforcement gate: the TUI is `clank tui`. `clank status --tui` is
-//! gone as a command, but the panes of sessions opened before the
-//! rename still run it, so the pane matcher's two spellings are the
-//! ONLY place the old name may live. Anything else naming it is a
-//! stray the rename sweep missed, found here rather than one review
-//! at a time (clank-tui-runs-the-remote-in-process). `clank web` is
-//! gone as a command and may be named nowhere.
-use std::path::{Path, PathBuf};
-
-fn files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs" || x == "md") {
-            out.push(p);
-        }
-    }
-}
-
-fn crate_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Files that may still spell the old name, and why.
-fn may_name_status_tui(rel: &str) -> bool {
-    // The pane matcher accepts both spellings; its fixtures use the old one.
-    rel.ends_with("cli/open_zellij.rs")
-        || rel.ends_with("status_tui/zellij.rs")
-        // This gate.
-        || rel.ends_with("tui_is_the_command.rs")
-}
+//! The public command is `tui`; retired spellings are parser errors.
+use clank::cli::command::Cli;
+use clap::Parser;
 
 #[test]
-fn the_old_name_lives_only_in_the_matcher() {
-    let root = crate_root();
-    let mut scanned = Vec::new();
-    files(&root.join("src"), &mut scanned);
-    files(&root.join("tests"), &mut scanned);
-    let repo = root
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
-    for name in ["README.md", "RELEASE-CHECKLIST.md"] {
-        scanned.push(repo.join(name));
+fn tui_parses_and_the_retired_commands_do_not() {
+    assert!(Cli::try_parse_from(["clank", "tui"]).is_ok());
+    for args in [vec!["clank", "status", "--tui"], vec!["clank", "web"]] {
+        assert!(Cli::try_parse_from(&args).is_err(), "accepted {args:?}");
     }
-    let mut strays = Vec::new();
-    for path in &scanned {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let rel = path
-            .strip_prefix(repo)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
-        for (n, line) in text.lines().enumerate() {
-            let names_old = line.contains("status --tui") || line.contains("\"--tui\"");
-            if names_old && !may_name_status_tui(&rel) {
-                strays.push(format!("{rel}:{}: {}", n + 1, line.trim()));
-            }
-            if line.contains("clank web") && !rel.ends_with("tui_is_the_command.rs") {
-                strays.push(format!(
-                    "{rel}:{}: names `clank web`: {}",
-                    n + 1,
-                    line.trim()
-                ));
-            }
-        }
-    }
-    assert!(
-        strays.is_empty(),
-        "the TUI is `clank tui`, and the remote is the TUI's:\n{}",
-        strays.join("\n")
-    );
 }

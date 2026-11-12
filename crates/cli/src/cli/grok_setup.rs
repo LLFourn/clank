@@ -133,7 +133,11 @@ fn version_tuple(version: &str) -> Option<(u32, u32, u32)> {
 }
 
 pub(super) async fn probe(provider: &Provider, repo: &Path) -> Capabilities {
-    match super::grok_launch::initialize(provider, repo).await {
+    probe_result(super::grok_launch::initialize(provider, repo).await)
+}
+
+fn probe_result(result: Result<Value>) -> Capabilities {
+    match result {
         Ok(init) => Capabilities::decode(&init),
         Err(_) => Capabilities {
             version: None,
@@ -231,6 +235,15 @@ pub(super) async fn launch_ready(
     label: &AgentLabel,
     provider: &Provider,
 ) -> Result<()> {
+    launch_ready_with(repo, label, provider, probe(provider, repo)).await
+}
+
+async fn launch_ready_with(
+    repo: &Path,
+    label: &AgentLabel,
+    provider: &Provider,
+    capabilities: impl std::future::Future<Output = Capabilities>,
+) -> Result<()> {
     let cfg = crate::agent_store::load_agent_config(repo, label)?;
     let home = provider
         .env
@@ -245,7 +258,7 @@ pub(super) async fn launch_ready(
         shell_words::quote(&repo.to_string_lossy())
     );
     validate_hooks(provider).with_context(|| recovery.clone())?;
-    let capabilities = probe(provider, repo).await;
+    let capabilities = capabilities.await;
     ensure!(
         capabilities.candidate,
         "Grok automatic handoff unavailable: {}; {recovery}",

@@ -14,15 +14,7 @@ type Attaching<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Attempt>
 pub(crate) fn repo_with(tool: clank_core::Tool, owed: bool) -> (tempfile::TempDir, AgentLabel) {
     use crate::cli::github::log::{EventLog, Transport as Wal};
     let repo = tempfile::tempdir().unwrap();
-    assert!(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo.path())
-            .args(["init", "--quiet"])
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::test_git::init(repo.path());
     let author = AgentLabel::parse("claude").unwrap();
     crate::cli::agent::add_repo_roster_agent(
         repo.path(),

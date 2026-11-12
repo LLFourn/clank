@@ -46,8 +46,6 @@ impl Fixture {
         let bin = home.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_clank"), bin.join("clank")).unwrap();
-        let script = home.join("provider.py");
-        std::fs::write(&script, include_str!("fixtures/grok_provider.py")).unwrap();
         let mut profile_env = BTreeMap::from([
             ("HOME".into(), home.to_string_lossy().into_owned()),
             ("GROK_HOME".into(), grok.to_string_lossy().into_owned()),
@@ -62,11 +60,8 @@ impl Fixture {
                 tool: Tool::Grok,
                 initial_prompt: None,
                 launch: Some(LaunchConfig {
-                    command: Some("/usr/bin/python3".into()),
-                    args: vec![
-                        script.to_string_lossy().into_owned(),
-                        "--fixture-profile".into(),
-                    ],
+                    command: Some(env!("CARGO_BIN_EXE_clank-test-fixture").into()),
+                    args: vec!["grok".into(), "--fixture-profile".into()],
                     env: profile_env,
                 }),
             },
@@ -74,26 +69,7 @@ impl Fixture {
         )
         .unwrap();
         clank::agent_store::set_auto_mode(&root, &label(), AutoMode::On).unwrap();
-        let result = std::process::Command::new("git")
-            .current_dir(&root)
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "commit",
-                "--quiet",
-                "--allow-empty",
-                "-m",
-                "fixture",
-            ])
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        crate::common::git_fixture::commit_files(&root, &[], "fixture");
         let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display());
         Self {
             env,
@@ -109,6 +85,7 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_clank"));
         command
             .env_clear()
+            .envs(crate::common::runtime_env())
             .env("HOME", &self.home)
             .env("PATH", &self.path)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -273,10 +250,7 @@ impl Fixture {
         }
     }
     fn monitor_descriptor(&self) -> Option<Value> {
-        let runtime = PathBuf::from(format!(
-            "/tmp/clank-run-{}",
-            rustix::process::getuid().as_raw()
-        ));
+        let runtime = crate::common::runtime_dir();
         let tag = blake3::hash(self.root.as_os_str().as_encoded_bytes()).to_hex()[..32].to_owned();
         let value: Value =
             serde_json::from_slice(&std::fs::read(runtime.join(format!("{tag}.json"))).ok()?)
@@ -358,10 +332,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         // Only this fixture repo's descriptor and slot. No process listing or
         // global socket sweep; the monitor uses its own process group.
-        let runtime = PathBuf::from(format!(
-            "/tmp/clank-run-{}",
-            rustix::process::getuid().as_raw()
-        ));
+        let runtime = crate::common::runtime_dir();
         let tag = blake3::hash(self.root.as_os_str().as_encoded_bytes()).to_hex()[..32].to_owned();
         let descriptor = runtime.join(format!("{tag}.json"));
         if let Ok(bytes) = std::fs::read(&descriptor)

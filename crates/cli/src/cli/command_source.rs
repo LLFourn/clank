@@ -3505,12 +3505,14 @@ mod producer_tests {
     #[test]
     fn a_legacy_record_rendered_under_another_tz_defers() {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new("sleep")
-            .arg("300")
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = child.id() as i32;
+        // A failed identity probe must not leak the live fixture process.
+        let mut child = crate::proc_run::start(
+            crate::proc_run::Spec::new("sleep")
+                .arg("300")
+                .group(crate::proc_run::Group::New),
+        )
+        .unwrap();
+        let pid = child.pid() as i32;
         let Look::Alive(here) = look(pid) else {
             panic!("the child is running")
         };
@@ -3535,7 +3537,7 @@ mod producer_tests {
             "our own producer was signalled for rendering differently"
         );
         assert!(producer_path(dir.path(), "src-1").exists());
-        child.kill().unwrap();
+        child.kill();
         child.wait().unwrap();
     }
 

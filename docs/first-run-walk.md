@@ -156,13 +156,15 @@ CLANK_CLAUDE_PROTOCOL_BINARY="$(command -v claude)" \
 ```
 
 `cli::web::claude_questions::tests::installed_claude_uses_the_real_clank_hook_and_broker_end_to_end`
-needs the installed Claude and a freshly built clank:
+needs the installed Claude, a freshly built clank, and the shared Rust process
+fixture (no Python). The fixture is test-only and is not installed with clank:
 
 ```sh
-cargo build --locked -p clank --bin clank
+cargo build --locked -p clank --features test-runtime --bin clank --bin clank-test-fixture
 CLANK_CLAUDE_PROTOCOL_BINARY="$(command -v claude)" \
 CLANK_QUESTION_BINARY="$PWD/target/debug/clank" \
-  cargo test --locked -p clank --lib -- --ignored --exact cli::web::claude_questions::tests::installed_claude_uses_the_real_clank_hook_and_broker_end_to_end
+CLANK_PROCESS_FIXTURE="$PWD/target/debug/clank-test-fixture" \
+  scripts/test.sh --locked -p clank --lib -- --ignored --exact cli::web::claude_questions::tests::installed_claude_uses_the_real_clank_hook_and_broker_end_to_end
 ```
 
 ### Codex

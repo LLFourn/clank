@@ -1,6 +1,5 @@
 //! Real CLI producer -> WAL -> wait -> hook -> callback contracts. These
 //! need the subprocess boundary; no providers, terminals or live accounts.
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -25,7 +24,7 @@ struct Fixture {
     home: PathBuf,
     hook_cwd: PathBuf,
     host_cwd: PathBuf,
-    gate: std::fs::File,
+    gate: PathBuf,
     ready: UnixDatagram,
     output: PathBuf,
     source: CommandSource,
@@ -53,49 +52,31 @@ impl Fixture {
         .unwrap();
         clank::cli::agent::set_repo_master(&repo, &author).unwrap();
         std::fs::write(repo.join("seed"), "seed").unwrap();
-        for args in [
-            vec!["add", "seed"],
-            vec!["commit", "--quiet", "-m", "fixture"],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&repo)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
+        crate::common::git_fixture::commit_files(&repo, &["seed"], "fixture");
         let hook_cwd = repo.join("hook-cwd");
         let host_cwd = repo.join("monitor-cwd");
         std::fs::create_dir(&hook_cwd).unwrap();
         std::fs::create_dir(&host_cwd).unwrap();
         let gate_path = repo.join("producer-gate");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .args(["-m", "600"])
-                .arg(&gate_path)
-                .status()
-                .unwrap()
-                .success()
-        );
-        // RDWR keeps fixture readiness cancellation safe and writing finite;
-        // the producer reads one line, so no EOF dependency is introduced.
-        let gate = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&gate_path)
-            .unwrap();
+        let gate = gate_path.clone();
         let ready_path = repo.join("producer-ready.sock");
         let ready = UnixDatagram::bind(&ready_path).unwrap();
         let output = repo.join("receipt.json");
-        let source = CommandSource { interrupt_message: None, interrupt: false,
+        let source = CommandSource {
+            interrupt_message: None,
+            interrupt: false,
             name: "voice/a".into(),
-            command: vec!["/usr/bin/python3".into(), "-c".into(),
-                "import json,os,socket,sys,time; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); s.sendto(json.dumps({'pid':os.getpid(),'parent':os.getppid(),'cwd':os.getcwd(),'state':os.environ['CLANK_SOURCE_STATE_DIR'],'argv':sys.argv[1:3]}).encode(),sys.argv[3]); g=open(sys.argv[4]); data=json.loads(g.readline()); print(json.dumps(data),flush=True); time.sleep(300)".into(),
-                "events".into(), "--flag".into(), ready_path.to_str().unwrap().into(), gate_path.to_str().unwrap().into()],
-            reply_command: Some(vec!["/bin/false".into()]), receipt_command: None, glyph: None, stop_grace: None,
+            command: vec![
+                env!("CARGO_BIN_EXE_clank-test-fixture").into(),
+                "events".into(),
+                "--flag".into(),
+                ready_path.to_str().unwrap().into(),
+                gate_path.to_str().unwrap().into(),
+            ],
+            reply_command: Some(vec!["/bin/false".into()]),
+            receipt_command: None,
+            glyph: None,
+            stop_grace: None,
         };
         let cfg = AgentConfig {
             auto_mode: Some(AutoMode::On),
@@ -131,9 +112,12 @@ impl Fixture {
         fixture
     }
     fn enable_receipts(&mut self) {
-        self.source.receipt_command = Some(vec!["/usr/bin/python3".into(), "-c".into(),
-            "import json,os,pathlib,sys; data={'receipt':json.load(sys.stdin),'cwd':os.getcwd(),'state':os.environ['CLANK_SOURCE_STATE_DIR'],'argv':sys.argv[1:3]}; pathlib.Path(sys.argv[3]).write_text(json.dumps(data)); print('callback stdout'); print('callback stderr',file=sys.stderr)".into(),
-            "receipt".into(), "--flag".into(), self.output.to_str().unwrap().into()]);
+        self.source.receipt_command = Some(vec![
+            env!("CARGO_BIN_EXE_clank-test-fixture").into(),
+            "receipt".into(),
+            "--flag".into(),
+            self.output.to_str().unwrap().into(),
+        ]);
         clank::agent_store::update_agent_config(&self.repo, &self.author, |cfg| {
             cfg.wait_events = vec![WaitEventSource::Command(self.source.clone())]
         })
@@ -143,6 +127,7 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_clank"));
         command
             .env_clear()
+            .envs(crate::common::runtime_env())
             .env("HOME", &self.home)
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -212,13 +197,13 @@ impl Fixture {
         ready
     }
     fn emit_event(&mut self) {
-        serde_json::to_writer(
-            &mut self.gate,
-            &json!({"id":ID,"kind":"voice","content":"do the task","requires_reply":true}),
-        )
-        .unwrap();
-        self.gate.write_all(b"\n").unwrap();
-        self.gate.flush().unwrap();
+        // The producer binds before announcing readiness; one datagram releases
+        // one event without a FIFO utility, polling or an EOF dependency.
+        let event = json!({"id":ID,"kind":"voice","content":"do the task","requires_reply":true});
+        std::os::unix::net::UnixDatagram::unbound()
+            .unwrap()
+            .send_to(&serde_json::to_vec(&event).unwrap(), &self.gate)
+            .unwrap();
     }
     /// The receipt the source was handed. The monitor commits it once the
     /// hook reports its emit delivered, after the hook has exited, so it
@@ -350,10 +335,7 @@ impl Fixture {
     }
 }
 fn runtime_dir() -> PathBuf {
-    PathBuf::from(format!(
-        "/tmp/clank-run-{}",
-        rustix::process::getuid().as_raw()
-    ))
+    crate::common::runtime_dir()
 }
 fn repo_tag(repo: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;

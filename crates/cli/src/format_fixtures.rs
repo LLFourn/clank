@@ -36,14 +36,7 @@ fn raw(path: &Path) -> Value {
 
 fn git_repo() -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
-    assert!(
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(repo.path())
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::test_git::init(repo.path());
     repo
 }
 

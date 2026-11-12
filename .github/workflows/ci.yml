@@ -16,6 +16,17 @@ defaults:
     shell: bash
 
 jobs:
+  release-entrypoint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      # Deliberately no development cache: a production release build does not
+      # provision the maintenance example. One shared build checks that seam.
+      - name: Release entry point bootstraps its own tool
+        run: bash scripts/check-release-entrypoint.sh
+
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -60,21 +71,31 @@ jobs:
         run: cargo deny --locked check licenses
 
       - name: Rust dependency notices are fresh
-        run: scripts/notices/check.sh
+        # Exercise a symlinked checkout here once, rather than running the
+        # entire generator again inside the Rust integration suite.
+        run: |
+          notice_dir=$(mktemp -d)
+          trap 'rm -rf "$notice_dir"' EXIT
+          ln -s "$PWD" "$notice_dir/checkout"
+          cd "$notice_dir/checkout"
+          scripts/notices/check.sh
 
       - name: clank lib tests
-        run: unset $SESSION_IDENTITY_VARS; cargo test --locked -p clank --lib
+        run: unset $SESSION_IDENTITY_VARS; scripts/test.sh --locked -p clank --lib
 
       - name: clank integration tests
-        run: unset $SESSION_IDENTITY_VARS; cargo test --locked -p clank --test it
+        run: unset $SESSION_IDENTITY_VARS; scripts/test.sh --locked -p clank --test it
+
+      - name: repository maintenance tests
+        run: unset $SESSION_IDENTITY_VARS; scripts/test.sh --locked -p clank --example maintenance
 
       - name: other crates' tests
-        run: unset $SESSION_IDENTITY_VARS; cargo test --locked --workspace --exclude clank
+        run: unset $SESSION_IDENTITY_VARS; scripts/test.sh --locked --workspace --exclude clank
 
       - name: Report ignored tests as not run
         if: always()
         run: |
-          unset $SESSION_IDENTITY_VARS; cargo test --locked --workspace --all-targets -- --list --ignored > ignored.txt
+          unset $SESSION_IDENTITY_VARS; scripts/test.sh --locked --workspace --all-targets -- --list --ignored > ignored.txt
           {
             echo "## Ignored tests: NOT run"
             echo

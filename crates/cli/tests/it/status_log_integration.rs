@@ -170,6 +170,7 @@ fn legacy_cache_rebuild_and_warm_resume_share_one_accepted_plan() {
 fn cli(env: &TestEnv, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_clank"))
         .env_clear()
+        .envs(crate::common::runtime_env())
         .env("HOME", env.home())
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")

@@ -47,7 +47,10 @@ pub(crate) fn assert_every_test_step_unsets_every_identity_variable(text: &str) 
     let production: BTreeSet<&str> = SESSION_IDENTITY_VARS.iter().copied().collect();
     assert_eq!(listed, production);
 
-    let runs: Vec<&str> = text.lines().filter(|l| l.contains("cargo test")).collect();
+    let runs: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("cargo test") || l.contains("scripts/test.sh"))
+        .collect();
     assert!(!runs.is_empty(), "the workflow runs no tests");
     for line in runs {
         let command = line.trim_start().trim_start_matches("run:").trim_start();
@@ -65,7 +68,7 @@ fn the_workflow_never_skips_the_node_harness() {
 
 fn has_step(text: &str, run: &str) -> bool {
     text.lines()
-        .any(|l| l.trim().strip_prefix("run:").map(str::trim) == Some(run))
+        .any(|l| l.trim() == run || l.trim().strip_prefix("run:").map(str::trim) == Some(run))
 }
 
 #[test]

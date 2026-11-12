@@ -22,15 +22,16 @@ targets=$(sed -n '/^targets = \[/,/^\]/p' "$here/about.toml" | grep -o '"[^"]*"'
 cargo fetch --locked --manifest-path "$root/Cargo.toml"
 
 json="$(mktemp)"
-trap 'rm -f "$json"' EXIT
+metadata="$(mktemp)"
+trap 'rm -f "$json" "$metadata"' EXIT
 # --frozen: offline and locked, so the output depends on Cargo.lock and
 # the crates' own files, never on what a network fetch returns today.
 cargo about generate --frozen \
     --manifest-path "$root/Cargo.toml" \
     -c "$here/about.toml" \
     --format json -o "$json"
-members="$(cargo metadata --frozen --no-deps --format-version 1 --manifest-path "$root/Cargo.toml" |
-    python3 -B -I -c 'import json, sys; print("\n".join(json.load(sys.stdin)["workspace_members"]))')"
+cargo metadata --frozen --no-deps --format-version 1 --manifest-path "$root/Cargo.toml" > "$metadata"
 mkdir -p "$(dirname "$out")"
 # shellcheck disable=SC2086
-CLANK_WORKSPACE_MEMBERS="$members" python3 -B -I "$here/render.py" "$pinned" $targets < "$json" > "$out"
+cargo run --locked --offline --quiet --manifest-path "$root/Cargo.toml" \
+    -p clank --example maintenance -- notices "$json" "$metadata" "$pinned" $targets > "$out"

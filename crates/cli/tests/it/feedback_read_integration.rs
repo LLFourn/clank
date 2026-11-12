@@ -5,37 +5,15 @@
 use crate::common;
 
 use common::TestEnv;
+use common::git_fixture::commit_files;
 use std::path::Path;
-use std::process::Command;
 
 use clank::cli::{FeedbackArgs, FeedbackCmd, FeedbackReadArgs, FeedbackWriteArgs, VerdictArg};
-
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
 
 fn write(repo: &Path, rel: &str, body: &str) {
     let abs = repo.join(rel);
     std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
     std::fs::write(abs, body).unwrap();
-}
-
-fn commit(repo: &Path, subject: &str) -> String {
-    git(repo, &["add", "-A"]);
-    git(repo, &["commit", "--quiet", "-m", subject]);
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap();
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 async fn review(repo: &Path, sha: &str, author: &str, verdict: VerdictArg, message: &str) {
@@ -65,9 +43,9 @@ fn read(repo: &Path, plan: Option<&str>, commit: Option<&str>, json: bool) -> Fe
 async fn two_reviewed_commits(env: &TestEnv) -> (String, String) {
     let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n\nThe body.\n");
-    let intro = commit(repo, "[foo] intro");
+    let intro = commit_files(repo, &[".clank/plans/foo.md"], "[foo] intro");
     write(repo, "src/a.txt", "one\n");
-    let m1 = commit(repo, "[foo] the first milestone");
+    let m1 = commit_files(repo, &["src/a.txt"], "[foo] the first milestone");
     review(
         repo,
         &intro,
@@ -150,7 +128,7 @@ async fn a_plan_with_no_feedback_says_so() {
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
+    commit_files(repo, &[".clank/plans/foo.md"], "[foo] intro");
 
     let out = clank::cli::feedback::read_rendered(read(repo, Some("foo"), None, false))
         .await
@@ -168,7 +146,7 @@ async fn an_unreviewed_commit_is_shown_as_unreviewed() {
     let repo = env.repo();
     let (intro, _) = two_reviewed_commits(&env).await;
     write(repo, "src/b.txt", "two\n");
-    let m2 = commit(repo, "[foo] the second milestone");
+    let m2 = commit_files(repo, &["src/b.txt"], "[foo] the second milestone");
 
     let out = clank::cli::feedback::read_rendered(read(repo, Some("foo"), None, false))
         .await
@@ -249,7 +227,7 @@ async fn a_commit_with_no_feedback_still_says_so_in_prose() {
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
-    let intro = commit(repo, "[foo] intro");
+    let intro = commit_files(repo, &[".clank/plans/foo.md"], "[foo] intro");
 
     for json in [false, true] {
         let out = clank::cli::feedback::read_rendered(read(repo, None, Some(&intro), json))
@@ -260,13 +238,7 @@ async fn a_commit_with_no_feedback_still_says_so_in_prose() {
 }
 
 fn head(repo: &Path) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap();
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
+    gix::open(repo).unwrap().head_id().unwrap().to_string()
 }
 
 /// `finish` with a squash collapses the plan into one commit nobody
@@ -364,7 +336,7 @@ async fn a_reintroduced_plan_is_not_finished() {
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
+    commit_files(repo, &[".clank/plans/foo.md"], "[foo] intro");
     clank::cli::finish::run(finish_args(
         repo,
         Some("collapse foo\n\nbecause it was time"),
@@ -373,7 +345,7 @@ async fn a_reintroduced_plan_is_not_finished() {
     .expect("first finish");
 
     write(repo, ".clank/plans/foo.md", "# foo, again\n");
-    let second_intro = commit(repo, "[foo] intro");
+    let second_intro = commit_files(repo, &[".clank/plans/foo.md"], "[foo] intro");
 
     let out = clank::cli::feedback::read_rendered(read(repo, Some("foo"), None, false))
         .await
@@ -406,9 +378,9 @@ async fn an_unsquashed_finish_with_no_feedback_blames_no_squash() {
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
-    let intro = commit(repo, "[foo] intro");
+    let intro = commit_files(repo, &[".clank/plans/foo.md"], "[foo] intro");
     write(repo, "src/a.txt", "one\n");
-    commit(repo, "[foo] the first milestone");
+    commit_files(repo, &["src/a.txt"], "[foo] the first milestone");
     clank::cli::finish::run(finish_args(repo, None))
         .await
         .expect("no-squash finish");
@@ -426,14 +398,12 @@ async fn an_unsquashed_finish_with_no_feedback_blames_no_squash() {
     );
     assert!(out.contains("none of them reviewed"), "{out}");
     assert_eq!(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["cat-file", "-t", &intro])
-            .output()
+        gix::open(repo)
             .unwrap()
-            .stdout,
-        b"commit\n",
+            .find_object(gix::ObjectId::from_hex(intro.as_bytes()).unwrap())
+            .unwrap()
+            .kind,
+        gix::objs::Kind::Commit,
         "the intro is still in history",
     );
 }

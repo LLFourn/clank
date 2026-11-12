@@ -26,10 +26,7 @@ fn run_git(repo: &Path, args: &[&str]) {
 fn init_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path();
-    run_git(path, &["init", "--quiet", "--initial-branch=main"]);
-    run_git(path, &["config", "user.email", "test@test"]);
-    run_git(path, &["config", "user.name", "test"]);
-    run_git(path, &["config", "commit.gpgsign", "false"]);
+    crate::common::git_fixture::init(path);
     dir
 }
 

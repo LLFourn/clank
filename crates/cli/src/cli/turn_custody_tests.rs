@@ -1157,10 +1157,7 @@ fn present_receipt(
         &fixture.author,
         Some((std::slice::from_ref(&fixture.item), Some(&fixture.cwd))),
     );
-    let report = match tool {
-        Tool::Claude => stop(tool, &fixture.session, None),
-        _ => stop(tool, &fixture.session, None),
-    };
+    let report = stop(tool, &fixture.session, None);
     let frame = turns
         .answer(&fixture.author, conn, &report, true, &g)
         .unwrap();
@@ -1374,9 +1371,9 @@ async fn a_failing_receipt_callback_keeps_the_evidence_and_bounds_its_diagnostic
     let mut fixture = receipt_fixture(Tool::Claude);
     fixture.update_source(|source| {
         source.receipt_command = Some(vec![
-            "/usr/bin/python3".into(),
+            "/bin/sh".into(),
             "-c".into(),
-            "import sys; sys.stderr.write('x'*100000); sys.exit(7)".into(),
+            "i=0; while [ $i -lt 2000 ]; do printf '%064d' 0 >&2; i=$((i+1)); done; exit 7".into(),
         ])
     });
     let mut turns = Turns::new(fixture.repo.clone());

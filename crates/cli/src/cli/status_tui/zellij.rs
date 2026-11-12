@@ -4531,40 +4531,58 @@ mod tests {
         assert!(reports.contains(&Report::Lost(["claude".to_string()].into())));
     }
 
-    /// The runtime directory is shared: a stale `pane-launch-*.json` file
-    /// appearing in it is heard by nobody, while this repo's `clank remote`
-    /// reopen request in the same directory reaches the loop.
+    /// Filtering and deduplication do not depend on when the kernel batches
+    /// notifications: every scan sees exactly the eligible files.
     #[test]
     fn only_a_reopen_request_in_the_runtime_directory_reaches_the_loop() {
         let dir = tempfile::tempdir().unwrap();
         let repo = std::path::Path::new("/w/proj");
-        let (tx, requests) = std::sync::mpsc::channel();
-        let (woke, wakes) = std::sync::mpsc::channel();
-        // The loop reads requests when it is woken, so each wake looks
-        // for the request it is for at the moment it is made.
-        let watch = RuntimeWatch::start_in(repo, Ok(dir.path().to_path_buf()), tx, move || {
-            let _ = woke.send(requests.try_recv());
-        });
-        assert_eq!(watch.unavailable, None);
+        let mut scan = RequestScan::new(repo);
         let tag = crate::cli::monitor::runtime_path_in(dir.path(), repo, "")
             .file_name()
             .unwrap()
             .to_string_lossy()
             .into_owned();
         std::fs::write(dir.path().join(format!("{tag}pane-launch-x.json")), "{}").unwrap();
-        assert!(
-            wakes
-                .recv_timeout(std::time::Duration::from_millis(300))
-                .is_err(),
-            "a launch file is nobody's request"
+        assert!(scan.new_ids(dir.path()).is_empty());
+        let foreign =
+            crate::cli::remote_control::request_path(std::path::Path::new("/w/other"), "r1");
+        std::fs::write(dir.path().join(foreign.file_name().unwrap()), "{}").unwrap();
+        assert!(scan.new_ids(dir.path()).is_empty());
+        let request = crate::cli::remote_control::request_path(repo, "r1");
+        let path = dir.path().join(request.file_name().unwrap());
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(scan.new_ids(dir.path()), ["r1"]);
+        assert!(scan.new_ids(dir.path()).is_empty(), "delivered once");
+        std::fs::remove_file(&path).unwrap();
+        assert!(scan.new_ids(dir.path()).is_empty());
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(
+            scan.new_ids(dir.path()),
+            ["r1"],
+            "a new request can reuse an expired id"
         );
+    }
+
+    /// The actual native notification must enqueue the request before waking
+    /// the consumer. Filtering is exercised independently above.
+    #[test]
+    fn a_native_runtime_change_queues_the_request_before_waking() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::path::Path::new("/w/proj");
+        let (tx, requests) = std::sync::mpsc::channel();
+        let (woke, wakes) = std::sync::mpsc::channel();
+        let watch = RuntimeWatch::start_in(repo, Ok(dir.path().to_path_buf()), tx, move || {
+            woke.send(requests.try_recv()).unwrap();
+        });
+        assert_eq!(watch.unavailable, None);
         let request = crate::cli::remote_control::request_path(repo, "r1");
         std::fs::write(dir.path().join(request.file_name().unwrap()), "{}").unwrap();
         assert_eq!(
             wakes.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(Ok("r1".to_string()))
         );
-        assert!(wakes.try_recv().is_err(), "woken once");
         drop(watch);
+        assert!(wakes.try_recv().is_err(), "woken once");
     }
 }

@@ -90,6 +90,9 @@ pub mod stop_hook;
 pub mod team;
 pub mod teams_config;
 pub(crate) mod term;
+#[cfg(feature = "test-runtime")]
+#[doc(hidden)]
+pub mod test_support;
 pub(crate) mod timer_source;
 pub(crate) mod turn_child;
 pub(crate) mod turn_custody;

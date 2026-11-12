@@ -1940,7 +1940,33 @@ impl Drop for RepairPermit {
 /// repair permit in a different directory, locked different inodes,
 /// and both forked (codex on 88b6234).
 pub(crate) fn runtime_dir(me: u32) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("/tmp/clank-run-{me}"))
+    #[cfg(any(test, feature = "test-runtime"))]
+    if let Some(root) = std::env::var_os("CLANK_TEST_RUNTIME") {
+        let root = std::path::PathBuf::from(root);
+        assert!(root.is_absolute(), "CLANK_TEST_RUNTIME must be absolute");
+        return runtime_namespace(&root, me);
+    }
+    #[cfg(not(test))]
+    let root = std::path::Path::new("/tmp");
+    // Unit tests exercise real leases and watches, but must not join the
+    // developer's live namespace or inherit debris from previous test runs.
+    // One root per test process preserves cross-thread coordination.
+    #[cfg(test)]
+    let root = {
+        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("clank-ut-")
+                .tempdir_in("/tmp")
+                .unwrap()
+        })
+        .path()
+    };
+    runtime_namespace(root, me)
+}
+
+fn runtime_namespace(root: &std::path::Path, me: u32) -> std::path::PathBuf {
+    root.join(format!("clank-run-{me}"))
 }
 
 /// Vet and create this uid's runtime directory.
@@ -13031,7 +13057,7 @@ mod tests {
     #[test]
     fn the_runtime_namespace_does_not_move_with_the_environment() {
         assert_eq!(
-            runtime_dir(501),
+            runtime_namespace(std::path::Path::new("/tmp"), 501),
             std::path::PathBuf::from("/tmp/clank-run-501"),
             "fixed per uid, and derived from nothing else"
         );
@@ -15695,7 +15721,7 @@ mod tests {
             dir.join("config.json"),
             serde_json::to_vec(&serde_json::json!({"wait_events": [
                 {"kind": "command", "name": "restartable", "command": [
-                    "sh", "-c", "sleep 300 & echo $! > \"$0.gc\"; echo $$ >> \"$0.runs\"; wait", mark("a")]},
+                    "sh", "-c", "sleep 300 & child=$!; echo $$ >> \"$0.runs\"; echo $child > \"$0.gc\"; wait", mark("a")]},
                 {"kind": "command", "name": "sibling", "command": [
                     "sh", "-c", "echo $$ > \"$0.pid\"; exec sleep 300", mark("b")]},
             ]}))

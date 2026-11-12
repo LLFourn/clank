@@ -804,8 +804,8 @@ mod tests {
         let claude =
             std::env::var_os("CLANK_CLAUDE_PROTOCOL_BINARY").expect("select installed Claude");
         let clank = std::env::var_os("CLANK_QUESTION_BINARY").expect("select freshly built Clank");
-        let script =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/it/fixtures/claude_questions.py");
+        let process_fixture = std::env::var_os("CLANK_PROCESS_FIXTURE")
+            .expect("select the Cargo-built clank-test-fixture using CLANK_PROCESS_FIXTURE");
         for scenario in ["remote", "local", "cancel"] {
             let (repo, registry, _) = fixture();
             let session = "9129c0e1-8f66-4168-b3c2-a5b831c69a13";
@@ -818,8 +818,8 @@ mod tests {
             .unwrap();
             let broker = registry.start().unwrap();
             let mut child = ProviderChild(
-                std::process::Command::new("python3")
-                    .arg(&script)
+                std::process::Command::new(&process_fixture)
+                    .arg("claude-question")
                     .arg(&claude)
                     .args(["--broker", scenario])
                     .arg(repo.path())
@@ -976,14 +976,7 @@ mod tests {
 
     fn fixture() -> (tempfile::TempDir, Arc<Registry>, Hook) {
         let repo = tempfile::tempdir().unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(repo.path())
-                .status()
-                .unwrap()
-                .success()
-        );
+        crate::test_git::init(repo.path());
         let label = AgentLabel::parse("claude-question-agent").unwrap();
         crate::cli::agent::add_repo_roster_agent(
             repo.path(),

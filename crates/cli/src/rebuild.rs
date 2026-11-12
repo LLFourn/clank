@@ -480,10 +480,7 @@ mod tests {
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path();
-        run_git(path, &["init", "--quiet", "--initial-branch=main"]);
-        run_git(path, &["config", "user.email", "test@test"]);
-        run_git(path, &["config", "user.name", "test"]);
-        run_git(path, &["config", "commit.gpgsign", "false"]);
+        crate::test_git::init(path);
         dir
     }
 

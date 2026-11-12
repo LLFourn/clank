@@ -3,7 +3,6 @@ use crate::common::TestEnv;
 use clank::cli::teams_config::{AgentDescription, RosterRole};
 use clank_core::{Tool, agent_config::LaunchConfig, ids::AgentLabel};
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 struct Fixture {
@@ -17,36 +16,10 @@ impl Fixture {
         let env = TestEnv::init();
         let root = env.home().join("selected-profile");
         let marker = env.home().join("launched");
-        let script = env.home().join("provider.py");
-        std::fs::write(
-            &script,
-            r#"import os,pathlib,sys,json
-if '--version' in sys.argv:
- print('2.1.0 (Claude Code)'); sys.exit(0)
-r=pathlib.Path(os.environ['EXPECTED_ROOT'])
-for name in ['clank-master','clank-reviewer','clank-standby','clank-github']:
- assert (r/'skills'/name/'SKILL.md').is_file(), name
-tool=os.environ['EXPECTED_TOOL']
-required={'claude':'settings.json','codex':'hooks.json','opencode':'plugin/clank.js'}[tool]
-assert (r/required).is_file(), required
-if tool == 'claude':
- assert pathlib.Path.cwd() == pathlib.Path(os.environ['EXPECTED_REPO']).resolve()
- profile=os.environ.get('CLAUDE_CONFIG_DIR') or os.environ['HOME']
- config=json.loads((pathlib.Path(profile)/'.claude.json').read_text())
- assert config['projects'][os.environ['EXPECTED_TRUST_ROOT']]['hasTrustDialogAccepted'] is True, config
-if tool == 'codex':
- config=(r/'config.toml').read_text()
- assert 'trust_level = "trusted"' in config, config
- assert not (pathlib.Path(os.environ['HOME'])/'.codex/config.toml').exists()
-pathlib.Path(os.environ['MARKER']).write_text(tool)
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o600)).unwrap();
         let label = AgentLabel::parse("agent").unwrap();
         let launch = LaunchConfig {
-            command: Some("/usr/bin/python3".into()),
-            args: vec![script.to_string_lossy().into()],
+            command: Some(env!("CARGO_BIN_EXE_clank-test-fixture").into()),
+            args: vec!["setup".into()],
             env: BTreeMap::from([
                 ("HOME".into(), env.home().to_string_lossy().into()),
                 (config_key.into(), root.to_string_lossy().into()),
@@ -85,6 +58,7 @@ pathlib.Path(os.environ['MARKER']).write_text(tool)
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_clank"));
         command
             .env_clear()
+            .envs(crate::common::runtime_env())
             .env("HOME", self.env.home())
             .env("PATH", "/usr/bin:/bin")
             .current_dir(self.env.repo())

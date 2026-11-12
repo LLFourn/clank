@@ -261,6 +261,25 @@ pub(crate) async fn prepare(
     label: &AgentLabel,
     provider: &Provider,
 ) -> anyhow::Result<Prepared> {
+    prepare_with(
+        repo,
+        label,
+        provider,
+        async |source: &str, intent: &ForkIntent| {
+            fork_rpc(provider, repo, source, intent, BUDGET).await
+        },
+    )
+    .await
+}
+
+// Keep state decisions independent of the process transport. The native ACP
+// boundary is exercised separately; bookkeeping tests need no executable.
+async fn prepare_with(
+    repo: &Path,
+    label: &AgentLabel,
+    provider: &Provider,
+    copy: impl AsyncFn(&str, &ForkIntent) -> anyhow::Result<ForkResponse>,
+) -> anyhow::Result<Prepared> {
     let _lock = lock(repo, label)?;
     let mut spec =
         load_fork_spec(repo, label)?.context("Grok fork intent disappeared before preparation")?;
@@ -333,7 +352,7 @@ pub(crate) async fn prepare(
                     summary.info.id == source && summary.info.cwd == intent.source_cwd,
                     "Grok fork source does not match its recorded cwd"
                 );
-                let result = fork_rpc(provider, repo, &source, &intent, BUDGET).await?;
+                let result = copy(&source, &intent).await?;
                 anyhow::ensure!(
                     result.new_session_id == intent.child_id
                         && result.new_cwd == repo
@@ -416,7 +435,7 @@ fn acp_spec(provider: &Provider, repo: &Path) -> crate::proc_run::Spec {
         .group(Group::New)
 }
 
-async fn acp_rpc(
+pub(super) async fn acp_rpc(
     provider: &Provider,
     repo: &Path,
     followup: Option<(&str, Value)>,

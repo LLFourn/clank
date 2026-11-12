@@ -37,14 +37,7 @@ fn handle(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<String
 fn fixture() -> (tempfile::TempDir, PathBuf, AgentLabel, SessionId, Stated) {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().canonicalize().unwrap();
-    assert!(
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::test_git::init(&repo);
     let label = AgentLabel::parse("grok").unwrap();
     crate::cli::agent::add_repo_roster_agent(
         &repo,

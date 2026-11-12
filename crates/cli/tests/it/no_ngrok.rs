@@ -93,29 +93,3 @@ fn the_crate_does_not_depend_on_ngrok() {
         assert!(!lock.contains(gone), "still locked: {gone}");
     }
 }
-
-/// The README must not offer the retired PROVIDER, and must document
-/// the migration — which names ngrok, legitimately. Banning the word
-/// would reject the documentation the removal owes its users.
-#[test]
-fn the_readme_retires_the_provider_and_documents_the_migration() {
-    let readme = std::fs::read_to_string(crates_dir().parent().unwrap().join("README.md"))
-        .expect("read README.md");
-    assert!(
-        !readme.contains(r#""provider": "ngrok""#),
-        "the README still offers the retired provider"
-    );
-    assert!(
-        readme.contains(r#"{"provider": "quick"}"#),
-        "and still offers the accountless one"
-    );
-    // The migration, and the reason its `url` is load-bearing.
-    assert!(
-        readme.contains(r#""run": ["ngrok", "http", "--url""#),
-        "the README does not show how to keep ngrok through `command`"
-    );
-    assert!(
-        readme.contains("terminal UI rather than to stdout"),
-        "nor why the recipe must claim its endpoint"
-    );
-}

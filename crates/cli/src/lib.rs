@@ -37,3 +37,7 @@ pub mod cli;
 
 #[cfg(test)]
 mod format_fixtures;
+
+#[cfg(test)]
+#[path = "../tests/support/git.rs"]
+pub(crate) mod test_git;

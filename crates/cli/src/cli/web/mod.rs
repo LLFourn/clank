@@ -1371,6 +1371,41 @@ fn library_candidates(home: Option<&Path>) -> anyhow::Result<serde_json::Value> 
 
 #[cfg(test)]
 mod tests {
+    /// A cancelled async caller cannot detach the blocking work it started.
+    /// The held channel makes the join observably pending without a sleep.
+    #[tokio::test]
+    async fn cancelled_callers_leave_their_blocking_work_joinable() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let blocking = Arc::new(super::Blocking::default());
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let caller = tokio::spawn({
+            let blocking = blocking.clone();
+            async move {
+                blocking
+                    .run(move || {
+                        let _ = entered.send(());
+                        // Disconnecting also releases the worker on test failure.
+                        let _ = held.recv_timeout(Duration::from_secs(10));
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), started)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let mut joined = Box::pin(blocking.join_all());
+        assert!(futures_util::poll!(joined.as_mut()).is_pending());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), joined)
+            .await
+            .unwrap();
+    }
+
     /// What the remote asks of a TUI kept running on a replaced build is
     /// refused where the change would be written, with the reason the
     /// TUI's own bar gives, and nothing is changed.

@@ -265,6 +265,7 @@ mod tests {
         secrets: Vec<String>,
         starts: usize,
         stops: usize,
+        started: Option<std::sync::mpsc::Sender<()>>,
     }
 
     impl Switch for Fake {
@@ -277,6 +278,9 @@ mod tests {
                 return Some(why);
             }
             self.shown = Some(self.lands.unwrap_or(rc::Shown::On));
+            if let Some(started) = &self.started {
+                let _ = started.send(());
+            }
             None
         }
         fn switch_off(&mut self) {
@@ -313,6 +317,7 @@ mod tests {
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let repo = repo.to_path_buf();
             let (f, s) = (fake.clone(), stop.clone());
+            let (armed, ready_rx) = std::sync::mpsc::sync_channel(0);
             let thread = std::thread::spawn(move || {
                 let mut served = Served::starting(&repo);
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -322,6 +327,7 @@ mod tests {
                     false => Some("the runtime directory cannot be watched".into()),
                 };
                 served.armed(unavailable, &*f.lock().unwrap());
+                armed.send(()).unwrap();
                 while !s.load(std::sync::atomic::Ordering::SeqCst) {
                     if let Ok(id) = rx.recv_timeout(Duration::from_millis(20)) {
                         served.request(&id, &mut *f.lock().unwrap(), &snap());
@@ -329,6 +335,7 @@ mod tests {
                     served.progress(&*f.lock().unwrap());
                 }
             });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             Self {
                 fake,
                 stop,
@@ -398,10 +405,12 @@ mod tests {
     fn applied_waits_for_the_transition_and_a_second_caller_is_busy() {
         let repo = TempRepo::new();
         let _lease = super::super::lease::acquire(repo.path()).unwrap();
+        let (started, seen) = std::sync::mpsc::channel();
         let owner = Owner::serve(
             repo.path(),
             Fake {
                 lands: Some(rc::Shown::Starting),
+                started: Some(started),
                 ..Fake::default()
             },
             true,
@@ -409,10 +418,7 @@ mod tests {
         let path = repo.path().to_path_buf();
         let first =
             std::thread::spawn(move || rc::set(&path, rc::Want::On, Duration::from_secs(10)));
-        let started = std::time::Instant::now();
-        while owner.fake.lock().unwrap().starts == 0 && started.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        seen.recv_timeout(Duration::from_secs(5)).unwrap();
         let second = rc::set(repo.path(), rc::Want::On, Duration::from_secs(10));
         assert_eq!(
             second,
@@ -480,14 +486,7 @@ mod tests {
             },
             true,
         );
-        let t = std::time::Instant::now();
-        let published = loop {
-            let raw = std::fs::read_to_string(rc::status_path(repo.path())).unwrap_or_default();
-            if raw.contains("rejected") || t.elapsed() > Duration::from_secs(5) {
-                break raw;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let published = std::fs::read_to_string(rc::status_path(repo.path())).unwrap();
         assert!(published.contains("rejected"), "{published}");
         assert!(!leaks(&published), "{published}");
         let shown = rc::status_text(repo.path());
@@ -499,12 +498,7 @@ mod tests {
         let repo = TempRepo::new();
         let _lease = super::super::lease::acquire(repo.path()).unwrap();
         let _owner = Owner::serve(repo.path(), Fake::default(), false);
-        let t = std::time::Instant::now();
-        let mut answer = rc::set(repo.path(), rc::Want::On, Duration::from_secs(10));
-        // The owner's thread may not have published yet on the first look.
-        while matches!(answer, rc::Answer::Unconfirmed(_)) && t.elapsed() < Duration::from_secs(5) {
-            answer = rc::set(repo.path(), rc::Want::On, Duration::from_millis(200));
-        }
+        let answer = rc::set(repo.path(), rc::Want::On, Duration::from_secs(10));
         assert!(
             matches!(&answer, rc::Answer::Unavailable { reason, .. } if reason.contains("cannot be watched")),
             "{answer:?}"
@@ -552,13 +546,13 @@ mod tests {
             updated: String::new(),
         };
         rc::write_atomic(&rc::status_path(repo.path()), &status).unwrap();
+        let (tx, written) = std::sync::mpsc::channel();
+        let _watch = super::super::zellij::RuntimeWatch::start(repo.path(), tx, || {});
+        assert!(_watch.unavailable.is_none());
         let path = repo.path().to_path_buf();
         let asked =
             std::thread::spawn(move || rc::set(&path, rc::Want::On, Duration::from_secs(10)));
-        let t = std::time::Instant::now();
-        while requests_written(repo.path()) == 0 && t.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        written.recv_timeout(Duration::from_secs(5)).unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
         let answer = asked.join().unwrap();
@@ -712,28 +706,19 @@ mod tests {
                 })
             },
         };
+        let (tx, written) = std::sync::mpsc::channel();
+        let _watch = super::super::zellij::RuntimeWatch::start(repo.path(), tx, || {});
+        assert!(_watch.unavailable.is_none());
         let path = repo.path().to_path_buf();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let asked = std::thread::spawn(move || {
             rc::set_observed(&path, rc::Want::On, deadline, &mut hooked)
         });
-        let t = std::time::Instant::now();
-        let request = loop {
-            let dir = rc::status_path(repo.path());
-            let found = std::fs::read_dir(dir.parent().unwrap())
-                .unwrap()
-                .filter_map(Result::ok)
-                .find_map(|e| rc::request_id(repo.path(), &e.path()));
-            if let Some(id) = found {
-                break rc::read::<rc::Request>(&rc::request_path(repo.path(), &id)).unwrap();
-            }
-            assert!(t.elapsed() < Duration::from_secs(5), "no request written");
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let id = written.recv_timeout(Duration::from_secs(5)).unwrap();
+        let request = rc::read::<rc::Request>(&rc::request_path(repo.path(), &id)).unwrap();
         assert_eq!(request.owner, owner_b);
         a.kill().unwrap();
         a.wait().unwrap();
-        std::thread::sleep(Duration::from_millis(300));
         assert!(!asked.is_finished(), "the retired owner's exit is not B's");
         b.kill().unwrap();
         b.wait().unwrap();

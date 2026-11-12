@@ -645,22 +645,7 @@ mod tests {
 
     fn git_repo() -> super::super::monitor::TempRepo {
         let repo = super::super::monitor::TempRepo::new();
-        for args in [
-            vec!["init", "--quiet", "--initial-branch=main"],
-            vec!["config", "user.email", "test@example.test"],
-            vec!["config", "user.name", "test"],
-            vec!["config", "commit.gpgsign", "false"],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(repo.path())
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
+        crate::test_git::init(repo.path());
         repo
     }
 

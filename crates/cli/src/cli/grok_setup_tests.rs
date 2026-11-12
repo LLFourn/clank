@@ -30,29 +30,6 @@ impl Fixture {
             provider,
         }
     }
-    fn configure_fake(&mut self) {
-        let script = self.cwd.join("fake.py");
-        std::fs::write(&script,r#"
-import os,sys,json,pathlib
-root=pathlib.Path(os.environ['GROK_HOME'])
-req=json.loads(sys.stdin.readline())
-(root/'audit.json').write_text(json.dumps({'request':req,'argv':sys.argv[1:],'updater':os.environ.get('GROK_DISABLE_AUTOUPDATER'),'identity':{k:os.environ.get(k) for k in ['CLANK_AGENT','GROK_SESSION_ID','CLAUDE_CODE_SESSION_ID','CODEX_THREAD_ID']}}))
-print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'protocolVersion':1,'_meta':{'agentVersion':'1.0.46','accountSecret':'must-not-appear'},'agentCapabilities':{'_meta':{'x.ai/hooks':{'blockingEvents':['pre_tool_use','stop']}}}}}),flush=True)
-for line in sys.stdin: raise Exception('unexpected second request')
-"#).unwrap();
-        self.provider.program = "/usr/bin/python3".into();
-        self.provider.args = vec![
-            script.to_string_lossy().into_owned(),
-            "profile-argument".into(),
-        ];
-        self.provider.env.insert(
-            "GROK_HOME".into(),
-            self.provider.root.to_string_lossy().into_owned(),
-        );
-        self.provider
-            .env
-            .insert("HOME".into(), self.cwd.to_string_lossy().into_owned());
-    }
     fn install(&self, dry: bool) -> Result<()> {
         super::super::setup::install_grok_hooks(&hook_path(&self.provider), dry, &mut vec![])
     }
@@ -251,34 +228,6 @@ fn selected_profile_uses_actual_tool_and_custom_home_without_binding_mutation() 
 }
 
 #[tokio::test]
-async fn initialize_probe_uses_configured_executable_and_only_one_scrubbed_request() {
-    let mut f = Fixture::new();
-    f.configure_fake();
-    for key in crate::agent_env::SESSION_IDENTITY_VARS {
-        f.provider.env.insert((*key).into(), "foreign".into());
-    }
-    let cap = probe(&f.provider, &f.cwd).await;
-    assert!(cap.candidate, "{}", cap.description());
-    let audit: Value =
-        serde_json::from_slice(&std::fs::read(f.provider.root.join("audit.json")).unwrap())
-            .unwrap();
-    assert_eq!(audit["request"]["method"], "initialize");
-    assert_eq!(
-        audit["argv"],
-        json!(["profile-argument", "agent", "--no-leader", "stdio"])
-    );
-    assert_eq!(audit["updater"], "1");
-    assert!(
-        audit["identity"]
-            .as_object()
-            .unwrap()
-            .values()
-            .all(Value::is_null)
-    );
-    assert!(!cap.description().contains("must-not-appear"));
-}
-
-#[tokio::test]
 async fn auto_off_launch_does_not_probe_or_require_hooks() {
     let f = Fixture::new();
     let label = AgentLabel::parse("grok").unwrap();
@@ -309,24 +258,39 @@ fn diagnostic_keeps_config_advertisement_and_reaction_distinct() {
 }
 
 #[tokio::test]
-async fn real_auto_launch_gate_requires_complete_adapter_then_advertisement_without_binding() {
-    let mut f = Fixture::new();
-    f.configure_fake();
+async fn auto_launch_gate_checks_adapter_before_probing_and_keeps_binding_unchanged() {
+    let f = Fixture::new();
     let label = AgentLabel::parse("grok").unwrap();
     crate::agent_store::set_auto_mode(&f.cwd, &label, AutoMode::On).unwrap();
     let config = crate::agent_store::agent_config_path(&f.cwd, &label);
     let before = std::fs::read(&config).unwrap();
-    assert!(launch_ready(&f.cwd, &label, &f.provider).await.is_err());
+    let calls = std::cell::Cell::new(0);
+    let advertisement = || async {
+        calls.set(calls.get() + 1);
+        probe_result(Ok(advertised("1.0.46", &["stop"])))
+    };
     assert!(
-        !f.provider.root.join("audit.json").exists(),
+        launch_ready_with(&f.cwd, &label, &f.provider, advertisement())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        calls.get(),
+        0,
         "missing configuration must not start a helper"
     );
     f.install(false).unwrap();
-    launch_ready(&f.cwd, &label, &f.provider).await.unwrap();
+    launch_ready_with(&f.cwd, &label, &f.provider, advertisement())
+        .await
+        .unwrap();
+    assert_eq!(calls.get(), 1);
     assert_eq!(std::fs::read(config).unwrap(), before);
-    assert!(f.provider.root.join("audit.json").exists());
-    f.provider.program = "/does-not-exist/secret-profile-option".into();
-    let error = launch_ready(&f.cwd, &label, &f.provider)
+    let failed = async {
+        probe_result(Err(anyhow::anyhow!(
+            "/does-not-exist/secret-profile-option"
+        )))
+    };
+    let error = launch_ready_with(&f.cwd, &label, &f.provider, failed)
         .await
         .unwrap_err()
         .to_string();

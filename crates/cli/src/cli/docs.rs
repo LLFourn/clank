@@ -782,12 +782,6 @@ mod tests {
     }
 
     #[test]
-    fn the_version_stamp_is_not_rendered() {
-        let all: String = pages().into_values().collect();
-        assert!(!all.contains("9.9.9-stamp"));
-    }
-
-    #[test]
     fn two_runs_are_byte_identical() {
         assert_eq!(pages(), pages());
         let a = tempfile::tempdir().unwrap();

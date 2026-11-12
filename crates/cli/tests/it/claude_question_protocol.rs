@@ -8,10 +8,8 @@
 fn interactive_permission_question_hooks_arbitrate_with_the_local_terminal() {
     let binary = std::env::var_os("CLANK_CLAUDE_PROTOCOL_BINARY")
         .expect("select the installed Claude using CLANK_CLAUDE_PROTOCOL_BINARY");
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/it/fixtures/claude_questions.py");
-    let result = std::process::Command::new("python3")
-        .arg(fixture)
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_clank-test-fixture"))
+        .arg("claude-question")
         .arg(binary)
         .output()
         .expect("run the isolated interactive Claude fixture");

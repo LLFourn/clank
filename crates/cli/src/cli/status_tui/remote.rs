@@ -1237,86 +1237,94 @@ mod tests {
         r.stop().await;
     }
 
-    /// A listing longer than the grace: the supervisor's task is
-    /// aborted when the grace runs out, but the listing it was waiting
-    /// for is waited for all the same — off returns only once it has ended,
-    /// and nothing of the remote's is left running.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn off_waits_for_a_listing_past_the_grace() {
-        use std::time::Duration;
-        let repo = repo_with_config();
-        let metrics = tokio::runtime::Handle::current().metrics();
-        let baseline = metrics.num_alive_tasks();
-        let (mut r, _) = remote_with(
-            repo.path(),
-            true,
-            Duration::from_millis(1200),
-            Duration::from_millis(150),
-        );
-        let snap = snap();
-        r.toggle(&snap);
-        settle(&mut r, &snap).await;
-        r.panes_changed();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let pressed = std::time::Instant::now();
-        r.toggle(&snap);
-        settle(&mut r, &snap).await;
-        assert_eq!(r.shown(), Shown::Off);
-        assert!(
-            pressed.elapsed() >= Duration::from_millis(900),
-            "the listing outlived the grace and was waited for: {:?}",
-            pressed.elapsed()
-        );
-        let settled = std::time::Instant::now() + Duration::from_millis(300);
-        while metrics.num_alive_tasks() > baseline && std::time::Instant::now() < settled {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(metrics.num_alive_tasks(), baseline, "nothing left running");
+    /// The next listing is held until the driver releases it. Startup listings
+    /// remain immediate; readiness is the actual call entering, not a delay.
+    type ListingGate = (
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    struct HeldListing {
+        next: Mutex<Option<ListingGate>>,
+        finished: std::sync::atomic::AtomicBool,
     }
 
-    /// Off ends a supervisor that is in the middle of a slow listing: the
-    /// task is aborted and joined, not asked and left — the runtime's
-    /// live-task count is back where it was the moment off returns,
-    /// while a cancel alone would leave the task until the listing
-    /// came back.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn off_joins_a_listing_in_flight() {
+    impl Panes for HeldListing {
+        fn session(&self) -> &str {
+            "s"
+        }
+        fn table(&self) -> Option<Vec<PaneMeta>> {
+            let next = self.next.lock().unwrap().take();
+            if let Some((entered, held)) = next {
+                let _ = entered.send(());
+                // Disconnecting releases this on test failure as well.
+                let _ = held.recv_timeout(std::time::Duration::from_secs(10));
+                self.finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Some(Vec::new())
+        }
+        fn subscribe(&self, _: &[String]) -> Option<SubscribeChild> {
+            None
+        }
+        fn say(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn stop(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn off_during_listing(grace: std::time::Duration) {
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
         let repo = repo_with_config();
-        let metrics = tokio::runtime::Handle::current().metrics();
-        let baseline = metrics.num_alive_tasks();
-        let (mut r, _) = remote_with(
-            repo.path(),
-            true,
-            Duration::from_millis(600),
-            crate::cli::web::STOP_GRACE,
-        );
+        let (mut r, _) = remote_with(repo.path(), true, Duration::ZERO, grace);
+        let panes = Arc::new(HeldListing {
+            next: Mutex::new(None),
+            finished: AtomicBool::new(false),
+        });
+        r.panes = Arc::new({
+            let panes = panes.clone();
+            move || Ok(panes.clone() as Arc<dyn Panes>)
+        });
         let snap = snap();
         r.toggle(&snap);
         settle(&mut r, &snap).await;
+        assert_eq!(r.shown(), Shown::On);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        *panes.next.lock().unwrap() = Some((entered, held));
         r.panes_changed();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(metrics.num_alive_tasks() > baseline);
-        let pressed = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(10), started)
+            .await
+            .unwrap()
+            .unwrap();
         r.toggle(&snap);
         assert_eq!(r.shown(), Shown::Stopping);
-        settle(&mut r, &snap).await;
-        assert_eq!(r.shown(), Shown::Off);
-        // The listing in flight was waited for — about its length —
-        // and once off, every task of the remote's is gone.
+        let mut stopped = Box::pin(r.stop());
+        assert!(futures_util::poll!(stopped.as_mut()).is_pending());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), stopped)
+            .await
+            .unwrap();
         assert!(
-            pressed.elapsed() >= Duration::from_millis(300),
-            "waited for the listing"
+            panes.finished.load(Ordering::SeqCst),
+            "off left the listing running"
         );
-        let settled = std::time::Instant::now() + Duration::from_millis(300);
-        while metrics.num_alive_tasks() > baseline && std::time::Instant::now() < settled {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            metrics.num_alive_tasks(),
-            baseline,
-            "off means every task of the remote's is joined"
-        );
+        assert_eq!(r.shown(), Shown::Off);
+    }
+
+    /// Zero grace forces shutdown to join blocking work even when async tasks
+    /// get no grace period. Blocking's cancellation test holds that join itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_waits_for_a_listing_past_the_grace() {
+        off_during_listing(std::time::Duration::ZERO).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_joins_a_listing_in_flight() {
+        off_during_listing(crate::cli::web::STOP_GRACE).await;
     }
 
     /// A provider whose "tunnel" is the loopback itself: its URL is

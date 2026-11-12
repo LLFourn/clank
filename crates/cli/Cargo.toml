@@ -11,6 +11,7 @@ description = "Multi-agent peer review around plans: a master implements each pl
 include = [
     "/src/**",
     "/tests/**",
+    "/examples/**",
     "!/tests/browser/node_modules/**",
     "!/tests/browser/package.json",
     "!/tests/browser/package-lock.json",
@@ -22,6 +23,11 @@ include = [
 ]
 
 [dependencies]
+# Only the native test fixture serves a local model. These are already used by
+# integration tests; normal installations do not enable the test runtime.
+hyper = { version = "1", default-features = false, features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 memchr = "2"
 # Shared terminal width and grapheme boundaries for icons and row layout.
 unicode-width = "0.2"
@@ -164,10 +170,27 @@ name = "clank-web-cloudflare"
 path = "src/bin/clank-web-cloudflare.rs"
 test = false
 
+# Cargo builds this once for integration tests; fixtures never invoke a
+# compiler. The dev-dependency enables test-runtime, normal installs do not.
+[[bin]]
+name = "clank-test-fixture"
+path = "tests/support/process.rs"
+required-features = ["test-runtime"]
+test = false
+
 [features]
 # Test-only: native timers may run on a logical clock a test controls
 # (`timer_source::clock`). Never part of an installed build.
 test-clock = []
+# Test processes, including spawned CLI fixtures, share a runner-owned runtime
+# directory. Production builds never honor this environment override.
+test-runtime = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+
+# Repository maintenance code is tested as Rust, not by rebuilding tiny
+# stand-in projects from integration tests. It is never installed by cargo install.
+[[example]]
+name = "maintenance"
+test = true
 
 [build-dependencies]
 sha2 = "0.11"
@@ -184,7 +207,7 @@ clank-web-cloudflare = { path = "../web-cloudflare", version = "0.1.0", features
 clank-user-config = { path = "../user-config", version = "0.1.0", features = ["test-hooks"] }
 # Itself, so every test build -- the binary the integration tests spawn
 # included -- has the logical timer clock, and no installed build does.
-clank = { path = ".", features = ["test-clock"] }
+clank = { path = ".", features = ["test-clock", "test-runtime"] }
 # Only to answer a handshake by hand in the live connector test.
 sha1 = "0.11.0"
 # test-only: the vendored assets are checked against the digest their

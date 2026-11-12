@@ -12,6 +12,22 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../../support/git.rs"]
+pub mod git_fixture;
+
+/// The runtime shared with test-built CLI children. The test runner owns and
+/// removes the override; a plain Cargo invocation retains the CLI default.
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("CLANK_TEST_RUNTIME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(format!("clank-run-{}", rustix::process::getuid().as_raw()))
+}
+
+pub fn runtime_env() -> Option<(&'static str, std::ffi::OsString)> {
+    std::env::var_os("CLANK_TEST_RUNTIME").map(|root| ("CLANK_TEST_RUNTIME", root))
+}
+
 /// A git repo with its OWN HOME, distinct from the repo dir, so a
 /// team set up via [`register_team`] persists in user-scope.
 /// Tests pass `env.home()` / `env.repo()` to the library cores
@@ -30,10 +46,7 @@ impl TestEnv {
         let home = tempfile::tempdir().expect("home tempdir");
         let repo = tempfile::tempdir().expect("repo tempdir");
         let p = repo.path();
-        git(p, &["init", "--quiet", "--initial-branch=main"]);
-        git(p, &["config", "user.email", "test@test"]);
-        git(p, &["config", "user.name", "test"]);
-        git(p, &["config", "commit.gpgsign", "false"]);
+        git_fixture::init(p);
         Self { home, repo }
     }
 
@@ -63,11 +76,7 @@ impl Drop for TestEnv {
         use std::os::unix::ffi::OsStrExt;
         if let Ok(repo) = dunce::canonicalize(self.repo()) {
             let tag = blake3::hash(repo.as_os_str().as_bytes()).to_hex()[..32].to_string();
-            let path = PathBuf::from(format!(
-                "/tmp/clank-run-{}",
-                rustix::process::getuid().as_raw()
-            ))
-            .join(format!("{tag}.plan-mutation"));
+            let path = runtime_dir().join(format!("{tag}.plan-mutation"));
             let _ = std::fs::remove_file(path);
         }
     }

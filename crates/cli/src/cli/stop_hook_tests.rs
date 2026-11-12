@@ -6,14 +6,7 @@ fn stated() -> crate::agent_env::Stated {
 
 fn init_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let ok = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir.path())
-        .args(["init", "--quiet"])
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok);
+    crate::test_git::init(dir.path());
     dir
 }
 

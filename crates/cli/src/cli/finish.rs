@@ -691,10 +691,7 @@ mod tests {
 
     fn init_repo() -> super::super::monitor::TempRepo {
         let dir = super::super::monitor::TempRepo::new();
-        run_git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
-        run_git(dir.path(), &["config", "user.email", "test@test"]);
-        run_git(dir.path(), &["config", "user.name", "test"]);
-        run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        crate::test_git::init(dir.path());
         dir
     }
 

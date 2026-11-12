@@ -500,8 +500,11 @@ pub(super) mod fixtures {
             let source = CommandSource { interrupt_message: None, interrupt: false,
                 name: "voice/a".into(), command: vec!["producer".into(), "events".into(), "--flag".into()],
                 reply_command: Some(vec!["answer-backend".into()]), glyph: None, stop_grace: None,
-                receipt_command: Some(vec!["/usr/bin/python3".into(), "-c".into(),
-                    "import json,os,pathlib,sys; p=pathlib.Path(sys.argv[1]); assert pathlib.Path(str(p)+'.flushed').exists(); data=json.load(sys.stdin); data['cwd']=os.getcwd(); data['state']=os.environ['CLANK_SOURCE_STATE_DIR']; p.write_text(json.dumps(data)); print('callback stdout'); print('callback stderr',file=sys.stderr)".into(),
+                // Exercise the subprocess protocol without spending its 800ms
+                // budget importing a Python runtime under parallel test load.
+                receipt_command: Some(vec!["/bin/sh".into(), "-c".into(),
+                    "test -f \"$1.flushed\" || exit 10; cat > \"$1\"; printf '%s' \"$PWD\" > \"$1.cwd\"; printf '%s' \"$CLANK_SOURCE_STATE_DIR\" > \"$1.state\"; echo 'callback stdout'; echo 'callback stderr' >&2".into(),
+                    "receipt".into(),
                     output.to_str().unwrap().into()]),
             };
             let key = source.source_key();
@@ -762,9 +765,12 @@ mod tests {
         let receipt: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&fixture.output).unwrap()).unwrap();
         assert_eq!(receipt["ids"], serde_json::json!([fixture.id]));
-        assert_eq!(receipt["cwd"], fixture.cwd.to_str().unwrap());
         assert_eq!(
-            receipt["state"],
+            std::fs::read_to_string(fixture.output.with_extension("json.cwd")).unwrap(),
+            fixture.cwd.to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.output.with_extension("json.state")).unwrap(),
             super::super::command_source::backend_state_dir(
                 &crate::agent_store::agents_root(&fixture.repo).join(fixture.author.as_str()),
                 &fixture.key
