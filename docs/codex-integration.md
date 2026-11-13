@@ -4,6 +4,13 @@ Investigation date: 2026-11-13 (Australia/Sydney). Baseline: Clank v0.2.0,
 `5410fb629548341594a9de0bab7316bfc20ce2b2`. This report distinguishes direct
 observations, source inference, documented behavior, and proposed changes.
 
+**Follow-up:** [Actual-TUI background-work evidence](codex-tui-background.md)
+closes the client-ownership and unregistered-command questions left by this
+first investigation. It captures live Stop/tool/subagent hooks, tests a private
+per-agent server with the real TUI, and exercises Clank's disposable fork path.
+Its recommendation and coverage limits supersede this report's open endpoint
+questions; it does not establish a known-good regression baseline.
+
 ## Question
 
 A background command displayed “Exited” without continuing an agent parked in

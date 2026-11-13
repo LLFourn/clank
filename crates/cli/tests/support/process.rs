@@ -96,6 +96,21 @@ fn main() -> Result<()> {
         return Ok(());
     }
     match args.first().map(String::as_str) {
+        Some("codex-context") => {
+            println!(
+                "{}",
+                json!({"cwd":std::env::current_dir()?,
+                "sentinel":std::env::var("CLANK_TUI_SENTINEL").ok()})
+            );
+            Ok(())
+        }
+        Some("codex-observe") if args.len() == 2 => {
+            let input: Value = serde_json::from_reader(std::io::stdin().lock())?;
+            let socket = std::os::unix::net::UnixDatagram::unbound()?;
+            socket.send_to(&serde_json::to_vec(&input)?, &args[1])?;
+            println!("{{}}");
+            Ok(())
+        }
         Some("codex-completion") if args.len() == 4 => {
             // Real process/hook boundary for the opt-in Codex diagnostic.
             // The driver releases each phase through a socket, never a sleep.
@@ -108,7 +123,9 @@ fn main() -> Result<()> {
                 Value::Null
             };
             socket.send_to(
-                &serde_json::to_vec(&json!({"kind":args[1],"input":input}))?,
+                &serde_json::to_vec(&json!({"kind":args[1],"input":input,
+                    "cwd":std::env::current_dir()?,"pid":std::process::id(),
+                    "sentinel":std::env::var("CLANK_TUI_SENTINEL").ok()}))?,
                 &args[2],
             )?;
             let mut response = [0u8; 1024];
