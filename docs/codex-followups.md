@@ -1,9 +1,13 @@
 # Follow-up drafts from the Codex instrumentation investigation
 
 These are proposed plans, not approved production changes. Promote each only
-after the research review, against the then-current code. The completion plan
-can proceed independently of the larger native-connection plan. Their evidence
-is in [codex-integration.md](codex-integration.md).
+after the research review, against the then-current code. Implement the owned
+native connection first, then completion custody, then readiness diagnostics
+(basic capability checks belong in the adapter from its first commit).
+Evidence: [initial investigation](codex-integration.md) and
+[actual TUI, unregistered work and fork experiments](codex-tui-background.md).
+Registered-run custody can be an interim fallback, but does not solve unregistered
+work. These three drafts remain proposals; this research does not migrate agents.
 
 ## a-completed-run-cannot-strand-its-agent
 
@@ -17,9 +21,10 @@ noise the earlier removal was intended to solve.
 
 ### Build
 
-1. Define a completion obligation for an attended run, owned by the monitor
-   and tied to the registering agent's concrete session plus run identity
-   (including PID/birth). Keep it separate from messages and the TUI timeline.
+1. Define a completion obligation for an attended run or verified native command,
+   owned by the monitor and tied to the agent's concrete session plus run identity
+   (PID/birth for registered runs; server generation, concrete thread, turn and
+   item/process IDs for native commands). Keep it separate from messages and the TUI timeline.
    Completion means “collect the result”, never “the command succeeded”.
 2. Use existing lifecycle evidence to trigger delivery, with no process
    polling. When the matching session is parked, return the obligation through
@@ -41,6 +46,11 @@ noise the earlier removal was intended to solve.
 5. Update shared skills, help and book text to state the tested contract and
    fallback. Remove unconditional promises that the harness will always wake
    a parked agent. Preserve legacy retired `run_ended` log compatibility.
+6. Receive unregistered command completions from the owned native adapter;
+   never infer cell completion from a command's exit. SubagentStop/turn completion
+   is a turn boundary, not proof the child and all its descendants are closed.
+   Coalesce related facts and retain outstanding descendant work. On the current
+   embedded launch, explicitly show the registered-only coverage limit.
 
 ### Acceptance
 
@@ -54,6 +64,12 @@ continues on both success and failure. Do not use a timer or a user prompt as
 the successful handoff in that acceptance case. One complete implementation
 commit, followed by normal review corrections if needed.
 
+Include both direct `exec_command` and Code Mode inner commands with no
+`clank run`. The immediate native exit → parked hook reply → next TUI model
+request path is now demonstrated by the research fixture. Test a lost reply,
+missed exit reconciled from native history, and a server restart with no reliable
+end fact; the last must remain unknown, not silently become success.
+
 ## codex-native-evidence-has-an-owner
 
 ### Why
@@ -65,13 +81,15 @@ cannot replace transcript inference until the connection is real and owned.
 
 ### Build
 
-1. Establish and document a supported launch/attach arrangement with a
-   private, monitor-discoverable endpoint and an explicit owning server
-   generation. Evaluate an explicit app-server with a connected terminal
-   against any supported per-TUI control endpoint. Use the smallest verified
-   arrangement; do not silently change every existing session or restart a
-   shared daemon. If neither meets the requirement, stop at evidence and
-   rescope rather than shipping a guessed endpoint.
+1. Implement an opt-in private server per Clank agent and connect its actual TUI
+   with `--remote unix:///…`. The research proved this arrangement; `--no-daemon`
+   instead uses in-memory channels and cannot be combined with `--remote`.
+   Record a private monitor-discoverable endpoint and owning server generation.
+   Supply the intended environment/cwd to the server itself before thread creation,
+   and own its bounded teardown/upgrade lifecycle. Never guess a shared socket or
+   silently restart/migrate existing agents. Preserve profiles and approvals.
+   Exercise `clank fork` with the actual source spec and `fork -C DEST ID`;
+   remote forks inherit permissions and reject new permission overrides.
 2. Share the existing Codex protocol client machinery. Validate server,
    concrete thread ID, repo cwd and current Clank binding before subscribing.
    Never use a fork's shared `sessionId` as the individual agent identity and
@@ -91,6 +109,14 @@ cannot replace transcript inference until the connection is real and owned.
 6. Keep hooks minimal and policy-free. Move only the transcript dependencies
    for which native evidence is demonstrated; retain historical rendering and
    clearly identified compatibility fallback rather than a wholesale rewrite.
+7. Explicitly cover unregistered native commands, including commands called from
+   Code Mode, and child turn lifecycle. PreToolUse lacks the returned handle;
+   PostToolUse is skipped for a yielded shell call and its later exit, so hooks
+   alone are not a substitute for the native observer. Do not claim arbitrary
+   Code Mode cell discovery: its handle differs from an inner process and the
+   tested public schema has no cell inventory/end API. Keep cell collection in
+   the native tool flow and report unsupported passive observation. An upstream
+   extension is separate work, not a fabricated terminal mapping.
 
 ### Acceptance
 
@@ -99,7 +125,10 @@ turn, command and hook events for two independent agents. Wrong endpoint,
 wrong cwd, stale binding and shared-root fork identities cannot authorize a
 send. Reconnect across completion, duplicate events, mixed RPC replies/native
 requests, absent experimental APIs and interrupted turn release are covered.
-No unrelated session is loaded or cancelled. Record tested version ranges and
+Also preserve the tested two simultaneous servers' different environment
+sentinels/cwds and the distinct Clank fork thread. `turn/steer` acceptance while
+parked must not count as delivery; release the matching hook instead. No
+unrelated session is loaded or cancelled. Record tested version ranges and
 capabilities. Deliver the complete adapter in one implementation commit; split
 only by revising the plan before implementation if evidence requires it.
 
@@ -128,3 +157,9 @@ availability. Validate the trust transition in an isolated profile with only
 a generated test hook. Document the supported range and never imply that
 healthy hook discovery alone proves background completion delivery. One
 complete implementation commit.
+
+Report private-remote versus embedded runtime, concrete owning server generation,
+background-terminal capability and cell-observation limitations separately. A
+Stop payload is not a running-task list. Report hooks unsupported by the serving
+version and PostToolUse's yielded-shell limitation; never promise a hook update
+alone fixes unregistered command discovery.

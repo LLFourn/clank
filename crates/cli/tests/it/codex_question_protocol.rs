@@ -192,6 +192,8 @@ impl Drop for OwnedCodex {
     }
 }
 
+type ScriptedModel = dyn Fn(usize, &Value) -> Value + Send + Sync;
+
 struct Model {
     url: String,
     inputs: Arc<Mutex<Vec<Value>>>,
@@ -211,6 +213,13 @@ impl Model {
 
     async fn scripted(
         item: Arc<dyn Fn(usize) -> Value + Send + Sync>,
+        pause_second: Option<Arc<tokio::sync::Notify>>,
+    ) -> Result<Self> {
+        Self::scripted_input(Arc::new(move |count, _| item(count)), pause_second).await
+    }
+
+    async fn scripted_input(
+        item: Arc<ScriptedModel>,
         pause_second: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -235,13 +244,20 @@ impl Model {
                                     ensure!(req.uri().path() == "/v1/responses", "unexpected model endpoint");
                                     let body = req.into_body().collect().await?.to_bytes();
                                     let input: Value = serde_json::from_slice(&body)?;
+                                    // The actual TUI makes a separate title-generation request.
+                                    // It is not a continuation of the tested agent thread.
+                                    let title = input["client_metadata"]["x-codex-turn-metadata"].as_str()
+                                        .and_then(|s|serde_json::from_str::<Value>(s).ok())
+                                        .is_some_and(|metadata|metadata["thread_source"] == "thread_title");
                                     let count = {
                                         let mut inputs = inputs.lock().unwrap();
-                                        inputs.push(input);
-                                        inputs.len()
+                                        if title { 0 } else { inputs.push(input.clone()); inputs.len() }
                                     };
                                     let id = format!("response-{count}");
-                                    let item = item(count);
+                                    let item = if title {
+                                        json!({"type":"message","id":"title","role":"assistant",
+                                            "content":[{"type":"output_text","text":"{\"title\":\"Run diagnostic\"}","annotations":[]}]})
+                                    } else { item(count, &input) };
                                     if count == 2 && let Some(gate) = pause_second {
                                         gate.notified().await;
                                     }
@@ -277,8 +293,17 @@ impl Model {
                     item["type"] == "function_call_output" && item["call_id"] == call_id
                 })
             })
-            .and_then(|item| item["output"].as_str())
-            .map(str::to_owned)
+            .and_then(|item| {
+                item["output"].as_str().map(str::to_owned).or_else(|| {
+                    item["output"].as_array().map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                })
+            })
             .ok_or_else(|| anyhow!("model did not receive result for {call_id}"))
     }
 }
@@ -300,6 +325,9 @@ fn question_item(count: usize) -> Value {
 #[path = "../support/codex_completion.rs"]
 mod completion;
 
+#[path = "../support/codex_tui.rs"]
+mod tui;
+
 async fn start_codex(home: &Path, model: &Model) -> Result<(OwnedCodex, PathBuf)> {
     start_codex_with_features(home, model, "").await
 }
@@ -308,6 +336,15 @@ async fn start_codex_with_features(
     home: &Path,
     model: &Model,
     features: &str,
+) -> Result<(OwnedCodex, PathBuf)> {
+    start_codex_at(home, model, features, home).await
+}
+
+async fn start_codex_at(
+    home: &Path,
+    model: &Model,
+    features: &str,
+    cwd: &Path,
 ) -> Result<(OwnedCodex, PathBuf)> {
     let binary = std::env::var_os("CLANK_CODEX_PROTOCOL_BINARY").ok_or_else(|| {
         anyhow!("set CLANK_CODEX_PROTOCOL_BINARY to an installed Codex executable")
@@ -331,11 +368,12 @@ async fn start_codex_with_features(
             "--listen",
             &format!("unix://{}", socket.display()),
         ])
-        .current_dir(home)
+        .current_dir(cwd)
         .env_clear()
         .env("CODEX_HOME", home)
         .env("HOME", home)
         .env("CLANK_QUESTION_PROOF_KEY", "fixture-only")
+        .env("CLANK_TUI_SENTINEL", cwd.file_name().unwrap())
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(home.join("server.stderr"))?)
         .process_group(0);
