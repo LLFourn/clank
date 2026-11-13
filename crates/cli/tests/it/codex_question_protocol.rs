@@ -206,6 +206,13 @@ impl Drop for Model {
 
 impl Model {
     async fn start() -> Result<Self> {
+        Self::scripted(Arc::new(question_item), None).await
+    }
+
+    async fn scripted(
+        item: Arc<dyn Fn(usize) -> Value + Send + Sync>,
+        pause_second: Option<Arc<tokio::sync::Notify>>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/v1", listener.local_addr()?);
         let inputs = Arc::new(Mutex::new(Vec::new()));
@@ -217,9 +224,13 @@ impl Model {
                     accepted = listener.accept() => {
                         let Ok((socket, _)) = accepted else { break };
                         let inputs = captured.clone();
+                        let item = item.clone();
+                        let pause_second = pause_second.clone();
                         connections.spawn(async move {
                             let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                                 let inputs = inputs.clone();
+                                let item = item.clone();
+                                let pause_second = pause_second.clone();
                                 async move {
                                     ensure!(req.uri().path() == "/v1/responses", "unexpected model endpoint");
                                     let body = req.into_body().collect().await?.to_bytes();
@@ -230,17 +241,10 @@ impl Model {
                                         inputs.len()
                                     };
                                     let id = format!("response-{count}");
-                                    let item = if count % 2 == 1 {
-                                        json!({"type":"function_call","id":format!("fc-{count}"),
-                                            "call_id":format!("question-{count}"),"name":"request_user_input",
-                                            "arguments":json!({"questions":[{"id":"direction","header":"Direction",
-                                                "question":"Which direction?","options":[
-                                                    {"label":"North","description":"First"},
-                                                    {"label":"South","description":"Second"}]}]}).to_string()})
-                                    } else {
-                                        json!({"type":"message","id":format!("message-{count}"),"role":"assistant",
-                                            "content":[{"type":"output_text","text":"Answered.","annotations":[]}]})
-                                    };
+                                    let item = item(count);
+                                    if count == 2 && let Some(gate) = pause_second {
+                                        gate.notified().await;
+                                    }
                                     let events = [
                                         json!({"type":"response.created","response":{"id":id}}),
                                         json!({"type":"response.output_item.done","output_index":0,"item":item}),
@@ -279,7 +283,32 @@ impl Model {
     }
 }
 
+fn question_item(count: usize) -> Value {
+    if count % 2 == 1 {
+        json!({"type":"function_call","id":format!("fc-{count}"),
+            "call_id":format!("question-{count}"),"name":"request_user_input",
+            "arguments":json!({"questions":[{"id":"direction","header":"Direction",
+                "question":"Which direction?","options":[
+                    {"label":"North","description":"First"},
+                    {"label":"South","description":"Second"}]}]}).to_string()})
+    } else {
+        json!({"type":"message","id":format!("message-{count}"),"role":"assistant",
+            "content":[{"type":"output_text","text":"Answered.","annotations":[]}]})
+    }
+}
+
+#[path = "../support/codex_completion.rs"]
+mod completion;
+
 async fn start_codex(home: &Path, model: &Model) -> Result<(OwnedCodex, PathBuf)> {
+    start_codex_with_features(home, model, "").await
+}
+
+async fn start_codex_with_features(
+    home: &Path,
+    model: &Model,
+    features: &str,
+) -> Result<(OwnedCodex, PathBuf)> {
     let binary = std::env::var_os("CLANK_CODEX_PROTOCOL_BINARY").ok_or_else(|| {
         anyhow!("set CLANK_CODEX_PROTOCOL_BINARY to an installed Codex executable")
     })?;
@@ -291,7 +320,7 @@ async fn start_codex(home: &Path, model: &Model) -> Result<(OwnedCodex, PathBuf)
     std::fs::write(
         home.join("config.toml"),
         format!(
-            "model = \"mock-model\"\nmodel_provider = \"mock\"\n[model_providers.mock]\nname = \"Mock\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nenv_key = \"CLANK_QUESTION_PROOF_KEY\"\n[features]\ndefault_mode_request_user_input = true\n",
+            "model = \"mock-model\"\nmodel_provider = \"mock\"\n[model_providers.mock]\nname = \"Mock\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nenv_key = \"CLANK_QUESTION_PROOF_KEY\"\n[features]\ndefault_mode_request_user_input = true\n{features}\n",
             model.url
         ),
     )?;

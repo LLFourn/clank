@@ -96,6 +96,32 @@ fn main() -> Result<()> {
         return Ok(());
     }
     match args.first().map(String::as_str) {
+        Some("codex-completion") if args.len() == 4 => {
+            // Real process/hook boundary for the opt-in Codex diagnostic.
+            // The driver releases each phase through a socket, never a sleep.
+            let socket =
+                std::os::unix::net::UnixDatagram::bind(format!("{}.{}", args[2], args[1]))?;
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+            let input = if args[1] == "hook" {
+                serde_json::from_reader(std::io::stdin().lock())?
+            } else {
+                Value::Null
+            };
+            socket.send_to(
+                &serde_json::to_vec(&json!({"kind":args[1],"input":input}))?,
+                &args[2],
+            )?;
+            let mut response = [0u8; 1024];
+            let count = socket.recv(&mut response)?;
+            std::fs::remove_file(format!("{}.{}", args[2], args[1]))?;
+            if args[1] == "hook" {
+                std::io::stdout().write_all(&response[..count])?;
+                Ok(())
+            } else {
+                println!("fixture command completed");
+                std::process::exit(args[3].parse()?);
+            }
+        }
         Some("claude-exec") => claude::exec(&args[1..]),
         Some("claude-hook") => tokio::runtime::Builder::new_current_thread()
             .enable_all()
