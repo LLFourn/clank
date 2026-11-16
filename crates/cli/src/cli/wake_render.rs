@@ -361,11 +361,37 @@ impl WaitItem {
     }
 }
 
-/// One escalation line: what discharges `item`, or nothing when nothing
-/// the agent does would.
-pub(crate) fn duty_line(item: &WaitItem) -> Option<String> {
+/// Where `role` takes a need for a person while owing `item`'s `duty`.
+/// Only the master raises a block (I7); a reviewer's verdict carries the
+/// need to the master, and any other agent tells the master directly.
+fn human_input(role: Role, item: &WaitItem, duty: Duty) -> &'static str {
+    use clank_core::wait::WaitKind as K;
+    match (role, duty) {
+        (Role::Master, Duty::Step) if item.plan.is_some() => {
+            " Needs human input? `clank block ask <name> -m \"<question>\"` pauses \
+             review; it discharges nothing else."
+        }
+        (Role::Reviewer, Duty::Step)
+            if matches!(item.wake_kind(), Some(K::Reviewer | K::AdHocReview)) =>
+        {
+            " Needs human input? Write REQUEST_CHANGES saying what the person must decide; \
+             the master raises the block. `clank send --master` may add to the verdict, \
+             never replace it."
+        }
+        (Role::Reviewer | Role::Standby, Duty::Event) => {
+            " Needs human input? Tell the master: `clank send --master -m \"<question>\"`; \
+             only the master raises blocks."
+        }
+        _ => "",
+    }
+}
+
+/// One escalation line for `role`: what discharges `item`, or nothing
+/// when nothing the agent does would.
+pub(crate) fn duty_line(item: &WaitItem, role: Role) -> Option<String> {
     let kind = item.wake_kind()?;
     let (discharge, duty) = classify(kind, item.wake_reason());
+    let ask = human_input(role, item, duty);
     let what = item.identified();
     let line = match duty {
         Duty::Event => {
@@ -373,7 +399,7 @@ pub(crate) fn duty_line(item: &WaitItem) -> Option<String> {
                 let Discharge::Until(until) = discharge else {
                     return None;
                 };
-                return Some(format!("- {what}: {until}"));
+                return Some(format!("- {what}: {until}{ask}"));
             };
             let finish = if item.requires_reply.unwrap_or(false) {
                 format!(
@@ -387,19 +413,13 @@ pub(crate) fn duty_line(item: &WaitItem) -> Option<String> {
                      If waiting, report the dependency now and follow up"
                 )
             };
-            format!("- {what}: handle before ending your turn: {finish}.")
+            format!("- {what}: handle before ending your turn: {finish}.{ask}")
         }
         Duty::Step => {
             let Discharge::Until(until) = discharge else {
                 return None;
             };
-            let block = if item.plan.is_some() {
-                " Needs human input? `clank block ask <name> -m \"<question>\"` pauses \
-                 review; it discharges nothing else."
-            } else {
-                ""
-            };
-            format!("- {what}: {until}.{block}")
+            format!("- {what}: {until}.{ask}")
         }
         Duty::HumanOnly => format!(
             "- {what}: only the human can clear this. Do not act on it, and do not answer it \
@@ -1625,7 +1645,7 @@ mod tests {
             "{work}{}",
             crate::cli::wake_repeat::escalation(
                 clank_core::turn_policy::ESCALATE_AT,
-                &[duty_line(&item).unwrap()],
+                &[duty_line(&item, Role::Master).unwrap()],
             )
             .unwrap()
         );
@@ -1801,11 +1821,15 @@ mod tests {
     }
 
     fn duties(items: &[serde_json::Value]) -> Vec<String> {
+        duties_as(Role::Master, items)
+    }
+
+    fn duties_as(role: Role, items: &[serde_json::Value]) -> Vec<String> {
         let wire = serde_json::json!({ "items": items });
         parse_wait_json(wire.to_string().as_bytes())
             .unwrap()
             .iter()
-            .filter_map(duty_line)
+            .filter_map(|item| duty_line(item, role))
             .collect()
     }
 
@@ -1896,6 +1920,38 @@ mod tests {
         assert!(duties(&[serde_json::json!({"kind":"a_kind_from_the_future"})]).is_empty());
     }
 
+    /// Only the master's lines offer `clank block ask` (I7): a reviewer's
+    /// review step names REQUEST_CHANGES, and a non-master's event names
+    /// `clank send --master`. The master's events carry neither.
+    #[test]
+    fn only_the_master_is_offered_a_block() {
+        let review = serde_json::json!({"kind":"reviewer","plan":"p","sha":FULL_SHA});
+        let adhoc = serde_json::json!({"kind":"adhoc_review","sha":FULL_SHA});
+        let message = serde_json::json!({"kind":"message","handle":"h","selector":"messages@3"});
+        let reviewer = duties_as(Role::Reviewer, &[review, adhoc, message.clone()]);
+        assert_eq!(reviewer.len(), 3, "{reviewer:?}");
+        for line in &reviewer {
+            assert!(!line.contains("block ask"), "{line}");
+        }
+        assert!(
+            reviewer[0].contains("Write REQUEST_CHANGES"),
+            "{reviewer:?}"
+        );
+        assert!(
+            reviewer[1].contains("Write REQUEST_CHANGES"),
+            "{reviewer:?}"
+        );
+        assert!(reviewer[2].contains("`clank send --master"), "{reviewer:?}");
+
+        let standby = duties_as(Role::Standby, std::slice::from_ref(&message));
+        assert!(!standby[0].contains("block ask"), "{standby:?}");
+        assert!(standby[0].contains("`clank send --master"), "{standby:?}");
+
+        let master = duties_as(Role::Master, &[message]);
+        assert!(!master[0].contains("clank send --master"), "{master:?}");
+        assert!(!master[0].contains("block ask"), "{master:?}");
+    }
+
     /// A mixed delivery treats each item by its own class: the block is
     /// offered for the plan's step alone, and a blocked item excuses
     /// nothing else.
@@ -1943,7 +1999,7 @@ mod tests {
     fn projected(item: clank_core::wait::WaitItem) -> String {
         let wire = serde_json::json!({"items":[crate::cli::wait::render_json(&item)]});
         let parsed = parse_wait_json(wire.to_string().as_bytes()).unwrap();
-        duty_line(&parsed[0]).unwrap()
+        duty_line(&parsed[0], Role::Master).unwrap()
     }
 
     /// Through the real projection, every item is addressed by what

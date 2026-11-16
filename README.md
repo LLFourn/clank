@@ -651,7 +651,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `stash` | Set a plan's commits aside (bare or `push`, like `git stash`) / `pop` restores / `show` / `drop` / `list` |
 | `pick` | Copy plans (commits + files) from another branch (`--from`) |
 | `purge` | Strip a plan's `.clank/` artifacts from history (`--drop` = all of it) |
-| `block` | Questions only the human can answer: an agent's `block ask` (`--permission` for a refused permission, see *Permission blocks*), the human's `block answer` (`--nudge` types the answer into the agent's terminal), and `block list` to read what is still open or undelivered. Delivering an answer deletes its block; the agent acknowledges nothing |
+| `block` | Questions only the human can answer: the master's `block ask` (`--permission` for a refused permission, see *Permission blocks*), the human's `block answer` (`--nudge` types the answer into the agent's terminal), and `block list` to read what is still open or undelivered. Delivering an answer deletes its block; the agent acknowledges nothing |
 | `config` | Read/write typed config values (repo or `--global`): `review.adhoc_feedback`, `review.plan_feedback`, `review.require_commit_prefix`, `hooks.blocked`, `diff.editor.command`, `diff.wait`, `finish.autosquash`, `recovery.blind_nudge`, `recovery.stall_warn`, `recovery.stall_nudge` |
 | `export` | Dump the repo's roster config as JSON |
 
@@ -1181,8 +1181,10 @@ agent's session.
     a rejected action are followed;
   - background work is attended (`clank attend <name>`, `clank run`) rather
     than waited out by ending the turn;
-  - what discharges each item, one line per item; a plan step that truly
-    depends on a person points to `clank block ask <name> -m "…"`.
+  - what discharges each item, one line per item, and where a real dependency
+    on a person goes: on the master's plan step, `clank block ask <name> -m
+    "…"`; on a reviewer's review, REQUEST_CHANGES; on another agent's event,
+    `clank send --master`. Only the master raises blocks.
 
   A block pauses review work only; messages and events are still delivered.
 - **Resets:** the count resets when the items, the session, or the blocks (which

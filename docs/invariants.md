@@ -99,10 +99,20 @@ whether its assertions protect the invariant. Reviewers check that.
 ## I7. Only the master raises blocks.
 
 - Why: a block pauses the whole repo; the master decides when to ask a person.
-- Status: target
-- Today: reviewer wake text suggests `clank block ask`, and `block ask`
-  accepts any caller.
-- Plans: only-the-master-raises-blocks
+- Status: holds
+- Scope: `clank block ask`, plain and `--permission`, admits the repo's
+  unique master and a caller with no harness session variable and no
+  `CLANK_AGENT`. Any other agent is refused before a block file or the
+  `blocked` hook is touched, and so is a caller whose identity fails to
+  resolve. Only the master's wakes offer `block ask`: a reviewer's name
+  REQUEST_CHANGES, and other agents are pointed at `clank send --master`.
+- Tests: `crates/cli/src/cli/block/repo_tests.rs::a_reviewer_is_refused_a_block_and_told_to_request_changes`,
+  `crates/cli/src/cli/block/repo_tests.rs::a_standby_agent_is_refused_a_block_and_told_to_send_the_master`,
+  `crates/cli/src/cli/block/repo_tests.rs::the_master_raises_a_block`,
+  `crates/cli/src/cli/block/repo_tests.rs::a_caller_with_no_identity_raises_a_block`,
+  `crates/cli/src/cli/block/repo_tests.rs::an_unresolved_identity_is_refused_and_creates_nothing`,
+  `crates/cli/src/cli/wake_render.rs::only_the_master_is_offered_a_block`,
+  `crates/cli/src/cli/turn_custody_tests.rs::only_the_masters_escalated_wake_offers_a_block`
 
 ## I8. Any change to a monitor wire message bumps the protocol version.
 

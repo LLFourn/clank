@@ -3537,6 +3537,9 @@ mod tests {
                 !compose_skill(Role::Reviewer, tool).contains("clank block ask"),
                 "reviewer must not carry the master-only block-ask command"
             );
+            let standby = compose_skill(Role::Standby, tool);
+            assert!(!standby.contains("clank block ask"), "{standby}");
+            assert!(standby.contains("clank send --master"), "{standby}");
         }
     }
 

@@ -1853,6 +1853,10 @@ pub struct BlockArgs {
 #[derive(clap::Subcommand, Debug)]
 pub enum BlockCmd {
     /// Ask the human a question, and wait for the answer
+    ///
+    /// Only the repository's master, or a person running no agent, may
+    /// ask. A reviewer writes REQUEST_CHANGES instead, and any other agent
+    /// tells the master with `clank send --master`.
     Ask(BlockCreateArgs),
     /// Answer a repository question
     Answer(UnblockArgs),

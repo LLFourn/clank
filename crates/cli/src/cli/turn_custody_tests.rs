@@ -721,6 +721,101 @@ fn repeated_delivery_is_counted_by_delivery_and_escalates_with_its_duties() {
     assert_eq!(repeated, Some(4));
 }
 
+/// The text an escalated wake hands `who`: four deliveries of `owed`,
+/// each from a new Stop.
+fn escalated(repo: &Path, who: &str, session: &str, owed: &[clank_core::wait::WaitItem]) -> String {
+    let author = label(who);
+    let mut turns = Turns::new(repo.to_path_buf());
+    let g = gathered(repo, who, owed);
+    let mut text = String::new();
+    for position in 1..=clank_core::turn_policy::ESCALATE_AT as u64 {
+        let frame = turns
+            .answer(
+                &author,
+                position,
+                &stop(Tool::Codex, session, Some(position)),
+                true,
+                &g,
+            )
+            .unwrap();
+        let presentation = frame.presentation().expect("delivered").clone();
+        turns
+            .result(
+                &author,
+                position,
+                TurnResult::Delivered { presentation },
+                &g,
+            )
+            .unwrap();
+        text = frame.rendered.unwrap();
+    }
+    assert!(text.contains("times unchanged"), "{text}");
+    text
+}
+
+/// Only the master raises blocks (I7), so no other role's wake offers
+/// `clank block ask`: a reviewer's need for a person goes in its verdict,
+/// and a standby agent tells the master.
+#[test]
+fn only_the_masters_escalated_wake_offers_a_block() {
+    let repo = repo_with("boss", Tool::Codex, "sess-boss");
+    for (who, role, session) in [
+        (
+            "rev",
+            crate::cli::teams_config::RosterRole::Commit,
+            "sess-rev",
+        ),
+        (
+            "idle",
+            crate::cli::teams_config::RosterRole::Standby,
+            "sess-idle",
+        ),
+    ] {
+        crate::cli::agent::add_repo_roster_agent(
+            repo.path(),
+            &label(who),
+            crate::cli::teams_config::AgentDescription {
+                tool: Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+            },
+            role,
+        )
+        .unwrap();
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &label(who),
+            Tool::Codex,
+            &sid(session),
+        )
+        .unwrap();
+        crate::agent_store::set_auto_mode(repo.path(), &label(who), AutoMode::On).unwrap();
+    }
+    let review = clank_core::wait::WaitItem::Reviewer {
+        plan: crate::lifecycle::PlanKey::parse("p").unwrap(),
+        sha: crate::lifecycle::CommitSha::parse("f6feba2316851a36e3c6f4b0f7f0ad0b8c8ddb5d")
+            .unwrap(),
+        feedback_path: ".clank/feedback/p.md".into(),
+    };
+
+    let reviewer = escalated(repo.path(), "rev", "sess-rev", &[review, message("3")]);
+    assert!(
+        reviewer.starts_with("Clank: work for `rev` (reviewer)"),
+        "{reviewer}"
+    );
+    assert!(!reviewer.contains("block ask"), "{reviewer}");
+    assert!(reviewer.contains("Write REQUEST_CHANGES"), "{reviewer}");
+
+    let standby = escalated(repo.path(), "idle", "sess-idle", &[message("4")]);
+    assert!(
+        standby.starts_with("Clank: work for `idle` (standby)"),
+        "{standby}"
+    );
+    assert!(!standby.contains("block ask"), "{standby}");
+    assert!(!standby.contains("REQUEST_CHANGES"), "{standby}");
+    assert!(standby.contains("`clank send --master"), "{standby}");
+}
+
 /// The projection shows a count only once it escalates.
 #[test]
 fn a_count_below_the_threshold_is_not_shown() {

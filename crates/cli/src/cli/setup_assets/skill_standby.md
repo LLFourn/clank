@@ -11,3 +11,5 @@ and you act on them.
 - You write no verdicts and run no plan or roster commands (`feedback write`,
   `finish`, `queue promote`, `agent add`/`remove`): those belong to the
   reviewers and the master.
+- Need human input? Tell the master: `clank send --master -m "…"`. Only the
+  master raises a repo block.
