@@ -193,11 +193,23 @@ pub(super) fn render_at(
     if let Mode::AgentDetail { idx, sel } = mode
         && let Some(agent) = snap.agents.get(idx)
     {
-        let actions = detail_actions(agent.role, view.session_found, agent.session.is_some());
+        let actions = detail_actions(
+            agent.role,
+            view.session_found == Some(true),
+            agent.session.is_some(),
+        );
         // The loop settles the cursor by action before every frame;
         // this is only the guard against an index past the end.
         let sel = sel.min(actions.len().saturating_sub(1));
-        return render_agent_detail(agent, view.seen_session, &actions, sel, rows, cols);
+        return render_agent_detail(
+            agent,
+            view.seen_session,
+            view.session_found,
+            &actions,
+            sel,
+            rows,
+            cols,
+        );
     }
     if let Mode::WaitDetail { agent, sel } = mode
         && let Some((a, att)) = snap
@@ -3174,6 +3186,7 @@ pub(super) fn render_kill_confirm(
 pub(super) fn render_agent_detail(
     agent: &crate::cli::status::AgentAutoRow,
     seen: Option<&super::input::SeenSession>,
+    session_found: Option<bool>,
     actions: &[DetailAction],
     sel: usize,
     rows: usize,
@@ -3345,7 +3358,7 @@ pub(super) fn render_agent_detail(
             cols,
         )),
     }
-    if !actions.contains(&DetailAction::Reopen) {
+    if session_found == Some(false) && !actions.contains(&DetailAction::Reopen) {
         for line in wrap(
             "Reopen unavailable: no Zellij session found.",
             cols.saturating_sub(3).max(1),
@@ -6400,7 +6413,7 @@ mod tests {
                             picker: &[],
                             log_cursor: 0,
                             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
-                            session_found: false,
+                            session_found: Some(false),
                             remote: Default::default(),
                             remote_detail: None,
                             remote_page: None,
@@ -6453,7 +6466,7 @@ mod tests {
             picker: &[],
             log_cursor: cursor,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
-            session_found: false,
+            session_found: Some(false),
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -6689,7 +6702,7 @@ mod tests {
             log_cursor: 6,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
-            session_found: false,
+            session_found: Some(false),
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -8493,7 +8506,7 @@ mod tests {
                 .position(|a| *a == DetailAction::Reopen)
                 .unwrap();
             let mut view = PanelView::just(Mode::AgentDetail { idx: 1, sel });
-            view.session_found = true;
+            view.session_found = Some(true);
             for presence in [
                 None,
                 Some(Default::default()),
@@ -8509,7 +8522,7 @@ mod tests {
                         .any(|l| visible(l).contains("Reopen unavailable"))
                 );
             }
-            view.session_found = false;
+            view.session_found = Some(false);
             view.mode = Mode::AgentDetail { idx: 1, sel: 99 };
             let page = render_at(&s, 60, 100, 0, 0, &view).0;
             assert!(
@@ -8519,6 +8532,20 @@ mod tests {
             let band = page.iter().find(|l| l.contains("\x1b[7m")).unwrap();
             assert!(visible(band).contains("back"));
         }
+    }
+
+    /// Before the worker has said whether it found the session, the page
+    /// neither offers Reopen nor claims there is no session.
+    #[test]
+    fn a_session_not_yet_looked_for_is_not_reported_missing() {
+        let s = two_agent_snap();
+        let mut view = PanelView::just(Mode::AgentDetail { idx: 1, sel: 0 });
+        view.session_found = None;
+        let page = render_at(&s, 60, 100, 0, 0, &view).0;
+        assert!(
+            !page.iter().any(|l| visible(l).contains("Reopen")),
+            "{page:#?}"
+        );
     }
 
     #[test]
@@ -8634,7 +8661,7 @@ mod tests {
                 log_cursor: 0,
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
-                session_found: false,
+                session_found: Some(false),
                 remote: Default::default(),
                 remote_detail: None,
                 remote_page: None,
@@ -8694,7 +8721,7 @@ mod tests {
             log_cursor: 0,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
-            session_found: false,
+            session_found: Some(false),
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -8809,7 +8836,7 @@ mod tests {
                 log_cursor: 0,
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
-                session_found: false,
+                session_found: Some(false),
                 remote: Default::default(),
                 remote_detail: None,
                 remote_page: None,
@@ -10391,7 +10418,7 @@ mod tests {
             log_cursor: 1,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
-            session_found: false,
+            session_found: Some(false),
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -12334,7 +12361,7 @@ mod tests {
         use crate::cli::agent_state::Activity;
         let mut s = two_agent_snap();
         s.agents[0].state = Some(view_of(Activity::Idle, None));
-        let page = render_agent_detail(&s.agents[0], None, &[DetailAction::Back], 0, 40, 200)
+        let page = render_agent_detail(&s.agents[0], None, None, &[DetailAction::Back], 0, 40, 200)
             .0
             .iter()
             .map(|l| visible(l))
@@ -12345,7 +12372,7 @@ mod tests {
             "{page}"
         );
         s.agents[0].state = Some(view_of(Activity::Idle, Some("another session is bound")));
-        let page = render_agent_detail(&s.agents[0], None, &[DetailAction::Back], 0, 40, 200)
+        let page = render_agent_detail(&s.agents[0], None, None, &[DetailAction::Back], 0, 40, 200)
             .0
             .iter()
             .map(|l| visible(l))
@@ -12393,7 +12420,7 @@ mod tests {
         );
 
         let page: Vec<String> =
-            render_agent_detail(&s.agents[0], None, &[DetailAction::Back], 0, 40, 100)
+            render_agent_detail(&s.agents[0], None, None, &[DetailAction::Back], 0, 40, 100)
                 .0
                 .iter()
                 .map(|l| visible(l).trim_end().to_string())
@@ -13795,7 +13822,7 @@ mod tests {
                 .iter()
                 .position(|a| *a == DetailAction::Reopen)
                 .expect("reopen is on every page");
-            let (lines, _) = render_agent_detail(&agent, None, &actions, sel, 24, 60);
+            let (lines, _) = render_agent_detail(&agent, None, None, &actions, sel, 24, 60);
             let row = lines
                 .iter()
                 .find(|l| visible(l).contains("reopen pane"))
@@ -13816,7 +13843,7 @@ mod tests {
         use clank_core::vocab::AutoMode;
         let agent = agent_row("sb", RosterRole::Standby, AutoMode::On);
         let actions = detail_actions(RosterRole::Standby, false, false);
-        let (lines, _) = render_agent_detail(&agent, None, &actions, 0, 40, 80);
+        let (lines, _) = render_agent_detail(&agent, None, None, &actions, 0, 40, 80);
         let page: String = lines
             .iter()
             .map(|l| visible(l))
@@ -13881,7 +13908,7 @@ mod tests {
     ) -> String {
         use crate::cli::teams_config::RosterRole;
         let actions = detail_actions(RosterRole::Commit, false, agent.session.is_some());
-        let (lines, _) = render_agent_detail(agent, seen, &actions, 0, 40, 80);
+        let (lines, _) = render_agent_detail(agent, seen, None, &actions, 0, 40, 80);
         lines
             .iter()
             .map(|l| visible(l))
@@ -14037,7 +14064,8 @@ mod tests {
         };
         let actions = detail_actions(RosterRole::Commit, false, true);
         for (rows, cols) in [(8, 40), (12, 40), (8, 24)] {
-            let (lines, _) = render_agent_detail(&agent, Some(&seen), &actions, 0, rows, cols);
+            let (lines, _) =
+                render_agent_detail(&agent, Some(&seen), None, &actions, 0, rows, cols);
             let text: Vec<String> = lines.iter().map(|l| visible(l)).collect();
             assert_eq!(text.len(), rows, "{rows}x{cols}: {text:?}");
             assert!(
@@ -14068,7 +14096,7 @@ mod tests {
             .iter()
             .position(|a| *a == DetailAction::Swap)
             .expect("swap is on a reviewer page");
-        let (lines, _) = render_agent_detail(&agent, None, &actions, sel, 24, 60);
+        let (lines, _) = render_agent_detail(&agent, None, None, &actions, sel, 24, 60);
         let row = lines
             .iter()
             .map(|l| visible(l))
@@ -14111,7 +14139,7 @@ mod tests {
         // the binding and the hint, and nothing spare.
         for rows in [8, 12, 20] {
             for sel in 0..actions.len() {
-                let (lines, _) = render_agent_detail(&agent, None, &actions, sel, rows, 40);
+                let (lines, _) = render_agent_detail(&agent, None, None, &actions, sel, rows, 40);
                 assert_eq!(lines.len(), rows, "fills {rows} rows exactly at sel {sel}");
                 let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
                 let shown = texts.join("\n");
@@ -14193,7 +14221,7 @@ mod tests {
         use clank_core::vocab::AutoMode;
         let agent = agent_row("codex", RosterRole::Commit, AutoMode::On);
         let actions = detail_actions(RosterRole::Commit, false, false);
-        let (lines, _) = render_agent_detail(&agent, None, &actions, 0, 24, 60);
+        let (lines, _) = render_agent_detail(&agent, None, None, &actions, 0, 24, 60);
         let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
         let raw = lines.join("\n");
 
