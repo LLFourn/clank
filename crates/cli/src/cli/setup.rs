@@ -199,6 +199,15 @@ pub(crate) fn background_run(tool: Tool) -> &'static str {
     }
 }
 
+/// Who tells the agent a `clank run` ended: its harness, or clank where the
+/// harness cannot ([`Tool::reports_background_completion`]).
+pub(crate) fn run_ends(tool: Tool) -> &'static str {
+    match tool.reports_background_completion() {
+        true => "Your harness\n  tells you when a run ends;",
+        false => "Clank tells you\n  when a `clank run` ends (nothing else does);",
+    }
+}
+
 /// What ends a `clank attend` declaration on `tool`: the harness's own
 /// task listing where its Stop sends one, else only the agent's clear.
 pub(crate) fn declared_ends(tool: Tool) -> &'static str {
@@ -283,6 +292,7 @@ pub fn compose_skill_with(role: Role, tool: Tool, claude_async: bool) -> String 
         )
         .replace("{{BACKGROUND_RUN}}", background_run(tool))
         .replace("{{DECLARED_ENDS}}", declared_ends(tool))
+        .replace("{{RUN_ENDS}}", run_ends(tool))
 }
 
 /// Per-tool hook timeout we write into the agent's hook config.
@@ -2859,15 +2869,17 @@ mod tests {
         // say what ends a declaration on each tool
         // (declared-work-ends-by-the-harness-listing), and by the 139B
         // that sends reviewers to the invariant registry
-        // (invariants-are-written-down).
-        const CEILING: usize = 6_325;
+        // (invariants-are-written-down), and by the 21B that says clank,
+        // not Codex, tells it a run ended
+        // (codex-wakes-when-its-declared-work-ends).
+        const CEILING: usize = 6_350;
         let len = compose_skill(Role::Reviewer, Tool::Codex).len();
         assert!(
             len <= CEILING,
             "codex reviewer skill is {len}B, over the {CEILING}B ceiling (5,667B \
              before compression, 5,300B until the inbox, 5,600B until standby, 5,700B \
              until marking background work, 6,150B until per-tool declaration ends, \
-             6,175B until the invariant registry) — \
+             6,175B until the invariant registry, 6,325B until clank told Codex of run ends) — \
              re-read in full every reviewing turn, so growth here is paid again \
              on every wake"
         );
@@ -2906,7 +2918,7 @@ mod tests {
                     "clank attend\n  \"<name>\"",
                     "No exceptions, for any tool",
                     "Never wait for it in a turn",
-                    "Your harness\n  tells you when a run ends",
+                    run_ends(tool),
                     "messages don't end it",
                     "Never poll it or start a wait",
                     declared_ends(tool),

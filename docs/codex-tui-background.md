@@ -13,6 +13,12 @@ The current `--no-daemon` launch does not expose that external connection.
 A private per-agent server is a tested alternative to the shared daemon.
 It is not yet a complete passive observer of arbitrary Code Mode cells.
 
+**What clank does with this:** nothing native. That server is a new socket,
+which clank's remote gate forbids, and observing undeclared commands would be
+background-work detection, which clank does not do. On Codex, clank itself
+tells the agent when a `clank run` ends (`Tool::reports_background_completion`).
+Native background commands never wake a parked Codex agent.
+
 ## Answer table
 
 | Question/path | Evidence and identity | Completion/reconnect | Limit and action |
@@ -146,9 +152,9 @@ wrong. The experiment retains both identities and explicitly collects the cell.
 For an embedded TUI that must remain unchanged, there is no demonstrated complete
 passive discovery route for arbitrary unregistered shell/cell work. Parsing
 rollout tool results can recover handles using a version-specific decoder, but
-cannot supply a missing exit fact or a stable cell inventory. Registered-run
-completion custody remains a useful limited fallback; it does not solve this
-question. For cell-only background work, the smallest honest operational fallback
+cannot supply a missing exit fact or a stable cell inventory. Clank's notice
+that a `clank run` ended is the limited fallback it ships; it does not solve
+this question. For cell-only background work, the smallest honest operational fallback
 is to keep/collect the native `exec`/`wait` invocation through completion, rather
 than park expecting a passive monitor wake. Fully transparent coverage requires
 an upstream supported cell inventory/completion surface (or a maintained engine
@@ -222,20 +228,12 @@ One immediate bridge trace recorded command completion at 974 ms, hook release
 at 975 ms and agent request 3 at 983 ms after the case began. These timings are
 illustrative observations, not latency guarantees or test thresholds.
 
-## Recommended next implementation and upstream question
-
-Implement `codex-native-evidence-has-an-owner` first: an opt-in **private per-agent
-server + actual remote TUI + verified monitor observer**, preserving launch and
-fork policy. Then implement completion custody and hook release against that
-owned evidence, with native result collection and deduplication. Capability and
-hook readiness diagnostics make the covered and uncovered paths visible. The
-[three revised drafts](codex-followups.md) define these boundaries; none is queued
-as an overlapping production migration by this research commit.
+## Upstream question
 
 The demonstrated coverage is native shell work (direct or inside Code Mode) and
 subagent turn lifecycle. Arbitrary cell lifetime, server-crash recovery and other
-platform/version combinations require explicit compatibility handling. Do not
-advertise automatic wake for all background tasks yet.
+platform/version combinations would need explicit compatibility handling. Clank
+does not pursue it (see the answer above).
 
 Prepared upstream reproduction, not posted: run the native/wrapper parked and
 idle cases above on 0.167.2. A native `commandExecution` completion arrives with

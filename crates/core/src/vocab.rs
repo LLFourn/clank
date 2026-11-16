@@ -248,6 +248,29 @@ impl Tool {
         }
     }
 
+    /// Whether the harness itself continues a parked agent when its
+    /// background work ends. Where it does not, only clank can tell the
+    /// agent a `clank run` ended.
+    ///
+    /// - Claude: the Stop hook runs under `asyncRewake`, so the turn ends
+    ///   and Claude Code's own task notifications reach the agent. Claude
+    ///   Code before `asyncRewake` holds the turn like Codex; that fallback
+    ///   is not told.
+    /// - Grok: its Stop lists `backgroundTasks` and the hook never holds
+    ///   the turn.
+    /// - Codex: the Stop hook holds the turn, and a background command
+    ///   exiting never continues the agent while it does
+    ///   (docs/codex-tui-background.md).
+    /// - OpenCode: the plugin's Stop lists no background work, and nothing
+    ///   shows opencode continuing an idle session when a process exits.
+    ///   Telling it costs at most one extra turn.
+    pub fn reports_background_completion(self) -> bool {
+        match self {
+            Tool::Claude | Tool::Grok => true,
+            Tool::Codex | Tool::OpenCode => false,
+        }
+    }
+
     /// The inverse of [`Tool::as_str`], for the places that store a
     /// tool as the string it prints as.
     pub fn from_name(s: &str) -> Option<Self> {

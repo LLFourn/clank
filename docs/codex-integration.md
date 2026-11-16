@@ -269,9 +269,8 @@ An upstream report should provide the fixture and trace, specify these limits,
 and ask whether automatic continuation is intended for this execution path;
 it should not assert a removed guarantee or a particular culprit commit.
 
-Concrete follow-up drafts are in [codex-followups.md](codex-followups.md): run
-completion custody, owned native event connections, and hook/version readiness.
-They are proposals for separate review, not production changes in this plan.
+Clank tells a Codex agent when a `clank run` ends and observes no native
+background work; see [codex-tui-background.md](codex-tui-background.md).
 
 ### Measured results
 

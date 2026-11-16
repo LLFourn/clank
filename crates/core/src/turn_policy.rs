@@ -599,6 +599,9 @@ pub enum Notice {
     ArmWait,
     /// One check-in for every entry owed one when it was presented.
     CheckIn(Vec<CheckInLine>),
+    /// A `clank run` the agent registered is gone, on a harness that
+    /// would not tell it. Its exit status is the launching harness's.
+    RunEnded { desc: String },
 }
 
 /// A pending declaration merging into the one already bound to `task`.
@@ -740,8 +743,9 @@ pub struct CheckInLine {
     pub desc: String,
     /// What `clank attend` renews it by.
     pub name: String,
-    /// A `clank run`, whose end the agent's harness reports; otherwise a
-    /// declaration, whose end nothing reports.
+    /// A `clank run`, whose end is reported (by the harness, or by
+    /// [`Notice::RunEnded`] where it cannot); otherwise a declaration,
+    /// whose end nothing reports.
     pub run: bool,
     pub elapsed: Ms,
     pub expect: Ms,
@@ -1316,11 +1320,38 @@ impl SessionState {
 
     /// Retire every run whose registered process is positively gone; one
     /// whose process cannot be seen is kept. Whether any was retired.
-    pub fn end_gone_runs(&mut self, liveness: &dyn Liveness) -> bool {
-        self.retain_entries(|e| {
-            e.proof()
-                .is_none_or(|p| liveness.presence(p) != Presence::Gone)
-        }) > 0
+    ///
+    /// On a `tool` that does not report background completion, each
+    /// retired run is held as a [`Notice::RunEnded`] for this binding's
+    /// next Stop that may wake.
+    pub fn end_gone_runs(&mut self, liveness: &dyn Liveness, tool: Tool) -> bool {
+        // One observation per entry: a process that goes between two looks
+        // would otherwise be retired with no notice.
+        let gone: Vec<bool> = self
+            .attendances
+            .iter()
+            .map(|e| {
+                e.proof()
+                    .is_some_and(|p| liveness.presence(p) == Presence::Gone)
+            })
+            .collect();
+        let ended: Vec<String> = self
+            .attendances
+            .iter()
+            .zip(&gone)
+            .filter(|(_, gone)| **gone)
+            .map(|(e, _)| e.desc.clone())
+            .collect();
+        if ended.is_empty() {
+            return false;
+        }
+        let mut gone = gone.into_iter();
+        self.retain_entries(|_| !gone.next().unwrap_or(false));
+        if !tool.reports_background_completion() {
+            self.feedback
+                .extend(ended.into_iter().map(|desc| Notice::RunEnded { desc }));
+        }
+        true
     }
 
     pub fn step(&mut self, event: Event, facts: &Facts<'_>) -> Output {
@@ -1877,7 +1908,7 @@ impl SessionState {
     }
 
     /// The lines of every check-in owed now, in one. A run whose process
-    /// is gone is left out: it has ended, and the harness reports that.
+    /// is gone is left out: it has ended, and that is reported elsewhere.
     fn owed_check_ins(&self, facts: &Facts<'_>) -> Vec<CheckInLine> {
         self.attendances
             .iter()

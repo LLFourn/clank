@@ -22,17 +22,24 @@ only finished ones, and a mistyped plan is caught where the registry is
 edited. The gate cannot tell whether a test is enabled or
 whether its assertions protect the invariant. Reviewers check that.
 
-## I1. A parked agent is woken when work it is waiting on ends.
+## I1. A parked agent is told when a `clank run` it started ends.
 
-- Why: clank never parks an agent while its harness says work is in flight.
-  Where the harness cannot say, work the agent declared (`clank run`,
-  `clank attend`) wakes it when it ends.
-- Status: target
-- Today: the Stop hook yields when Claude or Grok lists in-flight background
-  tasks, and their harness wakes the agent. A declared run ending only retires
-  its attendance (`turn_policy.rs`, `end_gone_runs`). It wakes nobody, so a
-  Codex agent parked on a run is never told it ended.
-- Plans: codex-wakes-when-its-declared-work-ends
+- Why: an agent parked on a run it is never told about is stranded.
+- Status: holds
+- Scope: Claude and Grok tell their agent themselves, so clank sends nothing.
+  Codex holds the turn in its synchronous Stop hook and never continues the
+  agent when a background command exits; OpenCode shows no sign of doing so.
+  On those, clank holds a run-ended notice for the session that started the
+  run until its next Stop that may wake (`Tool::reports_background_completion`).
+  The notice claims no exit status. A bare `clank attend` has no process to
+  watch: it stands until cleared and checks in at `--expect`. Background work
+  started without `clank run` never wakes a Codex or OpenCode agent.
+- Tests: `crates/core/src/turn_policy/tests.rs::a_codex_run_ending_wakes_its_parked_agent_once`,
+  `crates/core/src/turn_policy/tests.rs::a_codex_run_ending_mid_turn_is_told_at_the_next_stop`,
+  `crates/core/src/turn_policy/tests.rs::a_claude_run_ending_is_left_to_the_harness`,
+  `crates/core/src/turn_policy/tests.rs::a_run_going_mid_retirement_is_never_retired_without_its_notice`,
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_codex_run_ending_wakes_its_parked_agent`,
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_codex_run_ending_is_never_told_to_a_rebound_session`
 
 ## I2. Reading durable state has no side effects.
 
