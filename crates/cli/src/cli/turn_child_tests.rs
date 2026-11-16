@@ -325,6 +325,21 @@ async fn a_newer_monitor_with_no_newer_install_is_an_outage() {
     );
 }
 
+/// A Claude or Codex Stop has no deadline, so its child has no last word
+/// of its own: only a verdict, an outage or its hook ends the wait. A
+/// finite deadline an older build handed over still has one.
+#[tokio::test]
+async fn a_report_with_no_deadline_has_no_last_word() {
+    for tool in [clank_core::Tool::Claude, clank_core::Tool::Codex] {
+        let park = stop_of(tool, super::super::turn_wire::NO_DEADLINE);
+        assert_eq!(park.deadline(), None, "{tool:?}");
+        assert_eq!(last_word(&park), None, "{tool:?}");
+    }
+    let ten = std::time::Duration::from_secs(10);
+    let by = last_word(&stop(within(ten))).expect("a finite deadline");
+    assert!(by <= tokio::time::Instant::now() + ten - DEADLINE_MARGIN);
+}
+
 /// A report that never parks, still retrying inside the outage budget at
 /// its deadline, ends unanswered then, ahead of its hook's giving up: it
 /// has no later chance.

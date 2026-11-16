@@ -22,13 +22,13 @@ fn hook_input(session: &str) -> HookInput {
 /// When the hooks these tests run say they started.
 const HOOK_STARTED: u64 = 1_794_355_246_100;
 
-/// `input`, as read from a harness just now.
+/// `input`, as read from Claude's harness just now.
 fn arrived(input: HookInput) -> Arrived {
     Arrived {
         raw: String::new(),
         input,
         resumed: None,
-        poll_deadline: poll_deadline(std::time::Instant::now()),
+        deadline: stop_deadline(Tool::Claude, std::time::Instant::now()),
         hook_started: Some(HOOK_STARTED),
     }
 }
@@ -159,7 +159,11 @@ async fn expiry_returns_none_and_drops_the_waiter() {
         std::future::pending::<u8>().await
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    assert_eq!(under_deadline(never, deadline).await, None, "deadline wins");
+    assert_eq!(
+        under_deadline(never, Some(deadline)).await,
+        None,
+        "deadline wins"
+    );
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
 
@@ -170,14 +174,14 @@ async fn work_arriving_before_the_deadline_wins() {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         "items"
     };
-    assert_eq!(under_deadline(quick, deadline).await, Some("items"));
+    assert_eq!(under_deadline(quick, Some(deadline)).await, Some("items"));
 }
 
 #[tokio::test(start_paused = true)]
 async fn an_already_past_deadline_does_not_wait_at_all() {
     let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
     assert_eq!(
-        under_deadline(std::future::pending::<u8>(), past).await,
+        under_deadline(std::future::pending::<u8>(), Some(past)).await,
         None
     );
 }
@@ -262,7 +266,7 @@ async fn owner_loss_near_the_deadline_keeps_its_silence_and_its_shutdown() {
         done: done.clone(),
     };
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Codex,
         true,
         &mut life,
@@ -285,7 +289,7 @@ async fn an_owner_gone_before_arming_spawns_no_wait() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut armed = false;
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Codex,
         true,
         &mut Lifetime::Gone,
@@ -319,7 +323,7 @@ async fn an_owner_ending_mid_wait_drops_the_wait_silently() {
     let got = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         await_verdict_under_deadline(
-            deadline,
+            Some(deadline),
             Tool::Codex,
             true,
             &mut life,
@@ -346,7 +350,7 @@ async fn owner_loss_outranks_a_verdict_the_wait_already_has() {
     let (mut life, end) = Lifetime::signalled();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Codex,
         true,
         &mut life,
@@ -367,7 +371,7 @@ async fn a_live_owner_lets_the_verdict_through() {
     let (mut life, _end) = Lifetime::signalled();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Codex,
         true,
         &mut life,
@@ -385,7 +389,7 @@ async fn a_local_deadline_never_starts_a_model_turn() {
     for tool in [Tool::Claude, Tool::Codex] {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let got = await_verdict_under_deadline(
-            deadline,
+            Some(deadline),
             tool,
             true,
             &mut Lifetime::Unbound,
@@ -403,7 +407,7 @@ async fn a_local_deadline_never_starts_a_model_turn() {
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::OpenCode,
         true,
         &mut Lifetime::Unbound,
@@ -420,7 +424,7 @@ async fn an_expired_deadline_never_arms_a_wait() {
     let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let armed = std::cell::Cell::new(false);
     let got = await_verdict_under_deadline(
-        past,
+        Some(past),
         Tool::Claude,
         true,
         &mut Lifetime::Unbound,
@@ -437,7 +441,7 @@ async fn an_expired_deadline_never_arms_a_wait() {
     );
     assert!(!armed.get(), "it must short-circuit BEFORE arming");
     let got = await_verdict_under_deadline(
-        past,
+        Some(past),
         Tool::OpenCode,
         true,
         &mut Lifetime::Unbound,
@@ -452,7 +456,7 @@ async fn an_expired_deadline_never_arms_a_wait() {
 async fn a_verdict_arriving_before_the_deadline_survives_the_seam() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Claude,
         true,
         &mut Lifetime::Unbound,
@@ -473,7 +477,7 @@ async fn consecutive_expiries_remain_diagnostics() {
     for period in 0..2 {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let got = await_verdict_under_deadline(
-            deadline,
+            Some(deadline),
             Tool::Claude,
             true,
             &mut Lifetime::Unbound,
@@ -488,13 +492,43 @@ async fn consecutive_expiries_remain_diagnostics() {
     }
 }
 
-/// A session start never parks: with no verdict by its budget it says
-/// nothing at all.
+/// A Claude or Codex park has no deadline: it holds through far longer
+/// than the runner's ceiling, until the verdict comes.
+#[tokio::test(start_paused = true)]
+async fn a_park_with_no_deadline_holds_until_its_verdict() {
+    let ceiling = std::time::Duration::from_secs(crate::cli::setup::HOOK_TIMEOUT_SECS);
+    for tool in [Tool::Claude, Tool::Codex] {
+        let began = tokio::time::Instant::now();
+        let got = await_verdict_under_deadline(
+            stop_deadline(tool, std::time::Instant::now()),
+            tool,
+            true,
+            &mut Lifetime::Unbound,
+            &mut crate::upgrade::Replacing::never(),
+            || {
+                Ok(plain(async move {
+                    tokio::time::sleep(ceiling * 2).await;
+                    Ok(delivered())
+                }))
+            },
+        )
+        .await;
+        assert!(
+            matches!(got, Ok((ref f, _)) if f == &delivered()),
+            "{tool:?}: {:?}",
+            got.err()
+        );
+        assert!(began.elapsed() >= ceiling * 2, "{tool:?}");
+    }
+}
+
+/// A session start never parks: with no verdict by its budget it is
+/// unanswered, which its hook surfaces as nothing at all.
 #[tokio::test(start_paused = true)]
 async fn a_session_start_out_of_time_says_nothing() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Claude,
         false,
         &mut Lifetime::Unbound,
@@ -502,7 +536,7 @@ async fn a_session_start_out_of_time_says_nothing() {
         || Ok(pending_wait()),
     )
     .await;
-    assert!(matches!(got, Err(ref f) if f.verdict == WireVerdict::Park));
+    assert!(matches!(got, Err(ref f) if matches!(f.verdict, WireVerdict::Unanswered { .. })));
 }
 
 fn stop_report() -> Report {
@@ -661,7 +695,7 @@ async fn groks_installed_timeout_covers_the_exchange_cleanup_and_emission() {
     tokio::time::timeout(ceiling, async {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await; // process startup
         let got = await_verdict_under_deadline(
-            (tokio::time::Instant::now() + crate::cli::grok_hook::HANDOFF_BUDGET).into_std(),
+            Some((tokio::time::Instant::now() + crate::cli::grok_hook::HANDOFF_BUDGET).into_std()),
             Tool::Grok,
             false,
             &mut Lifetime::Unbound,
@@ -674,7 +708,9 @@ async fn groks_installed_timeout_covers_the_exchange_cleanup_and_emission() {
             },
         )
         .await;
-        assert!(matches!(got, Err(ref frame) if frame.verdict == WireVerdict::Park));
+        assert!(
+            matches!(got, Err(ref frame) if matches!(frame.verdict, WireVerdict::Unanswered { .. }))
+        );
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));
         tokio::time::sleep(std::time::Duration::from_secs(1)).await; // framing/filesystem margin
         let frame = crate::cli::turn_child::unanswered(crate::cli::turn_child::NOT_ANSWERED);
@@ -727,7 +763,7 @@ async fn owner_loss_closes_the_pipe_and_collects_the_wait_after_its_own_shutdown
         let _ = end.send(());
     });
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Codex,
         true,
         &mut life,
@@ -1150,8 +1186,8 @@ async fn a_binding_replaced_before_the_emit_sends_nothing() {
 }
 
 /// The Stop's evidence is what the report carries: the session, its place,
-/// the harness's task listing as Claude sent it (a captured payload), or
-/// that it sent none, and the deadline the hook can wait to.
+/// and the harness's task listing as Claude sent it (a captured payload),
+/// or that it sent none.
 #[tokio::test]
 async fn the_report_carries_the_stops_evidence() {
     let dir = init_repo();
@@ -1179,7 +1215,6 @@ async fn the_report_carries_the_stops_evidence() {
         (listed(&bare), TaskSnapshot::Unavailable),
     ] {
         let recorder = Recorder::default();
-        let before = super::super::turn_custody::now_ms();
         let turn = stop(
             Tool::Claude,
             Some(&repo),
@@ -1192,16 +1227,7 @@ async fn the_report_carries_the_stops_evidence() {
             matches!(turn.outcome, HookOutcome::Diagnostic { ref message } if message == "recorded")
         );
         let carried = recorder.0.borrow();
-        let (
-            at,
-            who,
-            Report::TurnEnd {
-                stop: reported,
-                deadline,
-                ..
-            },
-        ) = &carried[0]
-        else {
+        let (at, who, Report::TurnEnd { stop: reported, .. }) = &carried[0] else {
             panic!("a Stop's report");
         };
         assert_eq!(at, &repo);
@@ -1214,7 +1240,48 @@ async fn the_report_carries_the_stops_evidence() {
             Some(HOOK_STARTED),
             "when its hook started"
         );
-        assert!(*deadline > before, "the deadline is ahead of the Stop");
+    }
+}
+
+/// A Claude or Codex Stop, and the park a compaction ended, report no
+/// deadline. OpenCode's reports the one its plugin renews at, ahead of
+/// the Stop.
+#[tokio::test]
+async fn only_an_opencode_stop_reports_a_deadline() {
+    for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+        for compacted in [false, true] {
+            let dir = init_repo();
+            let repo = dunce::canonicalize(dir.path()).unwrap();
+            bind_tool(&repo, "agent", "sess-deadline", tool);
+            let raw = serde_json::json!({
+                "session_id": "sess-deadline",
+                "cwd": repo,
+                "stop_hook_active": false,
+            })
+            .to_string();
+            let before = super::super::turn_custody::now_ms();
+            let arrived =
+                Arrived::fresh(raw, tool, std::time::Instant::now(), HOOK_STARTED).unwrap();
+            let recorder = Recorder::default();
+            stop(tool, Some(&repo), arrived, compacted, &Spawns(&recorder)).await;
+            let carried = recorder.0.borrow();
+            let report = &carried[0].2;
+            assert!(report.parks(), "{tool:?}");
+            let deadline = match report {
+                Report::TurnEnd { deadline, .. } | Report::Compacted { deadline, .. } => *deadline,
+                other => panic!("{tool:?}: a Stop's report: {other:?}"),
+            };
+            match tool {
+                Tool::OpenCode => {
+                    assert!(deadline > before, "{tool:?}: ahead of the Stop");
+                    assert_eq!(report.deadline(), Some(deadline));
+                }
+                _ => {
+                    assert_eq!(deadline, NO_DEADLINE, "{tool:?}, compacted {compacted}");
+                    assert_eq!(report.deadline(), None, "{tool:?}");
+                }
+            }
+        }
     }
 }
 
@@ -1774,7 +1841,7 @@ async fn a_parked_hook_whose_replacement_fails_stays_parked_and_retries() {
     let mut replacing = failing(&installed, &tried);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Claude,
         true,
         &mut Lifetime::Unbound,
@@ -1798,7 +1865,7 @@ async fn a_parked_hook_of_the_installed_build_is_left_alone() {
     let tried = std::cell::Cell::new(0);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Claude,
         true,
         &mut Lifetime::Unbound,
@@ -1825,7 +1892,7 @@ async fn a_hook_with_a_verdict_in_hand_is_not_replaced() {
     let tried = std::cell::Cell::new(0);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     let got = await_verdict_under_deadline(
-        deadline,
+        Some(deadline),
         Tool::Claude,
         true,
         &mut Lifetime::Unbound,
@@ -1927,7 +1994,13 @@ async fn a_stale_parked_stop_hands_over_its_input_and_report_and_survives_failur
         carriers: Default::default(),
         handoffs: Default::default(),
     };
-    let arrived = Arrived::fresh(raw.clone(), std::time::Instant::now(), HOOK_STARTED).unwrap();
+    let arrived = Arrived::fresh(
+        raw.clone(),
+        Tool::Claude,
+        std::time::Instant::now(),
+        HOOK_STARTED,
+    )
+    .unwrap();
     let presents = async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let line = serde_json::to_string(&delivered()).unwrap();
@@ -1958,13 +2031,19 @@ async fn a_stale_parked_stop_hands_over_its_input_and_report_and_survives_failur
         let handoff = read.as_ref().expect("the installed build can read it");
         assert_eq!(handoff.input, raw);
         assert_eq!(handoff.report, carriers[0].report);
+        assert_eq!(
+            handoff.report.deadline(),
+            None,
+            "the park it hands over has none"
+        );
         assert!(!path.exists(), "a failed attempt leaves its handoff behind");
     }
 }
 
 /// The installed build, resumed from a handoff, carries the report it was
 /// handed and not one read again now: the same evidence, the same
-/// deadline, and a wait held no longer than the first build would have.
+/// deadline, and a wait held as long as the first build would have, which
+/// for a park with no deadline is until its harness ends it.
 #[tokio::test]
 async fn a_resumed_stop_carries_the_report_it_was_handed() {
     let repo = init_repo();
@@ -1995,7 +2074,8 @@ async fn a_resumed_stop_carries_the_report_it_was_handed() {
     let handoff = super::super::hook_handoff::Handoff::new(raw, report.clone());
     let arrived = Arrived::resumed(handoff).unwrap();
     let until = arrived
-        .poll_deadline
+        .deadline
+        .expect("an older build's finite deadline is honoured")
         .saturating_duration_since(std::time::Instant::now());
     assert!(
         until <= left && until > left - std::time::Duration::from_secs(5),
@@ -2019,14 +2099,11 @@ async fn a_resumed_stop_carries_the_report_it_was_handed() {
         serde_json::json!({"session_id": "sess-resumed", "cwd": repo.path()}).to_string(),
         Report::Compacted {
             stop,
-            deadline: u64::MAX,
+            deadline: NO_DEADLINE,
         },
     );
     let arrived = Arrived::resumed(unbounded).unwrap();
-    assert!(
-        arrived.poll_deadline <= poll_deadline(std::time::Instant::now()),
-        "a handoff cannot keep a hook past the runner's ceiling"
-    );
+    assert_eq!(arrived.deadline, None, "a park with no deadline keeps none");
 }
 
 /// A payload recorded under `core/tests/fixtures/stop_hook/`, as Claude
@@ -2118,7 +2195,8 @@ async fn a_subagents_hook_reports_what_it_saw_and_never_parks() {
         };
         assert_eq!((at, who.as_str()), (&repo, "claude"));
         assert!(!report.parks() && !report.holds_session() && !report.reaches_agent());
-        let left = report.deadline().saturating_sub(before);
+        let deadline = report.deadline().expect("a subagent's report is bounded");
+        let left = deadline.saturating_sub(before);
         assert!(
             left > 0 && left <= SUBAGENT_BUDGET.as_millis() as u64 + 1000,
             "{left}ms"
@@ -2133,7 +2211,7 @@ async fn a_subagents_hook_reports_what_it_saw_and_never_parks() {
                     hook_started: Some(HOOK_STARTED),
                     seen,
                 },
-                deadline: report.deadline(),
+                deadline,
             }
         );
     }
@@ -2278,10 +2356,11 @@ impl Host for Fed {
 }
 
 /// The whole `--subagent` hook, from its argv: acknowledged, it exits 0
-/// at once having written nothing. Left unanswered by a carrier that
-/// stays connected, or told to park, it is still gone within its budget,
-/// exit 0 and silent: it cannot hold a subagent's stop. Only a diagnostic
-/// is written, to stderr, and that exits 0 too.
+/// at once having written nothing. Told to park it is gone as silently,
+/// and left unanswered by a carrier that stays connected it is gone within
+/// its budget, saying so as its child's last word would: it cannot hold a
+/// subagent's stop. Only a diagnostic is written, to stderr, and that
+/// exits 0 too.
 #[tokio::test(start_paused = true)]
 async fn a_subagents_hook_exits_zero_and_silent_within_its_budget() {
     let dir = init_repo();
@@ -2311,7 +2390,13 @@ async fn a_subagents_hook_exits_zero_and_silent_within_its_budget() {
     for (event, stdin, answers, within, stderr) in [
         ("stop", &stop, vec![recorded_frame()], 0, ""),
         ("start", &start, vec![recorded_frame()], 0, ""),
-        ("stop", &stop, vec![], SUBAGENT_BUDGET.as_secs(), ""),
+        (
+            "stop",
+            &stop,
+            vec![],
+            SUBAGENT_BUDGET.as_secs(),
+            "hook: the monitor has not answered\n",
+        ),
         ("stop", &stop, vec![Frame::bare(WireVerdict::Park)], 0, ""),
         (
             "start",

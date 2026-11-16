@@ -68,7 +68,10 @@ fn an_armed_wait_under_auto_off_is_quiet_not_manual() {
 fn routing_time_consumes_the_handoff_budget_instead_of_extending_it() {
     let (_temp, repo, _, session, _) = fixture();
     let routed = report(input(&repo, &session, "stop", json!([])), 100, false);
-    assert_eq!(routed.deadline(), 100 + HANDOFF_BUDGET.as_millis() as u64);
+    assert_eq!(
+        routed.deadline(),
+        Some(100 + HANDOFF_BUDGET.as_millis() as u64)
+    );
     let elapsed = std::time::Duration::from_secs(3);
     assert_eq!(remaining_budget(elapsed) + elapsed, HANDOFF_BUDGET);
     assert_eq!(

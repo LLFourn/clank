@@ -270,11 +270,12 @@ pub(crate) const DEADLINE_MARGIN: std::time::Duration = std::time::Duration::fro
 
 /// When the child stops trying for `report`, on this runtime's clock:
 /// [`DEADLINE_MARGIN`] before the hook can no longer hold its wait.
-/// `None` when that is further off than the clock can say.
+/// `None` when the report has no deadline, or one further off than the
+/// clock can say.
 fn last_word(report: &Report) -> Option<tokio::time::Instant> {
     let left = std::time::Duration::from_millis(
         report
-            .deadline()
+            .deadline()?
             .saturating_sub(super::turn_custody::now_ms()),
     );
     tokio::time::Instant::now().checked_add(left.saturating_sub(DEADLINE_MARGIN))
