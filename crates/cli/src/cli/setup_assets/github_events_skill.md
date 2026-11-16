@@ -7,8 +7,9 @@ description: Handle github_event wake items from clank's github wake sources —
 
 `clank wait` can watch GitHub repos (watches with `"kind":"github"`).
 Every event a watch ingests is written to that watch's own event log (a
-write-ahead log under `.clank/watch-events/<id>/`, or the agent's
-`events/` for one pinned to it) BEFORE it is presented to the watch's
+write-ahead log under `.clank/watch-events/<id>/`; a watch from before
+watches had their own storage keeps the agent's `events/`) BEFORE it is
+presented to the watch's
 recipient. Events stay **unhandled** there until you explicitly mark
 them handled.
 
