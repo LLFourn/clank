@@ -3855,7 +3855,12 @@ pub(crate) async fn run_tui(
             panes_told = presence.clone();
         }
         let session_found = reconcile_worker.session_found();
-        mode = settle_detail_cursor(mode, &snapshot.agents, session_found, &mut detail_shown);
+        mode = settle_detail_cursor(
+            mode,
+            &snapshot.agents,
+            session_found == Some(true),
+            &mut detail_shown,
+        );
         crate::cli::status_tui::input::settle_seen_session(
             mode,
             &snapshot.agents,
@@ -4710,7 +4715,7 @@ pub(crate) async fn run_tui(
                                 .map(|a| {
                                     detail_actions(
                                         a.role,
-                                        reconcile_worker.session_found(),
+                                        reconcile_worker.session_found() == Some(true),
                                         a.session.is_some(),
                                     )
                                 })
@@ -9666,7 +9671,7 @@ pub(crate) mod tests {
             picker: &[],
             log_cursor: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
-            session_found: false,
+            session_found: Some(false),
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,

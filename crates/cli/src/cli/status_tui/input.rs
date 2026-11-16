@@ -2373,8 +2373,9 @@ pub(super) struct PanelView<'a> {
     pub(super) lift: usize,
     /// Whether zellij answers, as the reconcile worker last saw it.
     pub(super) reach: crate::cli::status_tui::zellij::ZellijReach,
-    /// A session was found even if its pane listing failed.
-    pub(super) session_found: bool,
+    /// A session was found even if its pane listing failed; `None` until
+    /// the worker has said.
+    pub(super) session_found: Option<bool>,
     /// The remote switch, drawn beside the zellij glyph and as a row
     /// under the agents; `remote_detail` is what the row says beside
     /// its state — the URL when on, the reason when failed.
@@ -2420,7 +2421,7 @@ impl<'a> PanelView<'a> {
             log_cursor: 0,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
-            session_found: false,
+            session_found: Some(false),
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,

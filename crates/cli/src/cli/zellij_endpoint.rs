@@ -536,11 +536,26 @@ pub(crate) fn own_endpoint() -> Resolved {
     if let Some(found) = FOUND.get() {
         return Resolved::Found(found.clone());
     }
-    let resolved = endpoint_of(std::process::id() as i32);
+    let resolved = own_resolution(
+        endpoint_of(std::process::id() as i32),
+        crate::cli::open_zellij::in_session(),
+    );
     if let Resolved::Found(ep) = &resolved {
         let _ = FOUND.set(ep.clone());
     }
     resolved
+}
+
+/// A fallback policy for this process alone, not proof: an ancestry that
+/// could not be read is taken as outside zellij when `ZELLIJ` is unset,
+/// since every process a pane starts inherits it. A parent that scrubbed
+/// its environment would defeat it; clank's own never do. Whatever the
+/// walk did read wins over the environment.
+fn own_resolution(walked: Resolved, in_session: bool) -> Resolved {
+    match walked {
+        Resolved::Unknown(_) if !in_session => Resolved::NotInZellij,
+        other => other,
+    }
 }
 
 /// Every live server of this user, from `ps` output of `pid uid comm`
@@ -840,6 +855,29 @@ pub(crate) mod tests {
                 "{why:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_unreadable_ancestry_outside_a_pane_is_not_in_zellij() {
+        let unknown = || Resolved::Unknown("pid 2090's identity could not be read".into());
+        assert_eq!(own_resolution(unknown(), false), Resolved::NotInZellij);
+        assert!(matches!(
+            own_resolution(unknown(), true),
+            Resolved::Unknown(_)
+        ));
+        assert_eq!(
+            own_resolution(Resolved::NotInZellij, true),
+            Resolved::NotInZellij
+        );
+    }
+
+    #[test]
+    fn a_server_the_walk_found_wins_over_the_environment() {
+        let socket = format!("{DIR}/clank-life");
+        let table = Table::new(&[(7, 6, &["sh"]), (6, 1, &[EXE, "--server", &socket])]);
+        let found = endpoint_of_with(7, &table);
+        assert!(matches!(found, Resolved::Found(_)));
+        assert_eq!(own_resolution(found.clone(), false), found);
     }
 
     #[test]

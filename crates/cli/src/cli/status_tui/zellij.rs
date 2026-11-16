@@ -1600,7 +1600,8 @@ pub(super) struct ReconcileWorker {
     /// Last observed; `NotInSession` is fixed for the process's life,
     /// since `$ZELLIJ` does not change under a running TUI.
     reach: ZellijReach,
-    session_found: bool,
+    /// `None` until the worker has reported whether it found the session.
+    session_found: Option<bool>,
     /// The last presence report; `None` until one arrives or when the
     /// last listing did not answer.
     presence: Option<std::collections::BTreeSet<String>>,
@@ -1626,7 +1627,7 @@ impl ReconcileWorker {
                 join: None,
                 report_rx: None,
                 reach: ZellijReach::NotInSession,
-                session_found: false,
+                session_found: Some(false),
                 presence: None,
                 lost: Default::default(),
                 answered: Vec::new(),
@@ -1693,7 +1694,7 @@ impl ReconcileWorker {
             join: None,
             report_rx: Some(report_rx),
             reach: ZellijReach::Unknown,
-            session_found: false,
+            session_found: None,
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
@@ -1707,7 +1708,7 @@ impl ReconcileWorker {
             while let Ok(r) = rx.try_recv() {
                 match r {
                     Report::Reach(reach) => self.reach = reach,
-                    Report::SessionFound(found) => self.session_found = found,
+                    Report::SessionFound(found) => self.session_found = Some(found),
                     Report::Presence(live) => self.presence = live,
                     Report::Lost(lost) => self.lost = lost,
                     Report::Reopened(label, outcome) => self.answered.push((label, outcome)),
@@ -1718,7 +1719,7 @@ impl ReconcileWorker {
     }
 
     /// Session discovery reported by the worker, without doing I/O here.
-    pub(super) fn session_found(&mut self) -> bool {
+    pub(super) fn session_found(&mut self) -> Option<bool> {
         self.drain();
         self.session_found
     }
@@ -2009,7 +2010,7 @@ mod tests {
             join: None,
             report_rx: None,
             reach: ZellijReach::NotInSession,
-            session_found: false,
+            session_found: Some(false),
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
@@ -2029,7 +2030,7 @@ mod tests {
             join: None,
             report_rx: Some(rx),
             reach: ZellijReach::Connected,
-            session_found: true,
+            session_found: Some(true),
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
@@ -3746,6 +3747,13 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_that_has_not_reported_has_not_looked_for_the_session() {
+        let (_report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
+        let mut w = ReconcileWorker::in_session(report_rx);
+        assert_eq!(w.session_found(), None);
+    }
+
+    #[test]
     fn presence_changes_do_not_hide_reopen_for_a_found_session() {
         // Presence updates change the mark but leave recovery available.
         use super::super::input::{DetailAction, detail_actions};
@@ -3766,7 +3774,7 @@ mod tests {
         assert_eq!(w.presence_of("r1"), Presence::Live);
         assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "▶");
         assert!(
-            detail_actions(RosterRole::Commit, w.session_found(), false)
+            detail_actions(RosterRole::Commit, w.session_found() == Some(true), false)
                 .contains(&DetailAction::Reopen)
         );
 
@@ -3778,7 +3786,7 @@ mod tests {
         assert_eq!(w.presence_of("r1"), Presence::Missing);
         assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "?");
         assert!(
-            detail_actions(RosterRole::Commit, w.session_found(), false)
+            detail_actions(RosterRole::Commit, w.session_found() == Some(true), false)
                 .contains(&DetailAction::Reopen)
         );
 
@@ -3790,7 +3798,7 @@ mod tests {
         assert_eq!(w.presence_of("r1"), Presence::Live);
         assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "▶");
         assert!(
-            detail_actions(RosterRole::Commit, w.session_found(), false)
+            detail_actions(RosterRole::Commit, w.session_found() == Some(true), false)
                 .contains(&DetailAction::Reopen)
         );
         // A failed listing leaves presence unknown, but the session is still found.
@@ -3801,7 +3809,7 @@ mod tests {
         }
         assert_eq!(w.presence_of("r1"), Presence::Unknown);
         assert!(
-            detail_actions(RosterRole::Commit, w.session_found(), false)
+            detail_actions(RosterRole::Commit, w.session_found() == Some(true), false)
                 .contains(&DetailAction::Reopen)
         );
         assert_eq!(
@@ -3814,7 +3822,7 @@ mod tests {
             report_tx.send(r).unwrap();
         }
         assert!(
-            !detail_actions(RosterRole::Commit, w.session_found(), false)
+            !detail_actions(RosterRole::Commit, w.session_found() == Some(true), false)
                 .contains(&DetailAction::Reopen)
         );
     }
@@ -3882,7 +3890,7 @@ mod tests {
             join: None,
             report_rx: None,
             reach: ZellijReach::NotInSession,
-            session_found: false,
+            session_found: Some(false),
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),

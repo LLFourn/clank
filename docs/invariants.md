@@ -90,10 +90,8 @@ whether its assertions protect the invariant. Reviewers check that.
 - Status: target
 - Today: an agent's session is stored in `config.json`, `turn.json`,
   `state.json` and `delivered.json`; `state.json` repeats its role; watch
-  identity is re-parsed from strings; reopen availability is kept beside the
-  zellij reach it should derive from.
-- Plans: one-state-file-per-agent, a-watch-is-a-typed-producer,
-  an-unreadable-ancestor-is-outside-zellij
+  identity is re-parsed from strings.
+- Plans: one-state-file-per-agent, a-watch-is-a-typed-producer
 
 ## I7. Only the master raises blocks.
 
@@ -130,13 +128,17 @@ whether its assertions protect the invariant. Reviewers check that.
   bounded retries.
 - Plans: no-polls-but-github
 
-## I11. `clank open` works when no zellij session exists, and never nests one.
+## I11. `clank open` works when no zellij session exists.
 
 - Why: `clank open` is how a workspace starts.
-- Status: target
-- Today: outside zellij it works; inside a pane whose ancestry cannot be read
-  it can start a nested session.
-- Plans: an-unreadable-ancestor-is-outside-zellij
+- Status: holds
+- Scope: an ancestry that cannot be read never stops it. Outside a pane
+  (`ZELLIJ` unset) every caller of this process's endpoint takes that as not
+  in zellij. Inside a pane `open` still falls back to opening normally, by
+  the user's rule, so there it can start a nested session.
+- Tests: `crates/cli/src/cli/zellij_endpoint.rs::an_unreadable_ancestry_outside_a_pane_is_not_in_zellij`,
+  `crates/cli/src/cli/zellij_endpoint.rs::a_server_the_walk_found_wins_over_the_environment`,
+  `crates/cli/src/cli/open_zellij.rs::unreadable_ancestry_falls_back_to_normal_opening`
 
 ## I12. A process's zellij session is read from its ancestry.
 
