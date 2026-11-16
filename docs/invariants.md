@@ -167,11 +167,12 @@ whether its assertions protect the invariant. Reviewers check that.
   and wakes the loop, which retries the contended operations then. A holder may keep a lock
   across a side effect, such as signed user-command delivery, because the
   loop never waits on it. The ingest lease's patience (250 ms) remains only
-  off the loop: in commands, wait clients, and a hosted GitHub source's own
-  task. `messages.writer.lock` only serializes message writers.
+  off the loop: in commands and wait clients; a hosted GitHub source takes
+  it without waiting and follows until it is handed over. `messages.writer.lock` only serializes message writers.
   Corrupt or unreadable logs are skipped as before
   (`event_source::owed_from_sources`), which reads as no events.
 - Tests: `crates/cli/src/cli/monitor_turn_tests.rs::a_held_state_lock_stalls_no_serve_and_its_release_writes_what_it_left`,
+  `crates/cli/src/cli/github/supervisor.rs::a_held_lease_parks_no_runtime_thread_and_its_release_hands_it_over`,
   `crates/cli/src/agent_store/state.rs::a_held_lock_is_contended_for_a_take_that_does_not_wait`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_held_blocks_lock_stalls_no_serve`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_held_event_log_stalls_no_serve_and_the_retry_presents_it`,
