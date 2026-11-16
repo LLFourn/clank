@@ -152,6 +152,7 @@ impl Reached {
                 at,
                 build: Some("build-of-the-waiter".into()),
             },
+            unavailable: false,
             report: report.map(|report| {
                 Box::new(Reporting {
                     report,

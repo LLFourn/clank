@@ -33,6 +33,7 @@ fn facts<'a>(now: Ms, binding: &'a SessionId, owed: &'a [OwedItem]) -> Facts<'a>
         asking: false,
         blocked: false,
         owed,
+        owed_unknown: false,
         liveness: &LIVE,
         user_command: false,
     }

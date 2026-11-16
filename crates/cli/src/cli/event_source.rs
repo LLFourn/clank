@@ -243,7 +243,8 @@ mod tests {
 /// The rows come from the durable log rather than from anything the
 /// monitor remembers, so an ack made by the agent — or by an earlier
 /// incarnation of it — is what retires a row, and nothing here can
-/// re-present one that was handled.
+/// re-present one that was handled. A source whose sidecar `sidecars`
+/// finds held is unavailable: none of its rows are owed this pass.
 pub(crate) fn owed_from_sources(
     repo: &std::path::Path,
     author: &AgentLabel,
@@ -252,13 +253,15 @@ pub(crate) fn owed_from_sources(
         crate::cli::event_source::SourceOrigin,
     )],
     shown: &mut std::collections::HashSet<(String, u64, String)>,
+    sidecars: &crate::cli::github::log::Sidecars,
 ) -> Vec<WaitItem> {
+    use crate::cli::github::log::Tried;
     use clank_core::agent_config::WaitEventSource;
 
     let events_dir = crate::agent_store::agents_root(repo)
         .join(author.as_str())
         .join("events");
-    let mut owed = crate::cli::watch_store::owed(repo, author, shown);
+    let mut owed = crate::cli::watch_store::owed(repo, author, shown, sidecars);
     if !events_dir.is_dir() {
         return owed;
     }
@@ -288,7 +291,9 @@ pub(crate) fn owed_from_sources(
         let Ok(log) = crate::cli::github::log::EventLog::open(&events_dir, &key) else {
             continue;
         };
-        let Ok(Some(read)) = log.read_rows() else {
+        // A corrupt or unreadable log is skipped here as it always was
+        // (the-purge-protections-return); a contended one is unavailable.
+        let Ok(Tried::Ran(Some(read))) = sidecars.read_rows(&log, &key) else {
             continue;
         };
         owed.extend(crate::cli::command_source::owed_from_log(
@@ -317,16 +322,32 @@ mod backlog_tests {
         let wal = events.join(format!("{}.jsonl", fixture.key));
         let before = std::fs::read(&wal).unwrap();
         let mut shown = Default::default();
-        let owed = owed_from_sources(&fixture.repo, &fixture.author, &sources, &mut shown);
+        let owed = owed_from_sources(
+            &fixture.repo,
+            &fixture.author,
+            &sources,
+            &mut shown,
+            &crate::cli::github::log::Sidecars::waiting(),
+        );
         assert_eq!(owed, vec![fixture.item.clone()]);
-        assert!(owed_from_sources(&fixture.repo, &fixture.author, &sources, &mut shown).is_empty());
+        assert!(
+            owed_from_sources(
+                &fixture.repo,
+                &fixture.author,
+                &sources,
+                &mut shown,
+                &crate::cli::github::log::Sidecars::waiting()
+            )
+            .is_empty()
+        );
         let invoked = [(sources[0].0.clone(), SourceOrigin::Cli)];
         assert!(
             owed_from_sources(
                 &fixture.repo,
                 &fixture.author,
                 &invoked,
-                &mut Default::default()
+                &mut Default::default(),
+                &crate::cli::github::log::Sidecars::waiting(),
             )
             .is_empty()
         );
@@ -346,7 +367,14 @@ mod backlog_tests {
             SourceOrigin::Config,
         )];
         assert!(
-            owed_from_sources(&fixture.repo, &absent, &sources, &mut Default::default()).is_empty()
+            owed_from_sources(
+                &fixture.repo,
+                &absent,
+                &sources,
+                &mut Default::default(),
+                &crate::cli::github::log::Sidecars::waiting()
+            )
+            .is_empty()
         );
         assert!(!dir.exists());
     }

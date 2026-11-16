@@ -146,6 +146,7 @@ async fn a_presentation_its_carrier_never_received_fails_at_once() {
         shown: Default::default(),
         conn: 7,
         admitted: Default::default(),
+        unavailable: false,
         report: Some(Box::new(Reporting {
             report: stop_report(),
             stepped: false,
@@ -1009,6 +1010,7 @@ async fn recovery_after_a_lost_park(later: Later) {
             pending,
             turns,
         )
+        .facts
         .try_into()
         .unwrap();
         facts
@@ -1624,6 +1626,7 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
         shown: Default::default(),
         conn: 2,
         admitted: Default::default(),
+        unavailable: false,
         report: Some(Box::new(Reporting {
             report: hooked_stop(then + 1),
             stepped: true,
@@ -1722,6 +1725,7 @@ async fn a_run_ending_presents_its_parked_agent_the_work_it_held_quiet() {
         shown: Default::default(),
         conn: 2,
         admitted: Default::default(),
+        unavailable: false,
         report: Some(Box::new(Reporting {
             report: hooked_stop(now + 1),
             stepped: true,
@@ -1839,6 +1843,7 @@ async fn a_codex_run_ending_wakes_its_parked_agent() {
         shown: Default::default(),
         conn: 1,
         admitted: Default::default(),
+        unavailable: false,
         report: Some(Box::new(Reporting {
             report: codex_stop(now, SESSION),
             stepped: true,
@@ -1999,7 +2004,8 @@ async fn a_park_whose_hook_dies_is_nudged_on_the_stop_it_reported() {
         &mut Default::default(),
         &[],
         &mut turns,
-    );
+    )
+    .facts;
     recovery.reconcile(facts, now);
     let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
     assert_eq!(
@@ -2388,7 +2394,8 @@ async fn the_loop_gives_up_a_presentation_its_carrier_never_answered_for() {
         &Default::default(),
         &mut Default::default(),
         &[],
-    );
+    )
+    .expect("no log is held");
     let mut recovery =
         crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
     let mut clients = Vec::new();
@@ -2869,6 +2876,7 @@ fn served_then_retired(
                         shown: Default::default(),
                         conn: conn as u64 + 1,
                         admitted: Default::default(),
+                        unavailable: false,
                         report: Some(Box::new(Reporting {
                             report,
                             stepped: false,
@@ -3001,7 +3009,8 @@ fn a_held_blocks_lock_stalls_no_serve() {
             &mut Default::default(),
             &[],
             &mut turns,
-        );
+        )
+        .facts;
         let _ = facts_tx.send(found.len());
     });
     assert!(
@@ -3011,6 +3020,614 @@ fn a_held_blocks_lock_stalls_no_serve() {
 
     release.send(()).unwrap();
     holder.join().unwrap();
+}
+
+/// Each agent's first Stop served over a real writer, then `between`,
+/// then the contention retry, then retirement, on a thread of its own;
+/// what each agent's end read comes back, with whether each client was
+/// left unavailable by the first serve and by the retry.
+fn served_retried_then_retired(
+    repo: &std::path::Path,
+    state: crate::repo_state::RepoState,
+    authors: &[AgentLabel; 2],
+    between: impl FnOnce() + Send + 'static,
+) -> (Vec<String>, Vec<bool>, Vec<bool>) {
+    let (repo, authors) = (repo.to_path_buf(), authors.clone());
+    crate::cli::github::log::tests::within("the serve", move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let mut clients = Vec::new();
+                let mut theirs = Vec::new();
+                for (conn, (author, session)) in
+                    authors.iter().zip([SESSION, OTHER_SESSION]).enumerate()
+                {
+                    let (ours, their) = tokio::net::UnixStream::pair().unwrap();
+                    let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+                    let mut report = stop_report();
+                    if let Report::TurnEnd { stop, .. } = &mut report {
+                        stop.session = clank_core::SessionId::parse(session).unwrap();
+                    }
+                    clients.push(Client {
+                        who: Served::Agent {
+                            author: author.clone(),
+                        },
+                        holder: None,
+                        out,
+                        writer: Some(tokio::spawn(write_to(ours, queued, author.to_string()))),
+                        farewell: None,
+                        shown: Default::default(),
+                        conn: conn as u64 + 1,
+                        admitted: Default::default(),
+                        unavailable: false,
+                        report: Some(Box::new(Reporting {
+                            report,
+                            stepped: false,
+                            reader: None,
+                        })),
+                    });
+                    theirs.push(their);
+                }
+                let mut turns = Turns::new(repo.clone());
+                let unavailable = |clients: &[Client]| {
+                    let mut by_conn: Vec<_> =
+                        clients.iter().map(|c| (c.conn, c.unavailable)).collect();
+                    by_conn.sort();
+                    by_conn.into_iter().map(|(_, u)| u).collect::<Vec<_>>()
+                };
+                let mut leaving = serve(&repo, &mut clients, &state, &mut turns);
+                let first = unavailable(&clients);
+                between();
+                leaving.extend(retry_contended(
+                    &repo,
+                    &mut clients,
+                    Some(&state),
+                    &mut Vec::new(),
+                    &mut Default::default(),
+                    &mut Default::default(),
+                    &mut turns,
+                ));
+                let retried = unavailable(&clients);
+                let _ = retire(
+                    clients,
+                    leaving,
+                    Vec::new(),
+                    Duration::from_secs(10),
+                    Duration::from_millis(500),
+                    0,
+                )
+                .await;
+                let mut read = Vec::new();
+                for mut their in theirs {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = String::new();
+                    their.read_to_string(&mut buf).await.unwrap();
+                    read.push(buf);
+                }
+                (read, first, retried)
+            })
+    })
+}
+
+/// `claude`'s one event log in [`two_agents_claude_told`]: its events
+/// directory and source key.
+fn claude_log(repo: &std::path::Path) -> (std::path::PathBuf, String) {
+    let events = crate::agent_store::agents_root(repo).join("claude/events");
+    let key = std::fs::read_dir(&events)
+        .unwrap()
+        .filter_map(|e| {
+            let path = e.unwrap().path();
+            (path.extension()? == "jsonl").then(|| path.file_stem()?.to_str().map(str::to_owned))?
+        })
+        .next()
+        .expect("claude's timer log");
+    (events, key)
+}
+
+/// A process holding an agent's event log for the whole test stalls no
+/// serve: `claude`, whose work is then unknown, is held unanswered, told
+/// neither of the event nor that nothing is owed; the agent owed nothing
+/// is answered, the monitor retires, and recovery
+/// takes `claude` as unknown, keeping what its ledger owes, all before
+/// the lock is released. Once released, the contention retry presents it.
+#[test]
+fn a_held_event_log_stalls_no_serve_and_the_retry_presents_it() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (repo, authors, state) = runtime.block_on(two_agents_claude_told());
+    let claude_dir = crate::agent_store::agents_root(repo.path()).join("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let free = recovery_facts(
+        repo.path(),
+        &state,
+        &Default::default(),
+        &mut Default::default(),
+        &[],
+        &mut turns,
+    );
+    assert!(free.unknown.is_empty());
+    let owed = crate::cli::ledger::load(&claude_dir);
+    assert!(
+        owed.keys().any(|identity| identity.starts_with("event ")),
+        "the ledger owes claude its event while the log is free: {owed:?}"
+    );
+    let (events, key) = claude_log(repo.path());
+    let held = crate::cli::github::log::tests::hold(&[(&events, &key)]);
+
+    let (shutdown, parked) = served_then_retired(repo.path(), state.clone(), &authors)
+        .expect("the monitor waited on a held event log");
+    assert!(
+        matches!(
+            shutdown,
+            Shutdown::ReadyToRelease(Retired { drained: 2, .. })
+        ),
+        "{shutdown:?}"
+    );
+    assert!(
+        parked[0].is_empty(),
+        "claude is held unanswered while its work is unknown: {parked:?}"
+    );
+    assert!(!parked[1].is_empty(), "the agent owed nothing is answered");
+
+    let (facts_repo, facts_state) = (repo.path().to_path_buf(), state.clone());
+    let observed = crate::cli::github::log::tests::within("recovery", move || {
+        let mut turns = Turns::new(facts_repo.clone());
+        recovery_facts(
+            &facts_repo,
+            &facts_state,
+            &Default::default(),
+            &mut Default::default(),
+            &[],
+            &mut turns,
+        )
+    });
+    assert_eq!(
+        observed.unknown,
+        [authors[0].clone()].into(),
+        "claude is unknown for the pass"
+    );
+    assert!(observed.facts.iter().all(|f| f.author != authors[0]));
+    assert_eq!(
+        crate::cli::ledger::load(&claude_dir),
+        owed,
+        "the ledger is not told the event was handled"
+    );
+    let mut recovery =
+        crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
+    recovery.reconcile(observed, crate::cli::recovery::unix_now());
+    assert!(
+        recovery.awaits_a_complete_fold(),
+        "recovery waits for a complete fold"
+    );
+
+    let (read, first, retried) =
+        served_retried_then_retired(repo.path(), state.clone(), &authors, move || held.release());
+    assert_eq!(first, [true, false], "claude's serve is left to the retry");
+    assert!(
+        read[0].contains("timer:"),
+        "the retry presents the event once released: {read:?}"
+    );
+    assert!(retried.iter().all(|u| !u), "and settles it: {retried:?}");
+    let complete = recovery_facts(
+        repo.path(),
+        &state,
+        &Default::default(),
+        &mut Default::default(),
+        &[],
+        &mut Turns::new(repo.path().to_path_buf()),
+    );
+    recovery.reconcile(complete, crate::cli::recovery::unix_now());
+    assert!(
+        !recovery.awaits_a_complete_fold(),
+        "a complete fold settles it"
+    );
+}
+
+/// A waiting client served while its author's log is held is told no
+/// item from it and left for the contention retry; served again once the
+/// log is free, it is handed the event and settled.
+#[test]
+fn a_wait_served_while_its_log_is_held_is_left_for_the_retry() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (repo, author, timer) = timer_repo();
+    log_timer_event(repo.path(), &timer);
+    let state = runtime.block_on(folded(repo.path())).unwrap();
+    let (out, mut queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+    let mut clients = vec![Client {
+        who: Served::Agent {
+            author: author.clone(),
+        },
+        out,
+        writer: None,
+        holder: Some(Holder {
+            tool: clank_core::Tool::Claude,
+            session: SESSION.into(),
+        }),
+        shown: Default::default(),
+        conn: 1,
+        admitted: Default::default(),
+        unavailable: false,
+        report: None,
+        farewell: None,
+    }];
+    let (events, key) = claude_log(repo.path());
+    let held = crate::cli::github::log::tests::hold(&[(&events, &key)]);
+    let (path, held_state) = (repo.path().to_path_buf(), state.clone());
+    let mut clients = crate::cli::github::log::tests::within("the wait's serve", move || {
+        serve_to_cached(
+            &path,
+            &mut clients,
+            &held_state,
+            None,
+            &mut Vec::new(),
+            &mut Default::default(),
+            &Default::default(),
+        );
+        clients
+    });
+    assert!(
+        clients.len() == 1 && clients[0].unavailable,
+        "kept, and left for the retry"
+    );
+    while let Ok(frame) = queued.try_recv() {
+        assert!(
+            !frame.contains("timer:"),
+            "nothing from the held log: {frame}"
+        );
+    }
+    held.release();
+    serve_to_cached(
+        repo.path(),
+        &mut clients,
+        &state,
+        None,
+        &mut Vec::new(),
+        &mut Default::default(),
+        &Default::default(),
+    );
+    let mut frames = String::new();
+    while let Ok(frame) = queued.try_recv() {
+        frames.push_str(&frame);
+    }
+    assert!(frames.contains("timer_event"), "handed once free: {frames}");
+    assert!(clients.iter().all(|c| !c.unavailable));
+}
+
+/// A process holding an agent's event log while the result of a repeated
+/// presentation of its event arrives leaves the agent's custody as it was:
+/// the count stands, the presentation in flight is not taken as broken,
+/// and its delivery is counted. Once released, the unchanged work goes on
+/// being presented, the count going on from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_event_log_keeps_the_repeat_and_the_presentation_in_flight() {
+    let (repo, author, timer) = timer_repo();
+    log_timer_event(repo.path(), &timer);
+    let state = folded(repo.path()).await.unwrap();
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let presented = |turns: &mut Turns, conn: u64| {
+        let g = gathered(repo.path(), &author, &state);
+        turns
+            .answer(&author, conn, &stop_report(), true, &g)
+            .unwrap()
+            .presentation()
+            .expect("the event is presented")
+            .clone()
+    };
+    let first = presented(&mut turns, 1);
+    let g = gathered(repo.path(), &author, &state);
+    turns
+        .result(
+            &author,
+            1,
+            TurnResult::Delivered {
+                presentation: first,
+            },
+            &g,
+        )
+        .unwrap();
+    let second = presented(&mut turns, 2);
+    let count = |turns: &Turns, author: &AgentLabel| {
+        turns
+            .state(author)
+            .and_then(|s| s.repeat.as_ref())
+            .map(|r| r.count)
+    };
+    let counted = count(&turns, &author);
+    assert!(counted.is_some(), "a repeat episode stands");
+
+    let (events, key) = claude_log(repo.path());
+    let held = crate::cli::github::log::tests::hold(&[(&events, &key)]);
+    let (path, held_author, held_state) =
+        (repo.path().to_path_buf(), author.clone(), state.clone());
+    let (mut turns, standing, committed, after) =
+        crate::cli::github::log::tests::within("custody", move || {
+            let g = gathered(&path, &held_author, &held_state);
+            turns.observed(&held_author, &g);
+            let standing = count(&turns, &held_author);
+            let broken = turns
+                .state(&held_author)
+                .is_some_and(|s| s.outstanding_episode_broken);
+            let committed = turns
+                .result(
+                    &held_author,
+                    2,
+                    TurnResult::Delivered {
+                        presentation: second,
+                    },
+                    &g,
+                )
+                .unwrap()
+                .is_some();
+            assert!(!broken, "the presentation in flight is not broken");
+            let after = count(&turns, &held_author);
+            (turns, standing, committed, after)
+        });
+    assert_eq!(standing, counted, "the count stands while work is unknown");
+    assert!(committed, "the delivery commits");
+    assert_eq!(
+        after,
+        counted.map(|n| n + 1),
+        "and is counted: the episode was not broken"
+    );
+    held.release();
+
+    turns.observed(&author, &gathered(repo.path(), &author, &state));
+    assert_eq!(count(&turns, &author), after, "unchanged work keeps it");
+    let third = presented(&mut turns, 3);
+    let g = gathered(repo.path(), &author, &state);
+    turns
+        .result(
+            &author,
+            3,
+            TurnResult::Delivered {
+                presentation: third,
+            },
+            &g,
+        )
+        .unwrap();
+    assert_eq!(
+        count(&turns, &author),
+        after.map(|n| n + 1),
+        "and goes on counting once released"
+    );
+}
+
+/// The first presentation of an event, its result arriving while another
+/// process holds the event's log, starts the repeat episode its delivery
+/// decided: unknown work is not a change that breaks it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_event_log_keeps_a_first_presentation_in_flight() {
+    let (repo, author, timer) = timer_repo();
+    log_timer_event(repo.path(), &timer);
+    let state = folded(repo.path()).await.unwrap();
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), &author, &state);
+    let first = turns
+        .answer(&author, 1, &stop_report(), true, &g)
+        .unwrap()
+        .presentation()
+        .expect("the event is presented")
+        .clone();
+    assert!(turns.state(&author).unwrap().repeat.is_none());
+    let (events, key) = claude_log(repo.path());
+    let held = crate::cli::github::log::tests::hold(&[(&events, &key)]);
+    let (path, held_author) = (repo.path().to_path_buf(), author.clone());
+    let turns = crate::cli::github::log::tests::within("custody", move || {
+        let g = gathered(&path, &held_author, &state);
+        turns
+            .result(
+                &held_author,
+                1,
+                TurnResult::Delivered {
+                    presentation: first,
+                },
+                &g,
+            )
+            .unwrap();
+        turns
+    });
+    held.release();
+    assert_eq!(
+        turns
+            .state(&author)
+            .and_then(|s| s.repeat.as_ref())
+            .map(|r| r.count),
+        Some(1),
+        "the delivery is counted"
+    );
+}
+
+/// A process holding an agent's event log holds its due recovery attempt
+/// at the deadline's gate and at the last look before a send, though a
+/// message in a free log is owed beside it. Once released, the unchanged
+/// work lets both go ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_event_log_holds_a_due_recovery_attempt() {
+    use crate::cli::recovery::Gate;
+    let (repo, author, timer) = timer_repo();
+    log_timer_event(repo.path(), &timer);
+    let (events, key) = claude_log(repo.path());
+    crate::inbox::deliver(
+        repo.path(),
+        &author,
+        None,
+        "2026-11-16T00:00:00Z",
+        "a message",
+    )
+    .unwrap();
+    let state = folded(repo.path()).await.unwrap();
+    let gates = {
+        let (path, author, state) = (repo.path().to_path_buf(), author.clone(), state.clone());
+        move || {
+            let mut turns = Turns::new(path.clone());
+            let (reply, _) = tokio::sync::oneshot::channel();
+            let ask = Authorize {
+                author: author.clone(),
+                attempt: crate::cli::recovery::AttemptRef {
+                    session: SESSION.into(),
+                    opened_by: "t1".into(),
+                    n: 1,
+                },
+                screen: None,
+                transport: crate::cli::recovery::Transport::Typed,
+                state: Some(state.clone()),
+                reply,
+            };
+            let last = last_look(&path, &[], &Default::default(), &[], &mut turns, &ask)
+                .map(|(gate, _)| gate);
+            let due = due_gate(
+                &path,
+                &[],
+                &mut turns,
+                Some(&state),
+                &Default::default(),
+                &mut Default::default(),
+                &[],
+                &author,
+                SESSION,
+            );
+            (last, due)
+        }
+    };
+    assert_eq!(
+        gates(),
+        (Some(Gate::Go), Gate::Go),
+        "free, recovery may act"
+    );
+    let held = crate::cli::github::log::tests::hold(&[(&events, &key)]);
+    let during = gates.clone();
+    assert_eq!(
+        crate::cli::github::log::tests::within("the gates", during),
+        (Some(Gate::Hold), Gate::Hold),
+        "held, nothing is decided on part of the work"
+    );
+    held.release();
+    assert_eq!(
+        gates(),
+        (Some(Gate::Go), Gate::Go),
+        "released, it goes ahead"
+    );
+}
+
+/// A one-off timer, its log not yet written, whose sidecar another
+/// process holds throughout, and no report reader beside it: the loop's
+/// steps in order (a look arming the retry, the retry re-arming the timer,
+/// a look, the deadline's acceptance meeting the lock again) back off from
+/// 250 ms to 5 s rather than starting over at each re-arm. Once released,
+/// the next retry and deadline accept it exactly once, and the episode
+/// ends.
+#[test]
+fn a_held_timer_backs_off_across_retry_and_deadline_and_is_accepted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = clank_core::agent_config::TimerSource {
+        interrupt: false,
+        interrupt_message: None,
+        name: "once".into(),
+        repeat_every: None,
+        due_at: "1970-01-01T00:00:01Z".into(),
+        content: Some("work".into()),
+    };
+    let key = source.source_key(None);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut timers = crate::cli::timer_source::TimerSet::new(
+        &[(
+            clank_core::agent_config::WaitEventSource::Timer(source),
+            crate::cli::event_source::SourceOrigin::Config,
+        )],
+        dir.path(),
+        None,
+        tx.into(),
+    )
+    .unwrap()
+    .on_the_loop();
+    let held = crate::cli::github::log::tests::hold(&[(dir.path(), &key)]);
+    let now = tokio::time::Instant::now();
+    let mut contention = ContentionRetry::default();
+    let look = |contention: &mut ContentionRetry, timers: &crate::cli::timer_source::TimerSet| {
+        contention.look(timers.awaiting_retry(), now);
+        contention.due().map(|at| at - now)
+    };
+    let retry = |contention: &mut ContentionRetry,
+                 timers: &mut crate::cli::timer_source::TimerSet| {
+        assert!(contention.due().is_some_and(|at| contention.is_due(at)));
+        contention.ran();
+        timers.retry_contended();
+    };
+    timers.due();
+    let mut delays = vec![look(&mut contention, &timers)];
+    for _ in 0..6 {
+        retry(&mut contention, &mut timers);
+        delays.push(look(&mut contention, &timers));
+        timers.due();
+        assert_eq!(
+            look(&mut contention, &timers),
+            *delays.last().unwrap(),
+            "one deadline"
+        );
+    }
+    assert_eq!(
+        delays,
+        [250, 500, 1000, 2000, 4000, 5000, 5000].map(|ms| Some(Duration::from_millis(ms))),
+        "the pause grows across the episode"
+    );
+    assert!(rx.try_recv().is_err(), "nothing accepted while held");
+    held.release();
+
+    retry(&mut contention, &mut timers);
+    look(&mut contention, &timers);
+    timers.due();
+    assert!(
+        matches!(
+            rx.try_recv().map(|(item, _)| item),
+            Ok(WaitItem::TimerEvent { .. })
+        ),
+        "accepted once released"
+    );
+    assert!(!timers.awaiting_retry(), "nothing is left to retry");
+    assert_eq!(look(&mut contention, &timers), None, "the episode is over");
+    timers.retry_contended();
+    timers.due();
+    assert!(rx.try_recv().is_err(), "and accepted only once");
+    contention.look(true, now);
+    assert_eq!(
+        contention.due(),
+        Some(now + Duration::from_millis(250)),
+        "the next starts over"
+    );
+}
+
+/// The contention retry is armed only while something is unsettled, from
+/// 250 ms doubling to 5 s with each retry while it stays so, and keeps
+/// one deadline however often it is looked at. A look with nothing
+/// unsettled disarms it and starts over.
+#[test]
+fn the_contention_retry_backs_off_within_its_bound_and_disarms() {
+    let now = tokio::time::Instant::now();
+    let ms = Duration::from_millis;
+    let mut retry = ContentionRetry::default();
+    retry.look(false, now);
+    assert_eq!(retry.due(), None, "nothing unsettled, nothing armed");
+    retry.look(true, now);
+    assert_eq!(retry.due(), Some(now + ms(250)));
+    retry.look(true, now + ms(100));
+    assert_eq!(retry.due(), Some(now + ms(250)), "one deadline");
+    assert!(!retry.is_due(now) && retry.is_due(now + ms(250)));
+    let mut pauses = Vec::new();
+    for _ in 0..8 {
+        retry.ran();
+        assert_eq!(retry.due(), None, "a retry disarms until looked at");
+        retry.look(true, now);
+        pauses.push(retry.due().unwrap() - now);
+    }
+    assert_eq!(
+        pauses,
+        [500, 1000, 2000, 4000, 5000, 5000, 5000, 5000].map(ms)
+    );
+    retry.look(false, now);
+    assert_eq!(retry.due(), None, "settled, it disarms");
+    retry.look(true, now);
+    assert_eq!(retry.due(), Some(now + ms(250)), "and starts over");
 }
 
 /// With the binding lock free, the first serve ends the outage.

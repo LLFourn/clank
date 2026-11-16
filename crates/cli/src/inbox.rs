@@ -514,13 +514,25 @@ pub(crate) fn compact_after_ack(repo: &Path, label: &AgentLabel) {
 /// This agent's unacked messages, oldest first, each stamped with what
 /// acks it.
 pub fn pending(repo: &Path, label: &AgentLabel) -> Vec<WaitItem> {
+    pending_with(repo, label, &crate::cli::github::log::Sidecars::waiting())
+}
+
+/// [`pending`], its log read as `sidecars` takes the lock: a held sidecar
+/// leaves the messages unavailable this pass, not handled.
+pub(crate) fn pending_with(
+    repo: &Path,
+    label: &AgentLabel,
+    sidecars: &crate::cli::github::log::Sidecars,
+) -> Vec<WaitItem> {
     // Anything still in the old file inbox joins the log first, so one
     // read answers for both.
     let _ = migrate(repo, label);
     let Ok(log) = message_log(repo, label) else {
         return Vec::new();
     };
-    let Ok(Some(rows)) = log.read_rows() else {
+    let Ok(crate::cli::github::log::Tried::Ran(Some(rows))) =
+        sidecars.read_rows(&log, MESSAGES_SOURCE)
+    else {
         return Vec::new();
     };
     rows.rows

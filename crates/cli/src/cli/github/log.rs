@@ -28,6 +28,13 @@
 //!   and replaces the file by rename. Locking a sidecar —
 //!   never the log inode itself — means an appender can't write
 //!   through a stale fd into a file the compactor just replaced.
+//! - **The monitor's loop never waits for a sidecar** (I9): an agent or
+//!   CLI process can hold one for as long as it likes. Each event-log
+//!   operation the loop runs takes its lock once, first, without waiting
+//!   ([`Locking::Try`]), and hands that [`Sidecar`] to every step, so no
+//!   step acquires again. A held lock leaves the source unavailable for
+//!   the pass: its items absent, which is neither empty nor handled, and
+//!   the loop's bounded retry armed. Processes off the loop wait.
 //! - **Failure domains are separate** (codex 899f915): `state.json`
 //!   is cache metadata (ETag / poll-interval floor); corruption there
 //!   resets only the cache. Only the WAL itself corrupting degrades
@@ -514,29 +521,221 @@ pub(crate) struct LoadedLog {
     pub(crate) foreign: usize,
 }
 
-/// flock RAII over the sidecar. Shared = append, exclusive = compact.
-struct SidecarLock {
-    _file: std::fs::File,
+/// How an operation takes a log's sidecar lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Locking {
+    /// Block until it is free: CLI commands and a wait client's producers.
+    #[default]
+    Wait,
+    /// Take it at once or not at all: the monitor's serve loop (I9).
+    Try,
 }
 
-impl SidecarLock {
+/// What an operation under [`Locking::Try`] did: it ran, or another open
+/// file held the sidecar and it did nothing at all.
+#[must_use]
+#[derive(Debug)]
+pub(crate) enum Tried<T> {
+    Ran(T),
+    Contended,
+}
+
+/// Proof that this process holds a log's sidecar flock, shared or
+/// exclusive, until dropped: the fd's close releases it. Shared = append,
+/// exclusive = ack, reply, compaction. A step of a larger operation takes
+/// the operation's guard by reference, so it never acquires again.
+pub(crate) struct Sidecar {
+    _file: std::fs::File,
+    path: PathBuf,
+    exclusive: bool,
+}
+
+/// Sidecars a test has another process hold. A flock taken in this test
+/// process is copied, still held, into any child a parallel test spawns,
+/// until that child's exec (see `proc_run`), so its release cannot be
+/// observed at a known moment and an assertion after it would race.
+#[cfg(test)]
+mod elsewhere {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Condvar, Mutex};
+
+    static HELD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    static RELEASED: Condvar = Condvar::new();
+
+    pub(super) fn hold(paths: &[PathBuf]) {
+        HELD.lock().unwrap().extend(paths.iter().cloned());
+    }
+
+    pub(super) fn release(paths: &[PathBuf]) {
+        let mut held = HELD.lock().unwrap();
+        for path in paths {
+            held.remove(path);
+        }
+        RELEASED.notify_all();
+    }
+
+    /// Whether this process may go on to flock `path`: under
+    /// [`super::Locking::Try`] not while it is held elsewhere, under
+    /// [`super::Locking::Wait`] once it is released.
+    pub(super) fn admits(path: &Path, locking: super::Locking) -> bool {
+        let mut held = HELD.lock().unwrap();
+        match locking {
+            super::Locking::Try => !held.contains(path),
+            super::Locking::Wait => {
+                while held.contains(path) {
+                    held = RELEASED.wait(held).unwrap();
+                }
+                true
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ACQUISITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Sidecar acquisitions this thread has attempted, held or not.
+#[cfg(test)]
+pub(crate) fn acquisitions() -> usize {
+    ACQUISITIONS.with(std::cell::Cell::get)
+}
+
+impl Sidecar {
+    /// Block until `path`'s lock is held.
     fn acquire(path: &Path, exclusive: bool) -> std::io::Result<Self> {
+        Self::take(path, exclusive, Locking::Wait)?
+            .ok_or_else(|| std::io::Error::other("a blocking sidecar take returned untaken"))
+    }
+
+    /// `Ok(None)` only under [`Locking::Try`], when another open file holds
+    /// the lock; any other failure is an error.
+    fn take(path: &Path, exclusive: bool, locking: Locking) -> std::io::Result<Option<Self>> {
+        #[cfg(test)]
+        ACQUISITIONS.with(|n| n.set(n.get() + 1));
+        #[cfg(test)]
+        if !elsewhere::admits(path, locking) {
+            return Ok(None);
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
-        let op = if exclusive {
-            rustix::fs::FlockOperation::LockExclusive
-        } else {
-            rustix::fs::FlockOperation::LockShared
+        let held = match (locking, exclusive) {
+            (Locking::Try, true) => clank_user_config::lease::take_now(&file)?,
+            (Locking::Try, false) => clank_user_config::lease::take_shared_now(&file)?,
+            (Locking::Wait, _) => {
+                let op = if exclusive {
+                    rustix::fs::FlockOperation::LockExclusive
+                } else {
+                    rustix::fs::FlockOperation::LockShared
+                };
+                loop {
+                    match rustix::fs::flock(&file, op) {
+                        Ok(()) => break true,
+                        Err(rustix::io::Errno::INTR) => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
         };
-        rustix::fs::flock(&file, op)?;
-        Ok(Self { _file: file })
+        if !held {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            _file: file,
+            path: path.to_path_buf(),
+            exclusive,
+        }))
     }
 }
-// flock releases with the fd on drop; no explicit LOCK_UN needed.
+
+/// One pass of reads by the monitor's loop or a wait client: how each read
+/// takes its sidecar, and which sources' sidecars were held elsewhere.
+/// Nothing is known this pass of a source it names: its items are absent,
+/// which is neither empty nor handled.
+#[derive(Debug, Default)]
+pub(crate) struct Sidecars {
+    locking: Locking,
+    contended: std::cell::RefCell<std::collections::BTreeSet<String>>,
+}
+
+impl Sidecars {
+    /// Reads that block on a held sidecar, as off-loop processes do.
+    pub(crate) fn waiting() -> Self {
+        Self::default()
+    }
+
+    /// Reads that never wait for a sidecar, as the monitor's loop does.
+    pub(crate) fn never_waiting() -> Self {
+        Self {
+            locking: Locking::Try,
+            ..Self::default()
+        }
+    }
+
+    /// Whether some source was unavailable this pass.
+    pub(crate) fn contended(&self) -> bool {
+        !self.contended.borrow().is_empty()
+    }
+
+    /// The sources unavailable this pass, by the key their items present
+    /// under.
+    #[cfg(test)]
+    pub(crate) fn unavailable(&self) -> std::collections::BTreeSet<String> {
+        self.contended.borrow().clone()
+    }
+
+    /// `tried`, with `source` marked unavailable this pass when it was
+    /// contended.
+    pub(crate) fn note<T>(&self, source: &str, tried: Tried<T>) -> Tried<T> {
+        if matches!(tried, Tried::Contended) {
+            self.contended.borrow_mut().insert(source.to_owned());
+        }
+        tried
+    }
+
+    /// [`EventLog::read_rows`], taking the sidecar as this pass does;
+    /// `source` names the log's items for [`Self::note`].
+    pub(crate) fn read_rows(
+        &self,
+        log: &EventLog,
+        source: &str,
+    ) -> std::io::Result<Tried<Option<ReadRows>>> {
+        let tried = match self.locking {
+            Locking::Wait => Tried::Ran(log.read_rows()?),
+            Locking::Try => match log.sidecar(false, Locking::Try)? {
+                Some(held) => Tried::Ran(log.read_rows_held(&held)?),
+                None => Tried::Contended,
+            },
+        };
+        Ok(self.note(source, tried))
+    }
+
+    /// [`EventLog::read_timer_backlog`], taking the sidecar as this pass
+    /// does; `source` names the log's items for [`Self::note`]. A
+    /// contended recovering read publishes nothing, so recurring evidence
+    /// is still synced before anything of it is shown.
+    pub(crate) fn timer_backlog(
+        &self,
+        log: &mut EventLog,
+        recover: bool,
+        source: &str,
+    ) -> std::io::Result<Tried<Option<ReadRows>>> {
+        let tried = match self.locking {
+            Locking::Wait => Tried::Ran(log.read_timer_backlog(recover)?),
+            Locking::Try => match log.sidecar(log.timer_backlog_writes(recover), Locking::Try)? {
+                Some(held) => Tried::Ran(log.read_timer_backlog_held(&held, recover)?),
+                None => Tried::Contended,
+            },
+        };
+        Ok(self.note(source, tried))
+    }
+}
 
 /// The per-source INGEST LEASE (wal-single-ingest-writer): exactly one
 /// process may run a source's transports (polling AND the realtime
@@ -1239,15 +1438,46 @@ impl EventLog {
     /// ingest side's artifacts); interior corruption is `Ok(None)` for
     /// the caller to report.
     pub(crate) fn read_rows(&self) -> std::io::Result<Option<ReadRows>> {
-        let _lock = SidecarLock::acquire(&self.lock_path, false).ok();
+        let _lock = Sidecar::acquire(&self.lock_path, false).ok();
         self.read_rows_unlocked()
+    }
+
+    /// [`Self::read_rows`] under the operation's held sidecar.
+    pub(crate) fn read_rows_held(&self, held: &Sidecar) -> std::io::Result<Option<ReadRows>> {
+        self.holds(held, false);
+        self.read_rows_unlocked()
+    }
+
+    /// This log's sidecar lock, taken as `locking` says: `Ok(None)` only
+    /// under [`Locking::Try`], when another open file holds it. An operation
+    /// takes it once, first, and passes it to every step.
+    pub(crate) fn sidecar(
+        &self,
+        exclusive: bool,
+        locking: Locking,
+    ) -> std::io::Result<Option<Sidecar>> {
+        Sidecar::take(&self.lock_path, exclusive, locking)
+    }
+
+    fn holds(&self, held: &Sidecar, exclusive: bool) {
+        debug_assert_eq!(held.path, self.lock_path, "another log's sidecar");
+        debug_assert!(
+            held.exclusive || !exclusive,
+            "a shared sidecar for an exclusive step"
+        );
     }
 
     /// All retained producer IDs, without the replay cursor's horizon. Native
     /// timers checkpoint this evidence before permitting compaction. Unknown
     /// semantics or corruption cannot authorize a fresh occurrence.
+    #[cfg(test)]
     pub(crate) fn retained_timer_ids(&self) -> std::io::Result<Vec<String>> {
-        let _lock = SidecarLock::acquire(&self.lock_path, false)?;
+        self.retained_timer_ids_held(&Sidecar::acquire(&self.lock_path, false)?)
+    }
+
+    /// [`Self::retained_timer_ids`] under the operation's held sidecar.
+    pub(crate) fn retained_timer_ids_held(&self, held: &Sidecar) -> std::io::Result<Vec<String>> {
+        self.holds(held, false);
         let text = match std::fs::read_to_string(&self.log_path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1525,6 +1755,17 @@ impl EventLog {
     /// quarantined to `<log>.corrupt`, corrupt state resets cache
     /// only).
     pub(crate) fn load(&mut self) -> LoadedLog {
+        self.load_with(None)
+    }
+
+    /// [`Self::load`] under the operation's held sidecar. Quarantine moves
+    /// the log, so a shared guard leaves a corrupt one for a later load.
+    pub(crate) fn load_held(&mut self, held: &Sidecar) -> LoadedLog {
+        self.holds(held, false);
+        self.load_with(Some(held))
+    }
+
+    fn load_with(&mut self, held: Option<&Sidecar>) -> LoadedLog {
         let mut out = LoadedLog::default();
         match std::fs::read_to_string(&self.state_path) {
             Ok(text) => match serde_json::from_str::<StateFile>(&text) {
@@ -1539,7 +1780,9 @@ impl EventLog {
             Err(_) => out.state_corrupt = true,
         }
         let text = {
-            let _lock = SidecarLock::acquire(&self.lock_path, false).ok();
+            let _lock = held
+                .is_none()
+                .then(|| Sidecar::acquire(&self.lock_path, false).ok());
             match std::fs::read_to_string(&self.log_path) {
                 Ok(t) => t,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
@@ -1574,7 +1817,11 @@ impl EventLog {
                 // about the bytes we're about to move, not a stale
                 // read. If the lock can't be had, leave the file for
                 // a later arm — baselining is safe either way.
-                if let Ok(_lock) = SidecarLock::acquire(&self.lock_path, true)
+                let exclusive = match held {
+                    Some(held) => held.exclusive.then_some(None),
+                    None => Sidecar::acquire(&self.lock_path, true).ok().map(Some),
+                };
+                if let Some(_lock) = exclusive
                     && let Ok(text) = std::fs::read_to_string(&self.log_path)
                     && Self::parse(&text).is_err()
                 {
@@ -1590,8 +1837,20 @@ impl EventLog {
     }
 
     fn append(&mut self, record: &Record) -> std::io::Result<()> {
-        let _lock = SidecarLock::acquire(&self.lock_path, false)?;
+        let _lock = Sidecar::acquire(&self.lock_path, false)?;
         self.append_unlocked(record)
+    }
+
+    /// [`Self::append`] under the operation's held sidecar, or under its
+    /// own shared one for `None`.
+    fn append_under(&mut self, held: Option<&Sidecar>, record: &Record) -> std::io::Result<()> {
+        match held {
+            Some(held) => {
+                self.holds(held, false);
+                self.append_unlocked(record)
+            }
+            None => self.append(record),
+        }
     }
 
     fn append_unlocked(&mut self, record: &Record) -> std::io::Result<()> {
@@ -1645,6 +1904,7 @@ impl EventLog {
         item: &WaitItem,
     ) -> std::io::Result<u64> {
         self.append_inbox_record(
+            None,
             transport,
             feed_id,
             action_key,
@@ -1665,7 +1925,32 @@ impl EventLog {
         interrupt: Interrupt,
     ) -> std::io::Result<u64> {
         self.append_inbox_record(
-            transport, feed_id, action_key, event_at, item, false, interrupt,
+            None, transport, feed_id, action_key, event_at, item, false, interrupt,
+        )
+    }
+
+    /// [`Self::append_interruptible_inbox`] under the operation's held
+    /// sidecar.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_interruptible_inbox_held(
+        &mut self,
+        held: &Sidecar,
+        transport: Transport,
+        feed_id: Option<&str>,
+        action_key: Option<&str>,
+        event_at: Option<u64>,
+        item: &WaitItem,
+        interrupt: Interrupt,
+    ) -> std::io::Result<u64> {
+        self.append_inbox_record(
+            Some(held),
+            transport,
+            feed_id,
+            action_key,
+            event_at,
+            item,
+            false,
+            interrupt,
         )
     }
 
@@ -1679,6 +1964,7 @@ impl EventLog {
         item: &WaitItem,
     ) -> std::io::Result<u64> {
         self.append_inbox_record(
+            None,
             Transport::Poll,
             feed_id,
             action_key,
@@ -1692,6 +1978,7 @@ impl EventLog {
     #[allow(clippy::too_many_arguments)]
     fn append_inbox_record(
         &mut self,
+        held: Option<&Sidecar>,
         transport: Transport,
         feed_id: Option<&str>,
         action_key: Option<&str>,
@@ -1721,29 +2008,32 @@ impl EventLog {
                 "event-log seq namespace exhausted (a record reserves u64::MAX)",
             ));
         };
-        self.append(&Record::Inbox {
-            v: if matches!(
-                item,
-                WaitItem::Message {
-                    requires_reply: true,
-                    ..
-                }
-            ) {
-                REPLY_REQUIRED_MESSAGE_V
-            } else {
-                CURRENT_V
+        self.append_under(
+            held,
+            &Record::Inbox {
+                v: if matches!(
+                    item,
+                    WaitItem::Message {
+                        requires_reply: true,
+                        ..
+                    }
+                ) {
+                    REPLY_REQUIRED_MESSAGE_V
+                } else {
+                    CURRENT_V
+                },
+                seq,
+                at: now_epoch(),
+                event_at,
+                baseline,
+                interrupt: interrupt.on,
+                interrupt_hint: interrupt.hint,
+                transport,
+                feed_id: feed_id.map(str::to_owned),
+                action_key: action_key.map(str::to_owned),
+                item: item.clone(),
             },
-            seq,
-            at: now_epoch(),
-            event_at,
-            baseline,
-            interrupt: interrupt.on,
-            interrupt_hint: interrupt.hint,
-            transport,
-            feed_id: feed_id.map(str::to_owned),
-            action_key: action_key.map(str::to_owned),
-            item: item.clone(),
-        })?;
+        )?;
         self.next_seq = seq.checked_add(1);
         Ok(seq)
     }
@@ -1781,7 +2071,7 @@ impl EventLog {
     /// Revalidate under the write lock. An answer may have started since a
     /// batch was resolved; plain ack must not retire that pending transaction.
     pub(crate) fn append_checked_ack(&mut self, seq: u64, ident: &str) -> std::io::Result<()> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         let row = self.reply_target(seq, ident)?;
         if matches!(
             &row.item,
@@ -1838,7 +2128,7 @@ impl EventLog {
         ident: &str,
         reply: &EventReply,
     ) -> std::io::Result<bool> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         let row = self.reply_target(seq, ident)?;
         if row.reply.as_ref().is_some_and(|stored| stored != reply) {
             return Err(std::io::Error::other(
@@ -1872,7 +2162,7 @@ impl EventLog {
         ident: &str,
         reply: &EventReply,
     ) -> std::io::Result<bool> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         let row = self.reply_target(seq, ident)?;
         if row.reply.as_ref() != Some(reply) {
             return Err(std::io::Error::other(
@@ -2011,7 +2301,19 @@ impl EventLog {
         if self.lines < COMPACT_AT {
             return Ok(0);
         }
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        self.compact_held(&Sidecar::acquire(&self.lock_path, true)?)
+    }
+
+    /// [`Self::maybe_compact`] under the operation's held exclusive sidecar.
+    pub(crate) fn maybe_compact_held(&mut self, held: &Sidecar) -> std::io::Result<usize> {
+        if self.lines < COMPACT_AT {
+            return Ok(0);
+        }
+        self.compact_held(held)
+    }
+
+    fn compact_held(&mut self, held: &Sidecar) -> std::io::Result<usize> {
+        self.holds(held, true);
         if self.is_recurring_key() {
             return self.compact_recurring_unlocked();
         }
@@ -3990,6 +4292,118 @@ pub(crate) mod tests {
         dir: &std::path::Path,
     ) -> crate::cli::github::log::EventLog {
         crate::cli::github::log::EventLog::open(dir, "t").unwrap()
+    }
+
+    /// Another process's hold on each of `logs`' sidecars, until
+    /// released or dropped.
+    pub(crate) struct Held(Vec<PathBuf>);
+
+    /// Hold `logs` (events dir, source key) elsewhere.
+    pub(crate) fn hold(logs: &[(&Path, &str)]) -> Held {
+        let paths: Vec<PathBuf> = logs
+            .iter()
+            .map(|(dir, key)| EventLog::open(dir, key).unwrap().lock_path)
+            .collect();
+        super::elsewhere::hold(&paths);
+        Held(paths)
+    }
+
+    impl Held {
+        pub(crate) fn release(self) {
+            drop(self);
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            super::elsewhere::release(&self.0);
+        }
+    }
+
+    /// `f`'s answer, run on a thread of its own: a panic naming `what`
+    /// when it takes longer than any operation that waits for nothing can.
+    pub(crate) fn within<T: Send + 'static>(
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(f());
+        });
+        answer
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{what} waited on a held sidecar"))
+    }
+
+    /// `f`, and how many sidecar acquisitions it attempted on this thread.
+    pub(crate) fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = super::acquisitions();
+        let out = f();
+        (out, super::acquisitions() - before)
+    }
+
+    /// A loop read of a log another process holds answers at once that
+    /// the source is unavailable, naming it, and never reads as empty;
+    /// once released it reads the rows. A waiting read is untouched.
+    #[test]
+    fn a_held_log_is_unavailable_to_the_loop_not_empty() {
+        let dir = wal_tempdir();
+        let mut log = open_log(&dir);
+        log.append_inbox(Transport::Command, Some("a"), None, None, &item(1))
+            .unwrap();
+        let held = hold(&[(&dir, "t")]);
+        let reader = dir.clone();
+        let (contended, unavailable) = within("a loop read", move || {
+            let sidecars = Sidecars::never_waiting();
+            let read = sidecars.read_rows(&open_log(&reader), "src").unwrap();
+            (matches!(read, Tried::Contended), sidecars.unavailable())
+        });
+        assert!(contended, "a held log is contended, not rows");
+        assert_eq!(unavailable, ["src".to_string()].into());
+        held.release();
+        let sidecars = Sidecars::never_waiting();
+        let Tried::Ran(Some(read)) = sidecars.read_rows(&log, "src").unwrap() else {
+            panic!("a free log reads")
+        };
+        assert_eq!(read.rows.len(), 1);
+        assert!(!sidecars.contended());
+        let Tried::Ran(Some(read)) = Sidecars::waiting().read_rows(&log, "src").unwrap() else {
+            panic!("a waiting read reads")
+        };
+        assert_eq!(read.rows.len(), 1);
+    }
+
+    /// A loop read of a log whose sidecar another open file has flocked
+    /// is contended at once. Nothing is asserted after the release: a
+    /// spawn on another test's thread may still hold a copy of that fd.
+    #[test]
+    fn a_log_flocked_elsewhere_is_contended_for_the_loop() {
+        let dir = wal_tempdir();
+        let log = open_log(&dir);
+        let flocked = log.sidecar(true, Locking::Wait).unwrap().unwrap();
+        let reader = dir.clone();
+        let contended = within("a loop read", move || {
+            matches!(
+                Sidecars::never_waiting()
+                    .read_rows(&open_log(&reader), "t")
+                    .unwrap(),
+                Tried::Contended
+            )
+        });
+        assert!(contended);
+        drop(flocked);
+    }
+
+    /// A loop read takes its sidecar once.
+    #[test]
+    fn a_loop_read_takes_its_sidecar_once() {
+        let dir = wal_tempdir();
+        let mut log = open_log(&dir);
+        log.append_inbox(Transport::Command, Some("a"), None, None, &item(1))
+            .unwrap();
+        let (read, taken) = counted(|| Sidecars::never_waiting().read_rows(&log, "t"));
+        assert!(matches!(read.unwrap(), Tried::Ran(Some(_))));
+        assert_eq!(taken, 1);
     }
 
     #[test]

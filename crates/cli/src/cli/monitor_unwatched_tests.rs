@@ -127,6 +127,7 @@ impl Handing {
             shown: Default::default(),
             conn,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
         });
         self.sockets.insert(conn, socket);

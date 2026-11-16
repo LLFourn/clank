@@ -136,12 +136,20 @@ whether its assertions protect the invariant. Reviewers check that.
   stands until a serve finds it free), and blocks are read without
   `.clank/blocks.lock` (only writers take it; a read is checked against
   its question's generation, and one that cannot settle blocks and owes
-  nothing). Serving still blocks on locks agent and CLI processes hold:
-  each agent's event-log sidecar (`EventLog::read_rows` via `gather`, and
-  the timer host's `accept`), and the legacy inbox migration's
-  `inbox/.lock` and `messages.writer.lock` (`inbox::pending`).
-- Plans: the-serve-loop-survives-a-held-event-log,
-  the-serve-loop-survives-a-held-inbox-lock
+  nothing). Event-log sidecars are only tried on the loop: each loop
+  operation takes its lock once, without waiting, and a held one leaves
+  that source unavailable for the pass (its items absent, the agent
+  unknown to recovery and its ledger) until a bounded contention retry
+  (250 ms doubling to 5 s) finds it free. The one blocking lock serving
+  still takes is the legacy inbox migration's `inbox/.lock` and
+  `messages.writer.lock` (`inbox::pending_with`, via `migrate`). A timer
+  acceptance's ingest lease is taken with its bounded patience (250 ms),
+  never waited for. Corrupt or unreadable logs are skipped as before
+  (`event_source::owed_from_sources`), which reads as no events.
+- Tests: `crates/cli/src/cli/monitor_turn_tests.rs::a_held_event_log_stalls_no_serve_and_the_retry_presents_it`,
+  `crates/cli/src/cli/timer_source.rs::held_sidecars_leave_timers_pending_until_the_contention_retry`,
+  `crates/cli/src/cli/timer_source.rs::each_loop_timer_operation_takes_its_sidecar_once`
+- Plans: the-serve-loop-survives-a-held-inbox-lock
 
 ## I10. Nothing polls except GitHub.
 

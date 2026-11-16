@@ -103,7 +103,7 @@ const UNGATED: &[(&str, &str, &str)] = &[
     ),
     (
         "cli/github/log.rs",
-        "acquire",
+        "take",
         "OWN: opens the log's lock file",
     ),
     (
@@ -113,7 +113,7 @@ const UNGATED: &[(&str, &str, &str)] = &[
     ),
     (
         "cli/github/log.rs",
-        "load",
+        "load_with",
         "quarantines a log no build can parse, so that it is read once; it writes no row",
     ),
     (
@@ -201,6 +201,11 @@ const UNGATED: &[(&str, &str, &str)] = &[
         "cli/plan_mutation.rs",
         "runtime_lock",
         "OWN: opens a lock file",
+    ),
+    (
+        "cli/block.rs",
+        "read_answer",
+        "READ-ONLY: `OpenOptions` only to add O_NOFOLLOW and O_NONBLOCK to a read; it writes nothing",
     ),
     (
         "cli/question_hook.rs",

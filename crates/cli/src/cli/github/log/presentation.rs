@@ -12,7 +12,7 @@ impl EventLog {
         at: u64,
         current: impl Fn() -> bool,
     ) -> std::io::Result<usize> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         let read = self
             .read_rows_unlocked()?
             .ok_or_else(|| std::io::Error::other("corrupt presentation WAL"))?;
