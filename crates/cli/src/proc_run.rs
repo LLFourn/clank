@@ -935,6 +935,36 @@ pub fn start(spec: Spec) -> io::Result<Managed> {
     Ok(Managed::of(spec.spawn()?, spec.group))
 }
 
+/// A pipe already holding all of `bytes`, its write end closed, to hand a
+/// child as [`Stdin::Fd`]: the child reads them and then end of file.
+///
+/// Filling it never waits for a reader, so a child that never reads cannot
+/// hold up the caller. Bytes that do not fit in the pipe's buffer are an
+/// error, not a wait.
+pub fn preloaded(bytes: &[u8]) -> io::Result<OwnedFd> {
+    use rustix::io::{Errno, FdFlags};
+    let (read, write) = rustix::pipe::pipe()?;
+    for end in [&read, &write] {
+        rustix::io::fcntl_setfd(end, FdFlags::CLOEXEC)?;
+    }
+    rustix::fs::fcntl_setfl(&write, rustix::fs::OFlags::NONBLOCK)?;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match rustix::io::write(&write, rest) {
+            Ok(n) => rest = &rest[n..],
+            Err(Errno::INTR) => {}
+            Err(Errno::AGAIN) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("{} bytes do not fit in a pipe", bytes.len()),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(read)
+}
+
 impl Managed {
     fn of(spawned: Spawned, group: Group) -> Self {
         #[cfg(test)]

@@ -433,7 +433,7 @@ pub enum Command {
     StopHook(crate::cli::StopHookArgs),
     /// Native Claude question hook adapter (installed by setup).
     #[command(hide = true)]
-    QuestionHook,
+    QuestionHook(crate::cli::QuestionHookArgs),
     /// Print the licences of clank and of everything built into it
     #[command(hide = true)]
     Licenses,
@@ -508,7 +508,7 @@ pub async fn dispatch_with(
         Command::Remote(args) => crate::cli::remote_control::run(args).await,
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,
-        Command::QuestionHook => crate::cli::question_hook::run().await,
+        Command::QuestionHook(args) => crate::cli::question_hook::run(args).await,
         Command::Licenses => crate::cli::licenses::run(),
         Command::Docs(args) => crate::cli::docs::run(args),
         Command::StopHook(args) => {
@@ -1223,6 +1223,7 @@ mod tests {
     const PLUMBING: &[(&str, &str, &[&str])] = &[
         ("", "stop-hook", &["stop-hook", "--tool", "claude"]),
         ("", "question-hook", &["question-hook"]),
+        ("", "question-hook", &["question-hook", "--deliver"]),
         ("", "licenses", &["licenses"]),
         ("", "docs", &["docs", "cli", "book/reference"]),
         ("", "rewire", &["rewire", "--from-stdin"]),
