@@ -193,11 +193,7 @@ pub(super) fn render_at(
     if let Mode::AgentDetail { idx, sel } = mode
         && let Some(agent) = snap.agents.get(idx)
     {
-        let actions = detail_actions(
-            agent.role,
-            view.presence_of(&agent.label),
-            agent.session.is_some(),
-        );
+        let actions = detail_actions(agent.role, view.session_found, agent.session.is_some());
         // The loop settles the cursor by action before every frame;
         // this is only the guard against an index past the end.
         let sel = sel.min(actions.len().saturating_sub(1));
@@ -3267,7 +3263,7 @@ pub(super) fn render_agent_detail(
                     key,
                     label: "reopen pane",
                     value: None,
-                    desc: "its pane is gone; start it again",
+                    desc: "check its pane and open it if needed",
                     danger: false,
                 },
                 DetailAction::Remove => MenuRow::Action {
@@ -3348,6 +3344,14 @@ pub(super) fn render_agent_detail(
             "",
             cols,
         )),
+    }
+    if !actions.contains(&DetailAction::Reopen) {
+        for line in wrap(
+            "Reopen unavailable: no Zellij session found.",
+            cols.saturating_sub(3).max(1),
+        ) {
+            content.push(emit(&[dim(format!("   {line}"))], "", cols));
+        }
     }
     let attending_label = format!("{LEAD}attending ");
     let indent = display_width(&attending_label);
@@ -6396,6 +6400,7 @@ mod tests {
                             picker: &[],
                             log_cursor: 0,
                             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                            session_found: false,
                             remote: Default::default(),
                             remote_detail: None,
                             remote_page: None,
@@ -6448,6 +6453,7 @@ mod tests {
             picker: &[],
             log_cursor: cursor,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            session_found: false,
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -6683,6 +6689,7 @@ mod tests {
             log_cursor: 6,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            session_found: false,
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -8467,22 +8474,51 @@ mod tests {
         );
     }
 
-    /// The reopen row leaves when the pane comes back; a cursor that was
-    /// on it lands on a real row, not past the end.
     #[test]
-    fn the_detail_cursor_clamps_when_the_reopen_row_leaves() {
-        let s = two_agent_snap();
-        let mut view = PanelView::just(Mode::AgentDetail { idx: 1, sel: 99 });
-        view.presence = Some(s.agents.iter().map(|a| a.label.clone()).collect());
-        let page = render_at(&s, 40, 80, 0, 0, &view).0.join("\n");
-        let band = page
-            .lines()
-            .find(|l| l.contains("\x1b[7m"))
-            .expect("a selected row");
-        assert!(
-            visible(band).contains("back"),
-            "the cursor lands on the last real row: {band}"
-        );
+    fn reopen_stays_available_across_pane_states_when_the_session_is_found() {
+        use crate::cli::teams_config::RosterRole;
+        let mut s = two_agent_snap();
+        for role in [
+            RosterRole::Master,
+            RosterRole::Commit,
+            RosterRole::Plan,
+            RosterRole::Final,
+            RosterRole::Gate,
+            RosterRole::Standby,
+        ] {
+            s.agents[1].role = role;
+            let actions = detail_actions(role, true, s.agents[1].session.is_some());
+            let sel = actions
+                .iter()
+                .position(|a| *a == DetailAction::Reopen)
+                .unwrap();
+            let mut view = PanelView::just(Mode::AgentDetail { idx: 1, sel });
+            view.session_found = true;
+            for presence in [
+                None,
+                Some(Default::default()),
+                Some([s.agents[1].label.clone()].into_iter().collect()),
+            ] {
+                view.presence = presence;
+                let page = render_at(&s, 60, 100, 0, 0, &view).0;
+                let band = page.iter().find(|l| l.contains("\x1b[7m")).unwrap();
+                assert!(visible(band).contains("reopen pane"), "{role:?}: {band}");
+                assert!(
+                    !page
+                        .iter()
+                        .any(|l| visible(l).contains("Reopen unavailable"))
+                );
+            }
+            view.session_found = false;
+            view.mode = Mode::AgentDetail { idx: 1, sel: 99 };
+            let page = render_at(&s, 60, 100, 0, 0, &view).0;
+            assert!(
+                page.iter()
+                    .any(|l| visible(l).contains("Reopen unavailable: no Zellij session found."))
+            );
+            let band = page.iter().find(|l| l.contains("\x1b[7m")).unwrap();
+            assert!(visible(band).contains("back"));
+        }
     }
 
     #[test]
@@ -8598,6 +8634,7 @@ mod tests {
                 log_cursor: 0,
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                session_found: false,
                 remote: Default::default(),
                 remote_detail: None,
                 remote_page: None,
@@ -8657,6 +8694,7 @@ mod tests {
             log_cursor: 0,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            session_found: false,
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -8771,6 +8809,7 @@ mod tests {
                 log_cursor: 0,
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                session_found: false,
                 remote: Default::default(),
                 remote_detail: None,
                 remote_page: None,
@@ -10352,6 +10391,7 @@ mod tests {
             log_cursor: 1,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            session_found: false,
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -13750,7 +13790,7 @@ mod tests {
         use clank_core::vocab::AutoMode;
         for role in [RosterRole::Master, RosterRole::Commit] {
             let agent = agent_row("kimi", role, AutoMode::On);
-            let actions = detail_actions(role, Presence::Missing, false);
+            let actions = detail_actions(role, true, false);
             let sel = actions
                 .iter()
                 .position(|a| *a == DetailAction::Reopen)
@@ -13775,7 +13815,7 @@ mod tests {
         use crate::cli::teams_config::{ReviewKind, RosterRole};
         use clank_core::vocab::AutoMode;
         let agent = agent_row("sb", RosterRole::Standby, AutoMode::On);
-        let actions = detail_actions(RosterRole::Standby, Presence::Live, false);
+        let actions = detail_actions(RosterRole::Standby, false, false);
         let (lines, _) = render_agent_detail(&agent, None, &actions, 0, 40, 80);
         let page: String = lines
             .iter()
@@ -13840,7 +13880,7 @@ mod tests {
         seen: Option<&crate::cli::status_tui::input::SeenSession>,
     ) -> String {
         use crate::cli::teams_config::RosterRole;
-        let actions = detail_actions(RosterRole::Commit, Presence::Live, agent.session.is_some());
+        let actions = detail_actions(RosterRole::Commit, false, agent.session.is_some());
         let (lines, _) = render_agent_detail(agent, seen, &actions, 0, 40, 80);
         lines
             .iter()
@@ -13995,7 +14035,7 @@ mod tests {
             id: id.to_string(),
             present: Some(false),
         };
-        let actions = detail_actions(RosterRole::Commit, Presence::Live, true);
+        let actions = detail_actions(RosterRole::Commit, false, true);
         for (rows, cols) in [(8, 40), (12, 40), (8, 24)] {
             let (lines, _) = render_agent_detail(&agent, Some(&seen), &actions, 0, rows, cols);
             let text: Vec<String> = lines.iter().map(|l| visible(l)).collect();
@@ -14023,7 +14063,7 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
         let agent = agent_row("kimi", RosterRole::Commit, AutoMode::On);
-        let actions = detail_actions(RosterRole::Commit, Presence::Live, false);
+        let actions = detail_actions(RosterRole::Commit, false, false);
         let sel = actions
             .iter()
             .position(|a| *a == DetailAction::Swap)
@@ -14064,7 +14104,7 @@ mod tests {
         // that used to push the warning off the bottom.
         agent.invocation = format!("codex {}", "--flag value ".repeat(40));
         agent.session = None;
-        let actions = detail_actions(RosterRole::Commit, Presence::Live, false);
+        let actions = detail_actions(RosterRole::Commit, false, false);
         assert!(actions.len() > 4, "a menu taller than these panes");
 
         // 8 rows is the case codex named: title, blank, one menu line,
@@ -14152,7 +14192,7 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
         let agent = agent_row("codex", RosterRole::Commit, AutoMode::On);
-        let actions = detail_actions(RosterRole::Commit, Presence::Live, false);
+        let actions = detail_actions(RosterRole::Commit, false, false);
         let (lines, _) = render_agent_detail(&agent, None, &actions, 0, 24, 60);
         let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
         let raw = lines.join("\n");
