@@ -17,17 +17,18 @@ pub mod git_fixture;
 
 pub mod call_graph;
 
-/// The runtime shared with test-built CLI children. The test runner owns and
-/// removes the override; a plain Cargo invocation retains the CLI default.
+/// The runtime this harness shares with the CLI children it spawns: the
+/// runner's `CLANK_TEST_RUNTIME`, or one private to this process, never
+/// the live one.
 pub fn runtime_dir() -> PathBuf {
-    std::env::var_os("CLANK_TEST_RUNTIME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(format!("clank-run-{}", rustix::process::getuid().as_raw()))
+    clank::cli::test_support::runtime_dir()
 }
 
-pub fn runtime_env() -> Option<(&'static str, std::ffi::OsString)> {
-    std::env::var_os("CLANK_TEST_RUNTIME").map(|root| ("CLANK_TEST_RUNTIME", root))
+pub fn runtime_env() -> [(&'static str, std::ffi::OsString); 1] {
+    [(
+        "CLANK_TEST_RUNTIME",
+        clank::cli::test_support::runtime_root().into(),
+    )]
 }
 
 /// A git repo with its OWN HOME, distinct from the repo dir, so a
@@ -896,4 +897,18 @@ pub fn crates_dir() -> PathBuf {
         .parent()
         .expect("crates/cli has a parent")
         .to_path_buf()
+}
+
+#[test]
+fn the_harness_never_joins_the_live_runtime() {
+    let live = PathBuf::from(format!(
+        "/tmp/clank-run-{}",
+        rustix::process::getuid().as_raw()
+    ));
+    assert_ne!(runtime_dir(), live);
+    assert_eq!(
+        runtime_env()[0].1,
+        std::ffi::OsString::from(runtime_dir().parent().unwrap()),
+        "children are handed the namespace this process uses"
+    );
 }

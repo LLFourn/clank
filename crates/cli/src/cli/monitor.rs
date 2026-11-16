@@ -1956,33 +1956,71 @@ impl Drop for RepairPermit {
 /// repair permit in a different directory, locked different inodes,
 /// and both forked (codex on 88b6234).
 pub(crate) fn runtime_dir(me: u32) -> std::path::PathBuf {
-    #[cfg(any(test, feature = "test-runtime"))]
+    runtime_dir_under(test_runtime_root(), me)
+}
+
+/// `None` is the live namespace: `/tmp`, not `TMPDIR` or anything
+/// else a process inherits.
+fn runtime_dir_under(test_root: Option<std::path::PathBuf>, me: u32) -> std::path::PathBuf {
+    test_root
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(format!("clank-run-{me}"))
+}
+
+#[cfg(not(any(test, feature = "test-runtime")))]
+fn test_runtime_root() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// A test process never joins the developer's live namespace, however
+/// it was started: the runner's `CLANK_TEST_RUNTIME` when given (shared
+/// with the children it spawns), else a root private to this process.
+/// Deciding here, at first use, rather than in a harness setup step
+/// means no test can reach the runtime before isolation is in place.
+#[cfg(any(test, feature = "test-runtime"))]
+pub(crate) fn test_runtime_root() -> Option<std::path::PathBuf> {
     if let Some(root) = std::env::var_os("CLANK_TEST_RUNTIME") {
         let root = std::path::PathBuf::from(root);
         assert!(root.is_absolute(), "CLANK_TEST_RUNTIME must be absolute");
-        return runtime_namespace(&root, me);
+        return Some(root);
     }
-    #[cfg(not(test))]
-    let root = std::path::Path::new("/tmp");
-    // Unit tests exercise real leases and watches, but must not join the
-    // developer's live namespace or inherit debris from previous test runs.
-    // One root per test process preserves cross-thread coordination.
-    #[cfg(test)]
-    let root = {
-        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        ROOT.get_or_init(|| {
-            tempfile::Builder::new()
-                .prefix("clank-ut-")
-                .tempdir_in("/tmp")
-                .unwrap()
-        })
-        .path()
-    };
-    runtime_namespace(root, me)
+    Some(
+        PRIVATE_TEST_RUNTIME
+            .get_or_init(|| {
+                // `/tmp`, not `target/`: socket paths under it must fit
+                // `SUN_PATH_MAX`, and a target dir can be arbitrarily deep.
+                let root = tempfile::Builder::new()
+                    .prefix("clank-ut-")
+                    .tempdir_in("/tmp")
+                    .unwrap()
+                    .keep();
+                remove_private_test_runtime_at_exit();
+                root
+            })
+            .clone(),
+    )
 }
 
-fn runtime_namespace(root: &std::path::Path, me: u32) -> std::path::PathBuf {
-    root.join(format!("clank-run-{me}"))
+/// One per process, so every thread of it meets at the same leases.
+#[cfg(any(test, feature = "test-runtime"))]
+static PRIVATE_TEST_RUNTIME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Statics are never dropped, and libtest leaves `main` through
+/// `process::exit` on failure, so a `TempDir` guard would never run.
+#[cfg(any(test, feature = "test-runtime"))]
+#[allow(unsafe_code)]
+fn remove_private_test_runtime_at_exit() {
+    extern "C" fn remove_private_test_runtime() {
+        if let Some(root) = PRIVATE_TEST_RUNTIME.get() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+    // SAFETY: `atexit` only stores the pointer. The handler captures
+    // nothing, cannot unwind (it discards its only error), and reads a
+    // `OnceLock` that is set before registration and never cleared.
+    unsafe {
+        libc::atexit(remove_private_test_runtime);
+    }
 }
 
 /// Vet and create this uid's runtime directory.
@@ -13500,9 +13538,18 @@ mod tests {
     #[test]
     fn the_runtime_namespace_does_not_move_with_the_environment() {
         assert_eq!(
-            runtime_namespace(std::path::Path::new("/tmp"), 501),
+            runtime_dir_under(None, 501),
             std::path::PathBuf::from("/tmp/clank-run-501"),
             "fixed per uid, and derived from nothing else"
+        );
+        assert_eq!(
+            runtime_dir_under(Some("/elsewhere".into()), 501),
+            std::path::PathBuf::from("/elsewhere/clank-run-501"),
+        );
+        assert_ne!(
+            runtime_dir(501),
+            runtime_dir_under(None, 501),
+            "a test build never joins the live namespace"
         );
         assert_ne!(
             runtime_dir(501),

@@ -84,3 +84,48 @@ async fn silent_helper_is_ended_by_the_transport_deadline() {
     let (result, _) = exchange("hang", true).await;
     assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
 }
+
+/// The production gate, with the real transport behind it: a helper starts
+/// only once the gate has passed, so neither auto off nor a profile missing
+/// its hooks ever runs the configured executable.
+#[tokio::test]
+async fn an_automatic_launch_starts_no_helper_until_its_gate_passes() {
+    use clank::cli::test_support::{grok_launch_ready, install_grok_hooks};
+    use clank_core::AutoMode;
+    use clank_core::ids::AgentLabel;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    let profile = repo.join("profile");
+    let launch = LaunchConfig {
+        command: Some(env!("CARGO_BIN_EXE_clank-test-fixture").into()),
+        args: vec!["grok".into(), "--fixture-profile".into()],
+        env: BTreeMap::from([
+            ("GROK_HOME".into(), profile.to_string_lossy().into_owned()),
+            ("HOME".into(), repo.to_string_lossy().into_owned()),
+        ]),
+    };
+    let started = profile.join("audit.jsonl");
+    let label = AgentLabel::parse("grok").unwrap();
+
+    clank::agent_store::set_auto_mode(&repo, &label, AutoMode::Off).unwrap();
+    grok_launch_ready(&launch, &repo, &label).await.unwrap();
+    assert!(!started.exists(), "auto off started a helper");
+
+    clank::agent_store::set_auto_mode(&repo, &label, AutoMode::On).unwrap();
+    let error = grok_launch_ready(&launch, &repo, &label).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("clank setup --grok-agent grok"),
+        "{error:#}"
+    );
+    assert!(
+        !started.exists(),
+        "a helper started before the hooks were checked"
+    );
+
+    install_grok_hooks(&launch, &repo).unwrap();
+    grok_launch_ready(&launch, &repo, &label).await.unwrap();
+    assert!(
+        started.exists(),
+        "the gate passed without probing the helper"
+    );
+}

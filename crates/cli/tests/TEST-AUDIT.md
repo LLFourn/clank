@@ -76,9 +76,10 @@ actionlint was unavailable locally. No Rust code changed in this correction.
   nine failures; its initial long path exposed one Unix socket-path failure.
   The namespace now uses a short `/tmp` path. `scripts/test.sh` owns a private
   root, shares it with test-built CLI children and removes it at exit; CI uses
-  this runner. Production builds do not honor the test override. Bare Cargo
-  unit runs have a private fallback; use the runner for automatic cleanup and
-  isolation of integration-test subprocesses too.
+  this runner. Production builds do not honor the test override. Since
+  the-purge-protections-return, a bare Cargo run of any test build (unit or
+  the `it` harness) falls back to a root private to the process, hands it to
+  the CLI children it spawns, and removes it at exit.
 - After the short-path correction and first gix migrations: focused feedback
   and parser tests passed; CLI library 3,559 passed, zero failed, four ignored,
   46.10s test time. This is intermediate evidence, not final acceptance.
