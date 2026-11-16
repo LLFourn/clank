@@ -31,28 +31,17 @@ pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
     if !args.print {
         require_zellij()?;
     }
-    let current = opening_from(zellij_endpoint::own_endpoint(), in_session(), args.print)?;
+    let current = opening_from(zellij_endpoint::own_endpoint());
     run_with(&mut RealOpenIo, &args, current.as_ref()).await
 }
 
-/// The session `open` was called from, if any. An ancestry that can't be
-/// read (a root-owned `login` between a terminal and its shell refuses
-/// it) proves nothing about zellij on its own, but zellij sets `$ZELLIJ`
-/// in every pane, so a caller without it is outside zellij and `open`
-/// starts or attaches as it would from any terminal.
-fn opening_from(
-    resolved: Resolved,
-    in_session: bool,
-    print: bool,
-) -> anyhow::Result<Option<Endpoint>> {
+/// Use the caller's session when it can be identified. Unreadable ancestry
+/// falls back to normal opening; it must not prevent starting a workspace.
+/// The workspace scan still checks what is already open before creation.
+fn opening_from(resolved: Resolved) -> Option<Endpoint> {
     match resolved {
-        Resolved::Found(ep) => Ok(Some(ep)),
-        Resolved::NotInZellij => Ok(None),
-        Resolved::Unknown(_) if print || !in_session => Ok(None),
-        Resolved::Unknown(why) => anyhow::bail!(
-            "could not tell which zellij session this shell runs in ({why}), so where to \
-             open is unknown. Nothing was opened; retry."
-        ),
+        Resolved::Found(ep) => Some(ep),
+        Resolved::NotInZellij | Resolved::Unknown(_) => None,
     }
 }
 
@@ -6727,24 +6716,32 @@ keybinds {
         );
     }
 
-    #[test]
-    fn open_from_outside_zellij_goes_ahead_when_the_ancestry_cant_be_read() {
-        let unknown = || Resolved::Unknown("pid 2090's identity could not be read".into());
-        assert_eq!(opening_from(unknown(), false, false).unwrap(), None);
-        assert!(
-            opening_from(unknown(), true, false).is_err(),
-            "inside zellij, an unreadable ancestry still can't say which session"
+    #[tokio::test]
+    async fn unreadable_ancestry_falls_back_to_normal_opening() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = openable_repo(root.path(), "proj").canonicalize().unwrap();
+        let current = opening_from(Resolved::Unknown(
+            "pid 2090's identity could not be read".into(),
+        ));
+        let mut io = FakeOpenIo::with([query_output(1, "", NO_SESSIONS)]);
+        run_with(&mut io, &args(&repo), current.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            io.calls.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            ["scan", "query", "spawn"]
         );
-        assert_eq!(opening_from(unknown(), true, true).unwrap(), None);
+        assert_eq!(
+            io.spawned(),
+            [call_at(
+                At::Path,
+                &create_args(&layout_file_path(&repo), "clank-proj")
+            )
+            .as_slice()]
+        );
         let ep: Endpoint = "work".into();
-        assert_eq!(
-            opening_from(Resolved::Found(ep.clone()), true, false).unwrap(),
-            Some(ep)
-        );
-        assert_eq!(
-            opening_from(Resolved::NotInZellij, false, false).unwrap(),
-            None
-        );
+        assert_eq!(opening_from(Resolved::Found(ep.clone())), Some(ep));
+        assert_eq!(opening_from(Resolved::NotInZellij), None);
     }
 
     #[test]
