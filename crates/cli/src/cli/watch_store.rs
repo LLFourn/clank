@@ -479,7 +479,7 @@ pub(crate) fn add(repo: &Path, target: Target, source: WaitEventSource) -> anyho
     crate::agent_store::repo_config::transact(repo, |config| {
         ensure_on_roster(config, &target)?;
         let _binding = match &target {
-            Target::Agent { name } => Some(crate::agent_store::hold_binding(repo, name)?),
+            Target::Agent { name } => Some(crate::agent_store::hold_state(repo, name)?),
             Target::Master => None,
         };
         insert(
@@ -513,7 +513,7 @@ pub(crate) fn retarget(repo: &Path, id: u64, target: Target) -> anyhow::Result<(
     crate::agent_store::repo_config::transact(repo, |config| {
         ensure_on_roster(config, &target)?;
         let _binding = match &target {
-            Target::Agent { name } => Some(crate::agent_store::hold_binding(repo, name)?),
+            Target::Agent { name } => Some(crate::agent_store::hold_state(repo, name)?),
             Target::Master => None,
         };
         let watch = config
@@ -536,7 +536,7 @@ pub(crate) fn retarget(repo: &Path, id: u64, target: Target) -> anyhow::Result<(
     })
 }
 
-/// The config lock precedes the agent binding lock. No legacy file is rewritten:
+/// The config lock precedes the agent's state lock. No legacy file is rewritten:
 /// the repository record is the atomic authority that suppresses its old host.
 /// A crash cannot leave copied logs or half of a two-document transfer.
 pub(crate) fn transfer_legacy(
@@ -548,10 +548,10 @@ pub(crate) fn transfer_legacy(
 ) -> anyhow::Result<u64> {
     crate::agent_store::repo_config::transact(repo, |config| {
         ensure_on_roster(config, &target)?;
-        let _binding = crate::agent_store::hold_binding(repo, agent)?;
+        let _binding = crate::agent_store::hold_state(repo, agent)?;
         let _target_binding = match &target {
             Target::Agent { name } if name != agent => {
-                Some(crate::agent_store::hold_binding(repo, name)?)
+                Some(crate::agent_store::hold_state(repo, name)?)
             }
             _ => None,
         };

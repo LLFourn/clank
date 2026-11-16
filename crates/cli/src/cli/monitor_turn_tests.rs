@@ -338,11 +338,7 @@ async fn a_due_check_in_of_an_unbound_agent_is_not_due_again() {
 
 /// Recovery holding `author` as bound now: a Claude, resumed by typing.
 fn recovering(repo: &std::path::Path, author: &AgentLabel) -> crate::cli::recovery::Driver {
-    let binding = crate::agent_store::load_agent_config(repo, author)
-        .unwrap()
-        .unwrap()
-        .session
-        .unwrap();
+    let binding = crate::agent_store::binding(repo, author).unwrap().unwrap();
     let mut recovery = crate::cli::recovery::Driver::new(repo.to_path_buf(), "/nonexistent".into());
     recovery.reconcile(
         vec![crate::cli::recovery::Facts {
@@ -1912,10 +1908,9 @@ fn answered_without_an_end(repo: &std::path::Path, author: &AgentLabel) {
         ),
     )
     .unwrap();
-    crate::agent_store::update_agent_config(repo, author, |config| {
-        config.session.as_mut().unwrap().transcript = Some(record.display().to_string());
-    })
-    .unwrap();
+    let bound = crate::agent_store::binding(repo, author).unwrap().unwrap();
+    crate::agent_store::record_transcript(repo, author, &bound.id, &record.display().to_string())
+        .unwrap();
     crate::cli::recovery::tests::enable(
         clank_core::Tool::Claude,
         Some(crate::cli::recovery::Transport::Typed),
@@ -2820,21 +2815,19 @@ async fn two_agents_claude_told() -> (TempRepo, [AgentLabel; 2], crate::repo_sta
         &clank_core::SessionId::parse(OTHER_SESSION).unwrap(),
     )
     .unwrap();
-    crate::agent_store::update_agent_config(repo.path(), &claude, |config| {
-        config.outage_notified = Some(clank_core::agent_config::OutageNotified {
-            session: clank_core::SessionId::parse(SESSION).unwrap(),
-            at: "2026-11-16T00:00:00Z".into(),
-        });
-    })
-    .unwrap();
+    crate::agent_store::told_of_an_outage(repo.path(), &claude, SESSION);
     let state = folded(repo.path()).await.unwrap();
     (repo, [claude, other], state)
 }
 
 fn told(repo: &std::path::Path, author: &AgentLabel) -> bool {
-    crate::agent_store::load_agent_config(repo, author)
-        .unwrap()
-        .is_some_and(|cfg| cfg.outage_notified.is_some())
+    crate::agent_store::state::State::load(
+        &crate::agent_store::agents_root(repo).join(author.as_str()),
+    )
+    .unwrap()
+    .current::<serde_json::Value>(crate::agent_store::Bound::Outage)
+    .unwrap()
+    .is_some()
 }
 
 /// Serve each agent's first Stop over a real writer, then retire, on a
@@ -2910,25 +2903,22 @@ fn served_then_retired(
     finished.recv_timeout(Duration::from_secs(60)).ok()
 }
 
-/// An agent's process holding its binding lock for the whole serve stalls
-/// nothing: both agents' reports are served and the monitor retires while
-/// the lock is still held, and the outage notice the lock guards stands.
+/// Another process holding an agent's state lock for the whole serve
+/// (through the test-only registry, so no descriptor of it can leak into
+/// a child) stalls nothing: both agents' reports are served and the
+/// monitor retires while the lock is held, the held agent's turn record
+/// and outage notice left as they were. Its release wakes the loop, whose
+/// retry writes the turn record it left unwritten.
 #[test]
-fn a_held_binding_lock_stalls_no_serve_and_leaves_the_notice() {
+fn a_held_state_lock_stalls_no_serve_and_its_release_writes_what_it_left() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (repo, authors, state) = runtime.block_on(two_agents_claude_told());
-    let lock = crate::agent_store::agents_root(repo.path()).join("claude/binding.lock");
-    let (held_tx, held) = std::sync::mpsc::channel();
-    let (release, released) = std::sync::mpsc::channel::<()>();
-    let holder = std::thread::spawn(move || {
-        let _lock = crate::agent_store::exclusive_lock(&lock).unwrap();
-        held_tx.send(()).unwrap();
-        let _ = released.recv();
-    });
-    held.recv().unwrap();
+    let claude = crate::agent_store::agents_root(repo.path()).join("claude");
+    let before = crate::cli::turn_custody::load_stored(&claude);
+    let held = crate::cli::github::log::tests::hold_paths(std::slice::from_ref(&claude));
 
-    let (shutdown, read) = served_then_retired(repo.path(), state, &authors)
-        .expect("the monitor waited on the agent's binding lock");
+    let (shutdown, read) = served_then_retired(repo.path(), state.clone(), &authors)
+        .expect("the monitor waited on the agent's state lock");
     assert!(
         matches!(
             shutdown,
@@ -2943,9 +2933,23 @@ fn a_held_binding_lock_stalls_no_serve_and_leaves_the_notice() {
         );
     }
     assert!(told(repo.path(), &authors[0]), "nothing was cleared");
+    assert_eq!(
+        crate::cli::turn_custody::load_stored(&claude),
+        before,
+        "nothing was written under the held lock"
+    );
+    assert!(
+        crate::cli::github::log::found_held()
+            .iter()
+            .any(|(path, _)| path == &claude),
+        "the loop waits for its release"
+    );
 
-    release.send(()).unwrap();
-    holder.join().unwrap();
+    served_retried_then_retired(repo.path(), state, &authors, move || held.release());
+    let written = crate::cli::turn_custody::load_stored(&claude)
+        .expect("the retry wrote the turn record the held lock left");
+    assert_eq!(written.binding.as_str(), SESSION);
+    assert_ne!(Some(written), before);
 }
 
 /// A process holding `blocks.lock` for the whole test stalls no serve: with
@@ -3878,12 +3882,161 @@ async fn a_loop_waits_only_on_its_own_repos_locks() {
     assert!(releases.watching.is_empty());
 }
 
-/// With the binding lock free, the first serve ends the outage.
+/// With the agent's state lock free, the first serve ends the outage.
 #[test]
-fn a_free_binding_lock_lets_the_serve_clear_the_notice() {
+fn a_free_state_lock_lets_the_serve_clear_the_notice() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (repo, authors, state) = runtime.block_on(two_agents_claude_told());
     assert!(told(repo.path(), &authors[0]));
     served_then_retired(repo.path(), state, &authors).expect("served");
     assert!(!told(repo.path(), &authors[0]));
+}
+
+/// Every inbox event is at-least-once until acked, whichever session it
+/// was presented to (I3): a timer event, a command event and a message,
+/// presented and delivered to one session and never acked, are still owed
+/// and presented to the session bound after it, and each is owed until it
+/// is acked.
+#[tokio::test]
+async fn unacked_inbox_events_outlive_a_rebind_until_each_is_acked() {
+    use crate::cli::github::log::{EventLog, Transport as Wal};
+    let (repo, author, timer) = timer_repo();
+    log_timer_event(repo.path(), &timer);
+    let command = clank_core::agent_config::CommandSource {
+        interrupt: false,
+        interrupt_message: None,
+        name: "mail".into(),
+        command: vec!["example-mail-watch".into()],
+        reply_command: None,
+        receipt_command: None,
+        glyph: None,
+        stop_grace: None,
+    };
+    crate::agent_store::update_agent_config(repo.path(), &author, |config| {
+        config
+            .wait_events
+            .push(clank_core::agent_config::WaitEventSource::Command(
+                command.clone(),
+            ));
+    })
+    .unwrap();
+    let events = crate::agent_store::agents_root(repo.path()).join("claude/events");
+    EventLog::open(&events, &command.source_key())
+        .unwrap()
+        .append_inbox(
+            Wal::Command,
+            Some("mail-1"),
+            None,
+            None,
+            &WaitItem::CommandEvent {
+                presentation: None,
+                source_cwd: None,
+                name: "mail".into(),
+                id: "mail-1".into(),
+                event: "mail".into(),
+                content: "a letter arrived".into(),
+                at: None,
+                failure: false,
+                requires_reply: false,
+                reply_route: None,
+                selector: None,
+            },
+        )
+        .unwrap();
+    crate::inbox::deliver(repo.path(), &author, None, "1", "Rebase please").unwrap();
+    let state = folded(repo.path()).await.unwrap();
+    let owed = || {
+        owed_now(
+            repo.path(),
+            &state,
+            &author,
+            &Default::default(),
+            &mut Default::default(),
+            &[],
+        )
+        .unwrap()
+    };
+    let kinds = |items: &[WaitItem]| {
+        let mut kinds: Vec<&'static str> = items
+            .iter()
+            .map(|item| match item {
+                WaitItem::TimerEvent { .. } => "timer",
+                WaitItem::CommandEvent { .. } => "command",
+                WaitItem::Message { .. } => "message",
+                other => panic!("only inbox events are owed: {other:?}"),
+            })
+            .collect();
+        kinds.sort();
+        kinds
+    };
+    assert_eq!(kinds(&owed()), ["command", "message", "timer"]);
+
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let present = |turns: &mut Turns, conn: u64, session: &str| {
+        let g = gather(
+            repo.path(),
+            Some(&state),
+            &author,
+            &Default::default(),
+            &mut Default::default(),
+            &[],
+        );
+        let mut report = stop_report();
+        if let Report::TurnEnd { stop, .. } = &mut report {
+            stop.session = clank_core::SessionId::parse(session).unwrap();
+        }
+        let frame = turns.answer(&author, conn, &report, true, &g).unwrap();
+        let presentation = frame.presentation().expect("presented").clone();
+        let carried = turns
+            .state(&author)
+            .unwrap()
+            .outstanding
+            .as_ref()
+            .unwrap()
+            .identities
+            .len();
+        let commit = turns
+            .result(&author, conn, TurnResult::Delivered { presentation }, &g)
+            .unwrap()
+            .expect("the delivery commits");
+        (carried, commit)
+    };
+    let (carried, commit) = present(&mut turns, 1, SESSION);
+    assert_eq!(carried, 3, "all three are presented to the first session");
+    commit.run(repo.path()).await;
+
+    const REBOUND: &str = "session-rebound";
+    crate::agent_store::bind_session_to_agent(
+        repo.path(),
+        &author,
+        clank_core::Tool::Claude,
+        &clank_core::SessionId::parse(REBOUND).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        kinds(&owed()),
+        ["command", "message", "timer"],
+        "the rebind drops none of them"
+    );
+    let (carried, commit) = present(&mut turns, 2, REBOUND);
+    assert_eq!(carried, 3, "all three are presented to the rebound session");
+    commit.run(repo.path()).await;
+
+    let mut left = owed();
+    while let Some(item) = left.pop() {
+        let presented = item.presentation().expect("an inbox event acks").clone();
+        crate::cli::events::ack_members(
+            repo.path(),
+            &[crate::cli::github::timeline::MemberKey {
+                agent: crate::cli::watch_store::Producer::Agent(author.clone()),
+                source: presented.source,
+                seq: presented.seq,
+                ident: presented.ident,
+            }],
+        )
+        .unwrap();
+        let after = owed();
+        assert_eq!(after.len(), left.len(), "each is owed until it is acked");
+        left = after;
+    }
 }

@@ -555,7 +555,7 @@ mod tests {
         for path in [
             ".clank/agents/a/feedback/abc.md",
             ".clank/finished/a.md",
-            ".clank/agents/a/binding.lock",
+            ".clank/agents/a/events/messages.lock",
             ".clank/cache/x.bin",
             ".git/HEAD",
         ] {

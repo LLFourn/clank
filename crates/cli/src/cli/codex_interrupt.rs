@@ -39,9 +39,7 @@ pub(crate) async fn try_wake(
 }
 
 fn target(repo: &Path, label: &AgentLabel) -> Option<(String, PathBuf)> {
-    let session = crate::agent_store::load_agent_config(repo, label)
-        .ok()??
-        .session?;
+    let session = crate::agent_store::binding(repo, label).ok()??;
     if session.tool != Tool::Codex {
         return None;
     }

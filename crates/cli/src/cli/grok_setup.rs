@@ -38,8 +38,7 @@ pub(super) fn profile(repo: &Path, label: &AgentLabel) -> Result<Provider> {
         .context("this repo has no operating roster")?;
     let desc = super::agent::find_in_set(&set, label)
         .context("the selected Grok agent is not on this repo's roster")?;
-    let cfg = crate::agent_store::load_agent_config(repo, label)?;
-    let actual = match cfg.as_ref().and_then(|c| c.session.as_ref()) {
+    let actual = match crate::agent_store::binding(repo, label)? {
         Some(session) => session.tool,
         None => super::fork::load_fork_spec(repo, label)?.map_or(desc.tool, |spec| spec.tool),
     };

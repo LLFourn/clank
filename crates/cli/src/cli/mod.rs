@@ -60,7 +60,7 @@ pub(crate) mod pane_target;
 pub mod pick;
 pub(crate) mod plan_mutation;
 pub mod plan_resolve;
-mod presentation;
+pub(crate) mod presentation;
 pub(crate) mod prompt_record;
 pub mod purge;
 pub(crate) mod purge_drop;

@@ -56,15 +56,19 @@ whether its assertions protect the invariant. Reviewers check that.
 ## I3. Inbox events are at-least-once until acked; everything else is best effort.
 
 - Why: per-session delivery records replay work after every rebind.
-- Status: target
-- Today: GitHub, command, timer and message events are re-presented until
-  `clank events ack`, which is intended. Separately,
-  `presentation::Receipts` (`delivered.json`) records which items reached
-  which session, and the monitor reads it (`delivered_to`).
+- Status: holds
+- Scope: GitHub, command, timer and message events are re-presented until
+  `clank events ack`, whichever session they were shown to; a rebind drops
+  none of them. What the bound session was shown, and when, is kept only as
+  that session's `bound.delivered` part of the agent's `state.json`: best
+  effort, read for status and recovery's timing and never for what is
+  presented, and gone with the session at a rebind, so it replays nothing.
 - Terms: a transport attempt is a try to put an item in front of the model;
   a presentation is the model being shown it; an acknowledgement is the agent
   saying it is handled. Only inbox events have acknowledgements.
-- Plans: one-state-file-per-agent
+- Tests: `crates/cli/src/cli/monitor_turn_tests.rs::unacked_inbox_events_outlive_a_rebind_until_each_is_acked`,
+  `crates/cli/src/agent_store/state.rs::a_rebind_drops_every_bound_part_and_keeps_the_kept_ones`,
+  `crates/cli/src/cli/presentation_tests.rs::a_rebind_cannot_land_inside_an_old_sessions_receipt`
 
 ## I4. A hook acts only on what it is given.
 
@@ -91,10 +95,19 @@ whether its assertions protect the invariant. Reviewers check that.
 
 - Why: copies drift, and the code that reconciles them is where the bugs
   live.
-- Status: target
-- Today: an agent's session is stored in `config.json`, `turn.json`,
-  `state.json` and `delivered.json`; `state.json` repeats its role.
-- Plans: one-state-file-per-agent
+- Status: holds
+- Scope: an agent's directory holds `config.json` (what the user sets),
+  `state.json` (every runtime fact, its session once, in `binding`), its
+  history (`nudges.jsonl`), its inbox (`events/`) and its reviews
+  (`feedback/`). What is known of the bound session (`bound`) names no
+  session of its own and goes with it at a rebind, and nothing in
+  `state.json` repeats the roster. Each writer reloads the document under
+  the agent's lock and patches its own part, so no copy of the document is
+  ever written back. Other stores are not audited here.
+- Tests: `crates/cli/src/cli/turn_custody_tests.rs::a_fresh_agent_keeps_exactly_its_files_and_names_its_session_once`,
+  `crates/cli/src/format_fixtures.rs::the_state_document_reads_through_every_part_and_each_writer_keeps_the_rest`,
+  `crates/cli/src/cli/turn_custody_tests.rs::a_stale_turn_record_restores_no_binding_and_no_old_state`,
+  `crates/cli/src/cli/turn_custody_tests.rs::a_question_update_and_a_turn_record_landing_together_both_survive`
 
 ## I7. Only the master raises blocks.
 
@@ -133,11 +146,15 @@ whether its assertions protect the invariant. Reviewers check that.
 - Why: one agent holding a lock would stall serving for every agent.
 - Status: holds
 - Scope: the sweeps covered the locks serving, folding, recovery and
-  hosted timers take: an agent's binding lock, `.clank/blocks.lock`, event
+  hosted timers take: an agent's state lock, `.clank/blocks.lock`, event
   log sidecars, timer ingest leases, and the old file inbox's migration
   (`inbox/.lock` and `messages.writer.lock`), which is removed. The loop
-  only tries the binding lock (an outage notice stands until a serve finds
-  it free), reads blocks without their lock (a read is checked against its
+  only tries an agent's state lock. One found held leaves its write
+  undone: an outage notice stands, a control request is refused as busy,
+  recovery claims and dispatches nothing, and a turn record or a Stop's
+  question evidence is kept in memory. The release wakes the loop, which
+  writes those and folds again, redoing recovery's claim, the ledger and the
+  published state. It reads blocks without their lock (a read is checked against its
   question's generation, and one that cannot settle blocks and owes
   nothing), and takes each event-log sidecar and each timer acceptance's
   ingest lease once, without waiting. A held one leaves that source or
@@ -151,7 +168,8 @@ whether its assertions protect the invariant. Reviewers check that.
   task. `messages.writer.lock` only serializes message writers.
   Corrupt or unreadable logs are skipped as before
   (`event_source::owed_from_sources`), which reads as no events.
-- Tests: `crates/cli/src/cli/monitor_turn_tests.rs::a_held_binding_lock_stalls_no_serve_and_leaves_the_notice`,
+- Tests: `crates/cli/src/cli/monitor_turn_tests.rs::a_held_state_lock_stalls_no_serve_and_its_release_writes_what_it_left`,
+  `crates/cli/src/agent_store/state.rs::a_held_lock_is_contended_for_a_take_that_does_not_wait`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_held_blocks_lock_stalls_no_serve`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_held_event_log_stalls_no_serve_and_the_retry_presents_it`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once`,

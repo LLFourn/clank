@@ -339,9 +339,8 @@ mod tests {
     }
 
     fn bound_to(repo: &Path, label: &str) -> Option<String> {
-        crate::agent_store::load_agent_config(repo, &AgentLabel::parse(label).unwrap())
+        crate::agent_store::binding(repo, &AgentLabel::parse(label).unwrap())
             .unwrap()
-            .and_then(|c| c.session)
             .map(|s| s.id.as_str().to_string())
     }
 

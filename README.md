@@ -851,7 +851,7 @@ empty prompt. An agent parked in its Stop hook is released first (the turn
 ends instead of parking) and looked at again a moment later. Each attempt
 holds the request lock, then the pane's write lock, reads the input, and
 only then asks the monitor whether the agent is still idle, takes the
-label's `binding.lock` and verifies the envelope, key, clock, binding and
+agent's state lock and verifies the envelope, key, clock, binding and
 launch again before it records `dispatching` and types. The monitor's own
 pane writers give way to a reserved pane rather than wait. A person typing between that dump and the write can mix with
 the command; the outcome is then `delivered` or `unconfirmed`, never
@@ -1038,7 +1038,8 @@ nothing now.
 ├── config.json                     # roster + repo config — local-only
 ├── stash/                          # stashed plans
 ├── agents/<label>/
-│   ├── config.json                 # auto-mode, session binding, wait_events
+│   ├── config.json                 # what you set: auto-mode, wait_events
+│   ├── state.json                  # runtime state: binding, turn, questions, recovery
 │   ├── events/                     # inbox WAL (see `clank events`)
 │   ├── nudges.jsonl                # nudge history
 │   └── feedback/<sha>.md           # this agent's review notes
@@ -1231,7 +1232,7 @@ holds. Nothing is shown because nothing else matched.
 A Stop hook's report is evidence that the turn is over whatever the harness's
 own record says: Codex keeps a turn open in its rollout for as long as its
 Stop hook runs. The report is kept in the agent's turn state
-(`.clank/agents/<label>/turn.json`, `stopped`), against the turn and the place
+(`.clank/agents/<label>/state.json`, `bound.turn.stopped`), against the turn and the place
 in the record the hook read, so it survives a monitor restart. It stops
 counting as soon as the record shows a newer turn or more of the same one,
 and when clank delivers something to the agent. When the hook cannot place

@@ -57,7 +57,7 @@ acceptance = []
 version = "1.0.46"
 readme = "1.x, at least 1.0.46, advertising the native Stop decision gate"
 file = "crates/cli/src/cli/grok_setup.rs"
-line = 103
+line = 102
 
 [[harness]]
 name = "OpenCode"

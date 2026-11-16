@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 use clank_core::Tool;
 
+use crate::agent_store::state::{self as doc, Kept};
+
 /// The waits before each retry, in seconds; empty means escalate at once.
 ///
 /// Classes are matched as each harness spells them. A class nobody listed
@@ -648,7 +650,8 @@ pub(crate) enum State {
     Closed,
 }
 
-/// One failed turn's recovery, persisted in [`episode_path`].
+/// One failed turn's recovery, persisted as its session's
+/// [`doc::Bound::Recovery`] part of the agent's state.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Episode {
     pub(crate) session: String,
@@ -1794,6 +1797,10 @@ struct Watched {
     /// A decision is owed once the hold ends, whether or not there is an
     /// episode with a deadline to carry it.
     owed: bool,
+    /// The last decision found the agent's lock held, so nothing of it was
+    /// stored or done: the next fold decides again, and the loop folds
+    /// when the lock is released (I9). No deadline retries it.
+    awaiting_lock: bool,
     /// Answers that arrived during a hold, or whose decision could not be
     /// stored, applied in order by the next decision that is.
     answers: Vec<(AttemptRef, Answer)>,
@@ -2183,9 +2190,11 @@ impl Driver {
         self.agents.values().filter_map(|w| w.working_look).min()
     }
 
-    /// Whether the latest fold left some bound agent unknown.
+    /// Whether the latest fold left some bound agent unknown, or some
+    /// decision found its agent's lock held: either waits for a fold after
+    /// the held lock's release.
     pub(crate) fn awaits_a_complete_fold(&self) -> bool {
-        !self.unknown.is_empty()
+        !self.unknown.is_empty() || self.agents.values().any(|w| w.awaiting_lock)
     }
 
     /// Bring every agent in line with the latest fold.
@@ -2233,6 +2242,7 @@ impl Driver {
                     held_until: None,
                     in_flight: None,
                     owed: false,
+                    awaiting_lock: false,
                     answers: Vec::new(),
                     role: String::new(),
                     ledger: Default::default(),
@@ -2286,6 +2296,7 @@ impl Driver {
                 w.tool = f.session.tool;
                 w.snap = Snapshot::default();
                 w.activity = None;
+                w.published = None;
                 w.reach = Default::default();
             }
             if let Some(waiters) = &self.waiters {
@@ -2457,7 +2468,7 @@ impl Driver {
                 .is_some_and(|at| at <= now)
                 || w.owed
                 || w.in_flight_until.take_if(|at| *at <= now).is_some();
-            let due = due && w.held_until.is_none_or(|at| at <= now);
+            let due = due && !w.awaiting_lock && w.held_until.is_none_or(|at| at <= now);
             if !due {
                 continue;
             }
@@ -2573,16 +2584,14 @@ impl Driver {
     fn publish(&mut self, now: u64) {
         use crate::cli::agent_state::{Activity, Reachability};
         for w in self.agents.values_mut() {
-            let held = w.published.as_ref().filter(|p| p.session == w.session);
+            let held = w.published.as_ref();
             let activity = evidenced(activity(w, now), held, now);
             w.working_look = working_look(&activity, now);
             // A monitor that takes over an agent takes over its clock: the
             // activity it finds published has lasted since it was.
             let since = match (&w.activity, &w.published) {
                 (Some((a, since)), _) if continues(a, &activity) => *since,
-                (None, Some(p)) if continues(&p.activity, &activity) && p.session == w.session => {
-                    p.since
-                }
+                (None, Some(p)) if continues(&p.activity, &activity) => p.since,
                 _ => now,
             };
             // A turn this monitor saw end with no waiter connected dates
@@ -2599,9 +2608,6 @@ impl Driver {
             }
             w.activity = Some((activity.clone(), since));
             let state = crate::cli::agent_state::AgentState {
-                role: w.role.clone(),
-                session: w.session.clone(),
-                tool: w.tool,
                 monitor: self.observer.clone(),
                 activity,
                 since,
@@ -2616,12 +2622,14 @@ impl Driver {
                 asking: w.projection.asking.clone(),
                 repeated: w.projection.repeated,
             };
-            // A state left unpublished by a stale monitor stays owed to
-            // `published`, so the monitor that follows writes it.
+            // A state left unpublished, by a stale monitor or a held lock,
+            // stays owed to `published`: the monitor that follows writes
+            // it, and so does the next publish after the lock's release.
             if w.published.as_ref() != Some(&state)
                 && let Ok(permit) = crate::upgrade::process().permit()
+                && let Ok(session) = clank_core::SessionId::parse(&w.session)
+                && crate::cli::agent_state::store(&w.agent_dir, &session, &state, &permit)
             {
-                crate::cli::agent_state::store(&w.agent_dir, &state, &permit);
                 w.published = Some(state);
             }
         }
@@ -2715,10 +2723,10 @@ fn question_evidence(
     arming: bool,
 ) {
     use super::question_state::{Observation, load, observe, recorded_end};
-    if w.tool != Tool::Claude || !super::question_state::path(&w.agent_dir).exists() {
+    if w.tool != Tool::Claude {
         return;
     }
-    let pending: Vec<super::question_state::Key> = load(&w.agent_dir)
+    let pending: Vec<super::question_state::Key> = load(&w.agent_dir, &w.session)
         .map(|s| s.pending.into_iter().map(|q| q.key).collect())
         .unwrap_or_default();
     // Only a pending call's result is news: a hook ran before the record
@@ -2973,6 +2981,7 @@ fn decision(
         w.owed = true;
         return Vec::new();
     }
+    w.awaiting_lock = false;
     // Read only past the hold, and after any answer is kept: a fault here
     // holds new claims, never the results of claims already made.
     let issued = match load_issued(&w.agent_dir) {
@@ -3014,27 +3023,21 @@ fn decision(
         (true, None) => crate::upgrade::writing().map(Some),
         (false, None) => Ok(None),
     };
-    let stored = permit.map_err(std::io::Error::from).and_then(|permit| {
-        if let Some(permit) = &permit {
-            if high > issued {
-                store_issued_under(&w.agent_dir, high, permit)?;
-            }
-            if durable(&next) != durable(&prev) {
-                store_under(&w.agent_dir, durable(&next), permit)?;
-            }
-        }
-        Ok(permit)
+    let stored = permit.map_err(anyhow::Error::from).and_then(|permit| {
+        let Some(held) = &permit else {
+            return Ok((permit, Claimed::Stored));
+        };
+        let episode = (durable(&next) != durable(&prev)).then(|| durable(&next));
+        let claimed = claim_durably(&w.agent_dir, &w.session, high, episode, held)?;
+        Ok((permit, claimed))
     });
-    let permit = match stored {
-        Ok(permit) => permit,
+    let (permit, claimed) = match stored {
+        Ok(stored) => stored,
         Err(e) => {
-            match e
-                .get_ref()
-                .is_some_and(|inner| inner.is::<crate::upgrade::Stale>())
-            {
+            match e.is::<crate::upgrade::Stale>() {
                 true => tracing::debug!(%author, %e, "recovery left undecided"),
                 false => eprintln!(
-                    "monitor: could not record `{author}`'s recovery, so nothing was done: {e}"
+                    "monitor: could not record `{author}`'s recovery, so nothing was done: {e:#}"
                 ),
             }
             w.held_until = Some(now + RETRY_LOOK);
@@ -3042,6 +3045,12 @@ fn decision(
             return Vec::new();
         }
     };
+    if claimed == Claimed::Contended {
+        tracing::debug!(%author, "recovery left for the agent's lock's release");
+        w.awaiting_lock = true;
+        w.owed = true;
+        return Vec::new();
+    }
     w.in_flight = permit.filter(|_| awaiting_answer(&next));
     w.held_until = None;
     w.owed = false;
@@ -3063,6 +3072,11 @@ fn decision(
     let Some(e) = w.episode.as_ref() else {
         return Vec::new();
     };
+    // Its session lost the label, which forgot the episode with the rest
+    // of what was known of it: nothing is done for a session not bound.
+    if claimed == Claimed::Unbound {
+        return Vec::new();
+    }
     if let Some(Silence {
         since,
         warned: Some(at),
@@ -3149,6 +3163,9 @@ pub(crate) struct Live {
 /// When `w` is next looked at with nothing else happening: a decision it
 /// is owed, its episode's deadline, or the end of a delivery's bound.
 fn next_look(w: &Watched) -> Option<u64> {
+    if w.awaiting_lock {
+        return None;
+    }
     let held = w.held_until.unwrap_or(0);
     if w.owed {
         return Some(held);
@@ -3459,40 +3476,74 @@ fn fallback_identity(work: &[String]) -> String {
     format!("fallback-{h:016x}")
 }
 
-/// The highest attempt number issued to the agent: control state, not
-/// history, and never forgotten with an episode.
-fn issued_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("recovery-issued.json")
+/// What storing a decision's claim came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claimed {
+    Stored,
+    /// The attempt number was stored, and the episode was not: its session
+    /// no longer holds the label.
+    Unbound,
+    /// Another process held the agent's lock: nothing was stored.
+    Contended,
 }
 
-/// The highest attempt number issued, zero when none ever was. A file
-/// that is there but cannot be read is an error, never zero.
-pub(crate) fn load_issued(agent_dir: &Path) -> std::io::Result<u32> {
-    match std::fs::read(issued_path(agent_dir)) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(e),
+/// Store a decision's claim in one transaction, without waiting for the
+/// agent's lock (I9): the attempt number `high`, which the stored
+/// high-water mark is raised to and never lowered from, and `episode`,
+/// when it changed, as `session`'s while that session holds the label.
+fn claim_durably(
+    agent_dir: &Path,
+    session: &str,
+    high: u32,
+    episode: Option<Option<&Episode>>,
+    permit: &crate::upgrade::Permit,
+) -> anyhow::Result<Claimed> {
+    let session = clank_core::SessionId::parse(session)?;
+    let episode = episode
+        .map(|e| e.map(stored_episode).transpose())
+        .transpose()?;
+    let claimed = doc::try_transact(agent_dir, permit, |txn| {
+        let issued: u32 = txn.kept(Kept::Issued)?.unwrap_or(0);
+        if high > issued {
+            txn.keep(Kept::Issued, Some(&high))?;
+        }
+        Ok(match &episode {
+            Some(episode) if !txn.patch(&session, doc::Bound::Recovery, episode.as_ref())? => {
+                Claimed::Unbound
+            }
+            _ => Claimed::Stored,
+        })
+    })?;
+    Ok(claimed.unwrap_or(Claimed::Contended))
+}
+
+/// `ep` as stored, naming no session: the binding is its session, and
+/// the launch it was opened under is that session's.
+fn stored_episode(ep: &Episode) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(ep)?;
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("session");
+        if let Some(launch) = fields.get_mut("bound").and_then(|b| b.as_object_mut()) {
+            launch.remove("session");
+        }
     }
+    Ok(value)
+}
+
+/// The highest attempt number issued, zero when none ever was: control
+/// state, not history, and never forgotten with an episode. One that is
+/// there but cannot be read is an error, never zero.
+pub(crate) fn load_issued(agent_dir: &Path) -> anyhow::Result<u32> {
+    Ok(doc::State::load(agent_dir)?
+        .kept(Kept::Issued)?
+        .unwrap_or(0))
 }
 
 #[cfg(test)]
-pub(crate) fn store_issued(agent_dir: &Path, n: u32) -> std::io::Result<()> {
-    store_issued_under(agent_dir, n, &crate::upgrade::writing()?)
-}
-
-fn store_issued_under(
-    agent_dir: &Path,
-    n: u32,
-    _permit: &crate::upgrade::Permit,
-) -> std::io::Result<()> {
-    let path = issued_path(agent_dir);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&n)?)?;
-    std::fs::rename(&tmp, &path)
-}
-
-pub(crate) fn episode_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("recovery.json")
+pub(crate) fn store_issued(agent_dir: &Path, n: u32) -> anyhow::Result<()> {
+    doc::transact(agent_dir, &crate::upgrade::writing()?, |txn| {
+        txn.keep(Kept::Issued, Some(&n))
+    })
 }
 
 /// What the agent was told when its episode escalated, while it still
@@ -3503,34 +3554,38 @@ pub(crate) fn waiting_for_you(agent_dir: &Path) -> Option<String> {
         .and_then(|ep| ep.notice)
 }
 
+/// The episode of whichever session holds the label.
 pub(crate) fn load(agent_dir: &Path) -> Option<Episode> {
-    let raw = std::fs::read_to_string(episode_path(agent_dir)).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-/// Persist, or remove, the agent's episode.
-#[cfg(test)]
-pub(crate) fn store(agent_dir: &Path, ep: Option<&Episode>) -> std::io::Result<()> {
-    store_under(agent_dir, ep, &crate::upgrade::writing()?)
-}
-
-fn store_under(
-    agent_dir: &Path,
-    ep: Option<&Episode>,
-    _permit: &crate::upgrade::Permit,
-) -> std::io::Result<()> {
-    let path = episode_path(agent_dir);
-    match ep {
-        None => match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        },
-        Some(ep) => {
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec_pretty(ep)?)?;
-            std::fs::rename(&tmp, &path)
-        }
+    let (bound, mut episode) = doc::State::load(agent_dir)
+        .ok()?
+        .current::<serde_json::Map<String, serde_json::Value>>(doc::Bound::Recovery)
+        .ok()??;
+    episode.insert("session".into(), bound.id.as_str().into());
+    if let Some(launch) = episode.get_mut("bound").and_then(|b| b.as_object_mut()) {
+        launch.insert("session".into(), bound.id.as_str().into());
     }
+    serde_json::from_value(serde_json::Value::Object(episode)).ok()
+}
+
+/// Persist, or remove, the agent's episode, as its session's.
+#[cfg(test)]
+pub(crate) fn store(agent_dir: &Path, ep: Option<&Episode>) -> anyhow::Result<()> {
+    let permit = crate::upgrade::writing()?;
+    let session = match ep {
+        Some(ep) => clank_core::SessionId::parse(&ep.session)?,
+        None => {
+            doc::State::load(agent_dir)?
+                .binding()?
+                .ok_or_else(|| anyhow::anyhow!("no session is bound"))?
+                .id
+        }
+    };
+    let value = ep.map(stored_episode).transpose()?;
+    let patched = doc::transact(agent_dir, &permit, |txn| {
+        txn.patch(&session, doc::Bound::Recovery, value.as_ref())
+    })?;
+    anyhow::ensure!(patched, "the episode's session is not bound");
+    Ok(())
 }
 
 /// A helper's answer to one attempt.
@@ -4442,6 +4497,7 @@ pub(crate) mod tests {
                 "transcript": record,
             }))
             .unwrap();
+        crate::agent_store::state::tests::bind_session(dir, &session);
         Facts {
             author: label(),
             agent_dir: dir.to_path_buf(),
@@ -4624,6 +4680,12 @@ pub(crate) mod tests {
             files.sort();
             files
         };
+        let other = tempfile::tempdir().unwrap();
+        let record = other.path().join("rollout.jsonl");
+        append(&record, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
+        let other_facts = codex_facts(other.path(), &record, "session-two", true, false);
+        let other_state = crate::agent_store::state::path(other.path());
+        let bound = std::fs::read(&other_state).unwrap();
 
         installed.replace(1);
         assert!(
@@ -4656,20 +4718,8 @@ pub(crate) mod tests {
         assert_eq!(recorded(), settled, "nothing after the answer is written");
 
         // A monitor stale before it ever looked claims and sends nothing.
-        let other = tempfile::tempdir().unwrap();
-        let record = other.path().join("rollout.jsonl");
-        append(&record, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
         let mut late = driver();
-        late.reconcile(
-            vec![codex_facts(
-                other.path(),
-                &record,
-                "session-two",
-                true,
-                false,
-            )],
-            0,
-        );
+        late.reconcile(vec![other_facts], 0);
         let acts = late.due(60, |_, _| Gate::Go);
         assert!(
             dispatches(&acts).is_empty(),
@@ -4677,8 +4727,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             std::fs::read_dir(other.path()).unwrap().count(),
-            1,
-            "only the agent's own record is there"
+            2,
+            "only the agent's own record and its binding are there"
+        );
+        assert_eq!(
+            std::fs::read(&other_state).unwrap(),
+            bound,
+            "nothing claimed"
         );
     }
 
@@ -4975,14 +5030,13 @@ pub(crate) mod tests {
             )],
             0,
         );
-        let blocked = episode_path(dir.path()).with_extension("json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
+        let blocked = block_storage(dir.path());
         assert!(d.due(60, |_, _| Gate::Go).is_empty());
         assert_eq!(d.next_due(), Some(60 + RETRY_LOOK), "held, not due at once");
         assert!(d.due(61, |_, _| Gate::Go).is_empty());
         assert_eq!(load(dir.path()).unwrap().attempts, [], "nothing claimed");
 
-        std::fs::remove_dir(&blocked).unwrap();
+        unblock_storage(blocked);
         let acts = d.due(60 + RETRY_LOOK, |_, _| Gate::Go);
         assert_eq!(dispatches(&acts).len(), 1, "{acts:?}");
         assert_eq!(load(dir.path()).unwrap().attempts.len(), 1);
@@ -5004,6 +5058,7 @@ pub(crate) mod tests {
                 "id": "session-one", "tool": "codex", "updated_at": "2026-10-06T00:00:00Z",
             }))
             .unwrap();
+        crate::agent_store::state::tests::bind_session(home.path(), &session);
         let f = Facts {
             author: label(),
             agent_dir: home.path().to_path_buf(),
@@ -5346,15 +5401,29 @@ pub(crate) mod tests {
         assert!(waiting_for_you(dir.path()).is_some(), "{acts:?}");
     }
 
+    /// `e`, as an episode of the session bound in `dir`.
+    fn bound_in(dir: &Path, e: Option<Episode>) -> Option<Episode> {
+        const SESSION: &str = "session-one";
+        crate::agent_store::state::tests::bind(dir, Tool::Codex, SESSION);
+        e.map(|e| Episode {
+            session: SESSION.into(),
+            bound: e.bound.map(|b| Bound {
+                session: SESSION.into(),
+                ..b
+            }),
+            ..e
+        })
+    }
+
     #[test]
     fn only_an_escalated_episode_is_waiting_for_a_person() {
         let dir = tempfile::tempdir().unwrap();
         let s = snap([started("t1"), failed("t1", "server_error")]);
-        let waiting = decide(None, &s, &ctx(0, HELPER, None)).0;
+        let waiting = bound_in(dir.path(), decide(None, &s, &ctx(0, HELPER, None)).0);
         store(dir.path(), waiting.as_ref()).unwrap();
         assert_eq!(waiting_for_you(dir.path()), None, "still being retried");
         let s = snap([started("t1"), failed("t1", "billing_error")]);
-        let escalated = decide(None, &s, &ctx(0, HELPER, None)).0;
+        let escalated = bound_in(dir.path(), decide(None, &s, &ctx(0, HELPER, None)).0);
         store(dir.path(), escalated.as_ref()).unwrap();
         assert!(waiting_for_you(dir.path()).is_some_and(|t| t.contains("billing_error")));
     }
@@ -5402,7 +5471,7 @@ pub(crate) mod tests {
     fn an_episode_survives_the_disk() {
         let dir = tempfile::tempdir().unwrap();
         let s = snap([started("t1"), failed("t1", "server_error")]);
-        let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
+        let ep = bound_in(dir.path(), decide(None, &s, &ctx(0, HELPER, None)).0);
         store(dir.path(), ep.as_ref()).unwrap();
         assert_eq!(load(dir.path()), ep);
         store(dir.path(), None).unwrap();
@@ -5687,6 +5756,7 @@ pub(crate) mod tests {
                 "id": "session-one", "tool": "codex", "updated_at": "2026-10-06T00:00:00Z",
             }))
             .unwrap();
+        crate::agent_store::state::tests::bind_session(home.path(), &session);
         let f = Facts {
             author: label(),
             agent_dir: home.path().to_path_buf(),
@@ -5710,10 +5780,25 @@ pub(crate) mod tests {
         assert!(acts.contains(&Act::Watch(watch_of(&rollout))), "{acts:?}");
     }
 
-    fn block_storage(dir: &Path) -> PathBuf {
-        let blocked = episode_path(dir).with_extension("json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
-        blocked
+    /// Make the agent's state unwritable, reads still working, until
+    /// [`unblock_storage`].
+    fn block_storage(dir: &Path) -> crate::agent_store::state::tests::Unwritable {
+        crate::agent_store::state::tests::unwritable(dir)
+    }
+
+    fn unblock_storage(blocked: crate::agent_store::state::tests::Unwritable) {
+        drop(blocked);
+    }
+
+    /// Store `issued` as the attempt number's raw value, readable or not.
+    fn write_issued(dir: &Path, issued: impl Into<serde_json::Value>) {
+        let path = crate::agent_store::state::path(dir);
+        let mut raw: serde_json::Value = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| serde_json::json!({"version": 1}));
+        raw["issued"] = issued.into();
+        std::fs::write(path, raw.to_string()).unwrap();
     }
 
     /// An agent of `tool` whose turn failed, armed with `transport`, and
@@ -6147,7 +6232,7 @@ pub(crate) mod tests {
         assert!(touched(&mut d, &rollout, 62).is_empty());
         assert_eq!(d.next_due(), held, "an event during the hold wrote nothing");
 
-        std::fs::remove_dir(&blocked).unwrap();
+        unblock_storage(blocked);
         d.due(61 + RETRY_LOOK, |_, _| Gate::Go);
         assert_eq!(
             load(dir.path()).unwrap().attempts[0].disposition,
@@ -6179,7 +6264,7 @@ pub(crate) mod tests {
         );
         assert_eq!(waiting_for_you(dir.path()), None, "{acts:?}");
         assert_eq!(d.next_due(), Some(RETRY_LOOK));
-        std::fs::remove_dir(&blocked).unwrap();
+        unblock_storage(blocked);
         let acts = d.due(RETRY_LOOK, |_, _| Gate::Go);
         assert!(waiting_for_you(dir.path()).is_some(), "{acts:?}");
         assert_eq!(d.next_due(), None);
@@ -6218,7 +6303,7 @@ pub(crate) mod tests {
         append(&rollout, &[&line(STARTED, "t2"), &line(DONE, "t2")]);
         assert!(touched(&mut d, &rollout, 62).is_empty());
 
-        std::fs::remove_dir(&blocked).unwrap();
+        unblock_storage(blocked);
         let acts = d.due(61 + RETRY_LOOK, |_, _| Gate::Go);
         assert_eq!(waiting_for_you(dir.path()), None, "{acts:?}");
         let ep = load(dir.path()).unwrap();
@@ -6259,7 +6344,7 @@ pub(crate) mod tests {
         append(&rollout, &[&line(STARTED, "p1"), &line(&billing, "p1")]);
         assert!(touched(&mut d, &rollout, 62).is_empty());
 
-        std::fs::remove_dir(&blocked).unwrap();
+        unblock_storage(blocked);
         let acts = d.due(61 + RETRY_LOOK, |_, _| Gate::Go);
         assert!(
             waiting_for_you(dir.path()).is_some_and(|t| t.contains("billing_error")),
@@ -6272,14 +6357,7 @@ pub(crate) mod tests {
     /// `prompt` of session-one asks a question, the session bound as the
     /// question hook requires.
     fn ask(dir: &Path, prompt: &str) {
-        std::fs::write(
-            dir.join("config.json"),
-            serde_json::json!({"session": {
-                "id": "session-one", "tool": "claude", "updated_at": "2026-10-05T00:00:00Z",
-            }})
-            .to_string(),
-        )
-        .unwrap();
+        crate::agent_store::state::tests::bind(dir, Tool::Claude, "session-one");
         crate::cli::question_state::observe(
             dir,
             [crate::cli::question_state::Observation::Asked {
@@ -7066,10 +7144,6 @@ pub(crate) mod tests {
         let s = published(dir.path()).unwrap();
         assert_eq!(s.activity, Activity::Unobserved);
         assert_eq!(s.owed, None, "nothing owed puts it in no case");
-        assert_eq!(
-            (s.session.as_str(), s.role.as_str()),
-            ("session-one", "master")
-        );
 
         d.reconcile(
             vec![codex_facts(
@@ -7439,10 +7513,10 @@ pub(crate) mod tests {
     fn an_unreadable_issued_number_claims_nothing() {
         enable(Tool::Codex, Some(Transport::Typed));
         let (dir, _record, mut d) = idle_codex();
-        std::fs::write(issued_path(dir.path()), "not a number").unwrap();
+        write_issued(dir.path(), "not a number");
         let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
         assert!(dispatches(&acts).is_empty(), "{acts:?}");
-        std::fs::write(issued_path(dir.path()), "7").unwrap();
+        write_issued(dir.path(), 7);
         let acts = d.due(IDLE_WAITS[0] + RETRY_LOOK, |_, _| Gate::Go);
         assert_eq!(dispatches(&acts)[0].0.n, 8);
     }
@@ -7454,9 +7528,9 @@ pub(crate) mod tests {
     fn an_issued_number_fault_keeps_answers() {
         for answer in [Answer::Submitted { started: None }, Answer::Indeterminate] {
             let (dir, _record, mut d, attempt) = claimed_codex();
-            std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+            write_issued(dir.path(), "corrupt");
             d.answer(&label(), &attempt, answer.clone(), 181);
-            std::fs::write(issued_path(dir.path()), attempt.n.to_string()).unwrap();
+            write_issued(dir.path(), attempt.n);
             d.due(181 + RETRY_LOOK, |_, _| Gate::Go);
             let want = match answer {
                 Answer::Submitted { .. } => Disposition::Submitted,
@@ -7480,7 +7554,7 @@ pub(crate) mod tests {
     #[test]
     fn folds_inside_a_hold_do_not_move_it() {
         let (dir, record, mut d, _) = claimed_codex();
-        std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+        write_issued(dir.path(), "corrupt");
         let f = || vec![codex_facts(dir.path(), &record, "session-one", true, false)];
         d.reconcile(f(), 181);
         let until = d.agents.get(&label()).unwrap().held_until;
@@ -7498,7 +7572,7 @@ pub(crate) mod tests {
         for change in ["work cleared", "auto off"] {
             enable(Tool::Codex, Some(Transport::Typed));
             let (dir, record, mut d) = idle_codex();
-            std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+            write_issued(dir.path(), "corrupt");
             let mut f = codex_facts(dir.path(), &record, "session-one", true, false);
             d.reconcile(vec![f.clone()], 1);
             match change {
@@ -7506,7 +7580,7 @@ pub(crate) mod tests {
                 _ => f.auto = false,
             }
             d.reconcile(vec![f], 2);
-            std::fs::write(issued_path(dir.path()), "0").unwrap();
+            write_issued(dir.path(), 0);
             let acts = d.due(1 + RETRY_LOOK, |_, _| Gate::Go);
             assert!(dispatches(&acts).is_empty(), "{change}: {acts:?}");
             match change {
@@ -7573,7 +7647,7 @@ pub(crate) mod tests {
             let (dir, record, mut d, old) = claimed_codex();
             let repair = match hold {
                 "issued number" => {
-                    std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+                    write_issued(dir.path(), "corrupt");
                     None
                 }
                 _ => Some(block_storage(dir.path())),
@@ -7585,8 +7659,8 @@ pub(crate) mod tests {
             );
             assert!(!d.may_send(&label(), &old, &reviewer_live()), "{hold}");
             match repair {
-                None => std::fs::write(issued_path(dir.path()), old.n.to_string()).unwrap(),
-                Some(blocked) => std::fs::remove_dir(blocked).unwrap(),
+                None => write_issued(dir.path(), old.n),
+                Some(blocked) => unblock_storage(blocked),
             }
             d.due(182 + RETRY_LOOK, |_, _| Gate::Go);
             let ep = load(dir.path()).unwrap();
@@ -7896,7 +7970,7 @@ pub(crate) mod tests {
             let (dir, _record, mut d, old) = claimed_codex();
             let repair = match hold {
                 "issued number" => {
-                    std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+                    write_issued(dir.path(), "corrupt");
                     None
                 }
                 _ => Some(block_storage(dir.path())),
@@ -7904,8 +7978,8 @@ pub(crate) mod tests {
             relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 1);
             assert!(!d.may_send(&label(), &old, &live("master")), "{hold}");
             match repair {
-                None => std::fs::write(issued_path(dir.path()), old.n.to_string()).unwrap(),
-                Some(blocked) => std::fs::remove_dir(blocked).unwrap(),
+                None => write_issued(dir.path(), old.n),
+                Some(blocked) => unblock_storage(blocked),
             }
             d.due(IDLE_WAITS[0] + 1 + RETRY_LOOK, |_, _| Gate::Go);
             let ep = load(dir.path()).unwrap();
@@ -8073,7 +8147,7 @@ pub(crate) mod tests {
         assert!(go(&mut d, WARN).is_empty());
         assert!(warnings(dir.path()).is_empty(), "growth before the warning");
         assert!(
-            !episode_path(dir.path()).exists(),
+            load(dir.path()).is_none(),
             "an unwarned period is not written"
         );
         assert_eq!(d.next_due(), Some(1000 + WARN));
@@ -8355,6 +8429,7 @@ pub(crate) mod tests {
         // Past the bound, a record event alone is decided as recovery:
         // no deadline has to have cleared the delivery first.
         let moved = tempfile::tempdir().unwrap();
+        crate::agent_store::state::tests::bind_session(moved.path(), &f.session);
         let mut d = driver();
         let there = Facts {
             agent_dir: moved.path().to_path_buf(),
@@ -8373,6 +8448,7 @@ pub(crate) mod tests {
         // The same facts met long after by a monitor that never saw the
         // delivery begin: an expired one holds nothing back.
         let fresh = tempfile::tempdir().unwrap();
+        crate::agent_store::state::tests::bind_session(fresh.path(), &f.session);
         let mut d = driver();
         d.reconcile(
             vec![Facts {
@@ -9612,7 +9688,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("record.jsonl");
         append(&record, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
-        std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+        write_issued(dir.path(), "corrupt");
         let f = codex_facts(dir.path(), &record, "session-one", true, false);
         let mut d = driver();
         d.reconcile(vec![f.clone()], 1);
@@ -9623,7 +9699,7 @@ pub(crate) mod tests {
             Some(1 + RETRY_LOOK),
             "and the decision is due"
         );
-        std::fs::write(issued_path(dir.path()), "0").unwrap();
+        write_issued(dir.path(), 0);
         go(&mut d, 1 + RETRY_LOOK);
         assert_eq!(load(dir.path()).map(|e| e.kind), Some(Kind::Idle));
     }

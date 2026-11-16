@@ -39,14 +39,6 @@ const ROOTS: &[&str] = &[
 /// Readers of policy and of state the monitor owns, and what each reads.
 const DENIED: &[(&str, &str)] = &[
     ("crate::agent_store::load_agent_config", "an agent's config"),
-    (
-        "crate::agent_store::load_all_agent_configs",
-        "every agent's config",
-    ),
-    (
-        "crate::agent_store::load_all_agent_configs_lossy",
-        "every agent's config",
-    ),
     ("crate::agent_store::resolve_role", "a role decision"),
     ("crate::agent_store::repo_config::read", "the repo config"),
     ("crate::cli::watch_store::read", "the repo config"),
@@ -126,17 +118,25 @@ const EXCEPTIONS: &[Exception] = &[
     },
     Exception {
         at: "crate::agent_store::binding_in",
-        may: &["clank_user_config::versioned::read"],
-        keys: &["session"],
+        may: &["clank_user_config::versioned::read_stored"],
+        keys: &["binding"],
         targets: &["Binding"],
-        why: "the session an agent's config binds, parsed as identity alone",
+        why: "the session an agent's state binds, parsed as identity alone",
     },
     Exception {
         at: "crate::agent_store::identity::mutate",
-        may: &["clank_user_config::versioned::read"],
-        keys: &["session", "resume_pending"],
+        may: &["clank_user_config::versioned::read_stored"],
+        keys: &["binding", "resume_pending", "bound"],
         targets: &["Identity"],
-        why: "rewrites only the binding's own fields, preserving policy unparsed",
+        why: "rewrites only the binding's own fields, and on a rebind drops the old session's \
+              `bound` record unparsed; every other part is preserved unparsed",
+    },
+    Exception {
+        at: "crate::agent_store::state::path",
+        may: &["state.json"],
+        keys: &[],
+        targets: &[],
+        why: "the binding lives in the agent's state document",
     },
     Exception {
         at: "crate::agent_store::agents_root",
@@ -144,13 +144,6 @@ const EXCEPTIONS: &[Exception] = &[
         keys: &[],
         targets: &[],
         why: "where every agent's binding lives",
-    },
-    Exception {
-        at: "crate::agent_store::agent_config_path",
-        may: &["agents_root("],
-        keys: &[],
-        targets: &[],
-        why: "the binding is kept in the agent's config",
     },
     Exception {
         at: "crate::agent_store::identity::binding",
@@ -167,11 +160,11 @@ const EXCEPTIONS: &[Exception] = &[
         why: "a session clank did not launch is found by every agent's binding",
     },
     Exception {
-        at: "crate::agent_store::BindingGuard::acquire",
+        at: "crate::agent_store::StateGuard::acquire",
         may: &["agents_root("],
         keys: &[],
         targets: &[],
-        why: "the binding's lock lives in the agent's directory",
+        why: "the binding's lock is the agent's directory",
     },
 ];
 
@@ -832,23 +825,19 @@ fn a_binding_struct_that_grows_a_policy_field_is_caught() {
             "pub mod agent_store {{\n\
              pub fn binding_in(path: &std::path::Path) -> anyhow::Result<Option<u8>> {{\n\
              #[derive(serde::Deserialize)] struct Binding {{ {fields} }}\n\
-             let Some(doc) = clank_user_config::versioned::read(path, 1)? else {{ return Ok(None); }};\n\
-             let binding: Binding = serde_json::from_value(serde_json::Value::Object(doc))?;\n\
-             Ok(binding.session)\n}} }}\n\
+             let Some(stored) = clank_user_config::versioned::read_stored(path, 1)? else {{ return Ok(None); }};\n\
+             let binding: Binding = serde_json::from_value(serde_json::Value::Object(stored.doc))?;\n\
+             Ok(binding.binding)\n}} }}\n\
              pub fn run() {{ let _ = agent_store::binding_in(std::path::Path::new(\"\")); }}\n"
         )
     };
-    let (_dir, g) = fixture(&[("lib.rs", &lib("session: Option<u8>"))]);
+    let (_dir, g) = fixture(&[("lib.rs", &lib("binding: Option<u8>"))]);
     let v = violations(&g, &["crate::run"], EXCEPTIONS);
     assert!(v.is_empty(), "{v:?}");
-    let (_dir, g) = fixture(&[(
-        "lib.rs",
-        &lib("session: Option<u8>, outage_notified: Option<u8>"),
-    )]);
+    let (_dir, g) = fixture(&[("lib.rs", &lib("binding: Option<u8>, bound: Option<u8>"))]);
     let v = violations(&g, &["crate::run"], EXCEPTIONS);
     assert!(
-        v.iter()
-            .any(|v| v.contains("deserializes `Binding.outage_notified`")),
+        v.iter().any(|v| v.contains("deserializes `Binding.bound`")),
         "{v:?}"
     );
 }

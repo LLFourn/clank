@@ -5,8 +5,8 @@
 //! editing it and saving it back with no lock. Two overlapping writers
 //! meant the later one put back the earlier one's stale view, and an
 //! `auto_mode: "off"` the user had just set came back `"on"` minutes
-//! later. `agent_store` now holds the label's `binding.lock` from the
-//! load to the rename, and this gate keeps the bypasses closed:
+//! later. `agent_store` now holds the agent's lock from the load to
+//! the rename, and this gate keeps the bypasses closed:
 //!
 //! - `save_agent_config` is named nowhere outside `agent_store`, test
 //!   code included. It is private, so the compiler already refuses a
@@ -32,11 +32,6 @@ const READ_ONLY_SITES: &[(&str, &str, &str)] = &[
         "\"config.json\",",
         "the REPO's `.clank/config.json` as a name the watcher wakes on, \
          not an agent's config, and never written",
-    ),
-    (
-        "cli/src/cli/doctor.rs",
-        "agent_config_path(repo, label).display(),",
-        "names the file in a diagnostic",
     ),
     (
         "cli/src/cli/doctor.rs",

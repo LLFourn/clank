@@ -31,20 +31,15 @@ fn commit(repo: &Path, msg: &str) {
 
 fn bind_session(env: &TestEnv, label: &str, tool: clank_core::vocab::Tool, id: &str) {
     let l = clank_core::ids::AgentLabel::parse(label).unwrap();
-    let cfg = clank_core::agent_config::AgentConfig {
-        auto_mode: None,
-        session: Some(clank_core::agent_config::Session {
-            id: clank_core::ids::SessionId::parse(id).unwrap(),
-            tool,
-            updated_at: "2026-06-10T12:00:00Z".to_string(),
-            transcript: None,
-        }),
-        wait_events: Vec::new(),
-        resume_pending: None,
-        outage_notified: None,
-        extra: Default::default(),
-    };
-    clank::agent_store::update_agent_config(env.repo(), &l, |stored| *stored = cfg).unwrap();
+    clank::agent_store::update_agent_config(env.repo(), &l, |stored| *stored = Default::default())
+        .unwrap();
+    clank::agent_store::bind_session_to_agent(
+        env.repo(),
+        &l,
+        tool,
+        &clank_core::ids::SessionId::parse(id).unwrap(),
+    )
+    .unwrap();
     write_transcript(env.home(), tool, id);
 }
 
@@ -364,7 +359,12 @@ fn fork_carbon_copies_per_agent_settings_not_session() {
         .unwrap()
         .unwrap();
     assert_eq!(dst.auto_mode, Some(AutoMode::Off), "explicit auto carried");
-    assert!(dst.session.is_none(), "session is NOT copied");
+    assert!(
+        clank::agent_store::binding(&dest, &claude)
+            .unwrap()
+            .is_none(),
+        "session is NOT copied"
+    );
 
     // codex (source auto unset) → nothing to carry, so no
     // dest config is written; the fork inherits the global default.
@@ -391,7 +391,14 @@ fn fork_carbon_copies_per_agent_settings_not_session() {
         .unwrap()
         .unwrap();
     assert_eq!(after.auto_mode, Some(AutoMode::Off), "auto survives bind");
-    assert_eq!(after.session.unwrap().id, new_sid, "new session bound");
+    assert_eq!(
+        clank::agent_store::binding(&dest, &claude)
+            .unwrap()
+            .unwrap()
+            .id,
+        new_sid,
+        "new session bound"
+    );
 }
 
 #[test]
@@ -425,20 +432,15 @@ fn fork_from_worktree_lands_sibling_under_main_not_nested() {
         ),
     ] {
         let l = clank_core::ids::AgentLabel::parse(label).unwrap();
-        let cfg = clank_core::agent_config::AgentConfig {
-            auto_mode: None,
-            session: Some(clank_core::agent_config::Session {
-                id: clank_core::ids::SessionId::parse(id).unwrap(),
-                tool,
-                updated_at: "2026-06-17T00:00:00Z".to_string(),
-                transcript: None,
-            }),
-            wait_events: Vec::new(),
-            resume_pending: None,
-            outage_notified: None,
-            extra: Default::default(),
-        };
-        clank::agent_store::update_agent_config(&b, &l, |stored| *stored = cfg).unwrap();
+        clank::agent_store::update_agent_config(&b, &l, |stored| *stored = Default::default())
+            .unwrap();
+        clank::agent_store::bind_session_to_agent(
+            &b,
+            &l,
+            tool,
+            &clank_core::ids::SessionId::parse(id).unwrap(),
+        )
+        .unwrap();
     }
 
     // C: fork FROM B.

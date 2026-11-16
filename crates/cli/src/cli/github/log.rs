@@ -899,6 +899,36 @@ impl IngestLease {
 static HELD_ELSEWHERE: std::sync::Mutex<std::collections::BTreeMap<PathBuf, bool>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Take the exclusive flock of `file`, open at `path`, as `locking` says:
+/// `false` only under [`Locking::Try`], when another open file holds it,
+/// which is recorded for [`found_held`] so the monitor's loop waits for
+/// its release (I9).
+pub(crate) fn lock_exclusive(
+    path: &Path,
+    file: &std::fs::File,
+    locking: Locking,
+) -> std::io::Result<bool> {
+    #[cfg(test)]
+    if !elsewhere::admits(path, locking) {
+        held_elsewhere(path, true);
+        return Ok(false);
+    }
+    let held = match locking {
+        Locking::Try => clank_user_config::lease::take_now(file)?,
+        Locking::Wait => loop {
+            match rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive) {
+                Ok(()) => break true,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        },
+    };
+    if !held {
+        held_elsewhere(path, true);
+    }
+    Ok(held)
+}
+
 fn held_elsewhere(path: &Path, exclusive: bool) {
     *HELD_ELSEWHERE
         .lock()
@@ -930,12 +960,17 @@ pub(crate) fn when_released(path: &Path, exclusive: bool) -> std::io::Result<()>
     #[cfg(test)]
     elsewhere::admits(path, Locking::Wait);
     let waited = (|| {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
+        // A directory is locked through a read-only open: one cannot be
+        // opened for writing.
+        let file = match path.is_dir() {
+            true => std::fs::File::open(path)?,
+            false => std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)?,
+        };
         let op = if exclusive {
             rustix::fs::FlockOperation::LockExclusive
         } else {
@@ -4456,6 +4491,13 @@ pub(crate) mod tests {
             .collect();
         super::elsewhere::hold(&paths);
         Held(paths)
+    }
+
+    /// Another process's hold on the lock at each of `paths`, until
+    /// released or dropped.
+    pub(crate) fn hold_paths(paths: &[PathBuf]) -> Held {
+        super::elsewhere::hold(paths);
+        Held(paths.to_vec())
     }
 
     /// Whether a take of `source`'s ingest lease ever waited on its

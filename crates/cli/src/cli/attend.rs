@@ -42,8 +42,7 @@ pub(crate) fn session_of(
     if let Some((_, session)) = crate::agent_env::detect_session_from_env()? {
         return Ok(session);
     }
-    crate::agent_store::load_agent_config(repo, label)?
-        .and_then(|c| c.session)
+    crate::agent_store::binding(repo, label)?
         .map(|s| s.id)
         .ok_or_else(|| {
             anyhow::anyhow!("no session is bound to `{label}`, so there is nothing to attend for")

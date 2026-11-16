@@ -388,7 +388,9 @@ fn an_unresolved_identity_is_refused_and_creates_nothing() {
 
     let repo = team();
     write(
-        &crate::agent_store::agent_config_path(repo.path(), &label("boss")),
+        &crate::agent_store::state::path(
+            &crate::agent_store::agents_root(repo.path()).join("boss"),
+        ),
         "{ not json",
     );
     let err = format!(

@@ -11951,9 +11951,6 @@ mod tests {
         View {
             owed: None,
             state: AgentState {
-                role: "master".into(),
-                session: "s1".into(),
-                tool: clank_core::Tool::Claude,
                 monitor: Observer {
                     pid: 1,
                     birth: None,

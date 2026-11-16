@@ -1,13 +1,11 @@
 //! Persist only successful model-delivery boundaries, independently of callbacks.
 //! Selection metadata travels with work; viewing the inbox never calls this.
+use crate::agent_store::state::Bound;
 use clank_core::{
     AgentLabel,
     wait::{AnswerRef, EventPresentation},
 };
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::Path};
 
 /// What one presentation carried to the model.
 #[derive(Debug, Default)]
@@ -20,34 +18,25 @@ pub(crate) struct Carried {
     pub(crate) identities: Vec<String>,
 }
 
-/// What reached the model in one session, by item identity: the only proof
-/// that an item was delivered to the binding that holds the label now.
-///
-/// An event log's `presentation` record names no session, and review work
-/// has no log at all, so neither can say which binding saw an item.
-#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Receipts {
-    pub(crate) session: String,
-    /// Unix seconds of each item's first delivery to `session`.
-    pub(crate) delivered: BTreeMap<String, u64>,
-}
-
 /// Receipts kept for one session. Past this the oldest are dropped, whose
 /// items read as not delivered and are presented again.
 const RECEIPTS_KEPT: usize = 2048;
 
-pub(crate) fn receipts_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("delivered.json")
-}
-
-/// When each item reached `session`. Empty when the receipts on disk are
-/// another session's, missing, or unreadable: none of those is a delivery.
+/// When each item reached `session` (unix seconds of its first delivery),
+/// while `session` holds the label: the monitor's evidence of what the
+/// bound session was shown, kept as its [`Bound::Delivered`] part and gone
+/// with it at a rebind. Empty for any other session, or one that cannot
+/// be read: none of those is a delivery.
+///
+/// An event log's `presentation` record names no session, and review work
+/// has no log at all, so neither can say which binding saw an item.
 pub(crate) fn delivered_to(agent_dir: &Path, session: &str) -> BTreeMap<String, u64> {
-    std::fs::read(receipts_path(agent_dir))
+    let Ok(session) = clank_core::SessionId::parse(session) else {
+        return BTreeMap::new();
+    };
+    crate::agent_store::state::State::load(agent_dir)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<Receipts>(&bytes).ok())
-        .filter(|r| r.session == session)
-        .map(|r| r.delivered)
+        .and_then(|state| state.bound(&session, Bound::Delivered).ok().flatten())
         .unwrap_or_default()
 }
 
@@ -55,64 +44,60 @@ pub(crate) fn delivered_to(agent_dir: &Path, session: &str) -> BTreeMap<String, 
 /// session holds the label. `false` when it does not, and nothing is
 /// written.
 ///
-/// One transaction under the label's binding lock, which `guard` is: the
-/// binding is compared and the receipts read, merged and replaced with no
-/// bind, rebind or other receipt able to land between. A delivery whose
-/// session has since lost the label can therefore never replace its
-/// successor's receipts, and two deliveries never lose each other's.
+/// One transaction under the agent's lock, which `guard` is: the binding
+/// is compared and the receipts read, merged and replaced with no bind,
+/// rebind or other receipt able to land between. A delivery whose session
+/// has since lost the label can therefore never replace its successor's
+/// receipts, and two deliveries never lose each other's.
 pub(crate) fn receive(
-    guard: &crate::agent_store::BindingGuard,
+    guard: &crate::agent_store::StateGuard,
     tool: clank_core::Tool,
     session: &str,
     identities: &[String],
     at: u64,
     permit: &crate::upgrade::Permit,
-) -> std::io::Result<bool> {
+) -> anyhow::Result<bool> {
     receive_with(guard, tool, session, identities, at, permit, |_| {})
 }
 
 /// [`receive`], calling `before_write` with the label's directory once the
 /// receipts are merged and before they replace the file.
 fn receive_with(
-    guard: &crate::agent_store::BindingGuard,
+    guard: &crate::agent_store::StateGuard,
     tool: clank_core::Tool,
     session: &str,
     identities: &[String],
     at: u64,
-    _permit: &crate::upgrade::Permit,
+    permit: &crate::upgrade::Permit,
     before_write: impl FnOnce(&Path),
-) -> std::io::Result<bool> {
+) -> anyhow::Result<bool> {
     if !guard.bound_to(tool, session) {
         return Ok(false);
     }
     if identities.is_empty() {
         return Ok(true);
     }
+    let session = clank_core::SessionId::parse(session)?;
     let agent_dir = guard.agent_dir();
-    let mut delivered = delivered_to(&agent_dir, session);
-    for identity in identities {
-        delivered.entry(identity.clone()).or_insert(at);
-    }
-    while delivered.len() > RECEIPTS_KEPT {
-        let oldest = delivered
-            .iter()
-            .min_by_key(|(_, at)| **at)
-            .map(|(identity, _)| identity.clone());
-        match oldest {
-            Some(identity) => delivered.remove(&identity),
-            None => break,
-        };
-    }
-    before_write(&agent_dir);
-    let receipts = Receipts {
-        session: session.to_string(),
-        delivered,
-    };
-    let path = receipts_path(&agent_dir);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&receipts)?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(true)
+    crate::agent_store::state::under(agent_dir, guard.lock(), permit, |txn| {
+        let mut delivered: BTreeMap<String, u64> =
+            txn.bound(&session, Bound::Delivered)?.unwrap_or_default();
+        for identity in identities {
+            delivered.entry(identity.clone()).or_insert(at);
+        }
+        while delivered.len() > RECEIPTS_KEPT {
+            let oldest = delivered
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(identity, _)| identity.clone());
+            match oldest {
+                Some(identity) => delivered.remove(&identity),
+                None => break,
+            };
+        }
+        before_write(agent_dir);
+        txn.patch(&session, Bound::Delivered, Some(&delivered))
+    })
 }
 
 /// The one record of a wake that reached the model in `session` of
@@ -140,18 +125,16 @@ pub(crate) fn record_delivered(
     }
     let received = match carried.identities.is_empty() {
         true => Ok(true),
-        false => crate::agent_store::hold_binding(repo, author)
-            .map_err(std::io::Error::other)
-            .and_then(|guard| {
-                receive(
-                    &guard,
-                    tool,
-                    session,
-                    &carried.identities,
-                    super::github::log::now_epoch(),
-                    permit,
-                )
-            }),
+        false => crate::agent_store::hold_state(repo, author).and_then(|guard| {
+            receive(
+                &guard,
+                tool,
+                session,
+                &carried.identities,
+                super::github::log::now_epoch(),
+                permit,
+            )
+        }),
     };
     if let Err(e) = received {
         eprintln!(

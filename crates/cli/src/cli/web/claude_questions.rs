@@ -90,10 +90,9 @@ impl Registry {
             .filter(|(_, desc)| desc.tool == Tool::Claude)
             .map(|(label, _)| label);
         let mut found = labels.filter(|label| {
-            crate::agent_store::load_agent_config(&self.repo, label)
+            crate::agent_store::binding(&self.repo, label)
                 .ok()
                 .flatten()
-                .and_then(|c| c.session)
                 .is_some_and(|s| s.tool == Tool::Claude && s.id.as_str() == session)
         });
         let first = found.next()?.as_str().to_owned();
@@ -132,10 +131,9 @@ impl Registry {
         let Ok(label) = AgentLabel::parse(agent) else {
             return false;
         };
-        crate::agent_store::load_agent_config(&self.repo, &label)
+        crate::agent_store::binding(&self.repo, &label)
             .ok()
             .flatten()
-            .and_then(|c| c.session)
             .is_some_and(|s| s.tool == Tool::Claude)
     }
     /// Existing repo observation and bridge shutdown are the lifecycle owners.
@@ -162,10 +160,9 @@ impl Registry {
                 if desc.tool != Tool::Claude {
                     continue;
                 }
-                if let Some(session) = crate::agent_store::load_agent_config(&self.repo, &label)
+                if let Some(session) = crate::agent_store::binding(&self.repo, &label)
                     .ok()
                     .flatten()
-                    .and_then(|c| c.session)
                     .filter(|s| s.tool == Tool::Claude)
                 {
                     current.insert(
@@ -1126,10 +1123,10 @@ mod tests {
         registry.pre(hook.clone());
         let (_, receiver) = registry.permission(&hook).unwrap();
         let label = AgentLabel::parse("claude-question-agent").unwrap();
-        crate::agent_store::update_agent_config(repo.path(), &label, |config| {
-            config.session = None
-        })
-        .unwrap();
+        let bound = crate::agent_store::binding(repo.path(), &label)
+            .unwrap()
+            .unwrap();
+        assert!(crate::agent_store::release_binding(repo.path(), &label, &bound.id).unwrap());
         registry.feed.question_claim(
             label.as_str(),
             Some(Window {

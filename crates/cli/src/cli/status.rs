@@ -334,14 +334,16 @@ fn roster_auto_rows(
                 config_failed(config_errors, e);
                 clank_core::vocab::AutoMode::Off
             });
-        let session = cfg.as_ref().and_then(|c| c.session.clone());
+        let session = crate::agent_store::binding(repo, label).unwrap_or_else(|e| {
+            config_failed(config_errors, e);
+            None
+        });
         if let Err(why) = crate::cli::agent_state::read(
             &crate::agent_store::agents_root(repo).join(label.as_str()),
         ) {
             config_failed(config_errors, anyhow::anyhow!(why));
         }
-        let state =
-            crate::cli::agent_state::view(repo, label, session.as_ref().map(|s| s.id.as_str()));
+        let state = crate::cli::agent_state::view(repo, label);
         // What the monitor holds of the agent's turns, only while what it
         // published still describes this binding.
         let current = state
@@ -4892,35 +4894,31 @@ pub(crate) mod dirty_and_wake_tests {
         .unwrap();
         let dir = crate::agent_store::agents_root(repo.path()).join("claude");
         let me = std::process::id() as i32;
-        let role = crate::agent_store::resolve_role(repo.path(), &label)
-            .map(|r| r.to_string())
-            .unwrap_or_default();
         crate::cli::monitor::publish(
             repo.path(),
             &crate::cli::monitor::describe(repo.path(), me, std::path::Path::new("socket")),
         )
         .unwrap();
-        let shown = |count: u32, session: &str| {
-            std::fs::create_dir_all(&dir).unwrap();
-            crate::cli::agent_state::store(
-                &dir,
-                &crate::cli::agent_state::AgentState {
-                    role: role.clone(),
-                    session: session.into(),
-                    tool: clank_core::Tool::Claude,
-                    monitor: crate::cli::agent_state::Observer::me(),
-                    activity: crate::cli::agent_state::Activity::Idle,
-                    since: 0,
-                    reachability: Default::default(),
-                    owed: None,
-                    nudge: crate::cli::agent_state::Nudge::Nothing,
-                    cannot_resume: None,
-                    attending: Vec::new(),
-                    asking: Some("Life monitor".into()),
-                    repeated: Some(count),
-                },
-                &crate::upgrade::process().permit().unwrap(),
-            );
+        let shown = |count: Option<u32>| {
+            if let Some(count) = count {
+                assert!(crate::cli::agent_state::store(
+                    &dir,
+                    &clank_core::SessionId::parse("session-one").unwrap(),
+                    &crate::cli::agent_state::AgentState {
+                        monitor: crate::cli::agent_state::Observer::me(),
+                        activity: crate::cli::agent_state::Activity::Idle,
+                        since: 0,
+                        reachability: Default::default(),
+                        owed: None,
+                        nudge: crate::cli::agent_state::Nudge::Nothing,
+                        cannot_resume: None,
+                        attending: Vec::new(),
+                        asking: Some("Life monitor".into()),
+                        repeated: Some(count),
+                    },
+                    &crate::upgrade::process().permit().unwrap(),
+                ));
+            }
 
             let set = crate::cli::teams_config::RegisteredSet {
                 master: label.clone(),
@@ -4934,12 +4932,16 @@ pub(crate) mod dirty_and_wake_tests {
             let row = roster_auto_rows(repo.path(), None, &set, &mut Vec::new()).remove(0);
             (row.repeated, row.asking)
         };
+        assert_eq!(shown(Some(5)), (Some(5), Some("Life monitor".into())));
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &label,
+            clank_core::Tool::Claude,
+            &clank_core::SessionId::parse("session-two").unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            shown(5, "session-one"),
-            (Some(5), Some("Life monitor".into()))
-        );
-        assert_eq!(
-            shown(5, "session-old"),
+            shown(None),
             (None, None),
             "another session's count and question"
         );
@@ -4968,19 +4970,17 @@ pub(crate) mod dirty_and_wake_tests {
         assert_eq!(errors, Vec::<String>::new(), "no state is no error");
 
         std::fs::write(
-            dir.join("state.json"),
-            r#"{"role":"master","session":"s","attending":[{"attended":{"by":"a newer shape"}}]}"#,
+            crate::agent_store::state::path(&dir),
+            r#"{"version":2,"bound":{"projection":{"attending":[{"attended":{"by":"a newer shape"}}]}}}"#,
         )
         .unwrap();
         let rows = roster_auto_rows(repo.path(), None, &set, &mut errors);
         assert!(rows[0].attending.is_empty());
-        let [said] = errors.as_slice() else {
-            panic!("{errors:?}");
-        };
         assert!(
-            said.contains("state.json was written by a clank build this one cannot read")
-                && said.contains("not absent"),
-            "{said}"
+            errors.iter().any(|said| said
+                .contains("state.json was written by a clank build this one cannot read")
+                && said.contains("not absent")),
+            "{errors:?}"
         );
         let mut snap = minimal_snapshot();
         snap.config_errors = errors;
@@ -5014,9 +5014,6 @@ pub(crate) mod dirty_and_wake_tests {
         let state = |stale| View {
             owed: None,
             state: AgentState {
-                role: "commit".into(),
-                session: "s1".into(),
-                tool: clank_core::Tool::Codex,
                 monitor: Observer {
                     pid: 1,
                     birth: None,
@@ -5069,9 +5066,6 @@ pub(crate) mod dirty_and_wake_tests {
             row.state = Some(View {
                 owed: None,
                 state: AgentState {
-                    role: "commit".into(),
-                    session: "s1".into(),
-                    tool: clank_core::Tool::Claude,
                     monitor: Observer {
                         pid: 1,
                         birth: None,
@@ -5124,9 +5118,6 @@ pub(crate) mod dirty_and_wake_tests {
             delivery: Delivery::NotDelivered,
         };
         let state = AgentState {
-            role: "standby".into(),
-            session: "s1".into(),
-            tool: clank_core::Tool::Codex,
             monitor: Observer {
                 pid: 1,
                 birth: None,
@@ -5193,9 +5184,6 @@ pub(crate) mod dirty_and_wake_tests {
             delivery: Delivery::NotDelivered,
         };
         let state = |owed: Option<Owing>| AgentState {
-            role: "standby".into(),
-            session: "s1".into(),
-            tool: clank_core::Tool::Grok,
             monitor: Observer {
                 pid: 1,
                 birth: None,

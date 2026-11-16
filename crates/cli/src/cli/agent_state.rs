@@ -1,21 +1,20 @@
 //! What clank knows of each agent right now, as the monitor reconciles it,
-//! published for status and the TUI.
+//! published for status and the TUI as the bound session's
+//! [`Bound::Projection`] part of the agent's state: a new binding starts
+//! with none.
 //!
 //! A projection, never authority: nothing decides from a published state.
 //! The monitor decides from its own fold and record reads, and writes this
-//! only when it changes in meaning. A reader shows it stale once its stamps
-//! no longer match the agent's binding, its role, or the living monitor.
+//! only when it changes in meaning. A reader shows it stale once the
+//! monitor that published it is not the living one.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use clank_core::Tool;
+use crate::agent_store::state::{self, Bound};
 
-/// One agent's state, stamped with who observed it.
+/// One agent's state, stamped with the monitor that observed it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AgentState {
-    pub(crate) role: String,
-    pub(crate) session: String,
-    pub(crate) tool: Tool,
     pub(crate) monitor: Observer,
     pub(crate) activity: Activity,
     /// Unix seconds: when `activity` last changed, as the monitor saw it.
@@ -34,11 +33,7 @@ pub(crate) struct AgentState {
     pub(crate) cannot_resume: Option<String>,
     /// Every piece of background work the agent attends, as the monitor
     /// holds it.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "one_or_many"
-    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) attending: Vec<Attended>,
     /// The header of the question the agent is waiting on a person to
     /// answer, while one is pending in its bound session.
@@ -94,12 +89,7 @@ pub(crate) enum Reachability {
 
 /// What the agent is doing, by its record's latest turn.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(
-    tag = "is",
-    content = "why",
-    rename_all = "snake_case",
-    from = "stored::Activity"
-)]
+#[serde(tag = "is", content = "why", rename_all = "snake_case")]
 pub(crate) enum Activity {
     /// Its latest turn is open, no Stop was reported for it, and its
     /// record moved inside the stall window.
@@ -127,44 +117,6 @@ pub(crate) struct Moving {
     /// Unix seconds: when that write falls out of the stall window, and
     /// stops being evidence.
     pub(crate) until: u64,
-}
-
-mod stored {
-    /// [`super::Activity`] as any build wrote it. `working` carried no
-    /// evidence before it had to, and reads as a turn that is open.
-    /// `unwatched` took a lost wait for a turn's end, which it is not
-    /// evidence of, and reads as unknown.
-    #[derive(serde::Deserialize)]
-    #[serde(tag = "is", content = "why", rename_all = "snake_case")]
-    pub(super) enum Activity {
-        Working(Option<super::Moving>),
-        TurnOpen,
-        Unwatched,
-        Idle,
-        Failed(String),
-        Asking,
-        Interrupted,
-        Unknown(String),
-        Unobserved,
-    }
-
-    impl From<Activity> for super::Activity {
-        fn from(a: Activity) -> Self {
-            match a {
-                Activity::Working(Some(moving)) => Self::Working(moving),
-                Activity::Working(None) | Activity::TurnOpen => Self::TurnOpen,
-                Activity::Unwatched => Self::Unknown(
-                    "published by a build that read a lost wait as its turn's end".into(),
-                ),
-                Activity::Idle => Self::Idle,
-                Activity::Failed(class) => Self::Failed(class),
-                Activity::Asking => Self::Asking,
-                Activity::Interrupted => Self::Interrupted,
-                Activity::Unknown(why) => Self::Unknown(why),
-                Activity::Unobserved => Self::Unobserved,
-            }
-        }
-    }
 }
 
 /// The work clank owes an agent, and what stands between the agent and it.
@@ -292,10 +244,6 @@ pub(crate) enum Nudge {
     WaitingForYou(String),
 }
 
-pub(crate) fn path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("state.json")
-}
-
 /// How long attended work was expected to take, from the moment its
 /// attendance was accepted.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -360,24 +308,6 @@ pub(crate) struct Attended {
     /// the work it may be waiting on, or that it may be running again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rests_on: Option<String>,
-}
-
-/// A state a monitor published before an agent could attend several
-/// things carries one attendance, not a list.
-fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Attended>, D::Error> {
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum Shape {
-        Many(Vec<Attended>),
-        One(Box<Attended>),
-    }
-    Ok(
-        match <Option<Shape> as serde::Deserialize>::deserialize(d)? {
-            Some(Shape::Many(all)) => all,
-            Some(Shape::One(one)) => vec![*one],
-            None => Vec::new(),
-        },
-    )
 }
 
 impl Attended {
@@ -548,48 +478,50 @@ pub(crate) fn load(agent_dir: &Path) -> Option<AgentState> {
     read(agent_dir).ok().flatten()
 }
 
-/// The state published in `agent_dir`: `Ok(None)` when none is, and `Err`
-/// when one is there that this build cannot read, which a reader shows
-/// as that rather than as an agent with no state.
+/// The state published of the session bound in `agent_dir`: `Ok(None)`
+/// when none is, and `Err` when one is there that this build cannot read,
+/// which a reader shows as that rather than as an agent with no state.
 pub(crate) fn read(agent_dir: &Path) -> Result<Option<AgentState>, String> {
-    let path = path(agent_dir);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+    let path = state::path(agent_dir);
+    let unreadable = |e: anyhow::Error| {
         format!(
-            "{} was written by a clank build this one cannot read ({e}); what it says of the              agent is unknown here, not absent",
+            "{} was written by a clank build this one cannot read ({e:#}); what it says of the \
+             agent is unknown here, not absent",
             path.display()
         )
+    };
+    state::State::load(agent_dir)
+        .map_err(unreadable)?
+        .current::<AgentState>(Bound::Projection)
+        .map(|current| current.map(|(_, published)| published))
+        .map_err(unreadable)
+}
+
+/// Publish `published` as what is known of `session`, while it holds the
+/// label. Best effort, and never waits for the agent's lock: whether it
+/// was written, a failed write changing nothing else.
+pub(crate) fn store(
+    agent_dir: &Path,
+    session: &clank_core::SessionId,
+    published: &AgentState,
+    permit: &crate::upgrade::Permit,
+) -> bool {
+    state::try_transact(agent_dir, permit, |txn| {
+        txn.patch(session, Bound::Projection, Some(published))
     })
+    .is_ok_and(|written| written == Some(true))
 }
 
-/// Publish `state`. Best effort: a failed write changes nothing else.
-pub(crate) fn store(agent_dir: &Path, state: &AgentState, _permit: &crate::upgrade::Permit) {
-    let path = path(agent_dir);
-    let tmp = path.with_extension("json.tmp");
-    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
-        let _ = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path));
-    }
-}
-
-/// Why `state` no longer describes the agent, if it does not: another
-/// session is bound, the roster gives another role, or the monitor that
-/// published it is not the living, published one.
+/// Why `state` no longer describes the agent, if it does not: the monitor
+/// that published it is not the living, published one. A new binding or
+/// role is no cause: a binding starts with no state, and the monitor
+/// publishes again when a role change moves what it says.
 pub(crate) fn stale(
     state: &AgentState,
-    session: Option<&str>,
-    role: &str,
     monitor: Option<i32>,
     living: impl Fn(&Observer) -> bool,
 ) -> Option<&'static str> {
-    if session != Some(state.session.as_str()) {
-        Some("another session is bound")
-    } else if role != state.role {
-        Some("its role changed")
-    } else if monitor != Some(state.monitor.pid) || !living(&state.monitor) {
+    if monitor != Some(state.monitor.pid) || !living(&state.monitor) {
         Some("its monitor is gone")
     } else {
         None
@@ -778,23 +710,16 @@ impl Alarm {
     }
 }
 
-/// `label`'s published state, judged against its binding (`session`), its
-/// roster role, and the living, published monitor.
-pub(crate) fn view(
-    repo: &Path,
-    label: &clank_core::ids::AgentLabel,
-    session: Option<&str>,
-) -> Option<View> {
+/// `label`'s published state, judged against the living, published
+/// monitor.
+pub(crate) fn view(repo: &Path, label: &clank_core::ids::AgentLabel) -> Option<View> {
     let state = load(&crate::agent_store::agents_root(repo).join(label.as_str()))?;
-    let role = crate::agent_store::resolve_role(repo, label)
-        .map(|r| r.to_string())
-        .unwrap_or_default();
     let monitor = match crate::cli::monitor::published(repo) {
         crate::cli::monitor::Published::Ours(d) => Some(d.pid),
         _ => None,
     };
     let living = |o: &Observer| o.birth.as_ref().is_some_and(|b| b.still_holds(o.pid));
-    let stale = stale(&state, session, &role, monitor, living);
+    let stale = stale(&state, monitor, living);
     Some(View::at(state, stale, crate::cli::recovery::unix_now()))
 }
 
@@ -1008,9 +933,6 @@ mod tests {
 
     fn state() -> AgentState {
         AgentState {
-            role: "master".into(),
-            session: "s1".into(),
-            tool: Tool::Claude,
             monitor: Observer {
                 pid: 42,
                 birth: None,
@@ -1040,19 +962,35 @@ mod tests {
         })
     }
 
-    /// Each stamp that no longer matches makes the state stale; all of
-    /// them matching does not.
+    /// A state its living, published monitor did not publish is stale.
     #[test]
-    fn a_state_whose_stamps_moved_on_is_stale() {
+    fn a_state_whose_monitor_moved_on_is_stale() {
         let s = state();
         let alive = |_: &Observer| true;
-        assert_eq!(stale(&s, Some("s1"), "master", Some(42), alive), None);
-        assert!(stale(&s, Some("s2"), "master", Some(42), alive).is_some());
-        assert!(stale(&s, None, "master", Some(42), alive).is_some());
-        assert!(stale(&s, Some("s1"), "commit", Some(42), alive).is_some());
-        assert!(stale(&s, Some("s1"), "master", Some(43), alive).is_some());
-        assert!(stale(&s, Some("s1"), "master", None, alive).is_some());
-        assert!(stale(&s, Some("s1"), "master", Some(42), |_| false).is_some());
+        assert_eq!(stale(&s, Some(42), alive), None);
+        assert!(stale(&s, Some(43), alive).is_some());
+        assert!(stale(&s, None, alive).is_some());
+        assert!(stale(&s, Some(42), |_| false).is_some());
+    }
+
+    /// A projection belongs to the session it was published for: another
+    /// session's publish is refused, and a rebind leaves none to show.
+    #[test]
+    fn a_projection_is_its_sessions_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let permit = crate::upgrade::writing().unwrap();
+        crate::agent_store::state::tests::bind(dir.path(), clank_core::Tool::Claude, "session-1");
+        let s1 = clank_core::SessionId::parse("session-1").unwrap();
+        let s2 = clank_core::SessionId::parse("session-2").unwrap();
+        assert!(store(dir.path(), &s1, &state(), &permit));
+        assert_eq!(load(dir.path()), Some(state()));
+        assert!(!store(dir.path(), &s2, &state(), &permit), "not bound");
+        crate::agent_store::state::tests::bind(dir.path(), clank_core::Tool::Claude, "session-2");
+        assert_eq!(
+            load(dir.path()),
+            None,
+            "the old session's state went with it"
+        );
     }
 
     fn unobserved() -> AgentState {
@@ -1172,7 +1110,6 @@ mod tests {
     #[test]
     fn an_unreachable_agent_clank_cannot_resume_says_so() {
         let s = AgentState {
-            tool: Tool::Grok,
             since: 1000,
             reachability: Reachability::NoWaiter { since: Some(1000) },
             owed: Some(owing(
@@ -1514,65 +1451,6 @@ mod tests {
                 delivery: Delivery::NotDelivered,
             })
         );
-    }
-
-    /// A state published before owed work was accounted for, with the
-    /// suppressor list it carried, still loads and says nothing is owed.
-    #[test]
-    fn a_state_published_before_the_ledger_still_loads() {
-        let old: AgentState =
-            serde_json::from_str(include_str!("../../tests/fixtures/formats/state.json")).unwrap();
-        assert_eq!(old.owed, None);
-        assert_eq!(old.activity, Activity::Unobserved);
-        assert_eq!(old.attending.len(), 1);
-        assert_eq!(old.reachability, Reachability::Unknown);
-        assert_eq!(
-            View::at(old, None, 0).row(0).as_deref(),
-            Some("unknown"),
-            "a state that says nothing of a waiter does not rest on one"
-        );
-        let new: AgentState = serde_json::from_str(include_str!(
-            "../../tests/fixtures/formats/state-owing.json"
-        ))
-        .unwrap();
-        let owed = new.owed.unwrap();
-        assert_eq!(owed.case, Case::HandsOff(HandsOff::Blocked("stork".into())));
-        assert_eq!(owed.oldest.since, Since::At(1793845000));
-        assert_eq!(
-            owed.undelivered.unwrap().delivery,
-            Delivery::InFlight(1793845260)
-        );
-    }
-
-    /// A state published before reachability and evidence were kept says
-    /// `working` with nothing behind it: it loads as a turn that is open,
-    /// reachability unknown, and no row spins on it.
-    #[test]
-    fn a_state_published_before_evidence_claims_no_work_and_no_waiter() {
-        let old: AgentState = serde_json::from_str(include_str!(
-            "../../tests/fixtures/formats/state-working.json"
-        ))
-        .unwrap();
-        assert_eq!(old.activity, Activity::TurnOpen);
-        assert_eq!(old.reachability, Reachability::Unknown);
-        let v = View::at(old, None, 1794316320);
-        assert!(!v.working(1794316320));
-        assert_eq!(v.brief(1794316320), "turn open 42m");
-    }
-
-    /// A state published when a lost wait was read as its turn's end says
-    /// `unwatched`: it loads as unknown, never as a turn that is over, so
-    /// nothing reads it as unreachable-and-idle.
-    #[test]
-    fn a_state_published_as_unwatched_claims_no_ended_turn() {
-        let old: AgentState = serde_json::from_str(include_str!(
-            "../../tests/fixtures/formats/state-unwatched.json"
-        ))
-        .unwrap();
-        assert!(matches!(old.activity, Activity::Unknown(_)), "{old:?}");
-        let v = View::at(old, None, 1794316320);
-        assert!(!v.unreachable(1794316320));
-        assert_eq!(v.brief(1794316320), "unknown");
     }
 
     /// What is published now reads back as itself, evidence and waiter

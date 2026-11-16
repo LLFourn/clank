@@ -23,8 +23,8 @@ use crate::vocab::{AutoMode, Tool};
 /// Per-agent, per-machine state for one (label, repo). Lives at
 /// `.clank/agents/<label>/config.json`. Gitignored.
 ///
-/// State only: which session this label is bound to, whether
-/// auto-mode is on, and the wait-for-work timeout. Identity
+/// Configuration only: what the user sets for the agent. Its runtime
+/// state, the session bound to it included, lives in `state.json`. Identity
 /// (role / tool / launch / initial_prompt) lives in the
 /// team-based registration model — user-scope `agents` +
 /// `teams` and repo-scope `team` — not here. Unknown keys, a leftover
@@ -41,42 +41,26 @@ pub struct AgentConfig {
     /// silent `off`. Resolve via [`effective_auto_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_mode: Option<AutoMode>,
-    /// Session this agent label is currently bound to. Written by
-    /// `clank as <label>` (or `clank init` phase 2) using the
-    /// harness's session-id env var.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<Session>,
     /// Extra wake sources for this agent's `clank wait`
     /// (extra-wait-events): things beyond this repo's state — GitHub
     /// activity on OTHER repos, arbitrary command completions. Fixed
     /// at arm time; a config edit takes effect on the next re-arm.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wait_events: Vec<WaitEventSource>,
-    /// A resume `clank agent start` launched that its session has not yet
-    /// confirmed: Claude's SessionStart hook clears it. One left standing
-    /// past the check-in window has the next start forget the binding.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_pending: Option<ResumePending>,
-    /// The session a hook has told that its repo has no monitor. It stands
-    /// for one outage: while it does, that session is not told again, and
-    /// the first monitor to answer it clears it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outage_notified: Option<OutageNotified>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
-/// `session` was told, at `at` (RFC3339 UTC), that no monitor could be had.
+/// The bound session was told, at `at` (RFC3339 UTC), that no monitor
+/// could be had.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutageNotified {
-    pub session: SessionId,
     pub at: String,
 }
 
-/// An unconfirmed resume of `session`.
+/// An unconfirmed resume of the bound session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumePending {
-    pub session: SessionId,
     /// RFC3339 UTC instant of the first unconfirmed attempt; a retry of
     /// the same session keeps it, so retries do not extend the window.
     pub at: String,
@@ -1132,10 +1116,6 @@ mod tests {
 
     use super::*;
 
-    fn session_id(s: &str) -> SessionId {
-        SessionId::parse(s).unwrap()
-    }
-
     #[test]
     fn agent_config_round_trips_defaults() {
         let cfg = AgentConfig::default();
@@ -1143,22 +1123,13 @@ mod tests {
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
         assert_eq!(back.auto_mode, None, "fresh skeleton is unset, not Off");
-        assert!(back.session.is_none());
     }
 
     #[test]
     fn agent_config_round_trips_populated() {
         let cfg = AgentConfig {
             auto_mode: Some(AutoMode::On),
-            session: Some(Session {
-                id: session_id("742f6a04-f174-409a-ab01-419a16c5f372"),
-                tool: Tool::Claude,
-                updated_at: "2026-05-23T16:24:47+10:00".into(),
-                transcript: None,
-            }),
             wait_events: Vec::new(),
-            resume_pending: None,
-            outage_notified: None,
             extra: Default::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
@@ -1179,7 +1150,6 @@ mod tests {
         }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.auto_mode, Some(AutoMode::Off), "explicit off survives");
-        assert!(cfg.session.is_none());
         let back: serde_json::Value = serde_json::to_value(&cfg).unwrap();
         assert_eq!(
             back,
@@ -1203,17 +1173,6 @@ mod tests {
         let json = r#"{ "auto_mode": "wait" }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.auto_mode, Some(AutoMode::On));
-        assert!(cfg.session.is_none());
-    }
-
-    #[test]
-    fn agent_config_omits_none_session() {
-        let cfg = AgentConfig {
-            auto_mode: Some(AutoMode::On),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        assert!(!json.contains("session"), "expected no session key: {json}");
     }
 
     #[test]

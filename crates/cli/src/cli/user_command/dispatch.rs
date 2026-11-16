@@ -6,15 +6,15 @@
 //! and with both held finds the agent's pane again, which must still be the
 //! one recorded at the first look and still run Claude Code, and reads the
 //! input from one dump. Then comes its one commit point: the loop's
-//! readiness answer, then the label's `binding.lock`, and under it the
+//! readiness answer, then the agent's state lock, and under it the
 //! trusted keys and clock, the envelope verified again and the binding read
 //! under the guard; then `dispatching` is persisted and the command typed.
 //! Locks are released in reverse.
 //!
-//! No cycle: the loop takes no `binding.lock`, takes id locks only with a
+//! No cycle: the loop only tries an agent's state lock, takes id locks only with a
 //! try-lock, and never takes a pane lock (its own pane writers run off the
 //! loop and defer on a reserved pane), so asking it while holding the id
-//! and pane locks cannot wait on this attempt. `binding.lock` holders take
+//! and pane locks cannot wait on this attempt. State-lock holders take
 //! no other lock, and ordinary writers hold nothing while they wait for a
 //! pane.
 //!
@@ -270,7 +270,7 @@ pub(crate) trait Seams: Sync {
     async fn discover(&self, label: &AgentLabel) -> Result<(PaneSeen, Tool), String>;
     /// The loop's last look at the agent, asked before any lock but the id's.
     async fn last_look(&self, label: &AgentLabel, session: &SessionId) -> Result<(), String>;
-    /// Hold `label`'s binding lock until the guard is dropped.
+    /// Hold `label`'s state lock until the guard is dropped.
     async fn hold_binding<'a>(
         &'a self,
         label: &'a AgentLabel,
@@ -435,7 +435,7 @@ pub(crate) async fn attempt(
     }
     // The commit point: the loop's readiness, then the keys, the clock and
     // the binding as they are now, with no await between them and the first
-    // byte but taking the binding lock, whose holders take no other lock.
+    // byte but taking the agent's state lock, whose holders take no other lock.
     if let Err(why) = seams.last_look(label, &verified.session).await {
         wait(&mut record, why);
         return Ended::Done;

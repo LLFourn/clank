@@ -1,10 +1,10 @@
-//! Binding-only access for provider adapters. Policy fields stay opaque even
-//! when they share a JSON document with session identity.
+//! Binding-only access for provider adapters. Every other part of an
+//! agent's state stays opaque, even though it shares the document.
 use super::*;
 
 #[derive(Default, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct Identity {
-    pub session: Option<Session>,
+    pub binding: Option<Session>,
     pub resume_pending: Option<ResumePending>,
 }
 
@@ -49,33 +49,42 @@ pub(crate) fn tool(repo: &Path, label: &AgentLabel) -> anyhow::Result<Tool> {
     .map_err(Into::into)
 }
 
-/// Patch only changed identity fields under the same lock used by policy
-/// writers. Unknown and malformed policy values are preserved, not parsed.
+/// Patch only the identity fields, under the agent's lock. Binding a
+/// different session than the one bound (or none) drops everything known
+/// of the old one, `bound` and its unconfirmed resume, in the same write.
+/// The rest of the document is preserved unparsed; one an older build
+/// wrote, with no version, holds nothing to preserve.
 pub(super) fn mutate<T>(
-    guard: &BindingGuard,
+    guard: &StateGuard,
     edit: impl FnOnce(&mut Identity) -> T,
 ) -> anyhow::Result<T> {
-    let path = agent_config_path(guard.repo, guard.label);
-    let mut doc = versioned::read(&path, AGENT_CONFIG_VERSION)?.unwrap_or_default();
-    let before: Identity = serde_json::from_value(serde_json::Value::Object(doc.clone()))?;
+    let path = state::path(guard.agent_dir());
+    let mut doc = match versioned::read_stored(&path, state::VERSION)? {
+        Some(stored) if stored.versioned => stored.doc,
+        _ => Default::default(),
+    };
+    let before: Identity = serde_json::from_value(serde_json::Value::Object(doc.clone()))
+        .map_err(|e| Refusal::malformed(&path, e))?;
     let mut after = before.clone();
     let result = edit(&mut after);
     #[cfg(test)]
     tests::inside_edit();
     if after != before {
-        let before = serde_json::to_value(before)?;
+        let id = |i: &Identity| i.binding.as_ref().map(|s| s.id.clone());
+        if id(&after) != id(&before) {
+            after.resume_pending = None;
+            doc.remove("bound");
+        }
         let after = serde_json::to_value(after)?;
-        for key in ["session", "resume_pending"] {
-            if before[key] != after[key] {
-                if after[key].is_null() {
-                    doc.remove(key);
-                } else {
-                    doc.insert(key.into(), after[key].clone());
-                }
+        for key in ["binding", "resume_pending"] {
+            if after[key].is_null() {
+                doc.remove(key);
+            } else {
+                doc.insert(key.into(), after[key].clone());
             }
         }
         let _permit = crate::upgrade::writing()?;
-        versioned::write(&path, &doc, AGENT_CONFIG_VERSION)?;
+        versioned::write(&path, &doc, state::VERSION)?;
     }
     Ok(result)
 }
@@ -85,14 +94,16 @@ mod boundary_tests {
     use super::*;
 
     #[test]
-    fn hook_identity_ignores_policy_and_preserves_it_during_binding_changes() {
+    fn hook_identity_ignores_every_other_part_and_preserves_it_during_binding_changes() {
         let repo = tempfile::tempdir().unwrap();
         let label = AgentLabel::parse("agent").unwrap();
         let session = SessionId::parse("native-session").unwrap();
-        let path = agent_config_path(repo.path(), &label);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let policy = serde_json::json!({"auto_mode": ["invalid"], "wait_events": "invalid", "outage_notified": 123});
-        std::fs::write(&path, policy.to_string()).unwrap();
+        let dir = agents_root(repo.path()).join(label.as_str());
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = serde_json::json!({"auto_mode": ["invalid"], "wait_events": "invalid"});
+        std::fs::write(config_in(&dir), policy.to_string()).unwrap();
+        let kept = serde_json::json!({"version": 1, "issued": "invalid", "ledger": 123});
+        std::fs::write(state::path(&dir), kept.to_string()).unwrap();
         let roster = serde_json::json!({"agents": {"agent": {"tool":"claude", "role":"master", "launch":42}}, "event_watches": "invalid", "review": false});
         std::fs::write(repo_config::path(repo.path()), roster.to_string()).unwrap();
         assert!(load_agent_config(repo.path(), &label).is_err());
@@ -125,10 +136,13 @@ mod boundary_tests {
         );
         assert!(release_binding(repo.path(), &label, &session).unwrap());
         let after: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        for key in ["auto_mode", "wait_events", "outage_notified"] {
-            assert_eq!(after[key], policy[key]);
+            serde_json::from_slice(&std::fs::read(state::path(&dir)).unwrap()).unwrap();
+        for key in ["issued", "ledger"] {
+            assert_eq!(after[key], kept[key]);
         }
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config_in(&dir)).unwrap()).unwrap();
+        assert_eq!(config, policy, "a binding never touches the config");
     }
 
     /// The rosters the two readers are compared over: the format fixture,
@@ -223,9 +237,9 @@ mod boundary_tests {
             Tool::Claude,
             "native-session"
         ));
-        let path = agent_config_path(repo.path(), &label);
+        let path = state::path(&agents_root(repo.path()).join(label.as_str()));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        for bytes in ["not json", r#"{"session":false}"#] {
+        for bytes in ["not json", r#"{"version":1,"binding":false}"#] {
             std::fs::write(&path, bytes).unwrap();
             assert!(!binding_matches(
                 repo.path(),

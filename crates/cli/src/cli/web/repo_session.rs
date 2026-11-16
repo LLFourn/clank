@@ -417,9 +417,7 @@ fn check_target(
     );
     let label = clank_core::ids::AgentLabel::parse(label)?;
     crate::agent_store::resolve_tool(repo, &label)?;
-    let current = crate::agent_store::load_agent_config(repo, &label)?
-        .and_then(|cfg| cfg.session)
-        .map(|session| session.id.to_string());
+    let current = crate::agent_store::binding(repo, &label)?.map(|session| session.id.to_string());
     anyhow::ensure!(
         current.as_deref() == expected_session,
         "the agent session changed before the action arrived"
@@ -475,7 +473,6 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use clank_core::agent_config::{AgentConfig, Session};
     use clank_core::ids::{AgentLabel, SessionId};
     use clank_core::vocab::Tool;
     use clank_web::bridge::{ActionResult, Backend};
@@ -858,17 +855,13 @@ mod tests {
             );
         }
         let codex = AgentLabel::parse("codex").unwrap();
-        let config = AgentConfig {
-            session: Some(Session {
-                id: SessionId::parse("bound-session").unwrap(),
-                tool: Tool::Codex,
-                updated_at: "2026-09-26T00:00:00Z".into(),
-                transcript: None,
-            }),
-            ..Default::default()
-        };
-        crate::agent_store::update_agent_config(repo.path(), &codex, |stored| *stored = config)
-            .unwrap();
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &codex,
+            Tool::Codex,
+            &SessionId::parse("bound-session").unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             ask(
                 &backend,
@@ -897,10 +890,8 @@ mod tests {
             crate::cli::teams_config::RosterRole::Gate
         );
         assert_eq!(
-            crate::agent_store::load_agent_config(repo.path(), &codex)
+            crate::agent_store::binding(repo.path(), &codex)
                 .unwrap()
-                .unwrap()
-                .session
                 .unwrap()
                 .id,
             SessionId::parse("bound-session").unwrap()
@@ -970,17 +961,13 @@ mod tests {
         assert_eq!(reply(backend.dispatch(ask(None)).await).status, 204);
 
         let label = AgentLabel::parse("grok").unwrap();
-        let config = AgentConfig {
-            session: Some(Session {
-                id: SessionId::parse("session_1").unwrap(),
-                tool: Tool::Grok,
-                updated_at: "2026-01-01T00:00:00Z".into(),
-                transcript: None,
-            }),
-            ..Default::default()
-        };
-        crate::agent_store::update_agent_config(dir.path(), &label, |stored| *stored = config)
-            .unwrap();
+        crate::agent_store::bind_session_to_agent(
+            dir.path(),
+            &label,
+            Tool::Grok,
+            &SessionId::parse("session_1").unwrap(),
+        )
+        .unwrap();
         assert_eq!(reply(backend.dispatch(ask(None)).await).status, 409);
         assert_eq!(
             reply(backend.dispatch(ask(Some("session_1".into()))).await).status,

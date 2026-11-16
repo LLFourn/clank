@@ -115,14 +115,12 @@ impl WaitBinding {
         let Some((tool, session)) = &self.0 else {
             return Ok(());
         };
-        let cfg = loaded.ok().flatten();
-        let bound = cfg
+        let binding = crate::agent_store::binding(repo, author).ok().flatten();
+        let bound = binding
             .as_ref()
-            .and_then(|cfg| cfg.session.as_ref())
             .is_some_and(|current| current.tool == *tool && &current.id == session);
         if !bound {
-            let current = cfg
-                .and_then(|cfg| cfg.session)
+            let current = binding
                 .map(|s| format!("{} session {}", s.tool.as_str(), s.id.as_str()))
                 .unwrap_or_else(|| "no current session".into());
             return Err(WaitSuperseded(format!(

@@ -755,7 +755,8 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
     let mut classified: Vec<(String, SeedSource)> = Vec::new();
     for (label, agent) in &fork_roster {
         let cfg = crate::agent_store::load_agent_config(&source, label)?;
-        let (tool, bound) = match cfg.as_ref().and_then(|c| c.session.as_ref()) {
+        let binding = crate::agent_store::binding(&source, label)?;
+        let (tool, bound) = match binding.as_ref() {
             Some(session) => (session.tool, Some(session.id.as_str().to_string())),
             None => (agent.tool, None),
         };
@@ -937,7 +938,6 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
         {
             crate::agent_store::update_agent_config(&dest, label, |cfg| {
                 cfg.auto_mode = src_cfg.auto_mode;
-                cfg.session = None;
                 // Extra wake sources are per-repo watch lists; the
                 // fork's controller context differs — start clean.
                 cfg.wait_events = Vec::new();

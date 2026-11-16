@@ -131,9 +131,8 @@ fn say_with(
             .find(|entry| entry.id == pane)
             .and_then(|entry| clank_core::ids::AgentLabel::parse(&entry.label).ok());
         if let Some(bound) = label
-            .and_then(|label| crate::agent_store::load_agent_config(repo, &label).ok())
+            .and_then(|label| crate::agent_store::binding(repo, &label).ok())
             .flatten()
-            .and_then(|cfg| cfg.session)
             && bound.tool == Tool::Codex
             && native(bound.id.as_str(), &admitted)?
         {
@@ -531,10 +530,9 @@ fn chat_source(
 ) -> Result<(String, clank_core::vocab::Tool, PathBuf), &'static str> {
     let label =
         crate::lifecycle::AgentLabel::parse(name).map_err(|_| "This agent's label is invalid.")?;
-    let cfg = crate::agent_store::load_agent_config(repo, &label)
+    let session = crate::agent_store::binding(repo, &label)
         .map_err(|_| "Clank could not read this agent's session binding.")?
-        .ok_or("This agent has no session binding.")?;
-    let session = cfg.session.ok_or("This agent has no bound session.")?;
+        .ok_or("This agent has no bound session.")?;
     if !transcript::has_adapter(session.tool) {
         return Err("This agent's tool does not provide Chat history.");
     }

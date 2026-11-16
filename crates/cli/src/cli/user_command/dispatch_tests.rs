@@ -190,10 +190,9 @@ impl Seams for Fake {
     }
     fn binding(&self, label: &AgentLabel) -> Option<(Tool, SessionId)> {
         match &self.repo {
-            Some(repo) => crate::agent_store::load_agent_config(repo, label)
+            Some(repo) => crate::agent_store::binding(repo, label)
                 .ok()
                 .flatten()
-                .and_then(|c| c.session)
                 .map(|s| (s.tool, s.id)),
             None => self.binding.lock().unwrap().clone(),
         }
@@ -217,7 +216,7 @@ impl Seams for Fake {
         label: &'a AgentLabel,
     ) -> Result<Box<dyn Send + 'a>, String> {
         match &self.repo {
-            Some(repo) => crate::agent_store::hold_binding(repo, label)
+            Some(repo) => crate::agent_store::hold_state(repo, label)
                 .map(|g| Box::new((g, Held::take(&self.binding_held))) as Box<dyn Send + 'a>)
                 .map_err(|e| format!("{e:#}")),
             None => Ok(Box::new(Held::take(&self.binding_held))),

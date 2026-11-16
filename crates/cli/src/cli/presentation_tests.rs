@@ -1,7 +1,8 @@
 use super::*;
 use clank_core::{SessionId, Tool};
+use std::path::PathBuf;
 
-/// Whether the binding lock was held at the paused write, and the rival
+/// Whether the agent's lock was held at the paused write, and the rival
 /// started there.
 type Paused = std::cell::RefCell<Option<(bool, std::thread::JoinHandle<()>)>>;
 
@@ -39,18 +40,14 @@ fn dir(repo: &Path) -> PathBuf {
     crate::agent_store::agents_root(repo).join("agent")
 }
 
-/// Whether the label's binding lock is free to take at this instant.
-fn binding_lock_is_free(agent_dir: &Path) -> bool {
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(agent_dir.join("binding.lock"))
-        .unwrap();
+/// Whether the agent's lock is free to take at this instant.
+fn agent_lock_is_free(agent_dir: &Path) -> bool {
+    let lock = std::fs::File::open(agent_dir).unwrap();
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok()
 }
 
 /// Deliver `identity` to `session`, pausing between the merge and the
-/// write: note there whether the binding lock is held, and start `rival`
+/// write: note there whether the agent's lock is held, and start `rival`
 /// on a thread of its own, which can only get anywhere once this write is
 /// done. Whether the lock was held, once the rival has finished.
 fn deliver_against(
@@ -62,7 +59,7 @@ fn deliver_against(
     let paused = Paused::new(None);
     {
         let agent = label();
-        let guard = crate::agent_store::hold_binding(repo, &agent).unwrap();
+        let guard = crate::agent_store::hold_state(repo, &agent).unwrap();
         let received = receive_with(
             &guard,
             Tool::Codex,
@@ -71,7 +68,7 @@ fn deliver_against(
             1,
             &crate::upgrade::process().settling(),
             |agent_dir| {
-                let held = !binding_lock_is_free(agent_dir);
+                let held = !agent_lock_is_free(agent_dir);
                 *paused.borrow_mut() = Some((held, std::thread::spawn(rival)));
             },
         );
@@ -83,7 +80,7 @@ fn deliver_against(
 }
 
 /// A delivery commits off the monitor's loop, so two can be publishing at
-/// once. Each merges and writes while it holds the label's binding lock,
+/// once. Each merges and writes while it holds the agent's lock,
 /// which the other needs: a writer paused between its merge and its write
 /// cannot be overtaken, and the delivery that was waiting on it adds to
 /// its receipt rather than replacing it.
@@ -95,7 +92,7 @@ fn concurrent_deliveries_keep_each_others_receipts() {
     let held = deliver_against(repo.path(), "session-one", "first", move || {
         deliver(&path, "session-one", "second")
     });
-    assert!(held, "the merge is made under the binding lock");
+    assert!(held, "the merge is made under the agent's lock");
     let delivered = delivered_to(&dir(repo.path()), "session-one");
     assert_eq!(
         delivered.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -139,15 +136,15 @@ fn an_obsolete_delivery_publishes_nothing() {
     deliver(repo.path(), "session-old", "mine");
     bind(repo.path(), "session-new");
     deliver(repo.path(), "session-new", "theirs");
-    let before = std::fs::read(receipts_path(&dir(repo.path()))).unwrap();
+    let before = std::fs::read(crate::agent_store::state::path(&dir(repo.path()))).unwrap();
     deliver(repo.path(), "session-old", "late");
     assert_eq!(
-        std::fs::read(receipts_path(&dir(repo.path()))).unwrap(),
+        std::fs::read(crate::agent_store::state::path(&dir(repo.path()))).unwrap(),
         before,
         "`current` said yes; the binding, read under its lock, said no"
     );
     let agent = label();
-    let guard = crate::agent_store::hold_binding(repo.path(), &agent).unwrap();
+    let guard = crate::agent_store::hold_state(repo.path(), &agent).unwrap();
     assert!(
         !receive(
             &guard,

@@ -322,10 +322,9 @@ impl Seams for Live {
     }
 
     fn binding(&self, label: &AgentLabel) -> Option<(Tool, SessionId)> {
-        crate::agent_store::load_agent_config(&self.repo, label)
+        crate::agent_store::binding(&self.repo, label)
             .ok()
             .flatten()
-            .and_then(|c| c.session)
             .map(|s| (s.tool, s.id))
     }
 
@@ -361,11 +360,9 @@ impl Seams for Live {
         &'a self,
         label: &'a AgentLabel,
     ) -> Result<Box<dyn Send + 'a>, String> {
-        crate::cli::event_interrupt::blocking(|| {
-            crate::agent_store::hold_binding(&self.repo, label)
-        })
-        .map(|guard| Box::new(guard) as Box<dyn Send + 'a>)
-        .map_err(|e| format!("{e:#}"))
+        crate::cli::event_interrupt::blocking(|| crate::agent_store::hold_state(&self.repo, label))
+            .map(|guard| Box::new(guard) as Box<dyn Send + 'a>)
+            .map_err(|e| format!("{e:#}"))
     }
 
     async fn lock_pane(&self, pane: &PaneSeen) -> Result<Box<dyn Send>, String> {

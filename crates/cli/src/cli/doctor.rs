@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 
 use super::DoctorArgs;
 use crate::agent_env::{Ambient, detect_session_in, explicit_label_in, resolve_identity_in};
-use crate::agent_store::{
-    agent_config_path, agents_root, load_agent_config, load_all_agent_configs,
-};
+use crate::agent_store::{agent_config_path, agents_root, load_agent_config};
 use crate::cli::teams_config::AgentDescription;
 use clank_core::ids::AgentLabel;
 
@@ -226,13 +224,14 @@ async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResul
                 .map(|m| (m.label.clone(), m.desc.clone())),
         );
         for (label, desc) in members {
-            let cfg = match load_agent_config(repo, &label) {
-                Ok(cfg) => cfg,
-                Err(_) => continue, // repo checks already report invalid agent state
+            let (Ok(cfg), Ok(bound)) = (
+                load_agent_config(repo, &label),
+                crate::agent_store::binding(repo, &label),
+            ) else {
+                continue; // repo checks already report invalid agent state
             };
-            let tool = cfg
+            let tool = bound
                 .as_ref()
-                .and_then(|c| c.session.as_ref())
                 .map(|s| s.tool)
                 .or_else(|| {
                     super::fork::load_fork_spec(repo, &label)
@@ -533,8 +532,8 @@ pub fn repo_checks(
         // The EFFECTIVE launch executable on $PATH? — explicit
         // `launch.command` or the tool's bare default. Launch
         // feasibility comes from the ROSTER description alone, so
-        // this runs before any skeleton/session early-outs: a
-        // freshly added agent with no skeleton yet is exactly the
+        // this runs before any config/session early-outs: a
+        // freshly added agent never bound is exactly the
         // state where a missing binary should be diagnosed (codex
         // 0c90514/00fc9b4).
         let program = effective_launch_program(desc);
@@ -555,35 +554,30 @@ pub fn repo_checks(
             ));
         }
 
-        let skeleton = match load_agent_config(repo, label) {
-            Ok(s) => s,
+        let cfg = match load_agent_config(repo, label) {
+            Ok(cfg) => cfg,
             Err(e) => {
                 out.push(CheckResult::fail(
                     SECTION,
                     format!("agent: {}", label.as_str()),
-                    format!("failed to read skeleton: {e:#}"),
+                    format!("failed to read its config: {e:#}"),
                 ));
                 continue;
             }
         };
 
-        let Some(cfg) = skeleton else {
-            out.push(CheckResult::warn(
-                SECTION,
-                format!("agent: {}", label.as_str()),
-                format!(
-                    "registered {role_str} `{}` has no `.clank/agents/{}/config.json` yet; \
-                     start it with `clank agent start {}`, which binds it",
-                    label.as_str(),
-                    label.as_str(),
-                    label.as_str(),
-                ),
-            ));
-            continue;
+        let bound = match crate::agent_store::binding(repo, label) {
+            Ok(bound) => bound,
+            Err(e) => {
+                out.push(CheckResult::fail(
+                    SECTION,
+                    format!("agent: {}", label.as_str()),
+                    format!("failed to read its binding: {e:#}"),
+                ));
+                continue;
+            }
         };
-
-        let session_desc = cfg
-            .session
+        let session_desc = bound
             .as_ref()
             .map(|s| {
                 format!(
@@ -599,7 +593,7 @@ pub fn repo_checks(
         // reads as "off" when a user-global default is actually driving
         // (grok-first-turn-orchestration).
         let auto_desc =
-            match crate::cli::team::resolve_effective_auto_mode_with_source(Some(&cfg), home) {
+            match crate::cli::team::resolve_effective_auto_mode_with_source(cfg.as_ref(), home) {
                 Ok((auto_mode, clank_core::agent_config::AutoModeSource::PerAgent)) => {
                     format!("{} (per-agent)", auto_mode.as_str())
                 }
@@ -611,12 +605,8 @@ pub fn repo_checks(
                 }
                 Err(e) => format!("unknown ({e:#})"),
             };
-        let base_msg = format!(
-            "{}: auto_mode={auto_desc}, session={}",
-            agent_config_path(repo, label).display(),
-            session_desc,
-        );
-        let agent_check = if cfg.session.is_none() {
+        let base_msg = format!("auto_mode={auto_desc}, session={session_desc}");
+        let agent_check = if bound.is_none() {
             CheckResult::warn(
                 SECTION,
                 format!("agent: {}", label.as_str()),
@@ -637,15 +627,15 @@ pub fn repo_checks(
     if agents_root(repo).is_dir() {
         let registered_labels: std::collections::HashSet<&str> =
             members.iter().map(|(l, _, _)| l.as_str()).collect();
-        match load_all_agent_configs(repo) {
-            Ok(skeletons) => {
-                for (skel_label, _) in &skeletons {
+        match crate::agent_store::agent_labels(repo) {
+            Ok(dirs) => {
+                for skel_label in &dirs {
                     if !registered_labels.contains(skel_label.as_str()) {
                         out.push(CheckResult::warn(
                             SECTION,
                             format!("agent: {}", skel_label.as_str()),
                             format!(
-                                "found `.clank/agents/{}/config.json` but `{}` is not in this repo's \
+                                "found `.clank/agents/{}/` but `{}` is not in this repo's \
                                  agent roster (orphan state); add it via `clank agent add {}`, or `rm -rf .clank/agents/{}/` to remove it",
                                 skel_label.as_str(),
                                 skel_label.as_str(),
@@ -1008,13 +998,12 @@ async fn user_checks(repo: Option<&Path>) -> Vec<CheckResult> {
                 .map(|m| (m.label.clone(), m.desc.clone())),
         );
         for (label, desc) in members {
-            let cfg = match load_agent_config(repo, &label) {
-                Ok(cfg) => cfg,
+            let bound = match crate::agent_store::binding(repo, &label) {
+                Ok(bound) => bound,
                 Err(_) => continue,
             };
-            let tool = cfg
+            let tool = bound
                 .as_ref()
-                .and_then(|c| c.session.as_ref())
                 .map(|s| s.tool)
                 .or_else(|| {
                     super::fork::load_fork_spec(repo, &label)
@@ -1513,24 +1502,15 @@ fn describe_identity_source(
         );
     }
     if let Some((tool, sid)) = detected {
-        let agents = load_all_agent_configs(repo).unwrap_or_default();
-        let bound = agents.iter().find(|(label, cfg)| {
-            label == resolved
-                && cfg
-                    .session
-                    .as_ref()
-                    .is_some_and(|s| &s.id == sid && s.tool == *tool)
-        });
-        if let Some((label, cfg)) = bound {
-            let updated_at = cfg
-                .session
-                .as_ref()
-                .map(|s| s.updated_at.clone())
-                .unwrap_or_default();
+        let bound = crate::agent_store::binding(repo, resolved)
+            .ok()
+            .flatten()
+            .filter(|s| &s.id == sid && s.tool == *tool);
+        if let Some(session) = bound {
             return format!(
                 "resolved to `{}` via session binding (last bound {})",
-                label.as_str(),
-                updated_at
+                resolved.as_str(),
+                session.updated_at
             );
         }
     }
@@ -1692,7 +1672,7 @@ fn opencode_plugin_checks(
     std::iter::once(set.master.clone())
         .chain(set.members.iter().map(|m| m.label.clone()))
         .filter_map(|label| {
-            let session = load_agent_config(repo, &label).ok().flatten()?.session?;
+            let session = crate::agent_store::binding(repo, &label).ok().flatten()?;
             (session.tool == clank_core::Tool::OpenCode).then(|| {
                 let reports =
                     crate::cli::recovery::observed_path(&agents_root(repo).join(label.as_str()));
@@ -2535,8 +2515,7 @@ mod tests {
         // The exact fresh state the check exists for (codex 00fc9b4):
         // rostered via `clank agent add`, never bound, no
         // .clank/agents/<label>/ skeleton — launch feasibility comes
-        // from the roster description alone and must be diagnosed
-        // before the missing-skeleton early-out.
+        // from the roster description alone.
         use crate::cli::teams_config::{AgentDescription, RosterRole};
         use clank_core::vocab::Tool;
         let dir = init_git_repo();
@@ -2565,13 +2544,58 @@ mod tests {
                 .message
                 .contains("definitely-missing-opencode-binary")
         );
-        // And the skeleton-less state still gets its own warning —
-        // the launch check runs IN ADDITION, not instead.
+        // And the unbound agent still gets its own warning — the launch
+        // check runs IN ADDITION, not instead.
         let agent = results
             .iter()
             .find(|r| r.name == "agent: kimi")
             .expect("agent check ran");
         assert_eq!(agent.status, CheckStatus::Warn);
+    }
+
+    /// Binding writes no `config.json`: an agent on the defaults is healthy
+    /// once bound, and a directory of an agent off the roster is an orphan
+    /// whatever files it holds.
+    #[test]
+    fn a_bound_agent_on_the_defaults_is_healthy_and_any_unrostered_dir_is_an_orphan() {
+        use crate::cli::teams_config::{AgentDescription, RosterRole};
+        use clank_core::ids::{AgentLabel, SessionId};
+        use clank_core::vocab::Tool;
+        let dir = init_git_repo();
+        let codex = AgentLabel::parse("codex").unwrap();
+        crate::cli::agent::add_repo_roster_agent(
+            dir.path(),
+            &codex,
+            AgentDescription {
+                tool: Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+            },
+            RosterRole::Master,
+        )
+        .unwrap();
+        for (label, session) in [
+            (&codex, "session-one"),
+            (&AgentLabel::parse("gone").unwrap(), "session-two"),
+        ] {
+            let session = SessionId::parse(session).unwrap();
+            crate::agent_store::bind_session_to_agent(dir.path(), label, Tool::Codex, &session)
+                .unwrap();
+            assert!(!agent_config_path(dir.path(), label).exists());
+        }
+        let results = repo_checks(dir.path(), None, None);
+        let agent = results
+            .iter()
+            .find(|r| r.name == "agent: codex")
+            .expect("agent check ran");
+        assert_eq!(agent.status, CheckStatus::Ok, "{}", agent.message);
+        assert!(agent.message.contains("session-one"), "{}", agent.message);
+        let orphan = results
+            .iter()
+            .find(|r| r.name == "agent: gone")
+            .expect("the unrostered directory is reported");
+        assert_eq!(orphan.status, CheckStatus::Warn);
+        assert!(orphan.message.contains("orphan"), "{}", orphan.message);
     }
 
     /// An interrupting source without a usable description is a warning,

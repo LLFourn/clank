@@ -218,7 +218,9 @@ fn selected_profile_uses_actual_tool_and_custom_home_without_binding_mutation() 
         &SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap(),
     )
     .unwrap();
-    let config = crate::agent_store::agent_config_path(&f.cwd, &label);
+    let config = crate::agent_store::state::path(
+        &crate::agent_store::agents_root(&f.cwd).join(label.as_str()),
+    );
     let before = std::fs::read(&config).unwrap();
     let selected = profile(&f.cwd, &label).unwrap();
     assert_eq!(selected.program, "configured-grok");

@@ -198,10 +198,9 @@ fn target_check(v: &Verified) -> Result<(), String> {
     }
     crate::agent_store::resolve_role(&v.repo, &v.agent)
         .map_err(|_| format!("`{}` is not on that repo's roster", v.agent))?;
-    let bound = crate::agent_store::load_agent_config(&v.repo, &v.agent)
+    let bound = crate::agent_store::binding(&v.repo, &v.agent)
         .ok()
         .flatten()
-        .and_then(|c| c.session)
         .map(|s| (s.tool, s.id));
     if bound != Some((v.tool, v.session.clone())) {
         return Err("the session it names does not hold the label".into());

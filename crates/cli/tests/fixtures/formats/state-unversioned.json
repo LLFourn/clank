@@ -1,0 +1,33 @@
+{
+  "role": "master",
+  "session": "00000000-0000-4000-8000-000000000001",
+  "tool": "claude",
+  "monitor": {
+    "pid": 10010,
+    "birth": {
+      "v": "mac1",
+      "sec": 1793844431,
+      "usec": 124634
+    }
+  },
+  "activity": {
+    "is": "unobserved"
+  },
+  "since": 1793845193,
+  "suppressors": [
+    "attending"
+  ],
+  "nudge": {
+    "is": "nothing"
+  },
+  "attending": {
+    "task": "a0000000000000001",
+    "expect": {
+      "since": "2026-11-05T02:19:50.33Z",
+      "secs": 7200
+    },
+    "desc": "Implement the example plan",
+    "at": "2026-11-05T02:19:50.33Z",
+    "subagent": true
+  }
+}

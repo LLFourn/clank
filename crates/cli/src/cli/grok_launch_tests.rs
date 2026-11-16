@@ -120,7 +120,9 @@ async fn child_copy_preserves_source_and_consumes_only_on_matching_bind() {
     let f = Fixture::new("good");
     let sid = SessionId::parse(SOURCE).unwrap();
     crate::agent_store::bind_session_to_agent(&f.source, &f.label, Tool::Grok, &sid).unwrap();
-    let config = crate::agent_store::agent_config_path(&f.source, &f.label);
+    let config = crate::agent_store::state::path(
+        &crate::agent_store::agents_root(&f.source).join(f.label.as_str()),
+    );
     let original = std::fs::read(&config).unwrap();
     let p = f.prepare().await.unwrap();
     assert_eq!(p.id, CHILD);
@@ -133,7 +135,7 @@ async fn child_copy_preserves_source_and_consumes_only_on_matching_bind() {
         crate::agent_store::bind_session_to_agent(&f.repo, &f.label, Tool::Grok, &sid).is_err()
     );
     assert!(
-        crate::agent_store::load_agent_config(&f.repo, &f.label)
+        crate::agent_store::binding(&f.repo, &f.label)
             .unwrap()
             .is_none()
     );

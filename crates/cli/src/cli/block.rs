@@ -798,11 +798,7 @@ pub(crate) fn test_master(repo: &Path, fallback: &clank_core::AgentLabel) {
         .unwrap();
     }
     let agent = master(repo).unwrap();
-    if crate::agent_store::load_agent_config(repo, &agent)
-        .unwrap()
-        .and_then(|c| c.session)
-        .is_none()
-    {
+    if crate::agent_store::binding(repo, &agent).unwrap().is_none() {
         crate::agent_store::bind_session_to_agent(
             repo,
             &agent,
