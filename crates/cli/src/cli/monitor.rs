@@ -57,7 +57,9 @@ use clank_core::wait::WaitItem;
 // and this build cannot decode.
 // 22 owns repository watches independently of their current recipient. An
 // older monitor ignores these declarations and cannot deliver their selectors.
-pub(crate) const PROTO: u32 = 23;
+// 24 is the first protocol pinned by `wire_golden_tests`: development builds
+// speaking 23 lack `Control::Questions` and drop it silently.
+pub(crate) const PROTO: u32 = 24;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -74,6 +76,10 @@ mod unwatched_tests;
 #[cfg(test)]
 #[path = "monitor_reach_tests.rs"]
 mod reach_tests;
+
+#[cfg(test)]
+#[path = "monitor_wire_golden_tests.rs"]
+mod wire_golden_tests;
 
 #[path = "monitor_keeper.rs"]
 pub(crate) mod keeper;
@@ -11213,7 +11219,7 @@ mod tests {
             }
         }
 
-        for older in [PROTO - 1, 1] {
+        for older in [PROTO - 1, 23, 1] {
             assert!(
                 matches!(
                     greeting_of(&hello(older), repo.path()),
