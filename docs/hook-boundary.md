@@ -28,7 +28,8 @@ If attachment/reconnection or a hook deadline expires without a verdict, the
 hook emits a transport diagnostic. It neither manufactures a wake nor marks
 work delivered. Automatic progress may stop until the monitor becomes available
 and a new hook/wait runs. OpenCode can renew its wait without a model turn.
-Normal deadline wakes authorized by a healthy monitor remain unchanged.
+A Claude or Codex Stop has no deadline: its wait holds until the monitor
+answers or the harness ends the hook.
 
 The `hook_is_a_messenger` integration gate covers the adapters, carrier and
 identity helpers. Runtime regressions additionally exercise malformed policy

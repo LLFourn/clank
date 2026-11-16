@@ -8356,7 +8356,7 @@ fn expire_reports(
         std::mem::take(clients).into_iter().partition(|c| {
             c.report
                 .as_ref()
-                .is_some_and(|r| r.stepped && r.report.deadline() <= now)
+                .is_some_and(|r| r.stepped && r.report.deadline().is_some_and(|at| at <= now))
         });
     *clients = kept;
     for client in expired {
@@ -8379,12 +8379,13 @@ fn expire_reports(
     leaving
 }
 
-/// The soonest deadline a held report's hook has.
+/// The soonest deadline a held report's hook has: `None` when no held
+/// report has one.
 fn report_deadline(clients: &[Client]) -> Option<u64> {
     clients
         .iter()
         .filter_map(|c| c.report.as_ref().filter(|r| r.stepped))
-        .map(|r| r.report.deadline())
+        .filter_map(|r| r.report.deadline())
         .min()
 }
 

@@ -5,13 +5,20 @@
 use clank_core::turn_policy::{ChildReport, Ms, PresentationId, TaskSnapshot, TurnEndReport};
 use clank_core::{HookOutcome, SessionId, SilentReason, Tool};
 
+/// The `deadline` a report names when its hook has none: a Claude or Codex
+/// Stop holds its wait until its harness ends it. It is the largest value
+/// the field holds, so a monitor of a build that predates it never expires
+/// such a report either.
+pub(crate) const NO_DEADLINE: Ms = Ms::MAX;
+
 /// What a hook reports to the monitor.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "report", rename_all = "snake_case")]
 pub(crate) enum Report {
     TurnEnd {
         stop: TurnEndReport,
-        /// Unix ms past which the hook can no longer hold its wait.
+        /// Unix ms past which the hook can no longer hold its wait, or
+        /// [`NO_DEADLINE`].
         deadline: Ms,
         /// What the Stop proves about the questions the agent asked.
         #[serde(default)]
@@ -72,14 +79,17 @@ impl Report {
         }
     }
 
-    pub(crate) fn deadline(&self) -> Ms {
-        match self {
+    /// Unix ms past which the hook can no longer hold its wait, or `None`
+    /// when it holds it for as long as its harness lets it run.
+    pub(crate) fn deadline(&self) -> Option<Ms> {
+        let at = match self {
             Report::TurnEnd { deadline, .. }
             | Report::Compacted { deadline, .. }
             | Report::SessionStart { deadline, .. }
             | Report::Handoff { deadline, .. }
             | Report::Child { deadline, .. } => *deadline,
-        }
+        };
+        (at != NO_DEADLINE).then_some(at)
     }
 
     /// A session start, a handoff or a child's report is answered once:

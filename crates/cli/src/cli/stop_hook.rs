@@ -75,7 +75,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use super::turn_wire::{Frame, Report, TurnResult, WireVerdict};
+use super::turn_wire::{Frame, NO_DEADLINE, Report, TurnResult, WireVerdict};
 use super::{StopHookArgs, resolve_cwd_repo, resolve_repo};
 use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
 use crate::lifecycle::AgentLabel;
@@ -118,7 +118,7 @@ pub(crate) async fn run(args: StopHookArgs, host: &mut impl Host) -> anyhow::Res
         Some(path) => super::hook_handoff::Handoff::take(path).and_then(Arrived::resumed),
         None => host
             .input()
-            .and_then(|raw| Arrived::fresh(raw, started, hook_started)),
+            .and_then(|raw| Arrived::fresh(raw, tool, started, hook_started)),
     };
     let turn = match arrived {
         Ok(arrived) => {
@@ -156,40 +156,43 @@ struct Arrived {
     input: HookInput,
     /// The report the replaced build armed its park with.
     resumed: Option<Report>,
-    /// When the hook can no longer hold its wait.
-    poll_deadline: std::time::Instant,
+    /// When the hook can no longer hold its wait: `None` when it holds it
+    /// until its harness ends it.
+    deadline: Option<std::time::Instant>,
     /// When this hook started, by the host clock. `None` for a resumed
     /// one, whose report already carries the time its hook started at.
     hook_started: Option<Ms>,
 }
 
 impl Arrived {
-    fn fresh(raw: String, started: std::time::Instant, hook_started: Ms) -> Result<Self, String> {
+    fn fresh(
+        raw: String,
+        tool: Tool,
+        started: std::time::Instant,
+        hook_started: Ms,
+    ) -> Result<Self, String> {
         Ok(Arrived {
             input: parse_input(&raw)?,
             raw,
             resumed: None,
-            poll_deadline: poll_deadline(started),
+            deadline: stop_deadline(tool, started),
             hook_started: Some(hook_started),
         })
     }
 
-    /// The deadline is the report's own, and never later than a hook
-    /// started now would get: whatever the handoff says, the runner's
-    /// ceiling is not outstayed.
+    /// The deadline is the report's own, as the build that armed it wrote
+    /// it: that build's hook started under the same runner clock.
     fn resumed(handoff: super::hook_handoff::Handoff) -> Result<Self, String> {
         let now = std::time::Instant::now();
-        let ceiling = poll_deadline(now);
-        let left = std::time::Duration::from_millis(
-            handoff
-                .report
-                .deadline()
-                .saturating_sub(super::turn_custody::now_ms()),
-        );
+        let deadline = handoff.report.deadline().and_then(|at| {
+            now.checked_add(std::time::Duration::from_millis(
+                at.saturating_sub(super::turn_custody::now_ms()),
+            ))
+        });
         Ok(Arrived {
             input: parse_input(&handoff.input)?,
             raw: handoff.input,
-            poll_deadline: now.checked_add(left).map_or(ceiling, |by| by.min(ceiling)),
+            deadline,
             resumed: Some(handoff.report),
             hook_started: None,
         })
@@ -296,7 +299,7 @@ async fn stop(
         raw,
         input,
         resumed,
-        poll_deadline,
+        deadline,
         hook_started,
     } = arrived;
     // Read now, before any waiting: where in the agent's record this Stop
@@ -347,7 +350,7 @@ async fn stop(
                 tasks: TaskSnapshot::of(&input),
                 hook_started,
             };
-            let deadline = unix_ms(poll_deadline);
+            let deadline = deadline.map_or(NO_DEADLINE, unix_ms);
             // A compaction ends no turn, so it is no evidence about questions.
             match compacted {
                 true => Report::Compacted { stop, deadline },
@@ -369,7 +372,7 @@ async fn stop(
         handoff.hand_to(&dir, |path| host.become_installed(path))
     });
     let carried = await_verdict_under_deadline(
-        verdict_deadline(poll_deadline),
+        deadline.map(verdict_deadline),
         tool,
         true,
         &mut life,
@@ -651,7 +654,7 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
         session: input.session_id,
     };
     let carried = await_verdict_under_deadline(
-        started + SESSION_START_BUDGET,
+        Some(started + SESSION_START_BUDGET),
         binding_tool,
         false,
         &mut super::hook_owner::Lifetime::Unbound,
@@ -674,7 +677,7 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
 }
 
 /// Carry `report`, which never parks, to the monitor through a child
-/// `spawner` starts, and hand `emit` its verdict. A handoff with no verdict
+/// `spawner` starts, and hand `emit` its verdict. A report with no verdict
 /// within `budget` is [`WireVerdict::Unanswered`], as its child's own last
 /// word would be. `emit` says how writing it out went, or `None` when it
 /// wrote nothing; a presentation is answered by that, and is delivered only
@@ -686,11 +689,11 @@ pub(super) async fn answer_with(
     session: &str,
     report: Report,
     budget: std::time::Duration,
-    mut emit: impl FnMut(&Frame) -> Option<std::io::Result<()>>,
+    emit: impl FnOnce(&Frame) -> Option<std::io::Result<()>>,
 ) -> Frame {
     let tool = report.tool();
     let carried = await_verdict_under_deadline(
-        std::time::Instant::now() + budget,
+        Some(std::time::Instant::now() + budget),
         tool,
         false,
         &mut super::hook_owner::Lifetime::Unbound,
@@ -703,13 +706,6 @@ pub(super) async fn answer_with(
             let emitted = emit(&frame);
             let result = result_of(&frame, emitted, "it was not written out");
             Box::new(wait).answer(result).await;
-            frame
-        }
-        Err(frame)
-            if frame.verdict == WireVerdict::Park && matches!(report, Report::Handoff { .. }) =>
-        {
-            let frame = super::turn_child::unanswered(super::turn_child::NOT_ANSWERED);
-            emit(&frame);
             frame
         }
         Err(frame) => {
@@ -1025,7 +1021,8 @@ impl Answer for OwnedWait {
     }
 }
 
-/// Margin between the report's deadline and the hook runner's ceiling.
+/// Margin between an OpenCode report's deadline and the hook runner's
+/// ceiling.
 ///
 /// The runner's clock starts at PROCESS SPAWN, so the margin covers
 /// everything else this process does. Generous on purpose: expiring early
@@ -1036,9 +1033,20 @@ const POLL_MARGIN_SECS: u64 = 300;
 /// deadline itself produces, before it frames that verdict on its own.
 const VERDICT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The ABSOLUTE instant the report names as its deadline, derived from the
-/// ceiling clank itself writes into the tool's hook config. Absolute, so
-/// time spent setting up is charged against it.
+/// When a Stop of `tool` whose hook started at `started` can no longer
+/// hold its wait. Only OpenCode's has a deadline, at which its plugin
+/// renews the long-poll; a Claude or Codex Stop holds its wait until its
+/// harness ends the hook.
+fn stop_deadline(tool: Tool, started: std::time::Instant) -> Option<std::time::Instant> {
+    match tool {
+        Tool::OpenCode => Some(poll_deadline(started)),
+        Tool::Claude | Tool::Codex | Tool::Grok => None,
+    }
+}
+
+/// The ABSOLUTE instant an OpenCode report names as its deadline, derived
+/// from the ceiling clank itself writes into the tool's hook config.
+/// Absolute, so time spent setting up is charged against it.
 fn poll_deadline(started: std::time::Instant) -> std::time::Instant {
     let ceiling = std::time::Duration::from_secs(crate::cli::setup::HOOK_TIMEOUT_SECS);
     let margin = std::time::Duration::from_secs(POLL_MARGIN_SECS);
@@ -1051,35 +1059,39 @@ fn verdict_deadline(poll_deadline: std::time::Instant) -> std::time::Instant {
     poll_deadline + VERDICT_GRACE
 }
 
-/// Await `fut` until `deadline`. `None` = the deadline won, and `fut` was
-/// dropped — which is what closes the owner pipe so the child exits.
+/// Await `fut` until `deadline`, or to its end when there is none. `None`
+/// = the deadline won, and `fut` was dropped — which is what closes the
+/// owner pipe so the child exits.
 async fn under_deadline<F: std::future::Future>(
     fut: F,
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
 ) -> Option<F::Output> {
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), fut)
-        .await
-        .ok()
+    match deadline {
+        Some(at) => tokio::time::timeout_at(tokio::time::Instant::from_std(at), fut)
+            .await
+            .ok(),
+        None => Some(fut.await),
+    }
 }
 
 /// Everything the deadline and the owner govern: the pre-check, the
 /// arming, and the wait for a terminal verdict.
 ///
 /// Owner loss outranks whatever the child found, and the deadline: there
-/// is nobody left to deliver to. A deadline with no verdict frames the
-/// one the tool takes at its deadline. For a report that parks that is
-/// [`super::turn_wire::expired_wait`]: OpenCode renews its wait, but Claude
-/// and Codex are told only a diagnostic, and their agent stays idle until
-/// something else wakes it. For one that does not it is the
-/// [`WireVerdict::Park`] sentinel, which the caller frames: Grok's handoff
-/// as [`WireVerdict::Unanswered`], which arms its wait.
+/// is nobody left to deliver to. With no `deadline` only those end the
+/// wait. A deadline with no verdict frames the one the tool takes at its
+/// deadline. For a report that parks that is
+/// [`super::turn_wire::expired_wait`]: OpenCode renews its wait, and a
+/// Claude or Codex report handed over by an older build that gave it a
+/// deadline is told only a diagnostic. For one that does not it is
+/// [`WireVerdict::Unanswered`], as its child's own last word would be.
 ///
 /// While no terminal verdict has been read the hook is parked, holding
 /// nothing but its report, and that is where `replacing` may turn it into
 /// the installed build. A verdict in hand always goes first: once one is
 /// read this process emits it, answers for it and exits by itself.
 async fn await_verdict_under_deadline<W: Run>(
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
     tool: Tool,
     parks: bool,
     life: &mut Lifetime,
@@ -1095,14 +1107,14 @@ async fn await_verdict_under_deadline<W: Run>(
     };
     let at_deadline = || match parks {
         true => super::turn_wire::expired_wait(tool),
-        false => Frame::bare(WireVerdict::Park),
+        false => super::turn_child::unanswered(super::turn_child::NOT_ANSWERED),
     };
     if life.gone_now() {
         return Err(owner_gone());
     }
     // The rarer exit, and the strictly worse one: it dies having done no
     // waiting at all. Short-circuits BEFORE arming.
-    if std::time::Instant::now() >= deadline {
+    if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
         return Err(at_deadline());
     }
     let mut wait = match arm() {

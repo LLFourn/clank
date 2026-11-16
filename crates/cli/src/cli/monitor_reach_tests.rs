@@ -175,7 +175,7 @@ impl Reached {
                 tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
                 hook_started: None,
             },
-            deadline: u64::MAX,
+            deadline: crate::cli::turn_wire::NO_DEADLINE,
             questions: Vec::new(),
         }
     }
@@ -707,6 +707,44 @@ async fn a_hook_woken_at_its_deadline_is_past_its_stop() {
     assert_eq!(a.turns.state(&agent()).unwrap().stopped, None);
     let stored = std::fs::read_to_string(a.dir().join("turn.json")).unwrap();
     assert!(!stored.contains("stopped"), "{stored}");
+}
+
+/// A Claude or Codex Stop's report has no deadline: the monitor arms no
+/// timer for it and never expires it, however late, beside a report that
+/// does expire.
+#[tokio::test]
+async fn a_report_with_no_deadline_is_never_expired() {
+    for tool in [Tool::Claude, Tool::Codex] {
+        let mut a = Reached::new(tool);
+        a.stop("t1", 1000);
+        assert_eq!(
+            a.clients[0].report.as_ref().unwrap().report.deadline(),
+            None
+        );
+        assert_eq!(report_deadline(&a.clients), None, "{tool:?}: no timer");
+        let _ = expire_reports(&mut a.clients, Some(&mut a.turns), u64::MAX);
+        assert_eq!(a.clients.len(), 1, "{tool:?}: still held");
+        assert!(
+            a.turns.state(&agent()).unwrap().stopped.is_some(),
+            "{tool:?}"
+        );
+
+        let Report::TurnEnd { stop, .. } = a.stop_report("t1") else {
+            unreachable!()
+        };
+        let finite = Report::Compacted {
+            stop,
+            deadline: 2_000_000,
+        };
+        a.connect(Served::Agent { author: agent() }, None, Some(finite), 1000);
+        assert_eq!(report_deadline(&a.clients), Some(2_000_000), "{tool:?}");
+        let _ = expire_reports(&mut a.clients, None, 2_000_000);
+        assert_eq!(a.clients.len(), 1, "{tool:?}: only the finite one expired");
+        assert_eq!(
+            a.clients[0].report.as_ref().unwrap().report.deadline(),
+            None
+        );
+    }
 }
 
 /// A monitor that never held the agent's waiter cannot date its going,
