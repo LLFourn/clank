@@ -239,9 +239,11 @@ impl TurnResult {
 }
 
 /// A local timeout is transport failure, not permission for a model turn.
-/// OpenCode can renew its socket wait without involving the model.
+/// A plugin that renews its poll can do so without involving the model.
 pub(crate) fn expired_wait(tool: Tool) -> Frame {
-    Frame::bare(if tool == Tool::OpenCode {
+    let renews = clank_core::harness::of(tool).behaviour.deadline
+        == clank_core::harness::Deadline::RenewsPoll;
+    Frame::bare(if renews {
         WireVerdict::RenewWait
     } else {
         WireVerdict::Diagnostic {

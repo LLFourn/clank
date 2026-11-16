@@ -70,10 +70,11 @@ pub(crate) async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     let Some(dispatch) = await_recovery(&repo, &label, tool, &session).await else {
         return Ok(());
     };
-    if tool == Tool::Claude {
-        // Claude's asyncRewake wakes the session on exit 2 with the text on
-        // stderr. Answered as submitted first: once this process exits it
-        // cannot answer, and an unconfirmed submission escalates on its own.
+    let adapter = clank_core::harness::of(tool);
+    if adapter.behaviour.stop == clank_core::harness::Stop::AsyncRewake {
+        // The continuation wakes the session as this process exits.
+        // Answered as submitted first: once this process exits it cannot
+        // answer, and an unconfirmed submission escalates on its own.
         let n = dispatch["n"].as_u64().unwrap_or_default() as u32;
         let opened_by = dispatch["opened_by"]
             .as_str()
@@ -90,8 +91,15 @@ pub(crate) async fn run(args: StopHookArgs) -> anyhow::Result<()> {
         )
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
-        eprintln!("{}", dispatch["wake"].as_str().unwrap_or_default());
-        crate::cli::source_group::exit(2);
+        let answer = adapter.answer(&clank_core::HookOutcome::Continue {
+            reason: dispatch["wake"].as_str().unwrap_or_default().to_string(),
+        });
+        match &answer.write {
+            Some((clank_core::harness::Stream::Stdout, text)) => println!("{text}"),
+            Some((clank_core::harness::Stream::Stderr, text)) => eprintln!("{text}"),
+            None => {}
+        }
+        crate::cli::source_group::exit(answer.exit);
     }
     println!("{dispatch}");
     Ok(())
@@ -107,10 +115,10 @@ fn observation(args: &StopHookArgs, tool: Tool, session: &str) -> Option<serde_j
         crate::cli::ObserveArg::Interrupted => "interrupted",
         crate::cli::ObserveArg::Retry => "retry",
     };
-    let class = args.class.as_deref().map(|name| match tool {
-        Tool::OpenCode => crate::cli::recovery::opencode_class(name, args.status).to_string(),
-        _ => name.to_string(),
-    });
+    let class = args
+        .class
+        .as_deref()
+        .map(|name| clank_core::harness::of(tool).failure_class(name, args.status));
     Some(serde_json::json!({
         "session": session,
         "turn": turn,

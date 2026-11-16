@@ -390,8 +390,9 @@ pub enum Command {
     /// `clank run --desc "test run" -- cargo test`. Clank registers the
     /// run with the monitor, beside anything else you attend, then BECOMES
     /// the command — same pid, same stdio, same exit status. When that
-    /// process is gone the run is no longer attended. Claude and Grok tell
-    /// you it ended; on Codex and OpenCode clank does, at your next Stop.
+    /// process is gone the run is no longer attended. On Claude and Grok
+    /// clank leaves telling you it ended to the harness; on Codex and
+    /// OpenCode clank tells you, at your next Stop.
     /// Its output and exit status are wherever you launched it. `--expect 30m` says how long it should
     /// take; past that you are checked in on once, and nothing is
     /// cancelled. With no monitor to take the registration the command is

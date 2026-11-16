@@ -1,4 +1,5 @@
 use super::*;
+use clank_core::CLAUDE_CONTINUATION_EXIT;
 
 fn stated() -> crate::agent_env::Stated {
     crate::agent_env::Stated::default()
@@ -1191,7 +1192,7 @@ async fn the_report_carries_the_stops_evidence() {
     let repo = dunce::canonicalize(dir.path()).unwrap();
     bind_tool(&repo, "claude", "sess-evidence", Tool::Claude);
     let captured: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../core/tests/fixtures/stop_hook/stop_subagent_running.json"
+        "../../../core/tests/fixtures/claude/stop_subagent_running.json"
     ))
     .unwrap();
     let listed = |payload: &serde_json::Value| -> HookInput {
@@ -1417,8 +1418,8 @@ fn the_child_carries_the_report_and_dies_with_its_owner() {
     );
 }
 
-fn start_input(session: &str, source: &str) -> SessionStartInput {
-    SessionStartInput {
+fn start_input(session: &str, source: &str) -> harness::SessionStart {
+    harness::SessionStart {
         session_id: session.to_string(),
         cwd: "/tmp".to_string(),
         source: Some(source.to_string()),
@@ -1672,7 +1673,8 @@ fn a_hand_started_session_is_identified_by_its_id_and_never_bound_here() {
 
 #[test]
 fn session_start_payload_carries_items_as_additional_context() {
-    let v = session_start_payload("Clank wait returned work for `x`.");
+    let v: serde_json::Value =
+        serde_json::from_str(&session_start_answer("Clank wait returned work for `x`.")).unwrap();
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
     let ctx = v["hookSpecificOutput"]["additionalContext"]
         .as_str()
@@ -1700,7 +1702,9 @@ async fn a_session_starts_context_is_answered_after_its_flush() {
         writer.fail_flush = failure;
         emit_session_start(delivered(), &binding, answered.clone(), &mut writer).await;
         let value: serde_json::Value = serde_json::from_slice(&writer.bytes).unwrap();
-        assert_eq!(value, session_start_payload("Clank wait returned work"));
+        let want: serde_json::Value =
+            serde_json::from_str(&session_start_answer("Clank wait returned work")).unwrap();
+        assert_eq!(value, want);
         match answered.got() {
             Some(Some(TurnResult::Delivered { .. })) => assert!(!failure),
             Some(Some(TurnResult::EmitFailed { .. })) => assert!(failure),
@@ -2103,11 +2107,11 @@ async fn a_resumed_stop_carries_the_report_it_was_handed() {
     assert_eq!(arrived.deadline, None, "a park with no deadline keeps none");
 }
 
-/// A payload recorded under `core/tests/fixtures/stop_hook/`, as Claude
+/// A payload recorded under `core/tests/fixtures/claude/`, as Claude
 /// would send it for `session` working in `repo`.
 fn recorded(fixture: &str, repo: &Path, session: &str) -> serde_json::Value {
     let path = format!(
-        "{}/../core/tests/fixtures/stop_hook/{fixture}",
+        "{}/../core/tests/fixtures/claude/{fixture}",
         env!("CARGO_MANIFEST_DIR")
     );
     let mut payload: serde_json::Value =

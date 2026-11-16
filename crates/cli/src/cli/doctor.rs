@@ -117,6 +117,12 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         ));
     }
 
+    if let Some(cwd) = crate::agent_env::Process.cwd() {
+        results.extend(fixture_drift(&VersionProbe {
+            cwd: repo.as_deref().unwrap_or(&cwd),
+        }));
+    }
+
     // Session scope — only meaningful inside an agent.
     results.extend(session_checks(repo.as_deref(), &crate::agent_env::Process));
 
@@ -129,6 +135,95 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         return Err(DoctorFailed.into());
     }
     Ok(())
+}
+
+/// What a harness's installed version is: `Ok(None)` when it is not
+/// installed.
+pub(crate) trait InstalledVersion {
+    fn of(&self, tool: clank_core::Tool) -> Result<Option<String>, String>;
+}
+
+/// Each harness's own `--version`, run on the executable a launch would
+/// find from `cwd`.
+struct VersionProbe<'a> {
+    cwd: &'a Path,
+}
+
+impl InstalledVersion for VersionProbe<'_> {
+    fn of(&self, tool: clank_core::Tool) -> Result<Option<String>, String> {
+        use crate::proc_run::{Out, Spec};
+        let Some(exe) = super::agent::launch_executable(tool, None, self.cwd) else {
+            return Ok(None);
+        };
+        let out = crate::proc_run::run_blocking(
+            Spec::new(&exe)
+                .arg("--version")
+                .cwd(self.cwd)
+                .stdout(Out::Capture { cap: 1 << 16 })
+                .stderr(Out::Capture { cap: 1 << 16 }),
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|e| format!("{}: {e}", exe.display()))?;
+        let printed = String::from_utf8_lossy(&out.stdout);
+        clank_core::harness::version_in(&printed)
+            .map(|v| Some(v.to_string()))
+            .ok_or_else(|| format!("{} --version printed `{}`", exe.display(), printed.trim()))
+    }
+}
+
+/// Whether each installed harness is the version its recorded hook
+/// payloads came from. A payload recorded under another version, or under
+/// one nobody wrote down, may no longer be what that harness sends.
+pub(crate) fn fixture_drift(installed: &dyn InstalledVersion) -> Vec<CheckResult> {
+    const SECTION: &str = "harness fixtures";
+    let mut out = Vec::new();
+    for adapter in clank_core::harness::all() {
+        let name = adapter.tool.as_str();
+        let manifest = match adapter.manifest() {
+            Ok(m) => m,
+            Err(e) => {
+                out.push(CheckResult::warn(SECTION, name, e));
+                continue;
+            }
+        };
+        if manifest.recorded.is_empty() {
+            continue;
+        }
+        let version = match installed.of(adapter.tool) {
+            Ok(Some(version)) => version,
+            Ok(None) => continue,
+            Err(why) => {
+                out.push(CheckResult::warn(
+                    SECTION,
+                    name,
+                    format!("cannot read the installed version: {why}"),
+                ));
+                continue;
+            }
+        };
+        let drifted = manifest.drifted(&version);
+        out.push(match drifted.is_empty() {
+            true => CheckResult::ok(
+                SECTION,
+                name,
+                format!("{version} installed; every recorded payload is from it"),
+            ),
+            false => CheckResult::warn(
+                SECTION,
+                name,
+                format!(
+                    "{version} installed, but these payloads were recorded with another \
+                     version; re-record them under crates/core/tests/fixtures/{name}/: {}",
+                    drifted
+                        .iter()
+                        .map(|r| format!("{} ({})", r.file, r.version))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+        });
+    }
+    out
 }
 
 /// Each config document this build reads, as ok, missing, malformed or
@@ -1927,6 +2022,64 @@ mod tests {
             assert_eq!(parse_settle_row("|\n"), OpenCodeSettle::Never);
             assert!(matches!(parse_settle_row(""), OpenCodeSettle::Unknown(_)));
         }
+    }
+
+    struct Installed(Vec<(clank_core::Tool, Result<Option<String>, String>)>);
+
+    impl InstalledVersion for Installed {
+        fn of(&self, tool: clank_core::Tool) -> Result<Option<String>, String> {
+            self.0
+                .iter()
+                .find(|(t, _)| *t == tool)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Ok(None))
+        }
+    }
+
+    /// Doctor names every recorded payload whose version is not the
+    /// installed one, says nothing of a harness that is not installed, and
+    /// asks nothing of one with nothing recorded.
+    #[test]
+    fn fixture_drift_names_the_payloads_to_re_record() {
+        use clank_core::Tool;
+        let manifest = clank_core::harness::of(Tool::Claude).manifest().unwrap();
+        let installed = "2.1.999".to_string();
+        assert!(manifest.recorded.iter().all(|r| r.version != installed));
+        let checks = fixture_drift(&Installed(vec![(
+            Tool::Claude,
+            Ok(Some(installed.clone())),
+        )]));
+        let [claude] = checks.as_slice() else {
+            panic!("{checks:#?}")
+        };
+        assert_eq!(claude.name, "claude");
+        assert!(matches!(claude.status, CheckStatus::Warn), "{claude:?}");
+        assert!(claude.message.starts_with(&installed), "{claude:?}");
+        for r in &manifest.recorded {
+            assert!(
+                claude
+                    .message
+                    .contains(&format!("{} ({})", r.file, r.version)),
+                "{} is not named: {claude:?}",
+                r.file
+            );
+        }
+        assert!(
+            fixture_drift(&Installed(vec![])).is_empty(),
+            "nothing installed"
+        );
+        let unrecorded = fixture_drift(&Installed(
+            [Tool::Grok, Tool::OpenCode]
+                .into_iter()
+                .map(|t| (t, Ok(Some("9.9.9".to_string()))))
+                .collect(),
+        ));
+        assert!(unrecorded.is_empty(), "{unrecorded:#?}");
+        let unreadable = fixture_drift(&Installed(vec![(Tool::Codex, Err("no".into()))]));
+        assert!(
+            matches!(unreadable.as_slice(), [c] if matches!(c.status, CheckStatus::Warn)),
+            "{unreadable:#?}"
+        );
     }
 
     #[test]

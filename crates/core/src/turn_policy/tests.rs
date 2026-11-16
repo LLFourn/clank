@@ -63,10 +63,10 @@ fn report(tool: Tool) -> TurnEndReport {
     }
 }
 
-/// Claude's Stop exactly as captured under `tests/fixtures/stop_hook/`.
+/// Claude's Stop exactly as captured under `tests/fixtures/claude/`.
 fn claude_stop(fixture: &str) -> TurnEndReport {
     let path = format!(
-        "{}/tests/fixtures/stop_hook/{fixture}",
+        "{}/tests/fixtures/claude/{fixture}",
         env!("CARGO_MANIFEST_DIR")
     );
     let input: HookInput = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

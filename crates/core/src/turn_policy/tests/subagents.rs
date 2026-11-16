@@ -1,6 +1,6 @@
 //! A declared subagent through the work it may have started: the
 //! transition table, and the sequence recorded on 2026-11-11 under
-//! `tests/fixtures/stop_hook/`.
+//! `tests/fixtures/claude/`.
 
 use super::*;
 
@@ -20,7 +20,7 @@ const H: Ms = 2_000_000_000;
 
 fn recorded(fixture: &str) -> HookInput {
     let path = format!(
-        "{}/tests/fixtures/stop_hook/{fixture}",
+        "{}/tests/fixtures/claude/{fixture}",
         env!("CARGO_MANIFEST_DIR")
     );
     serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()

@@ -26,11 +26,14 @@ whether its assertions protect the invariant. Reviewers check that.
 
 - Why: an agent parked on a run it is never told about is stranded.
 - Status: holds
-- Scope: Claude and Grok tell their agent themselves, so clank sends nothing.
-  Codex holds the turn in its synchronous Stop hook and never continues the
-  agent when a background command exits; OpenCode shows no sign of doing so.
+- Scope: on Claude and Grok clank sends nothing and relies on the harness
+  to tell its agent: Grok's source says it does, and Claude's doing so has
+  not been recorded (`docs/harness-support.toml`). Codex holds the turn in
+  its synchronous Stop hook and was observed (0.167.2) never to continue the
+  agent when a background command exits; nothing shows OpenCode doing so.
   On those, clank holds a run-ended notice for the session that started the
-  run until its next Stop that may wake (`Tool::reports_background_completion`).
+  run until its next Stop that may wake
+  (`clank_core::harness::Behaviour::reports_background_completion`).
   The notice claims no exit status. A bare `clank attend` has no process to
   watch: it stands until cleared and checks in at `--expect`. Background work
   started without `clank run` never wakes a Codex or OpenCode agent. A Grok

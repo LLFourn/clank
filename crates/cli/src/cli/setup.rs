@@ -200,25 +200,30 @@ pub(crate) fn background_run(tool: Tool) -> &'static str {
 }
 
 /// Who tells the agent a `clank run` ended: its harness, or clank where the
-/// harness cannot ([`Tool::reports_background_completion`]).
+/// harness does not
+/// ([`clank_core::harness::Behaviour::reports_background_completion`]).
 pub(crate) fn run_ends(tool: Tool) -> &'static str {
-    match tool.reports_background_completion() {
-        true => "Your harness\n  tells you when a run ends;",
-        false => "Clank tells you\n  when a `clank run` ends (nothing else does);",
+    match clank_core::harness::of(tool)
+        .behaviour
+        .reports_background_completion
+    {
+        true => "Clank leaves telling\n  you a run ended to your harness;",
+        false => "Clank tells you\n  when a `clank run` ends;",
     }
 }
 
 /// What ends a `clank attend` declaration on `tool`: the harness's own
 /// task listing where its Stop sends one, else only the agent's clear.
 pub(crate) fn declared_ends(tool: Tool) -> &'static str {
-    match tool {
-        Tool::Claude | Tool::Grok => {
+    match clank_core::harness::of(tool)
+        .behaviour
+        .lists_background_tasks
+    {
+        true => {
             "A declaration ends when your harness stops\n  listing that work (named by its \
              exact description) and any background work it\n  left running."
         }
-        Tool::Codex | Tool::OpenCode => {
-            "Clear a declaration with `clank attend\n  --clear \"<name>\"` once done."
-        }
+        false => "Clear a declaration with `clank attend\n  --clear \"<name>\"` once done.",
     }
 }
 

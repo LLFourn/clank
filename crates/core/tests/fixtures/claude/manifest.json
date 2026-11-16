@@ -1,0 +1,62 @@
+{
+  "tool": "claude",
+  "note": "Stop and SubagentStop payloads recorded from real Claude Code runs. No SessionStart, SubagentStart or PostCompact payload has been recorded: the adapter's tests for those use synthetic payloads in the documented shape, labelled as such.",
+  "recorded": [
+    {
+      "file": "stop_subagent_running.json",
+      "hook": "Stop",
+      "version": "unknown",
+      "date": "2026-10-21",
+      "provenance": "Committed in 7a3a36be (2026-10-21), the squashed the-stop-hook-is-a-messenger plan, as its Step 0 evidence: real Claude Code payloads with ids, paths, prompt id, last message and artifact URL redacted. The plan names no Claude Code version, so none is claimed; 2026-10-21 is the latest the recording can have been made. Contemporaneous plans cite 2.1.280 as this machine's install, which is not evidence for these files."
+    },
+    {
+      "file": "stop_subagent_finished.json",
+      "hook": "Stop",
+      "version": "unknown",
+      "date": "2026-10-21",
+      "provenance": "Committed in 7a3a36be (2026-10-21), the squashed the-stop-hook-is-a-messenger plan, as its Step 0 evidence: real Claude Code payloads with ids, paths, prompt id, last message and artifact URL redacted. The plan names no Claude Code version, so none is claimed; 2026-10-21 is the latest the recording can have been made. Contemporaneous plans cite 2.1.280 as this machine's install, which is not evidence for these files."
+    },
+    {
+      "file": "stop_monitor_task_running.json",
+      "hook": "Stop",
+      "version": "unknown",
+      "date": "2026-10-21",
+      "provenance": "Committed in 7a3a36be (2026-10-21), the squashed the-stop-hook-is-a-messenger plan, as its Step 0 evidence: real Claude Code payloads with ids, paths, prompt id, last message and artifact URL redacted. The plan names no Claude Code version, so none is claimed; 2026-10-21 is the latest the recording can have been made. Contemporaneous plans cite 2.1.280 as this machine's install, which is not evidence for these files."
+    },
+    {
+      "file": "stop_a_parked_b_running.json",
+      "hook": "Stop",
+      "version": "unknown",
+      "date": "2026-11-11",
+      "provenance": "Recorded on 2026-11-11 by a recording hook on Stop and SubagentStop (attendance-survives-a-subagent-waiting, committed in 52131efa): subagent A backgrounds `sleep 240` and ends its turn. The plan names no Claude Code version, so none is claimed; this machine ran 2.1.308 on 2026-11-05 (clank-agents-run-without-agent-view), which is not evidence for these files."
+    },
+    {
+      "file": "stop_a_parked_shell_running.json",
+      "hook": "Stop",
+      "version": "unknown",
+      "date": "2026-11-11",
+      "provenance": "Recorded on 2026-11-11 by a recording hook on Stop and SubagentStop (attendance-survives-a-subagent-waiting, committed in 52131efa): subagent A backgrounds `sleep 240` and ends its turn. The plan names no Claude Code version, so none is claimed; this machine ran 2.1.308 on 2026-11-05 (clank-agents-run-without-agent-view), which is not evidence for these files."
+    },
+    {
+      "file": "subagent_stop_a_parks.json",
+      "hook": "SubagentStop",
+      "version": "unknown",
+      "date": "2026-11-11",
+      "provenance": "Recorded on 2026-11-11 by a recording hook on Stop and SubagentStop (attendance-survives-a-subagent-waiting, committed in 52131efa): subagent A backgrounds `sleep 240` and ends its turn. The plan names no Claude Code version, so none is claimed; this machine ran 2.1.308 on 2026-11-05 (clank-agents-run-without-agent-view), which is not evidence for these files."
+    },
+    {
+      "file": "subagent_stop_a_final.json",
+      "hook": "SubagentStop",
+      "version": "unknown",
+      "date": "2026-11-11",
+      "provenance": "Recorded on 2026-11-11 by a recording hook on Stop and SubagentStop (attendance-survives-a-subagent-waiting, committed in 52131efa): subagent A backgrounds `sleep 240` and ends its turn. The plan names no Claude Code version, so none is claimed; this machine ran 2.1.308 on 2026-11-05 (clank-agents-run-without-agent-view), which is not evidence for these files."
+    },
+    {
+      "file": "subagent_stop_b_finished.json",
+      "hook": "SubagentStop",
+      "version": "unknown",
+      "date": "2026-11-11",
+      "provenance": "Recorded on 2026-11-11 by a recording hook on Stop and SubagentStop (attendance-survives-a-subagent-waiting, committed in 52131efa): subagent A backgrounds `sleep 240` and ends its turn. The plan names no Claude Code version, so none is claimed; this machine ran 2.1.308 on 2026-11-05 (clank-agents-run-without-agent-view), which is not evidence for these files."
+    }
+  ]
+}

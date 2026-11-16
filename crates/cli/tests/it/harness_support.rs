@@ -6,6 +6,10 @@
 //! from the source, its test identities resolve to real `#[ignore]`d tests,
 //! and `scripts/first-run/env.sh` really leaves no way back to a production
 //! profile or session.
+//!
+//! Every behaviour a harness adapter declares
+//! (`clank_core::harness::Behaviour`) has exactly one provenance entry
+//! here, with the adapter's value and a status saying what it rests on.
 
 use crate::common::{Production, crates_dir, is_cfg_test, rs_files};
 use serde::Deserialize;
@@ -34,6 +38,29 @@ struct Harness {
     required_acceptance: Required,
     #[serde(default)]
     acceptance: Vec<Acceptance>,
+    #[serde(default)]
+    behaviour: Vec<Provenance>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Provenance {
+    capability: String,
+    value: String,
+    status: Status,
+    version: String,
+    conditions: Option<String>,
+    evidence: String,
+    uncertain: String,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "kebab-case")]
+enum Status {
+    Observed,
+    Source,
+    Policy,
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -311,6 +338,31 @@ fn record_violations(h: &Harness) -> Vec<String> {
             }
         }
     }
+    let mut capabilities = BTreeSet::new();
+    for b in &h.behaviour {
+        if !capabilities.insert(b.capability.as_str()) {
+            out.push(format!("behaviour `{}` has two entries", b.capability));
+        }
+        if [&b.value, &b.version, &b.evidence, &b.uncertain]
+            .iter()
+            .any(|s| s.trim().is_empty())
+        {
+            out.push(format!(
+                "behaviour `{}` needs a value, version, evidence and what is uncertain",
+                b.capability
+            ));
+        }
+        let conditions = b
+            .conditions
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty());
+        if conditions != (b.status == Status::Observed) {
+            out.push(format!(
+                "behaviour `{}` is {:?}: an observed entry, and only one, states its conditions",
+                b.capability, b.status
+            ));
+        }
+    }
     for a in &h.acceptance {
         if a.version.is_empty() || !is_date(&a.date) {
             out.push(format!(
@@ -338,6 +390,160 @@ fn read(path: &Path) -> String {
 
 fn record() -> Record {
     toml::from_str(&read(&workspace().join("docs/harness-support.toml"))).unwrap()
+}
+
+/// The behaviour `adapter` declares, as (capability, value) in the
+/// record's spelling.
+fn declared(adapter: &clank_core::harness::Adapter) -> BTreeMap<String, String> {
+    let serde_json::Value::Object(fields) = serde_json::to_value(adapter.behaviour).unwrap() else {
+        panic!("{}: Behaviour is not a struct", adapter.name)
+    };
+    fields
+        .into_iter()
+        .map(|(k, v)| {
+            let v = match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            (k, v)
+        })
+        .collect()
+}
+
+/// Every way `record` and the adapters' declarations disagree.
+fn provenance_violations(
+    record: &Record,
+    adapters: &[(&str, BTreeMap<String, String>)],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, declared) in adapters {
+        let Some(h) = record.harness.iter().find(|h| h.name == *name) else {
+            out.push(format!("{name}: an adapter with no harness in the record"));
+            continue;
+        };
+        for (capability, value) in declared {
+            match h.behaviour.iter().find(|b| &b.capability == capability) {
+                None => out.push(format!(
+                    "{name}: `{capability}` = {value} has no provenance entry"
+                )),
+                Some(b) if &b.value != value => out.push(format!(
+                    "{name}: `{capability}` is {value} in the adapter but {} in the record",
+                    b.value
+                )),
+                Some(_) => {}
+            }
+        }
+        for b in &h.behaviour {
+            if !declared.contains_key(&b.capability) {
+                out.push(format!(
+                    "{name}: `{}` is recorded but the adapter declares no such behaviour",
+                    b.capability
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn every_declared_behaviour_has_its_provenance() {
+    let adapters: Vec<_> = clank_core::harness::all()
+        .into_iter()
+        .map(|a| (a.name, declared(a)))
+        .collect();
+    assert!(adapters.iter().all(|(_, d)| !d.is_empty()));
+    let errors = provenance_violations(&record(), &adapters);
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+fn a_behaviour_without_provenance_or_with_another_value_is_rejected() {
+    let record: Record = toml::from_str(
+        r#"
+[[harness]]
+name = "Tool"
+required_acceptance = "unavailable"
+
+[harness.source_floor]
+version = "none"
+readme = "no version check"
+
+[[harness.behaviour]]
+capability = "stop"
+value = "blocking"
+status = "policy"
+version = "n/a"
+evidence = "e"
+uncertain = "u"
+
+[[harness.behaviour]]
+capability = "retired"
+value = "true"
+status = "unknown"
+version = "unknown"
+evidence = "e"
+uncertain = "u"
+"#,
+    )
+    .unwrap();
+    let declared = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let errors = provenance_violations(
+        &record,
+        &[(
+            "Tool",
+            declared(&[("stop", "async_rewake"), ("new_one", "true")]),
+        )],
+    );
+    for expected in [
+        "Tool: `stop` is async_rewake in the adapter but blocking in the record",
+        "Tool: `new_one` = true has no provenance entry",
+        "Tool: `retired` is recorded but the adapter declares no such behaviour",
+    ] {
+        assert!(
+            errors.iter().any(|e| e == expected),
+            "{expected}: {errors:#?}"
+        );
+    }
+    assert_eq!(errors.len(), 3, "{errors:#?}");
+}
+
+#[test]
+fn an_observed_behaviour_states_its_conditions_and_nothing_else_does() {
+    let (record, readme) = fixture(UNTESTED, UNTESTED);
+    let entry = |status: &str, conditions: &str| {
+        record.replacen(
+            "\n[[harness]]\nname = \"Unavailable\"",
+            &format!(
+                "\n[[harness.behaviour]]\ncapability = \"stop\"\nvalue = \"blocking\"\n\
+                 status = \"{status}\"\nversion = \"1.0.0\"\n{conditions}evidence = \"e\"\n\
+                 uncertain = \"u\"\n\n[[harness]]\nname = \"Unavailable\""
+            ),
+            1,
+        )
+    };
+    let conditions = "conditions = \"a parked Stop\"\n";
+    assert_eq!(
+        violations(&entry("observed", conditions), &readme),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        violations(&entry("source", ""), &readme),
+        Vec::<String>::new()
+    );
+    rejects(
+        (entry("observed", ""), readme.clone()),
+        "behaviour `stop` is Observed: an observed entry, and only one, states its conditions",
+    );
+    rejects(
+        (entry("policy", conditions), readme.clone()),
+        "behaviour `stop` is Policy",
+    );
+    rejects((entry("asserted", ""), readme), "the record does not parse");
 }
 
 #[test]

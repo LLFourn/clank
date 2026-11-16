@@ -29,6 +29,13 @@ review gate.
 - **Name the invariants a plan touches**, when the repo keeps a
   `docs/invariants.md` registry. A plan names each one it touches, and the
   commit that changes an entry's status updates the entry.
+- **A claim about harness behaviour cites its evidence.** A plan built on
+  how a harness behaves (what its hooks send, whether its Stop re-wakes or
+  blocks, whether it reports a background run's end, how it times out)
+  cites a recorded payload or an experiment, and the claim's provenance
+  entry, where the repo keeps `docs/harness-support.toml`, says which:
+  observed, source, policy or unknown. Never build on an `unknown` one as
+  if it were fact.
 
 ### Commit tagging
 

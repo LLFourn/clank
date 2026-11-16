@@ -1,0 +1,5 @@
+{
+  "tool": "grok",
+  "note": "No payload has been recorded from a real Grok run. The adapter's tests use synthetic payloads in the shape Grok's hook documentation describes (grok-build 2bdd1d6, Grok 1.0.46), labelled as such.",
+  "recorded": []
+}

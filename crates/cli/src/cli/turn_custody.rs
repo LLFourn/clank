@@ -796,9 +796,11 @@ impl Turns {
                 }
                 let text = text.trim_start().to_string();
                 // A session start's context earns receipts only where it
-                // reaches the model: Claude's.
-                let commits =
-                    !matches!(report, Report::SessionStart { .. }) || tool == Tool::Claude;
+                // reaches the model.
+                let commits = !matches!(report, Report::SessionStart { .. })
+                    || clank_core::harness::of(tool)
+                        .behaviour
+                        .session_start_reaches_model;
                 let (delivered, prepared) = if commits {
                     (
                         super::wake_render::carried(items.iter().copied()),
@@ -830,7 +832,7 @@ impl Turns {
 
     /// The terminal verdict a parked report gets at its hook's deadline.
     pub(crate) fn deadline_frame(tool: Tool) -> Frame {
-        match clank_core::turn_policy::deadline_verdict(tool) {
+        match clank_core::harness::of(tool).deadline_verdict() {
             clank_core::turn_policy::DeadlineVerdict::ReArm => Frame::text(
                 WireVerdict::Notify,
                 super::wake_render::REARM_REASON.to_string(),
@@ -990,7 +992,11 @@ impl Turns {
             }
             AttendRequest::Clear { .. } => None,
         };
-        let listed = matches!(g.binding, Some((Tool::Claude | Tool::Grok, _)));
+        let listed = g.binding.as_ref().is_some_and(|(tool, _)| {
+            clank_core::harness::of(*tool)
+                .behaviour
+                .lists_background_tasks
+        });
         let attending = |verb: &str| {
             let (what, run, expect) = said.clone().expect("an attend names what it attends");
             let ends = match (run, listed) {

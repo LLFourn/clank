@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent_env::Stated;
 use crate::cli::teams_config::{AgentDescription, RosterRole};
-use clank_core::AutoMode;
+use clank_core::{AutoMode, SessionId};
 use serde_json::json;
 
 const ARM: &str = crate::cli::wake_render::ARM_WAIT;
