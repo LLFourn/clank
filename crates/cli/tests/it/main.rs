@@ -62,6 +62,7 @@ mod wait_config_reload;
 mod wait_event_sources;
 mod wait_for_observer;
 mod wake_receipt_acceptance;
+mod watch_text_boundary;
 mod web_host_process;
 mod web_timeline_boundary;
 mod workflow_tree;

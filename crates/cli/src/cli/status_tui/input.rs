@@ -423,14 +423,14 @@ pub(super) fn plan_action_key(a: PlanAction) -> &'static str {
 /// display name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SourceRef {
-    pub(super) agent: String,
+    pub(super) agent: crate::cli::watch_store::Producer,
     pub(super) key: String,
 }
 
 impl SourceRef {
     pub(super) fn of(source: &crate::cli::source_status::ConfiguredSource) -> Self {
         Self {
-            agent: source.agent.to_string(),
+            agent: source.agent.clone(),
             key: source.key.clone(),
         }
     }
@@ -441,7 +441,7 @@ impl SourceRef {
     ) -> Option<&'a crate::cli::source_status::ConfiguredSource> {
         sources
             .iter()
-            .find(|s| s.agent.as_str() == self.agent && s.key == self.key)
+            .find(|s| s.agent == self.agent && s.key == self.key)
     }
 }
 
@@ -503,9 +503,7 @@ pub(super) fn active_timers(
         _ => (2, 0),
     };
     let mut timers: Vec<_> = sources.iter().filter(|s| s.timer.is_some()).collect();
-    timers.sort_by(|a, b| {
-        (rank(a), &a.name, a.agent.as_str()).cmp(&(rank(b), &b.name, b.agent.as_str()))
-    });
+    timers.sort_by(|a, b| (rank(a), &a.name, &a.agent).cmp(&(rank(b), &b.name, &b.agent)));
     timers
 }
 

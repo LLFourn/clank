@@ -28,8 +28,7 @@ impl Route {
         cwd: &Path,
         agent_dir: &Path,
     ) -> anyhow::Result<Option<Self>> {
-        let (events, physical_key) =
-            super::watch_store::log_location(&agent_dir.join("events"), key)?;
+        let (events, physical_key) = super::watch_store::locate(&agent_dir.join("events"), key)?;
         let owner = events
             .parent()
             .ok_or_else(|| anyhow::anyhow!("missing source owner"))?;
@@ -277,9 +276,13 @@ pub(crate) fn prepare<'a>(
         }
     };
     let watches = crate::cli::watch_store::read(repo).unwrap_or_default();
-    config
-        .wait_events
-        .retain(|s| !crate::cli::watch_store::transferred(&watches, author, s));
+    config.wait_events.retain(|s| {
+        matches!(
+            crate::cli::watch_store::Watches(&watches)
+                .log_owner(author, &crate::cli::watch_store::source_key(s)),
+            crate::cli::watch_store::Producer::Agent(_)
+        )
+    });
     let assigned = crate::cli::watch_store::assigned(&watches, author);
     let agent_dir = crate::agent_store::agents_root(repo).join(author.as_str());
     // Borrow existing selected identities; neither whole WALs nor oversized
@@ -293,7 +296,7 @@ pub(crate) fn prepare<'a>(
             continue;
         }
         let repository_source = assigned.iter().find_map(|(id, watch)| {
-            (crate::cli::watch_store::selector_key(*id, &watch.key()) == key)
+            (crate::cli::watch_store::watch_text(*id, Some(&watch.key())) == key)
                 .then_some(&watch.source)
         });
         let selected_source = repository_source.or_else(|| {
@@ -694,16 +697,27 @@ mod tests {
         use super::super::watch_store::{self, Target};
         use clank_core::agent_config::WaitEventSource;
         let fixture = fixtures::Fixture::new();
-        crate::agent_store::repo_config::transact(&fixture.repo, |config| {
-            config.agents = serde_json::from_value(serde_json::json!({
-                "codex": {"tool":"codex", "role":"master"}
-            }))
+        let roster = |master: &str| {
+            crate::agent_store::repo_config::transact(&fixture.repo, |config| {
+                config.agents = serde_json::from_value(serde_json::json!({
+                    "codex": {"tool":"codex", "role":"standby"},
+                    "other": {"tool":"codex", "role":"standby"}
+                }))
+                .unwrap();
+                config
+                    .agents
+                    .get_mut(&AgentLabel::parse(master).unwrap())
+                    .unwrap()
+                    .role = crate::cli::teams_config::RosterRole::Master;
+                Ok(())
+            })
             .unwrap();
-            Ok(())
-        })
-        .unwrap();
+        };
         // A pinned legacy source has the same display name, but a different
         // callback. Only the exact repository selector chooses this route.
+        // The master watch is added before codex is master: added to codex,
+        // it would duplicate codex's own source and be refused.
+        roster("other");
         let mut source = fixture.source.clone();
         source.receipt_command = Some(vec!["repository-receipt".into()]);
         let id = watch_store::add(
@@ -712,7 +726,8 @@ mod tests {
             WaitEventSource::Command(source.clone()),
         )
         .unwrap();
-        let key = watch_store::selector_key(id, &source.source_key());
+        roster("codex");
+        let key = watch_store::watch_text(id, Some(&source.source_key()));
         let selector = format!("{key}@1");
         let prepared = prepare(
             &fixture.repo,
@@ -729,7 +744,10 @@ mod tests {
         assert_eq!(route.argv, vec!["repository-receipt"]);
         assert_eq!(route.key, key);
         let config = watch_store::read(&fixture.repo).unwrap();
-        let events = config.event_watches[&id].directory(&fixture.repo, id);
+        let events = watch_store::Watches(&config)
+            .producer(id)
+            .unwrap()
+            .directory(&fixture.repo);
         assert_eq!(
             route.state_dir,
             super::super::command_source::backend_state_dir(
@@ -738,6 +756,9 @@ mod tests {
             )
         );
 
+        // Transferring codex's own declaration to codex would make it a
+        // second producer beside the master watch, so that watch goes first.
+        watch_store::remove(&fixture.repo, id, &Target::Master).unwrap();
         let transferred = watch_store::transfer_legacy(
             &fixture.repo,
             &fixture.author,
@@ -748,7 +769,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let alias = format!("{}@1", watch_store::selector_key(transferred, &fixture.key));
+        let alias = format!(
+            "{}@1",
+            watch_store::watch_text(transferred, Some(&fixture.key))
+        );
         let prepared = prepare(
             &fixture.repo,
             &fixture.author,

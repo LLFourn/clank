@@ -331,7 +331,7 @@ fn claim_pending(dir: PathBuf) -> anyhow::Result<(Vec<Claim>, Vec<String>)> {
         }
         // Re-read under the exclusive transaction: inspector snapshots do not
         // grant authority, including when an acknowledgement won the race.
-        let result = EventLog::open(&dir, &candidate.source)
+        let result = located(&dir, &candidate.source)
             .and_then(|mut log| log.claim_interrupt(row.seq, &row.ident));
         match result {
             Ok(true) => claims.push(Claim {
@@ -348,10 +348,16 @@ fn claim_pending(dir: PathBuf) -> anyhow::Result<(Vec<Claim>, Vec<String>)> {
     Ok((claims, errors))
 }
 
+/// The log an inbox row's `source` names, wherever it is stored.
+fn located(dir: &std::path::Path, source: &str) -> std::io::Result<EventLog> {
+    let (at, key) = crate::cli::watch_store::locate(dir, source).map_err(std::io::Error::other)?;
+    EventLog::open(&at, &key)
+}
+
 fn finish(dir: PathBuf, claims: Vec<Claim>, outcome: InterruptOutcome) -> Vec<String> {
     let mut errors = Vec::new();
     for claim in claims {
-        if let Err(error) = EventLog::open(&dir, &claim.source)
+        if let Err(error) = located(&dir, &claim.source)
             .and_then(|mut log| log.finish_interrupt(claim.seq, &claim.ident, outcome.clone()))
         {
             errors.push(format!("{}@{}: {error}", claim.source, claim.seq));

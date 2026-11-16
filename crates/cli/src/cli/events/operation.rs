@@ -81,7 +81,10 @@ impl Transport {
     ) -> anyhow::Result<T> {
         match self {
             Transport::Message { .. } => crate::inbox::message_transaction(repo, author, f),
-            Transport::Command { source, .. } => f(&mut EventLog::open(dir, source)?),
+            Transport::Command { source, .. } => {
+                let (at, key) = crate::cli::watch_store::locate(dir, source)?;
+                f(&mut EventLog::open(&at, &key)?)
+            }
         }
     }
     fn handle(&self) -> &str {
@@ -109,22 +112,11 @@ pub(super) async fn submit(
     let expected = crate::agent_store::agents_root(&repo)
         .join(author.as_str())
         .join("events");
-    let agent_inbox = dir
-        .parent()
-        .and_then(|p| p.file_name())
-        .is_some_and(|s| s == author.as_str());
     // A repository watch can be an agent's first inbox item; it lives in the
     // shared watch store, so the ordinary agent events directory may not exist.
-    if agent_inbox {
-        std::fs::create_dir_all(dir)?;
-    }
-    let (physical, _) = crate::cli::watch_store::log_location(dir, &selected.source)?;
+    std::fs::create_dir_all(dir)?;
     anyhow::ensure!(
-        if agent_inbox {
-            dunce::canonicalize(dir)? == expected
-        } else {
-            physical != dir
-        },
+        dunce::canonicalize(dir)? == expected,
         "reply author directory does not match the selected repository"
     );
     let (transport, saved_route, _lease) = match &selected.row.item {

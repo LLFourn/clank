@@ -93,9 +93,8 @@ whether its assertions protect the invariant. Reviewers check that.
   live.
 - Status: target
 - Today: an agent's session is stored in `config.json`, `turn.json`,
-  `state.json` and `delivered.json`; `state.json` repeats its role; watch
-  identity is re-parsed from strings.
-- Plans: one-state-file-per-agent, a-watch-is-a-typed-producer
+  `state.json` and `delivered.json`; `state.json` repeats its role.
+- Plans: one-state-file-per-agent
 
 ## I7. Only the master raises blocks.
 

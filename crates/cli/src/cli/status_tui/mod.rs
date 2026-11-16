@@ -1220,38 +1220,33 @@ fn event_prompts(
 ) -> Vec<(Option<String>, String)> {
     use std::collections::BTreeSet;
     let mut per_agent: std::collections::HashMap<
-        String,
+        &crate::cli::watch_store::Producer,
         std::collections::HashMap<String, String>,
     > = Default::default();
     let mut pairs: BTreeSet<(String, String)> = Default::default();
     for m in &event.members {
-        let map = per_agent.entry(m.key.agent.clone()).or_insert_with(|| {
-            if let Ok(crate::cli::watch_store::Owner::Watch(id)) =
-                crate::cli::watch_store::Owner::parse(&m.key.agent)
-                && let Ok(config) = crate::cli::watch_store::read(repo)
-                && let Some(watch) = config.event_watches.get(&id)
-            {
-                return match &watch.source {
-                    clank_core::agent_config::WaitEventSource::Github(g) => g
-                        .prompt
-                        .as_ref()
-                        .map(|p| [(watch.key(), p.clone())].into_iter().collect())
-                        .unwrap_or_default(),
-                    _ => Default::default(),
-                };
-            }
-
-            let dir = crate::agent_store::agents_root(repo)
-                .join(&m.key.agent)
-                .join("events");
+        let map = per_agent.entry(&m.key.agent).or_insert_with(|| {
+            let agent = match &m.key.agent {
+                crate::cli::watch_store::Producer::Agent(agent) => agent,
+                crate::cli::watch_store::Producer::Watch { id, .. } => {
+                    let Ok(config) = crate::cli::watch_store::read(repo) else {
+                        return Default::default();
+                    };
+                    return match config.event_watches.get(id).map(|w| (w.key(), &w.source)) {
+                        Some((key, clank_core::agent_config::WaitEventSource::Github(g))) => g
+                            .prompt
+                            .as_ref()
+                            .map(|p| [(key, p.clone())].into_iter().collect())
+                            .unwrap_or_default(),
+                        _ => Default::default(),
+                    };
+                }
+            };
+            let dir = m.key.agent.directory(repo);
             let githubs: Vec<clank_core::agent_config::GithubSource> =
-                clank_core::ids::AgentLabel::parse(&m.key.agent)
+                crate::agent_store::load_agent_config(repo, agent)
                     .ok()
-                    .and_then(|l| {
-                        crate::agent_store::load_agent_config(repo, &l)
-                            .ok()
-                            .flatten()
-                    })
+                    .flatten()
                     .map(|c| {
                         c.wait_events
                             .iter()
@@ -1267,7 +1262,7 @@ fn event_prompts(
             crate::cli::events::join_prompts(&githubs, &dir)
         });
         if let Some(p) = map.get(&m.key.source) {
-            pairs.insert((m.key.agent.clone(), p.clone()));
+            pairs.insert((m.key.agent.to_string(), p.clone()));
         }
     }
     let texts: BTreeSet<&String> = pairs.iter().map(|(_, t)| t).collect();
@@ -6599,7 +6594,7 @@ pub(crate) mod tests {
             body: None,
             actor: None,
             url: None,
-            seen_by: members.iter().map(|m| m.key.agent.clone()).collect(),
+            seen_by: members.iter().map(|m| m.key.agent.to_string()).collect(),
             sender: None,
             unhandled: members.iter().any(|m| !m.acked),
             baseline: false,

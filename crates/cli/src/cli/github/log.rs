@@ -1211,13 +1211,16 @@ pub(crate) fn now_epoch() -> u64 {
 }
 
 impl EventLog {
-    /// `source_key` must be filesystem-safe and stable for the
-    /// source's identity (repo + config); the caller owns that
+    /// The log `source_key` in `events_dir`, which is where it is stored:
+    /// a selector naming a watch is resolved before this, and this reads
+    /// no configuration. `source_key` must be filesystem-safe and stable
+    /// for the source's identity (repo + config); the caller owns that
     /// derivation.
     pub(crate) fn open(events_dir: &Path, source_key: &str) -> std::io::Result<Self> {
-        let (events_dir, source_key) =
-            crate::cli::watch_store::log_location(events_dir, source_key)?;
-        let events_dir = events_dir.as_path();
+        debug_assert!(
+            crate::cli::watch_store::parse_watch_text(source_key).is_none(),
+            "an unresolved watch selector `{source_key}` reached EventLog::open"
+        );
         std::fs::create_dir_all(events_dir)?;
         Ok(Self {
             log_path: events_dir.join(format!("{source_key}.jsonl")),

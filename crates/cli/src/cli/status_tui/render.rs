@@ -1133,11 +1133,11 @@ fn tally<'a>(states: impl Iterator<Item = &'a str>, counted: bool) -> String {
 /// Each agent once, with how many of the row's sources are its when
 /// that is more than one.
 fn row_agents(members: &[&crate::cli::source_status::ConfiguredSource]) -> String {
-    let mut counts: Vec<(&str, usize)> = Vec::new();
+    let mut counts: Vec<(&crate::cli::watch_store::Producer, usize)> = Vec::new();
     for source in members {
-        match counts.iter_mut().find(|(a, _)| *a == source.agent.as_str()) {
+        match counts.iter_mut().find(|(a, _)| **a == source.agent) {
             Some((_, n)) => *n += 1,
-            None => counts.push((source.agent.as_str(), 1)),
+            None => counts.push((&source.agent, 1)),
         }
     }
     counts
@@ -4071,7 +4071,7 @@ pub(super) fn render_event_detail(
             "reply to",
             format!(
                 "{}/{}@{} · {}",
-                clean(&reply.original.agent),
+                clean(&reply.original.agent.to_string()),
                 clean(&reply.original.source),
                 reply.original.seq,
                 clean(&reply.original_handle)
@@ -9251,7 +9251,7 @@ mod tests {
                 monitor: 1,
                 birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
                 sources: vec![crate::cli::source_status::Hosted {
-                    agent: source.agent.to_string(),
+                    agent: source.agent.clone(),
                     key: source.key.clone(),
                     accepted,
                     lifecycle,
@@ -9338,7 +9338,7 @@ mod tests {
                 sources: hosted
                     .iter()
                     .map(|(s, lifecycle)| crate::cli::source_status::Hosted {
-                        agent: s.agent.to_string(),
+                        agent: s.agent.clone(),
                         key: s.key.clone(),
                         accepted: crate::cli::source_status::fingerprint(&s.config),
                         lifecycle: Some(lifecycle.clone()),
@@ -9348,7 +9348,7 @@ mod tests {
             },
             producers
                 .iter()
-                .map(|(s, pid)| ((s.agent.to_string(), s.key.clone()), *pid))
+                .map(|(s, pid)| ((s.agent.clone(), s.key.clone()), *pid))
                 .collect(),
         )
     }
@@ -9501,7 +9501,7 @@ mod tests {
                 sources: sources
                     .iter()
                     .map(|s| crate::cli::source_status::Hosted {
-                        agent: s.agent.to_string(),
+                        agent: s.agent.clone(),
                         key: s.key.clone(),
                         accepted: crate::cli::source_status::fingerprint(&s.config),
                         lifecycle: None,
@@ -11754,7 +11754,7 @@ mod tests {
             number: Some(602),
             actor: Some("LLFourn".into()),
             url: None,
-            seen_by: members.iter().map(|m| m.key.agent.clone()).collect(),
+            seen_by: members.iter().map(|m| m.key.agent.to_string()).collect(),
             sender: None,
             unhandled: members.iter().any(|m| !m.acked),
             baseline: false,

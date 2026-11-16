@@ -10,7 +10,7 @@ const SESSION: &str = "session-handshake";
 
 /// A timer event no log keeps: the monitor holds it for its author until
 /// a presentation of it is delivered.
-fn transient(author: &AgentLabel) -> Vec<(SourceOwner, WaitItem)> {
+fn transient(author: &AgentLabel) -> Vec<(Stream, WaitItem)> {
     vec![(
         author.clone().into(),
         WaitItem::TimerEvent {
@@ -29,7 +29,7 @@ fn gathered_with(
     repo: &std::path::Path,
     author: &AgentLabel,
     state: &crate::repo_state::RepoState,
-    pending: &[(SourceOwner, WaitItem)],
+    pending: &[(Stream, WaitItem)],
 ) -> crate::cli::turn_custody::Gathered {
     gather(
         repo,
@@ -207,7 +207,7 @@ async fn a_delivery_discharges_the_transient_work_it_presented() {
             .contains("UNLOGGED-PAYLOAD")
     );
     let arrived = (
-        SourceOwner::Agent(author.clone()),
+        Stream::from(author.clone()),
         WaitItem::TimerEvent {
             presentation: None,
             name: "arrived-in-flight".into(),
@@ -1000,7 +1000,7 @@ async fn recovery_after_a_lost_park(later: Later) {
     let parked = turns.answer(&author, 2, &stop_report(), true, &g).unwrap();
     assert_eq!(parked.verdict, WireVerdict::Park);
 
-    type Pending = [(SourceOwner, WaitItem)];
+    type Pending = [(Stream, WaitItem)];
     let facts = |state: &crate::repo_state::RepoState, pending: &Pending, turns: &mut Turns| {
         let [facts] = recovery_facts(
             repo.path(),
@@ -3341,7 +3341,7 @@ fn a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once() {
     .unwrap()
     .on_the_loop();
     let hosted = std::collections::BTreeMap::from([(
-        SourceOwner::Agent(authors[1].clone()),
+        Producer::Agent(authors[1].clone()),
         Hosted {
             timers: Some(timers),
             spec: Vec::new(),
@@ -3387,7 +3387,7 @@ fn a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once() {
 
     let _runtime = runtime.enter();
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let mut retry_and_accept = |hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>| {
+    let mut retry_and_accept = |hosted: &mut std::collections::BTreeMap<Producer, Hosted>| {
         let leaving = retry_contended(
             repo.path(),
             &mut Vec::new(),

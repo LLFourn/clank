@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use rustix::event::PollFlags;
 
-use crate::cli::watch_store::Owner as SourceOwner;
+use crate::cli::watch_store::{Producer, Stream};
 use clank_core::ids::AgentLabel;
 use clank_core::wait::WaitItem;
 
@@ -59,7 +59,9 @@ use clank_core::wait::WaitItem;
 // older monitor ignores these declarations and cannot deliver their selectors.
 // 24 is the first protocol pinned by `wire_golden_tests`: development builds
 // speaking 23 lack `Control::Questions` and drop it silently.
-pub(crate) const PROTO: u32 = 24;
+// 25 names a restart's producer as a tagged value: an agent labelled
+// `watch:1` and watch 1 display alike, so a 24 peer's string named either.
+pub(crate) const PROTO: u32 = 25;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -201,7 +203,7 @@ pub(crate) enum Control {
     /// Restart one of `author`'s command sources, if what the monitor
     /// runs for it is still the configuration `accepted` fingerprints.
     Restart {
-        author: String,
+        author: Producer,
         key: String,
         accepted: String,
     },
@@ -3580,7 +3582,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // — delivering a row a later admission replays again, or one some
     // other client has since acked (codex on ca2ea69).
     let (source_items, mut from_sources) =
-        tokio::sync::mpsc::unbounded_channel::<(SourceOwner, crate::cli::event_source::Emission)>();
+        tokio::sync::mpsc::unbounded_channel::<(Stream, crate::cli::event_source::Emission)>();
     // The last completed fold, so a source signal can present against
     // the same state a tick would.
     let mut folded_state: Option<crate::repo_state::RepoState> = None;
@@ -3588,8 +3590,8 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // emission arriving before the first fold has no state to present
     // against AND no row for a later fold to replay, so dropping it
     // loses it outright (codex on aa3d9a5).
-    let mut pending: Vec<(SourceOwner, WaitItem)> = Vec::new();
-    let mut hosted: std::collections::BTreeMap<SourceOwner, Hosted> = Default::default();
+    let mut pending: Vec<(Stream, WaitItem)> = Vec::new();
+    let mut hosted: std::collections::BTreeMap<Producer, Hosted> = Default::default();
     // Collected by the owner loop below as they end, and handed whole
     // to the retirement: `abort` only asks, and a producer or a
     // handshake live at the cutoff still owns its resources.
@@ -4160,9 +4162,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 )
                                 .await;
                                 if restarted.is_ok() {
-                                    if let Ok(author) = SourceOwner::parse(author) {
-                                        lifecycles.remove(&(author, key.clone()));
-                                    }
+                                    lifecycles.remove(&(author.clone(), key.clone()));
                                     if let Some(birth) = &birth {
                                         publish_sources(
                                             &repo,
@@ -4615,7 +4615,7 @@ impl ContentionRetry {
 /// yet to run again unheld: a hosted timer's step, a client's last serve,
 /// or recovery's last fold.
 fn unavailable_somewhere(
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     clients: &[Client],
     recovery: &crate::cli::recovery::Driver,
 ) -> bool {
@@ -4635,9 +4635,9 @@ fn retry_contended(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
     state: Option<&crate::repo_state::RepoState>,
-    pending: &mut Vec<(SourceOwner, WaitItem)>,
+    pending: &mut Vec<(Stream, WaitItem)>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &mut std::collections::BTreeMap<Producer, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
     for host in hosted.values_mut() {
@@ -4681,7 +4681,7 @@ enum Wake {
     TimersDue,
     Accepted(tokio::net::UnixStream),
     Arrived(Greeted),
-    Emitted(SourceOwner, crate::cli::event_source::Emission),
+    Emitted(Stream, crate::cli::event_source::Emission),
     Lifecycle(crate::cli::event_source::LifecycleReport),
     Interrupted(AgentLabel),
     /// A held report's hook reached its deadline, or an attendance's.
@@ -4721,9 +4721,9 @@ fn user_command_round(
     user_commands: &mut crate::cli::user_command::live::UserCommands,
     clients: &mut Vec<Client>,
     state: Option<&crate::repo_state::RepoState>,
-    pending: &[(SourceOwner, WaitItem)],
+    pending: &[(Stream, WaitItem)],
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
     recovery: &mut crate::cli::recovery::Driver,
     answers: &tokio::sync::mpsc::UnboundedSender<RecoveryAnswer>,
@@ -4854,9 +4854,9 @@ fn user_command_look(
 fn recovery_facts(
     repo: &std::path::Path,
     state: &crate::repo_state::RepoState,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    pending: &[(SourceOwner, WaitItem)],
+    pending: &[(Stream, WaitItem)],
     turns: &mut crate::cli::turn_custody::Turns,
 ) -> crate::cli::recovery::Observed {
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
@@ -4975,9 +4975,9 @@ fn owed_items(
     repo: &std::path::Path,
     state: &crate::repo_state::RepoState,
     author: &AgentLabel,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    pending: &[(SourceOwner, WaitItem)],
+    pending: &[(Stream, WaitItem)],
     reviews: &crate::fs_plan_state_lookup::FsPlanStateLookup,
     head: Option<&clank_core::wait::HeadCommit>,
 ) -> Option<Vec<WaitItem>> {
@@ -5005,9 +5005,9 @@ fn admitted_items(
     repo: &std::path::Path,
     state: &crate::repo_state::RepoState,
     author: &AgentLabel,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    pending: &[(SourceOwner, WaitItem)],
+    pending: &[(Stream, WaitItem)],
     reviews: &crate::fs_plan_state_lookup::FsPlanStateLookup,
     head: Option<&clank_core::wait::HeadCommit>,
     sidecars: &crate::cli::github::log::Sidecars,
@@ -5020,7 +5020,7 @@ fn admitted_items(
     };
     let status = state.fold.derive_status(reviews, &inputs.work_policy, head);
     let current;
-    let sources = match hosted.get(&SourceOwner::Agent(author.clone())) {
+    let sources = match hosted.get(&Producer::Agent(author.clone())) {
         Some(host) => &host.spec,
         None => {
             current = hostable(repo, author).unwrap_or_default();
@@ -5085,10 +5085,14 @@ fn admissions(
     let mut logged = |key: &clank_core::wait::EventPresentation| {
         logs.entry(key.source.clone())
             .or_insert_with(|| {
-                if !crate::cli::watch_store::log_exists(&events_dir, &key.source) {
+                let Ok((at, physical)) = crate::cli::watch_store::locate(&events_dir, &key.source)
+                else {
+                    return Vec::new();
+                };
+                if !at.join(format!("{physical}.jsonl")).is_file() {
                     return Vec::new();
                 }
-                match crate::cli::github::log::EventLog::open(&events_dir, &key.source)
+                match crate::cli::github::log::EventLog::open(&at, &physical)
                     .and_then(|log| sidecars.read_rows(&log, &key.source))
                 {
                     Ok(crate::cli::github::log::Tried::Ran(Some(read))) => read.rows,
@@ -5189,9 +5193,9 @@ fn due_gate(
     clients: &[Client],
     turns: &mut crate::cli::turn_custody::Turns,
     state: Option<&crate::repo_state::RepoState>,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    pending: &[(SourceOwner, WaitItem)],
+    pending: &[(Stream, WaitItem)],
     author: &AgentLabel,
     session: &str,
 ) -> crate::cli::recovery::Gate {
@@ -5302,8 +5306,8 @@ async fn authorized(
 fn authorize(
     repo: &std::path::Path,
     clients: &[Client],
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
-    pending: &[(SourceOwner, WaitItem)],
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
+    pending: &[(Stream, WaitItem)],
     recovery: &mut crate::cli::recovery::Driver,
     turns: &mut crate::cli::turn_custody::Turns,
     a: Authorize,
@@ -5325,8 +5329,8 @@ fn authorize(
 fn may_send_now(
     repo: &std::path::Path,
     clients: &[Client],
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
-    pending: &[(SourceOwner, WaitItem)],
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
+    pending: &[(Stream, WaitItem)],
     recovery: &mut crate::cli::recovery::Driver,
     turns: &mut crate::cli::turn_custody::Turns,
     a: &Authorize,
@@ -5371,8 +5375,8 @@ fn may_send_now(
 fn last_look(
     repo: &std::path::Path,
     clients: &[Client],
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
-    pending: &[(SourceOwner, WaitItem)],
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
+    pending: &[(Stream, WaitItem)],
     turns: &mut crate::cli::turn_custody::Turns,
     a: &Authorize,
 ) -> Option<(crate::cli::recovery::Gate, Vec<WaitItem>)> {
@@ -5508,8 +5512,8 @@ fn retire_gone_runs(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
     state: Option<&crate::repo_state::RepoState>,
-    pending: &[(SourceOwner, WaitItem)],
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    pending: &[(Stream, WaitItem)],
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
     recovery: &mut crate::cli::recovery::Driver,
     author: &AgentLabel,
@@ -5570,8 +5574,8 @@ fn deadline_round(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
     state: Option<&crate::repo_state::RepoState>,
-    pending: &[(SourceOwner, WaitItem)],
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    pending: &[(Stream, WaitItem)],
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
     recovery: &mut crate::cli::recovery::Driver,
     now: u64,
@@ -5612,8 +5616,8 @@ fn expire_deliveries(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
     state: Option<&crate::repo_state::RepoState>,
-    pending: &[(SourceOwner, WaitItem)],
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    pending: &[(Stream, WaitItem)],
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
     recovery: &mut crate::cli::recovery::Driver,
     now: u64,
@@ -5657,11 +5661,11 @@ fn expire_deliveries(
 fn settle_result(
     repo: &std::path::Path,
     turns: &mut crate::cli::turn_custody::Turns,
-    pending: &mut Vec<(SourceOwner, WaitItem)>,
+    pending: &mut Vec<(Stream, WaitItem)>,
     author: &AgentLabel,
     conn: u64,
     result: crate::cli::turn_wire::TurnResult,
-    gathered: impl FnOnce(&[(SourceOwner, WaitItem)]) -> crate::cli::turn_custody::Gathered,
+    gathered: impl FnOnce(&[(Stream, WaitItem)]) -> crate::cli::turn_custody::Gathered,
 ) -> Result<Option<crate::cli::turn_custody::Commit>, String> {
     let g = gathered(pending);
     let commit = turns.result(author, conn, result, &g)?;
@@ -6075,9 +6079,9 @@ impl Tenure {
 /// The sink `author`'s hosted sources emit into, reporting their
 /// lifecycle when the monitor publishes it.
 fn host_sink(
-    into: &tokio::sync::mpsc::UnboundedSender<(SourceOwner, crate::cli::event_source::Emission)>,
+    into: &tokio::sync::mpsc::UnboundedSender<(Stream, crate::cli::event_source::Emission)>,
     lifecycle: Option<&LifecycleTx>,
-    author: &SourceOwner,
+    author: &Producer,
     instance: u64,
     sources: &[clank_core::agent_config::WaitEventSource],
 ) -> crate::cli::event_source::EmissionSink {
@@ -6085,22 +6089,16 @@ fn host_sink(
     let sources = sources.to_vec();
     let sink = crate::cli::event_source::EmissionSink::routed(into.clone(), move |item| {
         use clank_core::agent_config::WaitEventSource;
-        let SourceOwner::Agent(agent) = &owner else {
-            return owner.clone();
-        };
         let source = sources.iter().find(|source| match (source, item) {
             (WaitEventSource::Command(s), WaitItem::CommandEvent { name, .. }) => s.name == *name,
             (WaitEventSource::Timer(s), WaitItem::TimerEvent { name, .. }) => s.name == *name,
             (WaitEventSource::Github(s), WaitItem::GithubEvent { repo, .. }) => s.repo == *repo,
             _ => false,
         });
-        source.map_or_else(
-            || owner.clone(),
-            |source| SourceOwner::Source {
-                agent: agent.clone(),
-                key: crate::cli::watch_store::source_key(source),
-            },
-        )
+        Stream {
+            producer: owner.clone(),
+            key: source.map(crate::cli::watch_store::source_key),
+        }
     });
     match lifecycle {
         Some(tx) => sink.reporting(tx.clone(), author.clone(), instance),
@@ -6111,7 +6109,7 @@ fn host_sink(
 /// The account of what the monitor hosts, from `hosted` and the last
 /// lifecycle each running source reported.
 fn sources_account(
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     lifecycles: &Lifecycles,
     birth: crate::proc_identity::ProcToken,
 ) -> crate::cli::source_status::Account {
@@ -6122,7 +6120,7 @@ fn sources_account(
             host.spec.iter().map(move |(config, _)| {
                 let key = crate::cli::watch_store::source_key(config);
                 Entry {
-                    agent: author.to_string(),
+                    agent: author.clone(),
                     lifecycle: lifecycles
                         .get(&(author.clone(), key.clone()))
                         .filter(|(instance, _)| current(hosted, author, &key, *instance))
@@ -6175,8 +6173,8 @@ fn publish_sources(
 /// until that group is gone and its lease free.
 async fn restart_source(
     repo: &std::path::Path,
-    hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>,
-    into: &tokio::sync::mpsc::UnboundedSender<(SourceOwner, crate::cli::event_source::Emission)>,
+    hosted: &mut std::collections::BTreeMap<Producer, Hosted>,
+    into: &tokio::sync::mpsc::UnboundedSender<(Stream, crate::cli::event_source::Emission)>,
     lifecycle: &LifecycleTx,
     departing: &mut futures_util::stream::FuturesUnordered<tokio::task::JoinHandle<()>>,
     request: &Control,
@@ -6190,10 +6188,8 @@ async fn restart_source(
     else {
         return Err("not a restart".into());
     };
-    let author =
-        SourceOwner::parse(author).map_err(|e| format!("invalid author `{author}`: {e}"))?;
     let host = hosted
-        .get_mut(&author)
+        .get_mut(author)
         .ok_or_else(|| format!("the monitor runs no sources for `{author}`"))?;
     let config = host
         .spec
@@ -6212,9 +6208,9 @@ async fn restart_source(
         .remove(key)
         .ok_or_else(|| format!("`{author}`'s `{key}` has no running task"))?;
     departing.push(old.stop());
-    let events_dir = author.directory(repo).map_err(|e| e.to_string())?;
+    let events_dir = author.directory(repo);
     host.start(
-        &author,
+        author,
         &config,
         crate::cli::event_source::SourceOrigin::Config,
         &events_dir,
@@ -6250,17 +6246,14 @@ type Spawn = dyn Fn(
 
 /// What a host starts its sources' tasks with.
 struct Starts<'a> {
-    into: &'a tokio::sync::mpsc::UnboundedSender<(SourceOwner, crate::cli::event_source::Emission)>,
+    into: &'a tokio::sync::mpsc::UnboundedSender<(Stream, crate::cli::event_source::Emission)>,
     lifecycle: Option<&'a LifecycleTx>,
     spawn: &'a Spawn,
 }
 
 impl<'a> Starts<'a> {
     fn hosting(
-        into: &'a tokio::sync::mpsc::UnboundedSender<(
-            SourceOwner,
-            crate::cli::event_source::Emission,
-        )>,
+        into: &'a tokio::sync::mpsc::UnboundedSender<(Stream, crate::cli::event_source::Emission)>,
         lifecycle: Option<&'a LifecycleTx>,
     ) -> Self {
         Self {
@@ -6328,7 +6321,7 @@ impl Hosted {
     /// Start `source`'s task as a new instance, if it runs one.
     fn start(
         &mut self,
-        author: &SourceOwner,
+        author: &Producer,
         source: &clank_core::agent_config::WaitEventSource,
         origin: crate::cli::event_source::SourceOrigin,
         events_dir: &std::path::Path,
@@ -6389,7 +6382,7 @@ fn hostable(
 
 fn owned_sources(
     repo: &std::path::Path,
-    owner: &SourceOwner,
+    owner: &Producer,
 ) -> anyhow::Result<
     Vec<(
         clank_core::agent_config::WaitEventSource,
@@ -6397,10 +6390,8 @@ fn owned_sources(
     )>,
 > {
     match owner {
-        SourceOwner::Agent(author) | SourceOwner::Source { agent: author, .. } => {
-            hostable(repo, author)
-        }
-        SourceOwner::Watch(id) => {
+        Producer::Agent(author) => hostable(repo, author),
+        Producer::Watch { id, .. } => {
             let config = crate::cli::watch_store::read(repo)?;
             let watch = config
                 .event_watches
@@ -6436,8 +6427,8 @@ fn roster_authors(repo: &std::path::Path) -> Vec<AgentLabel> {
 #[must_use = "a stopped producer may still be winding down; keep its handle"]
 fn reconcile_hosting(
     repo: &std::path::Path,
-    hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>,
-    into: &tokio::sync::mpsc::UnboundedSender<(SourceOwner, crate::cli::event_source::Emission)>,
+    hosted: &mut std::collections::BTreeMap<Producer, Hosted>,
+    into: &tokio::sync::mpsc::UnboundedSender<(Stream, crate::cli::event_source::Emission)>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     reconcile_hosting_changed(repo, hosted, into, false)
 }
@@ -6446,8 +6437,8 @@ fn reconcile_hosting(
 #[must_use = "a stopped producer may still be winding down; keep its handle"]
 fn reconcile_hosting_changed(
     repo: &std::path::Path,
-    hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>,
-    into: &tokio::sync::mpsc::UnboundedSender<(SourceOwner, crate::cli::event_source::Emission)>,
+    hosted: &mut std::collections::BTreeMap<Producer, Hosted>,
+    into: &tokio::sync::mpsc::UnboundedSender<(Stream, crate::cli::event_source::Emission)>,
     timers_changed: bool,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     reconcile_hosting_reporting(repo, hosted, into, timers_changed, None)
@@ -6459,7 +6450,7 @@ type LifecycleTx = tokio::sync::mpsc::UnboundedSender<crate::cli::event_source::
 /// What each hosted source's producer last reported, with the instance of
 /// the task that reported it.
 type Lifecycles =
-    std::collections::BTreeMap<(SourceOwner, String), (u64, crate::cli::event_source::Lifecycle)>;
+    std::collections::BTreeMap<(Producer, String), (u64, crate::cli::event_source::Lifecycle)>;
 
 /// A fresh instance number for tasks this monitor spawns, so a replaced
 /// task's late reports are known for what they are.
@@ -6471,7 +6462,7 @@ fn next_instance() -> u64 {
 /// Keep a producer's report if it is from the task hosted for its source
 /// now; a replaced task's late word is dropped. Whether it was kept.
 fn record_lifecycle(
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     lifecycles: &mut Lifecycles,
     (author, key, instance, state): crate::cli::event_source::LifecycleReport,
 ) -> bool {
@@ -6485,7 +6476,7 @@ fn record_lifecycle(
 /// Forget what replaced or removed tasks last said: a source's new task
 /// has said nothing yet, and its old one's word is not about it.
 fn forget_replaced(
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     lifecycles: &mut Lifecycles,
 ) {
     lifecycles.retain(|(author, key), (instance, _)| current(hosted, author, key, *instance));
@@ -6493,8 +6484,8 @@ fn forget_replaced(
 
 /// Whether `instance` is the task `author` hosts for `key` now.
 fn current(
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
-    author: &SourceOwner,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
+    author: &Producer,
     key: &str,
     instance: u64,
 ) -> bool {
@@ -6516,8 +6507,8 @@ fn current(
 /// apart from the tasks, so neither ever restarts the other.
 fn reconcile_hosting_reporting(
     repo: &std::path::Path,
-    hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>,
-    into: &tokio::sync::mpsc::UnboundedSender<(SourceOwner, crate::cli::event_source::Emission)>,
+    hosted: &mut std::collections::BTreeMap<Producer, Hosted>,
+    into: &tokio::sync::mpsc::UnboundedSender<(Stream, crate::cli::event_source::Emission)>,
     timers_changed: bool,
     lifecycle: Option<&LifecycleTx>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
@@ -6531,7 +6522,7 @@ fn reconcile_hosting_reporting(
 
 fn reconcile_hosting_with(
     repo: &std::path::Path,
-    hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &mut std::collections::BTreeMap<Producer, Hosted>,
     timers_changed: bool,
     starts: &Starts<'_>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
@@ -6553,17 +6544,15 @@ fn reconcile_hosting_with(
             return departing;
         }
     };
-    let authors: Vec<SourceOwner> = config
+    let authors: Vec<Producer> = config
         .agents
         .keys()
         .cloned()
-        .map(SourceOwner::Agent)
+        .map(Producer::Agent)
         .chain(
-            config
-                .event_watches
-                .iter()
-                .filter(|(_, w)| !w.removed)
-                .map(|(id, _)| SourceOwner::Watch(*id)),
+            crate::cli::watch_store::Watches(&config)
+                .hosted()
+                .map(|(producer, _)| producer),
         )
         .collect();
     for author in &authors {
@@ -6590,9 +6579,7 @@ fn reconcile_hosting_with(
                 }
             }
         }
-        let Ok(events_dir) = author.directory(repo) else {
-            continue;
-        };
+        let events_dir = author.directory(repo);
         departing.extend(reconcile_tasks(host, author, &spec, &events_dir, starts));
         let timers = reconcile_timers(host, author, &spec, &events_dir, starts, retry_timers);
         host.spec = spec
@@ -6606,7 +6593,7 @@ fn reconcile_hosting_with(
     }
     // An author off the roster keeps nothing running: a revoked agent's
     // producer is a producer nobody can ever be served from.
-    let gone: Vec<SourceOwner> = hosted
+    let gone: Vec<Producer> = hosted
         .keys()
         .filter(|a| !authors.contains(a))
         .cloned()
@@ -6628,7 +6615,7 @@ fn is_timer(source: &clank_core::agent_config::WaitEventSource) -> bool {
 /// changed. The stopped tasks, to observe as they end.
 fn reconcile_tasks(
     host: &mut Hosted,
-    author: &SourceOwner,
+    author: &Producer,
     spec: &[(
         clank_core::agent_config::WaitEventSource,
         crate::cli::event_source::SourceOrigin,
@@ -6679,7 +6666,7 @@ fn reconcile_tasks(
 /// set cannot be built.
 fn reconcile_timers(
     host: &mut Hosted,
-    author: &SourceOwner,
+    author: &Producer,
     spec: &[(
         clank_core::agent_config::WaitEventSource,
         crate::cli::event_source::SourceOrigin,
@@ -6779,8 +6766,8 @@ fn admit_into(
     clients: &mut Vec<Client>,
     client: Client,
     state: Option<&crate::repo_state::RepoState>,
-    pending: &mut Vec<(SourceOwner, WaitItem)>,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    pending: &mut Vec<(Stream, WaitItem)>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
     let mut leaving = Vec::new();
     // EOF closes each writer's receiver. Remove those connections before
@@ -7738,15 +7725,15 @@ async fn stand_down(
     repo: &std::path::Path,
     mut clients: Vec<Client>,
     mut leaving: Vec<tokio::task::JoinHandle<Wrote>>,
-    mut hosted: std::collections::BTreeMap<SourceOwner, Hosted>,
+    mut hosted: std::collections::BTreeMap<Producer, Hosted>,
     mut owned: OwnedTasks,
     arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<Greeted>,
     from_sources: &mut tokio::sync::mpsc::UnboundedReceiver<(
-        SourceOwner,
+        Stream,
         crate::cli::event_source::Emission,
     )>,
     folded: Option<&crate::repo_state::RepoState>,
-    pending: &mut Vec<(SourceOwner, WaitItem)>,
+    pending: &mut Vec<(Stream, WaitItem)>,
     drain: Option<Drain>,
     budget: Duration,
     settle: Duration,
@@ -8025,7 +8012,7 @@ fn serve_to(
     clients: &mut Vec<Client>,
     state: &crate::repo_state::RepoState,
     only: Option<&AgentLabel>,
-    pending: &mut Vec<(SourceOwner, WaitItem)>,
+    pending: &mut Vec<(Stream, WaitItem)>,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
     serve_to_cached(
         repo,
@@ -8043,9 +8030,9 @@ fn serve_to_cached(
     clients: &mut Vec<Client>,
     state: &crate::repo_state::RepoState,
     only: Option<&AgentLabel>,
-    pending: &mut Vec<(SourceOwner, WaitItem)>,
+    pending: &mut Vec<(Stream, WaitItem)>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
     if clients.is_empty() {
         return Vec::new();
@@ -8112,7 +8099,7 @@ fn serve_to_cached(
                 // rejected edit cannot hide the retained drivers' WAL rows or
                 // apply unaccepted GitHub prompt changes to their delivery.
                 let current;
-                let sources = match hosted.get(&SourceOwner::Agent(author.clone())) {
+                let sources = match hosted.get(&Producer::Agent(author.clone())) {
                     Some(host) => &host.spec,
                     None => {
                         current = hostable(repo, author).unwrap_or_default();
@@ -8236,9 +8223,9 @@ fn owed_now(
     repo: &std::path::Path,
     state: &crate::repo_state::RepoState,
     author: &AgentLabel,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    pending: &[(SourceOwner, WaitItem)],
+    pending: &[(Stream, WaitItem)],
 ) -> Option<Vec<WaitItem>> {
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
@@ -8262,9 +8249,9 @@ fn gather(
     repo: &std::path::Path,
     state: Option<&crate::repo_state::RepoState>,
     author: &AgentLabel,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    pending: &[(SourceOwner, WaitItem)],
+    pending: &[(Stream, WaitItem)],
 ) -> crate::cli::turn_custody::Gathered {
     let owed =
         state.and_then(|state| owed_now(repo, state, author, hosted, timer_backlogs, pending));
@@ -8283,8 +8270,8 @@ fn tend(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
     state: Option<&crate::repo_state::RepoState>,
-    pending: &[(SourceOwner, WaitItem)],
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    pending: &[(Stream, WaitItem)],
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
     recovery: &mut crate::cli::recovery::Driver,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
@@ -8319,8 +8306,8 @@ fn ended(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
     state: Option<&crate::repo_state::RepoState>,
-    pending: &[(SourceOwner, WaitItem)],
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    pending: &[(Stream, WaitItem)],
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
     recovery: &mut crate::cli::recovery::Driver,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
@@ -8364,8 +8351,8 @@ fn ended(
 struct Serving<'a> {
     repo: &'a std::path::Path,
     state: Option<&'a crate::repo_state::RepoState>,
-    pending: &'a [(SourceOwner, WaitItem)],
-    hosted: &'a std::collections::BTreeMap<SourceOwner, Hosted>,
+    pending: &'a [(Stream, WaitItem)],
+    hosted: &'a std::collections::BTreeMap<Producer, Hosted>,
 }
 
 /// Serve `author`'s reports on the arrival of one. A child's report
@@ -8418,9 +8405,9 @@ fn serve_reports(
     clients: &mut Vec<Client>,
     state: Option<&crate::repo_state::RepoState>,
     only: Option<&AgentLabel>,
-    pending: &[(SourceOwner, WaitItem)],
+    pending: &[(Stream, WaitItem)],
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
-    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    hosted: &std::collections::BTreeMap<Producer, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
     let mut leaving = Vec::new();
@@ -8857,7 +8844,7 @@ mod recovery_tests {
         timers.due();
         held.release();
         let hosting = std::collections::BTreeMap::from([(
-            SourceOwner::Agent(AgentLabel::parse("claude").unwrap()),
+            Producer::Agent(AgentLabel::parse("claude").unwrap()),
             Hosted {
                 timers: Some(timers),
                 spec: Vec::new(),
@@ -10693,7 +10680,7 @@ mod tests {
     /// A source channel nothing ever produced on, for the fixtures
     /// whose subject is not the source buffer.
     fn no_sources()
-    -> tokio::sync::mpsc::UnboundedReceiver<(SourceOwner, crate::cli::event_source::Emission)> {
+    -> tokio::sync::mpsc::UnboundedReceiver<(Stream, crate::cli::event_source::Emission)> {
         tokio::sync::mpsc::unbounded_channel().1
     }
 
@@ -14884,11 +14871,11 @@ mod tests {
         })
         .unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hosted: std::collections::BTreeMap<SourceOwner, Hosted> = Default::default();
+        let mut hosted: std::collections::BTreeMap<Producer, Hosted> = Default::default();
         assert!(reconcile_hosting(repo.path(), &mut hosted, &tx).is_empty());
         assert!(rx.try_recv().is_err(), "hosting only arms");
         hosted
-            .get_mut(&SourceOwner::Agent(author.clone()))
+            .get_mut(&Producer::Agent(author.clone()))
             .unwrap()
             .timers
             .as_mut()
@@ -14909,7 +14896,7 @@ mod tests {
             }
         ));
         assert!(
-            hosted[&SourceOwner::Agent(author.clone())]
+            hosted[&Producer::Agent(author.clone())]
                 .timers
                 .as_ref()
                 .unwrap()
@@ -14925,7 +14912,7 @@ mod tests {
         )
         .unwrap();
         assert!(reconcile_hosting_changed(repo.path(), &mut hosted, &tx, true).is_empty());
-        let deadline = hosted[&SourceOwner::Agent(author.clone())]
+        let deadline = hosted[&Producer::Agent(author.clone())]
             .timers
             .as_ref()
             .unwrap()
@@ -14934,7 +14921,7 @@ mod tests {
         assert!(deadline > tokio::time::Instant::now());
         assert!(reconcile_hosting(repo.path(), &mut hosted, &tx).is_empty());
         assert_eq!(
-            hosted[&SourceOwner::Agent(author.clone())]
+            hosted[&Producer::Agent(author.clone())]
                 .timers
                 .as_ref()
                 .unwrap()
@@ -15076,9 +15063,9 @@ mod tests {
                 "invalid edit is distinct from clearing sources"
             );
             assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
-            assert_eq!(hosts[&SourceOwner::Agent(author.clone())].spec, spec);
+            assert_eq!(hosts[&Producer::Agent(author.clone())].spec, spec);
             assert_eq!(
-                hosts[&SourceOwner::Agent(author.clone())]
+                hosts[&Producer::Agent(author.clone())]
                     .tasks
                     .values()
                     .map(|task| task.handle.id())
@@ -15086,7 +15073,7 @@ mod tests {
                 ids
             );
             assert_eq!(
-                hosts[&SourceOwner::Agent(author.clone())]
+                hosts[&Producer::Agent(author.clone())]
                     .timers
                     .as_ref()
                     .unwrap()
@@ -15157,20 +15144,20 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut hosts = Default::default();
         assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
-        let deadline = hosts[&SourceOwner::Agent(author.clone())]
+        let deadline = hosts[&Producer::Agent(author.clone())]
             .timers
             .as_ref()
             .unwrap()
             .next_deadline();
         assert!(deadline.is_some());
         assert!(
-            hosts[&SourceOwner::Agent(author.clone())].tasks.is_empty(),
+            hosts[&Producer::Agent(author.clone())].tasks.is_empty(),
             "native timer starts no tasks or producers"
         );
         for _ in 0..10 {
             assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
             assert_eq!(
-                hosts[&SourceOwner::Agent(author.clone())]
+                hosts[&Producer::Agent(author.clone())]
                     .timers
                     .as_ref()
                     .unwrap()
@@ -15199,10 +15186,10 @@ mod tests {
         let author = AgentLabel::parse("codex").unwrap();
         with_timer(repo.path(), "past", 1);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hosts: std::collections::BTreeMap<SourceOwner, Hosted> = Default::default();
+        let mut hosts: std::collections::BTreeMap<Producer, Hosted> = Default::default();
         assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
         hosts
-            .get_mut(&SourceOwner::Agent(author.clone()))
+            .get_mut(&Producer::Agent(author.clone()))
             .unwrap()
             .timers
             .as_mut()
@@ -16124,14 +16111,14 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut hosted = std::collections::BTreeMap::new();
         let mut departing: Vec<_> = reconcile_hosting(repo.path(), &mut hosted, &tx);
-        let before: Vec<_> = hosted[&SourceOwner::Agent(codex.clone())]
+        let before: Vec<_> = hosted[&Producer::Agent(codex.clone())]
             .tasks
             .values()
             .map(|t| t.handle.id())
             .collect();
         write(serde_json::json!([command.clone(), command]));
         departing.extend(reconcile_hosting(repo.path(), &mut hosted, &tx));
-        let after: Vec<_> = hosted[&SourceOwner::Agent(codex.clone())]
+        let after: Vec<_> = hosted[&Producer::Agent(codex.clone())]
             .tasks
             .values()
             .map(|t| t.handle.id())
@@ -16271,7 +16258,7 @@ mod tests {
         let grandchild = pid("a.gc").unwrap();
         let sibling = pid("b.pid").unwrap();
         let alive = |pid: i32| crate::signal::probe_process(pid) != crate::signal::Probe::Gone;
-        let config = hosted[&SourceOwner::Agent(codex.clone())]
+        let config = hosted[&Producer::Agent(codex.clone())]
             .spec
             .iter()
             .map(|(c, _)| c.clone())
@@ -16324,10 +16311,10 @@ mod tests {
             "and it started again"
         );
         assert!(
-            hosted[&SourceOwner::Agent(codex.clone())]
+            hosted[&Producer::Agent(codex.clone())]
                 .tasks
                 .contains_key(&key)
-                && hosted[&SourceOwner::Agent(codex.clone())].tasks.len() == 2,
+                && hosted[&Producer::Agent(codex.clone())].tasks.len() == 2,
             "and the monitor holds its new task, to stop or restart again"
         );
         assert!(
@@ -16379,7 +16366,7 @@ mod tests {
                     panic!("expected the hosted command's event");
                 };
                 assert!(!failure);
-                assert_eq!(content, author.to_string());
+                assert_eq!(content, author.producer.to_string());
                 heard.push(author);
             }
             heard
@@ -16388,18 +16375,19 @@ mod tests {
         .expect("both hosted producers must deliver into the monitor queue");
         heard.sort();
         assert_eq!(
-            heard.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            heard
+                .iter()
+                .map(|stream| stream.producer.to_string())
+                .collect::<Vec<_>>(),
             vec!["claude", "codex"]
         );
         for author in &heard {
             let label = author.recipient(repo.path()).unwrap();
-            let spec = &hosted[&SourceOwner::Agent(label)].spec;
+            let spec = &hosted[&Producer::Agent(label)].spec;
             let clank_core::agent_config::WaitEventSource::Command(command) = &spec[0].0 else {
                 unreachable!()
             };
-            let events = crate::agent_store::agents_root(repo.path())
-                .join(author.to_string())
-                .join("events");
+            let events = author.producer.directory(repo.path());
             assert!(
                 IngestLease::try_acquire(&events, &command.source_key())
                     .unwrap()
@@ -16414,13 +16402,11 @@ mod tests {
             let _ = task.await;
         }
         for author in &heard {
-            let sources = owned_sources(repo.path(), author).unwrap();
+            let sources = owned_sources(repo.path(), &author.producer).unwrap();
             let clank_core::agent_config::WaitEventSource::Command(command) = &sources[0].0 else {
                 unreachable!()
             };
-            let events = crate::agent_store::agents_root(repo.path())
-                .join(author.to_string())
-                .join("events");
+            let events = author.producer.directory(repo.path());
             assert!(
                 IngestLease::try_acquire(&events, &command.source_key())
                     .unwrap()
@@ -16475,7 +16461,7 @@ mod tests {
             "an author with no configured source hosts nothing"
         );
         let codex = AgentLabel::parse("codex").unwrap();
-        let first: Vec<_> = hosted[&SourceOwner::Agent(codex.clone())]
+        let first: Vec<_> = hosted[&Producer::Agent(codex.clone())]
             .tasks
             .values()
             .map(|t| t.handle.id())
@@ -16484,7 +16470,7 @@ mod tests {
 
         // An unrelated fold leaves a healthy producer alone.
         let _ = reconcile_hosting(repo.path(), &mut hosted, &tx);
-        let again: Vec<_> = hosted[&SourceOwner::Agent(codex.clone())]
+        let again: Vec<_> = hosted[&Producer::Agent(codex.clone())]
             .tasks
             .values()
             .map(|t| t.handle.id())
@@ -16497,7 +16483,7 @@ mod tests {
         with_source(repo.path(), "codex", "builds");
         let departing = reconcile_hosting(repo.path(), &mut hosted, &tx);
         assert_eq!(departing.len(), 1, "the source the edit removed is stopped");
-        let after: Vec<_> = hosted[&SourceOwner::Agent(codex.clone())]
+        let after: Vec<_> = hosted[&Producer::Agent(codex.clone())]
             .tasks
             .values()
             .map(|t| t.handle.id())
@@ -16558,10 +16544,10 @@ mod tests {
     }
 
     fn instances(
-        hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+        hosted: &std::collections::BTreeMap<Producer, Hosted>,
         author: &AgentLabel,
     ) -> std::collections::BTreeMap<String, u64> {
-        hosted[&SourceOwner::Agent(author.clone())]
+        hosted[&Producer::Agent(author.clone())]
             .tasks
             .iter()
             .map(|(key, task)| (key.clone(), task.instance))
@@ -16598,9 +16584,9 @@ mod tests {
         };
         let mut hosts = std::collections::BTreeMap::new();
         assert!(reconcile_hosting_with(repo.path(), &mut hosts, false, &starts).is_empty());
-        let tasks = |hosts: &std::collections::BTreeMap<SourceOwner, Hosted>| {
+        let tasks = |hosts: &std::collections::BTreeMap<Producer, Hosted>| {
             [command_id, github_id].map(|id| {
-                hosts[&SourceOwner::Watch(id)]
+                hosts[&Producer::repo_watch(id)]
                     .tasks
                     .values()
                     .next()
@@ -16610,7 +16596,7 @@ mod tests {
             })
         };
         let original = tasks(&hosts);
-        let deadline = hosts[&SourceOwner::Watch(timer_id)]
+        let deadline = hosts[&Producer::repo_watch(timer_id)]
             .timers
             .as_ref()
             .unwrap()
@@ -16631,7 +16617,7 @@ mod tests {
             assert!(reconcile_hosting_with(repo.path(), &mut hosts, false, &starts).is_empty());
             assert_eq!(tasks(&hosts), original);
             assert_eq!(
-                hosts[&SourceOwner::Watch(timer_id)]
+                hosts[&Producer::repo_watch(timer_id)]
                     .timers
                     .as_ref()
                     .unwrap()
@@ -16639,8 +16625,8 @@ mod tests {
                 deadline
             );
             assert_eq!(
-                SourceOwner::Watch(command_id)
-                    .recipient(repo.path())
+                Producer::repo_watch(command_id)
+                    .recipient(&crate::cli::watch_store::read(repo.path()).unwrap())
                     .as_ref()
                     .map(AgentLabel::as_str),
                 master
@@ -16677,7 +16663,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(owner, SourceOwner::Watch(id));
+        assert_eq!(owner.producer, Producer::repo_watch(id));
+        let owner = owner.producer;
         assert_eq!(durability, crate::cli::event_source::Durability::Logged);
         let pid = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -16788,7 +16775,7 @@ mod tests {
         let first = instances(&hosted, &codex);
         let theirs = instances(&hosted, &claude);
         assert_eq!(first.len(), 2);
-        let deadline = hosted[&SourceOwner::Agent(codex.clone())]
+        let deadline = hosted[&Producer::Agent(codex.clone())]
             .timers
             .as_ref()
             .unwrap()
@@ -16801,7 +16788,7 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        let reconcile = |hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>| {
+        let reconcile = |hosted: &mut std::collections::BTreeMap<Producer, Hosted>| {
             reconcile_hosting_with(repo.path(), hosted, false, &starts)
         };
 
@@ -16814,7 +16801,7 @@ mod tests {
             assert!(reconcile(&mut hosted).is_empty(), "{unrelated}");
             assert_eq!(instances(&hosted, &codex), first, "{unrelated}");
             assert_eq!(
-                hosted[&SourceOwner::Agent(codex.clone())]
+                hosted[&Producer::Agent(codex.clone())]
                     .timers
                     .as_ref()
                     .unwrap()
@@ -16856,7 +16843,7 @@ mod tests {
         let after = instances(&hosted, &codex);
         assert_ne!(after[&key("one")], now[&key("one")]);
         assert_eq!(after[&key("two")], now[&key("two")], "a timer removed");
-        assert!(hosted[&SourceOwner::Agent(codex.clone())].timers.is_none());
+        assert!(hosted[&Producer::Agent(codex.clone())].timers.is_none());
         assert_eq!(
             instances(&hosted, &claude),
             theirs,
@@ -16934,7 +16921,7 @@ mod tests {
         for task in departing {
             task.await.unwrap();
         }
-        assert!(!hosted.contains_key(&SourceOwner::Agent(codex.clone())));
+        assert!(!hosted.contains_key(&Producer::Agent(codex.clone())));
         let mut stopped = asked.lock().unwrap().clone();
         stopped.sort();
         keys.sort();
@@ -19542,5 +19529,78 @@ mod user_command_tests {
             Look::Wait("its released turn is ending".into())
         );
         assert!(matches!(look(&[], &mut recovery, &none), Look::Wait(_)));
+    }
+}
+
+#[cfg(test)]
+mod producer_identity_tests {
+    use super::*;
+
+    /// Agent `watch:1` and watch 1 display alike and host identical
+    /// definitions; a restart naming the watch must reach the watch alone.
+    #[tokio::test]
+    async fn a_restart_names_the_watch_not_the_agent_that_displays_like_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let agent = Producer::Agent(AgentLabel::parse("watch:1").unwrap());
+        let watch = Producer::repo_watch(1);
+        assert_eq!(agent.to_string(), watch.to_string());
+        let source: clank_core::agent_config::WaitEventSource = serde_json::from_value(
+            serde_json::json!({"kind":"command", "name":"build", "command":["producer"]}),
+        )
+        .unwrap();
+        let key = crate::cli::watch_store::source_key(&source);
+        let spec = vec![(
+            source.clone(),
+            crate::cli::event_source::SourceOrigin::Config,
+        )];
+        let agents_task = tokio::spawn(std::future::pending::<()>());
+        let agents_task_id = agents_task.id();
+        let mut hosted = std::collections::BTreeMap::from([
+            (
+                agent.clone(),
+                Hosted {
+                    spec: spec.clone(),
+                    timers: None,
+                    tasks: std::collections::BTreeMap::from([(
+                        key.clone(),
+                        HostedTask {
+                            instance: 1,
+                            handle: agents_task,
+                            stop: None,
+                        },
+                    )]),
+                },
+            ),
+            (
+                watch.clone(),
+                Hosted {
+                    spec,
+                    timers: None,
+                    tasks: Default::default(),
+                },
+            ),
+        ]);
+        let request = Control::Restart {
+            author: watch,
+            key: key.clone(),
+            accepted: crate::cli::source_status::fingerprint(&source),
+        };
+        let (into, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (lifecycle, _lrx) = tokio::sync::mpsc::unbounded_channel();
+        let mut departing = futures_util::stream::FuturesUnordered::new();
+        let err = restart_source(
+            repo.path(),
+            &mut hosted,
+            &into,
+            &lifecycle,
+            &mut departing,
+            &request,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("has no running task"), "{err}");
+        assert!(departing.is_empty(), "nothing of the agent's was stopped");
+        assert_eq!(hosted[&agent].tasks[&key].handle.id(), agents_task_id);
+        hosted[&agent].tasks[&key].handle.abort();
     }
 }

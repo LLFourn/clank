@@ -31,15 +31,22 @@ use super::{Control, Hello, Holder, Note, PROTO, Welcome, Who};
 use crate::cli::question_state::{Key, Observation};
 use crate::cli::recovery::{Reply, ReplyAnswer};
 use crate::cli::turn_wire::{Frame, Report, TurnResult, WireVerdict};
+use crate::cli::watch_store::{Producer, WatchStorage};
 
 /// Every `(PROTO, hash)` the wire has been pinned at, oldest first.
 ///
 /// Append a pair when the shape changes; never edit one in place. The
 /// test cannot tell an in-place edit from a bump, so review holds it.
-const PINS: &[(u32, &str)] = &[(
-    24,
-    "522c39c1769fe65c06da3128cf039906f35f1b45b2b16fc696d4b3d73baada11",
-)];
+const PINS: &[(u32, &str)] = &[
+    (
+        24,
+        "522c39c1769fe65c06da3128cf039906f35f1b45b2b16fc696d4b3d73baada11",
+    ),
+    (
+        25,
+        "547dd6eccf30d864bb65cfb4e89ae03e4e0bc6211406fb397496833bbbce3244",
+    ),
+];
 
 fn session() -> SessionId {
     SessionId::parse("session-1").unwrap()
@@ -129,7 +136,7 @@ fn controls() -> Vec<Control> {
             observation: observations().remove(0),
         },
         Control::Restart {
-            author: "alice".into(),
+            author: producers().remove(1),
             key: "source-key".into(),
             accepted: "fingerprint".into(),
         },
@@ -681,6 +688,37 @@ fn silent_reasons() -> Vec<SilentReason> {
     samples
 }
 
+fn producers() -> Vec<Producer> {
+    let samples = vec![
+        Producer::Agent(AgentLabel::parse("watch:1").unwrap()),
+        Producer::Watch {
+            id: u64::MAX,
+            storage: watch_storages().remove(1),
+        },
+    ];
+    for s in &samples {
+        match s {
+            Producer::Agent(_) => {}
+            Producer::Watch { id: _, storage: _ } => {}
+        }
+    }
+    samples
+}
+
+fn watch_storages() -> Vec<WatchStorage> {
+    let samples = vec![
+        WatchStorage::Repo,
+        WatchStorage::Agent(AgentLabel::parse("alice").unwrap()),
+    ];
+    for s in &samples {
+        match s {
+            WatchStorage::Repo => {}
+            WatchStorage::Agent(_) => {}
+        }
+    }
+    samples
+}
+
 fn tools() -> Vec<Tool> {
     let samples = vec![Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode];
     for s in &samples {
@@ -1121,6 +1159,8 @@ fn document() -> Vec<(&'static str, Vec<Value>)> {
         ("TimerRecurrence", samples(timer_recurrences())),
         ("TimerGeneration", samples(timer_generations())),
         ("AnswerRef", samples(answer_refs())),
+        ("Producer", samples(producers())),
+        ("WatchStorage", samples(watch_storages())),
     ]
 }
 
@@ -1261,6 +1301,8 @@ fn every_variant_has_a_sample() {
         check("WaitingReason", waiting_reasons(), External),
         check("CommitGateState", commit_gate_states(), External),
         check("ContentRef", content_refs(), Internal("ref")),
+        check("Producer", producers(), External),
+        check("WatchStorage", watch_storages(), External),
     ]
     .into_iter()
     .flatten()
