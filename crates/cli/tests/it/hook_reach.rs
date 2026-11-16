@@ -279,7 +279,13 @@ const UNFOLLOWABLE: &[Unfollowable] = &[
         at: "crate::cli::turn_child::carry",
         form: "select!",
         subject: "select!",
-        why: "races attaching, and the pause between attempts, against the hook going",
+        why: "races attaching, and the wait for an outage's events, against the hook going",
+    },
+    Unfollowable {
+        at: "crate::cli::monitor::outage::Absence::after",
+        form: "select!",
+        subject: "select!",
+        why: "races what can end an outage against its report deadline",
     },
     Unfollowable {
         at: "crate::cli::turn_child::shared",

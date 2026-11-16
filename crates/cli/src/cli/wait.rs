@@ -266,9 +266,14 @@ async fn run_automatic_grok(
         args.events.is_empty(),
         "automatic Grok wait uses monitor-hosted sources; configure wait_events or use auto off for invocation-only --event sources"
     );
-    let (items, cwd) = monitored(repo, author, binding, &mut replaced_as_started(), |who| {
-        crate::cli::monitor::attempt_with(repo, who, crate::cli::monitor::spawn_monitor)
-    })
+    let (items, cwd) = monitored(
+        repo,
+        author,
+        binding,
+        &mut replaced_as_started(),
+        |who| crate::cli::monitor::attempt_with(repo, who, crate::cli::monitor::spawn_monitor),
+        crate::cli::monitor::outage::Kernel::new(repo, crate::upgrade::process()),
+    )
     .await?;
     deliver_grok_wake(
         repo,
@@ -456,6 +461,7 @@ async fn items_with_context(
             &binding,
             &mut replaced_as_started(),
             |who| crate::cli::monitor::attempt_with(&repo, who, crate::cli::monitor::spawn_monitor),
+            crate::cli::monitor::outage::Kernel::new(&repo, crate::upgrade::process()),
         )
         .await?;
         *source_cwd = cwd;
@@ -982,11 +988,13 @@ impl WakeSources {
 /// The wake of a wait that serves an agent: whatever the repo's monitor
 /// decides it is owed, and nothing this process folds.
 ///
-/// A monitor that goes away is followed, every time. With none to be had
-/// within [`crate::cli::monitor::OUTAGE_BUDGET`] the wait fails saying so,
-/// which is what wakes whoever armed it. A session is told of one outage
-/// once, by this or by its hook: a wait armed again inside it goes on
-/// trying and does not fail a second time.
+/// A monitor that goes away is followed at once. With none to be had, the
+/// wait attempts again only when something that can end its failure
+/// moves, as `ears` hear it; and with none by the outage's deadline it
+/// fails saying so, which is what wakes whoever armed it. A session is
+/// told of one outage once, by this or by its hook: a wait armed again
+/// inside it stays parked on those events and does not fail a second
+/// time. A watch that cannot be heard fails the wait whatever it was told.
 ///
 /// While it holds no items the wait is parked, and that is where
 /// `replacing` turns it into the installed build: when an install is
@@ -1003,13 +1011,14 @@ pub(crate) async fn monitored<F>(
         impl FnMut(&crate::build_stamp::Build) -> std::io::Error,
     >,
     attach: impl Fn(crate::cli::monitor::Who) -> F,
+    ears: impl crate::cli::monitor::outage::Ears,
 ) -> anyhow::Result<(Vec<WaitItem>, Option<PathBuf>)>
 where
     F: std::future::Future<Output = crate::cli::monitor::Attempt>,
 {
-    use crate::cli::monitor::Unserved;
+    use crate::cli::monitor::outage::{Absence, Next, Unserved};
     use crate::upgrade::{Hosting, Pass};
-    let mut outage = crate::cli::monitor::Outage::default();
+    let mut absence = Absence::new(ears);
     let session = binding.0.as_ref().map(|(_, session)| session);
     loop {
         binding.ensure_current(repo, author)?;
@@ -1022,17 +1031,23 @@ where
         let unserved = match attach(who).await.served(repo) {
             Ok(conn) => {
                 tracing::debug!(%author, "monitor subscription registered");
-                let shared = shared_wait_within(conn, repo, author, binding, &mut outage);
-                tokio::pin!(shared);
-                let ended = tokio::select! {
-                    // Items in hand go out before anything else is considered.
-                    biased;
-                    ended = &mut shared => ended?,
-                    never = replacing.parked() => match never {},
+                let ended = {
+                    let shared = shared_wait_within(conn, repo, author, binding, &mut absence);
+                    tokio::pin!(shared);
+                    tokio::select! {
+                        // Items in hand go out before anything else is considered.
+                        biased;
+                        ended = &mut shared => ended?,
+                        never = replacing.parked() => match never {},
+                    }
                 };
                 match ended {
                     Shared::Woke(items, cwd) => return Ok((items, cwd)),
-                    Shared::Lost(why) => Unserved::Failed(why),
+                    Shared::Lost(why) if absence.left() => {
+                        tracing::debug!(%why, "the monitor serving this wait went");
+                        continue;
+                    }
+                    Shared::Lost(why) => Unserved::Unstartable(why),
                 }
             }
             Err(unserved) => unserved,
@@ -1043,30 +1058,39 @@ where
             replacing.until_current().await;
             continue;
         }
-        let pause = match outage.lost(tokio::time::Instant::now(), &unserved) {
-            Some(pause) => pause,
-            // Failing is all this wait can say, so committing to fail is
-            // its delivery. An unbound wait has nobody's notice to share
-            // and fails each time.
-            None => {
-                let told_already = session.is_some_and(|session| {
-                    matches!(
-                        crate::agent_store::announce_outage(
-                            repo,
-                            author,
-                            session,
-                            time::OffsetDateTime::now_utc(),
-                        ),
-                        Ok(false)
-                    )
-                });
-                if !told_already {
-                    anyhow::bail!("clank cannot start its monitor: {why}");
+        loop {
+            let next = tokio::select! {
+                next = absence.after(&unserved) => next,
+                never = replacing.parked() => match never {},
+            };
+            match next {
+                Next::Attempt => break,
+                Next::Deaf(deaf) => {
+                    anyhow::bail!("clank cannot start its monitor: {why}, and {deaf}")
                 }
-                crate::cli::monitor::OUTAGE_RETRY_CAP
+                Next::Report if replacing.stale() => absence.reported(),
+                // Failing is all this wait can say, so committing to fail
+                // is its delivery. An unbound wait has nobody's notice to
+                // share and fails each time.
+                Next::Report => {
+                    let told_already = session.is_some_and(|session| {
+                        matches!(
+                            crate::agent_store::announce_outage(
+                                repo,
+                                author,
+                                session,
+                                time::OffsetDateTime::now_utc(),
+                            ),
+                            Ok(false)
+                        )
+                    });
+                    if !told_already {
+                        anyhow::bail!("clank cannot start its monitor: {why}");
+                    }
+                    absence.reported();
+                }
             }
-        };
-        tokio::time::sleep(pause).await;
+        }
     }
 }
 
@@ -1103,13 +1127,13 @@ enum Shared {
 /// Only the socket closing ends it: a monitor that dies closes it, and
 /// one that wedges is stood down by its own watchdog, which closes it
 /// too. A quiet repo is silence, and silence is not loss. Every note
-/// heard ends `outage`.
+/// heard ends the outage in `absence`.
 async fn shared_wait_within(
     conn: crate::cli::monitor::Conn,
     repo: &Path,
     author: &AgentLabel,
     binding: &WaitBinding,
-    outage: &mut crate::cli::monitor::Outage,
+    absence: &mut crate::cli::monitor::outage::Absence<impl crate::cli::monitor::outage::Ears>,
 ) -> anyhow::Result<Shared> {
     let mut notes = bridge_notes(conn)?;
     let mut served = false;
@@ -1121,7 +1145,7 @@ async fn shared_wait_within(
     loop {
         match notes.recv().await {
             Some(Ok(note)) => {
-                outage.answered();
+                absence.answered();
                 // A subscription is served by the first thing its monitor
                 // says, whatever it is: the first fold's note.
                 if !std::mem::replace(&mut served, true)
@@ -3345,7 +3369,16 @@ pub(crate) fn parse_duration_str(raw: &str) -> anyhow::Result<Option<Duration>> 
 #[cfg(test)]
 mod shared_tests {
     use super::*;
+    use crate::cli::monitor::outage::Source;
     use crate::cli::monitor::{Conn, Note};
+
+    type Ears = crate::cli::monitor::outage::scripted::Scripted;
+
+    /// Move `source` on `ears` once `after` has passed.
+    async fn fire_after(ears: &Ears, after: Duration, source: Source) {
+        tokio::time::sleep(after).await;
+        assert!(ears.fire(source), "{source} was armed");
+    }
 
     /// A monitor's end of a pair, writing frames a test chooses.
     fn monitor_saying(frames: Vec<Note>) -> Conn {
@@ -3390,7 +3423,7 @@ mod shared_tests {
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
             &WaitBinding(None, WaitPolicy::Manual),
-            &mut Default::default(),
+            &mut crate::cli::monitor::outage::Absence::new(Ears::default()),
         )
         .await
         .expect("the items arrive");
@@ -3417,7 +3450,7 @@ mod shared_tests {
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
             &WaitBinding(None, WaitPolicy::Manual),
-            &mut Default::default(),
+            &mut crate::cli::monitor::outage::Absence::new(Ears::default()),
         )
         .await
         .unwrap();
@@ -3448,7 +3481,7 @@ mod shared_tests {
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
             &WaitBinding(None, WaitPolicy::Manual),
-            &mut Default::default(),
+            &mut crate::cli::monitor::outage::Absence::new(Ears::default()),
         )
         .await
         .unwrap();
@@ -3501,6 +3534,7 @@ mod shared_tests {
                     })
                 }
             },
+            Ears::default(),
         )
         .await
         .expect("the fourth monitor delivers");
@@ -3524,21 +3558,38 @@ mod shared_tests {
             panic!("the installed build has nothing to become")
         });
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let (items, _) = monitored(repo.path(), &author, &binding, &mut replacing, |_| {
-            let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move {
-                match nth {
-                    0..3 => Attempt::LeaseHeld("the retiring monitor still holds the lease".into()),
-                    _ => Attempt::Shared(monitor_saying(vec![Note::Items {
-                        source_cwd: None,
-                        items: vec![promote()],
-                    }])),
+        let ears = Ears::default();
+        let waiting = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut replacing,
+            |_| {
+                let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    match nth {
+                        0..2 => {
+                            Attempt::LeaseHeld("the retiring monitor still holds the lease".into())
+                        }
+                        _ => Attempt::Shared(monitor_saying(vec![Note::Items {
+                            source_cwd: None,
+                            items: vec![promote()],
+                        }])),
+                    }
                 }
-            }
-        })
-        .await
-        .expect("the installed build's monitor delivers");
-        assert_eq!(attempts.into_inner(), 4);
+            },
+            ears.clone(),
+        );
+        let (served, ()) = tokio::join!(
+            waiting,
+            fire_after(&ears, Duration::from_secs(1), Source::Lease)
+        );
+        let (items, _) = served.expect("the installed build's monitor delivers");
+        assert_eq!(
+            attempts.into_inner(),
+            3,
+            "the first, its look, and the release's"
+        );
         assert!(
             matches!(items.as_slice(), [WaitItem::PromoteFromQueue { .. }]),
             "{items:?}"
@@ -3556,11 +3607,13 @@ mod shared_tests {
         let (repo, author, binding) = unbound();
         let seventy = OUTAGE_BUDGET + Duration::from_secs(10);
         let began = tokio::time::Instant::now();
-        let (items, _) = monitored(
+        let ears = Ears::default();
+        let mut never = crate::upgrade::Replacing::never();
+        let waiting = monitored(
             repo.path(),
             &author,
             &binding,
-            &mut crate::upgrade::Replacing::never(),
+            &mut never,
             |_| async move {
                 match began.elapsed() < seventy {
                     true => Attempt::LeaseHeld("the retiring monitor still holds the lease".into()),
@@ -3570,10 +3623,11 @@ mod shared_tests {
                     }])),
                 }
             },
-        )
-        .await
-        .expect("a retirement is not an outage");
-        assert!(began.elapsed() >= seventy);
+            ears.clone(),
+        );
+        let (served, ()) = tokio::join!(waiting, fire_after(&ears, seventy, Source::Lease));
+        let (items, _) = served.expect("a retirement is not an outage");
+        assert_eq!(began.elapsed(), seventy);
         assert!(matches!(
             items.as_slice(),
             [WaitItem::PromoteFromQueue { .. }]
@@ -3592,7 +3646,7 @@ mod shared_tests {
         use crate::cli::monitor::{Attempt, Descriptor, OUTAGE_BUDGET, PROTO, TempRepo};
         let seventy = OUTAGE_BUDGET + Duration::from_secs(10);
         let began = tokio::time::Instant::now();
-        let contend = |repo: &Path, who: &str, began: tokio::time::Instant| {
+        let contend = |repo: &Path, who: &str, began: tokio::time::Instant, ears: Ears| {
             let (repo, author) = (repo.to_path_buf(), AgentLabel::parse(who).unwrap());
             async move {
                 monitored(
@@ -3612,6 +3666,7 @@ mod shared_tests {
                             }])),
                         }
                     },
+                    ears,
                 )
                 .await
             }
@@ -3630,9 +3685,12 @@ mod shared_tests {
             },
         )
         .unwrap();
-        let (claude, codex) = tokio::join!(
-            contend(going.path(), "claude", began),
-            contend(going.path(), "codex", began)
+        let ears = (Ears::default(), Ears::default());
+        let (claude, codex, (), ()) = tokio::join!(
+            contend(going.path(), "claude", began, ears.0.clone()),
+            contend(going.path(), "codex", began, ears.1.clone()),
+            fire_after(&ears.0, seventy, Source::Published),
+            fire_after(&ears.1, seventy, Source::Published),
         );
         for served in [claude, codex] {
             let (items, _) = served.expect("a contender spent its outage budget on a retirement");
@@ -3644,9 +3702,14 @@ mod shared_tests {
         assert!(began.elapsed() >= seventy);
 
         let quiet = TempRepo::new();
-        let failed = contend(quiet.path(), "claude", tokio::time::Instant::now())
-            .await
-            .expect_err("nothing says a monitor is going");
+        let failed = contend(
+            quiet.path(),
+            "claude",
+            tokio::time::Instant::now(),
+            Ears::default(),
+        )
+        .await
+        .expect_err("nothing says a monitor is going");
         assert!(
             failed
                 .to_string()
@@ -3668,6 +3731,7 @@ mod shared_tests {
             &binding,
             &mut crate::upgrade::Replacing::never(),
             |_| async { Attempt::LeaseHeld("its lease is still held".into()) },
+            Ears::default(),
         )
         .await
         .expect_err("it never went");
@@ -3698,10 +3762,17 @@ mod shared_tests {
                 asked.borrow_mut().push(build.stamp);
                 std::io::Error::other("no exec in a test")
             });
-            let waiting = monitored(repo.path(), &author, &binding, &mut replacing, |_| {
-                let conn = conn.borrow_mut().take().expect("attached once");
-                async move { Attempt::Shared(conn) }
-            });
+            let waiting = monitored(
+                repo.path(),
+                &author,
+                &binding,
+                &mut replacing,
+                |_| {
+                    let conn = conn.borrow_mut().take().expect("attached once");
+                    async move { Attempt::Shared(conn) }
+                },
+                Ears::default(),
+            );
             let parked = tokio::time::timeout(Duration::from_secs(60), waiting).await;
             assert!(parked.is_err(), "the wait ended: {parked:?}");
         }
@@ -3709,9 +3780,9 @@ mod shared_tests {
         assert_eq!(asked.borrow().first(), Some(&build));
     }
 
-    /// With no monitor to be had, the wait goes on trying for the outage
-    /// budget and then fails with the last attempt's reason. It delivers
-    /// nothing of its own.
+    /// With no monitor to be had and nothing moving, the wait attempts
+    /// nothing on a clock: it fails at the outage's deadline with the last
+    /// attempt's reason, and delivers nothing of its own.
     #[tokio::test(start_paused = true)]
     async fn a_wait_with_no_monitor_fails_with_the_reason_past_the_outage_budget() {
         use crate::cli::monitor::{Attempt, OUTAGE_BUDGET};
@@ -3727,6 +3798,7 @@ mod shared_tests {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Attempt::SpawnFailed("starting one failed: no binary".into()) }
             },
+            Ears::default(),
         )
         .await
         .expect_err("no monitor is not a wake with work");
@@ -3735,21 +3807,24 @@ mod shared_tests {
             "clank cannot start its monitor: starting one failed: no binary"
         );
         let took = began.elapsed();
-        assert!(
-            took >= OUTAGE_BUDGET && took < OUTAGE_BUDGET * 2,
-            "it held on for the budget and no longer: {took:?}"
+        assert_eq!(
+            took, OUTAGE_BUDGET,
+            "it held on for the budget and no longer"
         );
-        assert!(
-            attempts.into_inner() > 4,
-            "and went on attempting throughout"
+        assert_eq!(
+            attempts.into_inner(),
+            2,
+            "the first, and the look as its watches were armed"
         );
     }
 
     /// A session's wait ends once for one outage, with the reason. Armed
-    /// again inside it, the wait goes on trying well past the budget, and
-    /// the monitor that finally serves it ends what the session was told.
+    /// again inside it, the wait is not told again: well past the budget
+    /// it attempts nothing and arms nothing while nothing moves, then
+    /// attempts once its failure's source moves, and the monitor that
+    /// serves it ends what the session was told.
     #[tokio::test(start_paused = true)]
-    async fn a_bound_wait_fails_once_for_an_outage_and_then_goes_on_trying() {
+    async fn a_bound_wait_fails_once_for_an_outage_and_then_waits_on_its_events() {
         use crate::cli::monitor::{Attempt, OUTAGE_BUDGET};
         let repo = tempfile::tempdir().unwrap();
         let author = AgentLabel::parse("grok").unwrap();
@@ -3773,6 +3848,7 @@ mod shared_tests {
             &binding,
             &mut crate::upgrade::Replacing::never(),
             |_| async { Attempt::SpawnFailed("starting one failed: no binary".into()) },
+            Ears::default(),
         )
         .await
         .expect_err("the first wait of an outage says so");
@@ -3783,17 +3859,18 @@ mod shared_tests {
         assert!(told());
 
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let began = tokio::time::Instant::now();
-        let (items, _) = monitored(
+        let ears = Ears::default();
+        let mut never = crate::upgrade::Replacing::never();
+        let waiting = monitored(
             repo.path(),
             &author,
             &binding,
-            &mut crate::upgrade::Replacing::never(),
+            &mut never,
             |_| {
                 let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
                     match nth {
-                        0..40 => Attempt::SpawnFailed("starting one failed: no binary".into()),
+                        0..2 => Attempt::SpawnFailed("starting one failed: no binary".into()),
                         _ => Attempt::Shared(monitor_saying(vec![Note::Items {
                             source_cwd: None,
                             items: vec![promote()],
@@ -3801,16 +3878,99 @@ mod shared_tests {
                     }
                 }
             },
+            ears.clone(),
+        );
+        tokio::pin!(waiting);
+        let parked = tokio::time::timeout(OUTAGE_BUDGET * 5, &mut waiting).await;
+        assert!(parked.is_err(), "a wait already told does not fail again");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "nothing attempted while nothing moved"
+        );
+        assert_eq!(
+            ears.arms(),
+            [Source::Config, Source::Install, Source::Published],
+            "and nothing armed again"
+        );
+        assert!(told(), "and the notice stands");
+        assert!(ears.fire(Source::Config));
+        let (items, _) = waiting.await.expect("its source moved");
+        assert_eq!(items.len(), 1);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(!told(), "a monitor that serves it ends the outage");
+    }
+
+    /// A watch that cannot be armed, and one that stops, each fail the wait
+    /// at once with why, even for a session already told of the outage:
+    /// nothing would wake it otherwise.
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_refused_or_stopped_fails_the_wait() {
+        use crate::cli::monitor::Attempt;
+        let (repo, author) =
+            crate::cli::turn_child::tests::repo_with(clank_core::Tool::Grok, false);
+        let session = clank_core::SessionId::parse(crate::cli::turn_child::tests::SESSION).unwrap();
+        let binding = WaitBinding(
+            Some((clank_core::Tool::Grok, session.clone())),
+            WaitPolicy::Manual,
+        );
+        crate::agent_store::announce_outage(
+            repo.path(),
+            &author,
+            &session,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        let no_binary = || async { Attempt::SpawnFailed("starting one failed: no binary".into()) };
+        let began = tokio::time::Instant::now();
+
+        let refused = Ears::default();
+        refused.refuse("no descriptors left");
+        let failed = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |_| no_binary(),
+            refused,
         )
         .await
-        .expect("a wait already told of the outage does not fail again");
-        assert_eq!(items.len(), 1);
-        assert!(
-            began.elapsed() > OUTAGE_BUDGET * 3,
-            "it held on well past the budget: {:?}",
-            began.elapsed()
+        .expect_err("a watch that cannot be armed");
+        assert_eq!(
+            failed.to_string(),
+            "clank cannot start its monitor: starting one failed: no binary, and cannot \
+             watch the config files: no descriptors left"
         );
-        assert!(!told(), "a monitor that serves it ends the outage");
+
+        let ears = Ears::default();
+        let mut never = crate::upgrade::Replacing::never();
+        let waiting = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut never,
+            |_| no_binary(),
+            ears.clone(),
+        );
+        let stops = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            ears.end(Source::Published);
+        };
+        let bounded = tokio::time::timeout(crate::cli::monitor::OUTAGE_BUDGET * 2, waiting);
+        let (failed, ()) = tokio::join!(bounded, stops);
+        assert_eq!(
+            failed
+                .expect("it ended rather than staying parked")
+                .expect_err("a watch that stopped")
+                .to_string(),
+            "clank cannot start its monitor: starting one failed: no binary, and the watch \
+             on the repo's published monitor ended: its watch stopped"
+        );
+        assert_eq!(
+            began.elapsed(),
+            Duration::from_secs(1),
+            "at once, not at a deadline"
+        );
     }
 
     /// A monitor that serves an idle agent says only beats, and that is
@@ -3832,6 +3992,7 @@ mod shared_tests {
             &binding,
             &mut crate::upgrade::Replacing::never(),
             |_| async { no_binary() },
+            Ears::default(),
         )
         .await
         .expect_err("the first outage is announced");
@@ -3858,6 +4019,7 @@ mod shared_tests {
                     }
                 }
             },
+            Ears::default(),
         )
         .await
         .expect_err("the outage after a monitor served it is a new one");
@@ -3941,6 +4103,7 @@ mod shared_tests {
                             }
                         }
                     },
+                    Ears::default(),
                 ));
             let after_wait = std::fs::read(&config).unwrap();
             release.send(()).unwrap();
@@ -3991,9 +4154,14 @@ mod shared_tests {
                 asked.borrow_mut().push(build.stamp);
                 std::io::Error::other("the binary is missing mid-install")
             });
-            let waiting = monitored(repo.path(), &author, &binding, &mut replacing, |_| async {
-                Attempt::Newer("the monitor speaks proto 99".into())
-            });
+            let waiting = monitored(
+                repo.path(),
+                &author,
+                &binding,
+                &mut replacing,
+                |_| async { Attempt::Newer("the monitor speaks proto 99".into()) },
+                Ears::default(),
+            );
             tokio::pin!(waiting);
             for n in 1..=4 {
                 builds.push(installed.replace(n));
@@ -4021,6 +4189,7 @@ mod shared_tests {
             &binding,
             &mut crate::upgrade::Replacing::never(),
             |_| async { Attempt::Newer("the monitor speaks proto 99".into()) },
+            Ears::default(),
         )
         .await
         .expect_err("no monitor serves it");
@@ -4698,7 +4867,7 @@ mod shared_tests {
                 repo.path(),
                 &AgentLabel::parse("claude").unwrap(),
                 &WaitBinding(None, WaitPolicy::Manual),
-                &mut Default::default(),
+                &mut crate::cli::monitor::outage::Absence::new(Ears::default()),
             ),
         )
         .await
@@ -4731,7 +4900,7 @@ mod shared_tests {
                     &repo,
                     &AgentLabel::parse("claude").unwrap(),
                     &WaitBinding(None, WaitPolicy::Manual),
-                    &mut Default::default(),
+                    &mut crate::cli::monitor::outage::Absence::new(Ears::default()),
                 )
                 .await
             }));
@@ -4794,7 +4963,13 @@ mod shared_tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            shared_wait_within(conn, repo, &label, &binding, &mut Default::default()),
+            shared_wait_within(
+                conn,
+                repo,
+                &label,
+                &binding,
+                &mut crate::cli::monitor::outage::Absence::new(Ears::default()),
+            ),
         )
         .await
         .expect("a superseded wait must not park on beats")
@@ -4848,7 +5023,7 @@ mod shared_tests {
                 repo,
                 &label,
                 &binding,
-                &mut Default::default(),
+                &mut crate::cli::monitor::outage::Absence::new(Ears::default()),
             ),
         )
         .await

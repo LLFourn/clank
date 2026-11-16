@@ -6,129 +6,49 @@
 //! typed-nudge backstop — which only a running monitor can fire — would
 //! never run. The keeper is the TUI's one observer
 //! subscription and the lifecycle that brings it back: one attempt at a
-//! time through the established attach-or-spawn path, a backoff while
-//! the repo is unavailable, and a local watcher for the gap.
+//! time through the established attach-or-spawn path, another only when
+//! something that can end the failure moves, the outage shown once at its
+//! deadline, and a local watcher for the gap.
 //!
 //! Plain `clank status` and `status --watch` do not use it: they stay
 //! read-only through [`super::core_wakes`].
 
-use super::{
-    Attached, Attempt, Conn, Hangup, Started, Who, attempt_with, reconcile_after, subscribe,
-};
+use super::outage::{Ears, Heard, Hearing, Outage, Unserved};
+use super::{Attached, Conn, Hangup, Started, Who, attempt_with, reconcile_after, subscribe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
-
-/// The wait after the first unavailable attempt.
-pub(crate) const FIRST_RETRY: Duration = Duration::from_secs(5);
-
-/// The longest wait between attempts.
-pub(crate) const RETRY_CAP: Duration = Duration::from_secs(300);
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Instant;
 
 /// Where the keeper is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     /// Subscribed to the monitor's fold.
     Shared,
-    /// One attempt is out; `next` is the wait if it fails.
-    Attempting { next: Duration },
-    /// Unavailable, and the next reclassification is at `at`.
-    Waiting { at: Instant, next: Duration },
-}
-
-impl Phase {
-    /// When the keeper must look again with nothing else to wake it.
-    pub(crate) fn due(self) -> Option<Instant> {
-        match self {
-            Phase::Waiting { at, .. } => Some(at),
-            Phase::Shared | Phase::Attempting { .. } => None,
-        }
-    }
+    /// An attempt is due.
+    Attempting,
+    /// No monitor. Attempted again when a source of the failure moves.
+    Unattached,
 }
 
 /// What the keeper heard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Event {
     /// The fold moved, or the local watcher saw the repo change.
     Wake,
     /// The subscription's connection ended.
     Lost,
+    /// Something that can end the failure moved.
+    Moved,
+    /// The person asked for an attempt.
+    Asked,
+    /// What can end the failure can no longer be heard, and why.
+    Deaf(String),
     /// Time passed with nothing to hear.
     Quiet,
-    /// The attempt came back, attached or not.
-    Settled { attached: bool },
 }
 
-/// What the keeper must do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Effect {
-    /// Pass a wake on to the panel.
-    Forward,
-    /// Watch the repo locally, and reconcile what the watcher baselines.
-    WatchLocally,
-    /// Make one attach-or-spawn attempt.
-    Attempt,
-    /// Release the local watcher and owe the panel one fresh rebuild.
-    Handoff,
-}
-
-/// The keeper's first phase, from whether its first subscribe attached.
-pub(crate) fn start(attached: bool) -> (Phase, Vec<Effect>) {
-    if attached {
-        (Phase::Shared, Vec::new())
-    } else {
-        lose()
-    }
-}
-
-fn lose() -> (Phase, Vec<Effect>) {
-    (
-        Phase::Attempting { next: FIRST_RETRY },
-        vec![Effect::WatchLocally, Effect::Attempt],
-    )
-}
-
-/// The keeper's transition on `event` at `now`.
-///
-/// A wake only ever forwards. A refresh, a keypress or a repo edit is
-/// not evidence that the repo has become attachable, and an attempt on
-/// each would turn a busy working tree into a fork per edit against a
-/// repairer, a held lease or a newer peer.
-///
-/// The retry deadline is read off `now`, not off the event: whatever was
-/// heard, a backoff that has expired leaves `Waiting` with exactly one
-/// attempt, so a repo that never goes quiet cannot starve it.
-pub(crate) fn step(phase: Phase, event: Event, now: Instant) -> (Phase, Vec<Effect>) {
-    let (phase, mut effects) = react(phase, event, now);
-    match phase {
-        Phase::Waiting { at, next } if at <= now => {
-            effects.push(Effect::Attempt);
-            (Phase::Attempting { next }, effects)
-        }
-        phase => (phase, effects),
-    }
-}
-
-fn react(phase: Phase, event: Event, now: Instant) -> (Phase, Vec<Effect>) {
-    match (phase, event) {
-        (_, Event::Wake) => (phase, vec![Effect::Forward]),
-        (Phase::Shared, Event::Lost) => lose(),
-        (Phase::Attempting { .. }, Event::Settled { attached: true }) => {
-            (Phase::Shared, vec![Effect::Handoff])
-        }
-        (Phase::Attempting { next }, Event::Settled { attached: false }) => (
-            Phase::Waiting {
-                at: now + next,
-                next: (next * 2).min(RETRY_CAP),
-            },
-            Vec::new(),
-        ),
-        (phase, _) => (phase, Vec::new()),
-    }
-}
-
-/// What the keeper drives: its subscription, its attempts, its local
-/// watcher and the panel it wakes.
+/// What the keeper drives: its subscription, its attempts, what it hears
+/// while it has none, its local watcher and the panel it wakes.
 pub(crate) trait Port {
     fn now(&self) -> Instant;
     /// Whether the keeper is to stop.
@@ -136,56 +56,126 @@ pub(crate) trait Port {
     /// The next thing to hear, waiting no later than `until`, or `None`
     /// once the keeper is to stop.
     fn hear(&mut self, until: Option<Instant>) -> Option<Event>;
-    /// Make one attempt, returning its subscription if it attached.
-    fn attempt(&mut self) -> Option<Conn>;
-    /// Make `conn` the keeper's subscription.
+    /// Make one attempt: its subscription, or why there is none.
+    fn attempt(&mut self) -> Result<Conn, Unserved>;
+    /// Arm what can end `unserved`, as [`Hearing::arm`] does.
+    fn arm(&mut self, unserved: &Unserved) -> Result<bool, String>;
+    /// Make `conn` the keeper's subscription; nothing more is heard for
+    /// the outage it ends.
     fn adopt(&mut self, conn: Conn);
     fn forward(&mut self);
     fn watch_locally(&mut self);
     fn handoff(&mut self);
+    /// Show that no monitor could be attached, and why.
+    fn report(&mut self, why: String);
 }
 
 /// Run the keeper until its port says stop, starting from whether the
 /// first subscribe attached.
+///
+/// A wake only ever forwards. A refresh, a keypress or a repo edit is
+/// not evidence that the repo has become attachable, and an attempt on
+/// each would turn a busy working tree into a fork per edit against a
+/// repairer, a held lease or a newer peer.
 pub(crate) fn drive(port: &mut impl Port, attached: bool) {
-    let (mut phase, effects) = start(attached);
-    let mut pending: std::collections::VecDeque<Effect> = effects.into();
+    let mut outage = Outage::default();
+    let mut why = String::new();
+    let mut asked = false;
+    let mut phase = Phase::Shared;
+    if !attached {
+        // A stop can land before the thread first runs; no watcher or
+        // attempt may follow it.
+        if port.stopped() {
+            return;
+        }
+        port.watch_locally();
+        phase = Phase::Attempting;
+    }
     loop {
-        while let Some(effect) = pending.pop_front() {
-            // A stop can land before the thread first runs or between
-            // hearing and acting; either way no new watcher or attempt
-            // may follow it.
+        if port.stopped() {
+            return;
+        }
+        // On every transition, and so before every attempt: wakes or moves
+        // that keep coming must not keep the report from its deadline.
+        report_if_due(port, &mut outage, &why);
+        if phase == Phase::Attempting {
+            let tried = port.attempt();
+            // Cancelled in flight: the connection is dropped unadopted,
+            // and a monitor the attempt started stays with its own reaper.
             if port.stopped() {
                 return;
             }
-            match effect {
-                Effect::Forward => port.forward(),
-                Effect::WatchLocally => port.watch_locally(),
-                Effect::Handoff => port.handoff(),
-                Effect::Attempt => {
-                    let conn = port.attempt();
-                    // Cancelled in flight: the connection is dropped
-                    // unadopted, and a monitor the attempt started stays
-                    // with its own reaper.
-                    if port.stopped() {
-                        return;
-                    }
-                    let attached = conn.is_some();
-                    if let Some(conn) = conn {
-                        port.adopt(conn);
-                    }
-                    let (next, more) = step(phase, Event::Settled { attached }, port.now());
-                    phase = next;
-                    pending.extend(more);
+            phase = match tried {
+                Ok(conn) => {
+                    port.adopt(conn);
+                    outage.answered();
+                    asked = false;
+                    port.handoff();
+                    Phase::Shared
                 }
-            }
+                Err(unserved) => {
+                    why = unserved.why().to_string();
+                    tracing::debug!("the monitor keeper did not attach: {why}");
+                    outage.lost(tokio::time::Instant::from_std(port.now()), &unserved);
+                    match port.arm(&unserved) {
+                        Ok(true) => Phase::Attempting,
+                        // The person who asked is answered now, not at a
+                        // deadline already spent.
+                        Ok(false) if std::mem::take(&mut asked) => {
+                            port.report(why.clone());
+                            outage.reported();
+                            Phase::Unattached
+                        }
+                        Ok(false) => Phase::Unattached,
+                        Err(deaf) => {
+                            asked = false;
+                            port.report(format!("{why}, and {deaf}"));
+                            outage.reported();
+                            Phase::Unattached
+                        }
+                    }
+                }
+            };
+            continue;
         }
-        let Some(event) = port.hear(phase.due()) else {
+        let until = match phase {
+            Phase::Unattached => outage.report_by().map(tokio::time::Instant::into_std),
+            Phase::Shared | Phase::Attempting => None,
+        };
+        let Some(event) = port.hear(until) else {
             return;
         };
-        let (next, more) = step(phase, event, port.now());
-        phase = next;
-        pending.extend(more);
+        phase = match (phase, event) {
+            (phase, Event::Wake) => {
+                port.forward();
+                phase
+            }
+            (Phase::Shared, Event::Lost) => {
+                port.watch_locally();
+                Phase::Attempting
+            }
+            (Phase::Unattached, Event::Moved) => Phase::Attempting,
+            (Phase::Unattached, Event::Asked) => {
+                asked = true;
+                Phase::Attempting
+            }
+            (Phase::Unattached, Event::Deaf(deaf)) => {
+                port.report(format!("{why}, and {deaf}"));
+                outage.reported();
+                Phase::Unattached
+            }
+            (phase, _) => phase,
+        };
+    }
+}
+
+fn report_if_due(port: &mut impl Port, outage: &mut Outage, why: &str) {
+    if outage
+        .report_by()
+        .is_some_and(|by| by.into_std() <= port.now())
+    {
+        port.report(why.to_string());
+        outage.reported();
     }
 }
 
@@ -207,58 +197,135 @@ impl FreshRebuild {
     }
 }
 
+/// The outage as the panel sees it: why no monitor could be attached, once
+/// the keeper has said so, and the person's asks to try again.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Unattached(Arc<Mutex<Said>>);
+
+#[derive(Debug, Default)]
+struct Said {
+    /// Counted, so the same reason said again is a new report.
+    why: Option<(u64, String)>,
+    reports: u64,
+    asked: bool,
+    keeper: Option<mpsc::Sender<()>>,
+}
+
+impl Unattached {
+    fn said(&self) -> std::sync::MutexGuard<'_, Said> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set(&self, why: Option<String>) {
+        let mut said = self.said();
+        said.why = why.map(|why| {
+            said.reports += 1;
+            (said.reports, why)
+        });
+    }
+
+    /// The last report, numbered, while no monitor is attached.
+    pub(crate) fn why(&self) -> Option<(u64, String)> {
+        self.said().why.clone()
+    }
+
+    /// Ask the keeper for one attempt. It is heard only while the keeper
+    /// is unattached.
+    pub(crate) fn ask(&self) {
+        let mut said = self.said();
+        said.asked = true;
+        if let Some(keeper) = &said.keeper {
+            let _ = keeper.send(());
+        }
+    }
+
+    fn take_ask(&self) -> bool {
+        std::mem::take(&mut self.said().asked)
+    }
+
+    fn heard_by(&self, keeper: mpsc::Sender<()>) {
+        self.said().keeper = Some(keeper);
+    }
+}
+
 /// The production port: a monitor connection or a local watcher of type
-/// `W`, made by `watch`, and attempts made by `attempt`.
-pub(crate) struct Live<A, M, W> {
+/// `W`, made by `watch`, attempts made by `attempt`, and what can end a
+/// failed one heard through `ears`.
+pub(crate) struct Live<A, M, W, E> {
     attempt: A,
     watch: M,
+    ears: E,
     sub: Option<Conn>,
     local: Option<W>,
+    hearing: Option<Hearing>,
+    /// What the hearing heard, each with a poke on the local channel.
+    heard: Arc<Mutex<std::collections::VecDeque<Heard>>>,
     local_tx: mpsc::Sender<()>,
     local_rx: mpsc::Receiver<()>,
     wake: mpsc::Sender<()>,
     fresh: FreshRebuild,
+    unattached: Unattached,
     stop: Arc<Hangup>,
     closed: bool,
 }
 
-impl<A, M, W> Live<A, M, W>
+impl<A, M, W, E> Live<A, M, W, E>
 where
-    A: FnMut() -> Attempt,
+    A: FnMut() -> Result<Conn, Unserved>,
     M: FnMut(mpsc::Sender<()>) -> anyhow::Result<W>,
+    E: Ears,
 {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         attempt: A,
         watch: M,
+        ears: E,
         sub: Option<Conn>,
         wake: mpsc::Sender<()>,
         fresh: FreshRebuild,
+        unattached: Unattached,
         stop: Arc<Hangup>,
     ) -> Self {
         let (local_tx, local_rx) = mpsc::channel();
         stop.poke_on_stop(local_tx.clone());
+        unattached.heard_by(local_tx.clone());
         if let Some(conn) = &sub {
             stop.hang_up_on(conn);
         }
         Self {
             attempt,
             watch,
+            ears,
             sub,
             local: None,
+            hearing: None,
+            heard: Arc::default(),
             local_tx,
             local_rx,
             wake,
             fresh,
+            unattached,
             stop,
             closed: false,
         }
     }
+
+    fn deafen(&mut self) {
+        self.hearing = None;
+        self.heard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
-impl<A, M, W> Port for Live<A, M, W>
+impl<A, M, W, E> Port for Live<A, M, W, E>
 where
-    A: FnMut() -> Attempt,
+    A: FnMut() -> Result<Conn, Unserved>,
     M: FnMut(mpsc::Sender<()>) -> anyhow::Result<W>,
+    E: Ears,
 {
     fn now(&self) -> Instant {
         Instant::now()
@@ -287,7 +354,7 @@ where
                 }
             };
         }
-        let heard = match until {
+        let poked = match until {
             Some(at) => self
                 .local_rx
                 .recv_timeout(at.saturating_duration_since(Instant::now())),
@@ -299,26 +366,54 @@ where
         if self.stopped() {
             return None;
         }
-        match heard {
-            Ok(()) => Some(Event::Wake),
-            Err(_) => Some(Event::Quiet),
+        if poked.is_err() {
+            return Some(Event::Quiet);
+        }
+        if self.unattached.take_ask() {
+            return Some(Event::Asked);
+        }
+        let heard = self
+            .heard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front();
+        match (heard, &mut self.hearing) {
+            (Some(heard), Some(hearing)) => match hearing.heard(heard) {
+                Ok(()) => Some(Event::Moved),
+                Err(why) => {
+                    self.deafen();
+                    Some(Event::Deaf(why))
+                }
+            },
+            _ => Some(Event::Wake),
         }
     }
 
-    fn attempt(&mut self) -> Option<Conn> {
-        match (self.attempt)() {
-            Attempt::Shared(conn) => Some(conn),
-            unavailable => {
-                tracing::debug!(
-                    "the monitor keeper did not attach: {}",
-                    unavailable.why().unwrap_or_default()
-                );
-                None
-            }
+    fn attempt(&mut self) -> Result<Conn, Unserved> {
+        (self.attempt)()
+    }
+
+    fn arm(&mut self, unserved: &Unserved) -> Result<bool, String> {
+        let hearing = self.hearing.get_or_insert_with(|| {
+            let (heard, poke) = (self.heard.clone(), self.local_tx.clone());
+            Hearing::new(move |h| {
+                heard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push_back(h);
+                let _ = poke.send(());
+            })
+        });
+        let armed = hearing.arm(&self.ears, unserved);
+        if armed.is_err() {
+            self.deafen();
         }
+        armed
     }
 
     fn adopt(&mut self, conn: Conn) {
+        self.deafen();
+        self.unattached.take_ask();
         self.stop.hang_up_on(&conn);
         self.sub = Some(conn);
     }
@@ -338,18 +433,25 @@ where
 
     fn handoff(&mut self) {
         self.local = None;
+        self.unattached.set(None);
         // Owed before the wake, so the refresh it raises finds it.
         self.fresh.owe();
+        self.forward();
+    }
+
+    fn report(&mut self, why: String) {
+        self.unattached.set(Some(why));
         self.forward();
     }
 }
 
 /// The TUI's monitor keeper, on its own thread. Dropping it stops the
-/// thread's retry work and releases its watcher; the monitor itself is
+/// thread's attempts and releases its watchers; the monitor itself is
 /// independent and never signalled.
 pub(crate) struct MonitorKeeper {
     stop: Arc<Hangup>,
     fresh: FreshRebuild,
+    unattached: Unattached,
     fault: crate::fs_notice::Fault,
 }
 
@@ -364,6 +466,7 @@ impl MonitorKeeper {
     ) -> Self {
         let stop = Arc::new(Hangup::default());
         let fresh = FreshRebuild::default();
+        let unattached = Unattached::default();
         let fault = crate::fs_notice::Fault::default();
         let first = match subscribe(repo) {
             Attached::Shared(conn) => Some(conn),
@@ -374,17 +477,27 @@ impl MonitorKeeper {
         };
         let repo = repo.to_path_buf();
         {
-            let (stop, fresh, watching) = (stop.clone(), fresh.clone(), fault.clone());
+            let (stop, fresh, unattached, watching) = (
+                stop.clone(),
+                fresh.clone(),
+                unattached.clone(),
+                fault.clone(),
+            );
             std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build();
                 let attached = first.is_some();
                 let watched = repo.clone();
+                let ears = super::outage::Kernel::new(&repo, crate::upgrade::process());
                 let mut live = Live::new(
                     || match &runtime {
-                        Ok(runtime) => runtime.block_on(attempt_with(&repo, Who::Observer, &spawn)),
-                        Err(e) => Attempt::Unproven(format!("no runtime to attach on: {e}")),
+                        Ok(runtime) => runtime
+                            .block_on(attempt_with(&repo, Who::Observer, &spawn))
+                            .served(&repo),
+                        Err(e) => Err(Unserved::Unstartable(format!(
+                            "no runtime to attach on: {e}"
+                        ))),
                     },
                     |tx| {
                         crate::repo_watch::RepoStateWatcher::attach_reporting_to(
@@ -399,21 +512,41 @@ impl MonitorKeeper {
                             )
                         })
                     },
+                    ears,
                     first,
                     wake,
                     fresh,
+                    unattached,
                     stop,
                 );
                 drive(&mut live, attached);
             });
         }
-        Self { stop, fresh, fault }
+        Self {
+            stop,
+            fresh,
+            unattached,
+            fault,
+        }
     }
 
     /// Why the watcher it keeps while no monitor serves failed, once it
     /// has: from then on nothing wakes the panel for the repo's state.
     pub(crate) fn fault(&self) -> Option<String> {
         crate::fs_notice::read(&self.fault)
+    }
+
+    /// Why no monitor could be attached, numbered, once the outage was
+    /// reported and until one is.
+    pub(crate) fn unattached(&self) -> Option<(u64, String)> {
+        self.unattached.why()
+    }
+
+    /// Attempt once more now, as the person asked: heard only while no
+    /// monitor is attached, and through the keeper's own attempts, one at
+    /// a time. A failure is reported at once and its watches armed again.
+    pub(crate) fn retry(&self) {
+        self.unattached.ask();
     }
 
     /// The fresh rebuilds this keeper owes the panel.
@@ -430,87 +563,25 @@ impl Drop for MonitorKeeper {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Attempt;
+    use super::super::outage::scripted::Scripted as ScriptedEars;
+    use super::super::outage::{Source, Unserved};
     use super::*;
+    use std::time::Duration;
 
-    fn at(t0: Instant, secs: u64) -> Instant {
-        t0 + Duration::from_secs(secs)
-    }
+    /// A repo nothing is published for, so no attempt reads as a
+    /// retirement.
+    const NOWHERE: &str = "/nonexistent/clank-keeper-test-repo";
 
-    /// Unavailable outcomes back off 5s, doubling, to a 5 minute cap, and
-    /// a successful attach starts the next loss from 5s again.
-    #[test]
-    fn the_backoff_doubles_to_its_cap_and_resets_on_attach() {
-        let t0 = Instant::now();
-        let (mut phase, effects) = start(false);
-        assert_eq!(effects, [Effect::WatchLocally, Effect::Attempt]);
-        let mut now = t0;
-        let mut waits = Vec::new();
-        for _ in 0..8 {
-            (phase, _) = step(phase, Event::Settled { attached: false }, now);
-            let Phase::Waiting { at, .. } = phase else {
-                panic!("{phase:?}");
-            };
-            waits.push((at - now).as_secs());
-            now = at;
-            let effects;
-            (phase, effects) = step(phase, Event::Quiet, now);
-            assert_eq!(effects, [Effect::Attempt]);
-        }
-        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300]);
-
-        (phase, _) = step(phase, Event::Settled { attached: true }, now);
-        (phase, _) = step(phase, Event::Lost, now);
-        (phase, _) = step(phase, Event::Settled { attached: false }, now);
-        assert_eq!(phase.due(), Some(now + FIRST_RETRY));
-    }
-
-    /// A wake before the backoff is due — a refresh, a key, a beat, a repo
-    /// edit — forwards and starts nothing, however many arrive; only the
-    /// due time does.
-    #[test]
-    fn wakes_during_a_backoff_coalesce_into_nothing() {
-        let t0 = Instant::now();
-        let (phase, _) = start(false);
-        let (mut phase, _) = step(phase, Event::Settled { attached: false }, t0);
-        for secs in 0..5 {
-            let effects;
-            (phase, effects) = step(phase, Event::Wake, at(t0, secs));
-            assert_eq!(effects, [Effect::Forward]);
-            let effects;
-            (phase, effects) = step(phase, Event::Quiet, at(t0, secs));
-            assert!(effects.is_empty(), "{effects:?}");
-        }
-        let (phase, effects) = step(phase, Event::Quiet, at(t0, 5));
-        assert_eq!(effects, [Effect::Attempt]);
-        let (_, effects) = step(phase, Event::Wake, at(t0, 5));
-        assert_eq!(effects, [Effect::Forward], "nor while the attempt is out");
-    }
-
-    /// Wakes that keep arriving through an expired backoff reclassify
-    /// once per due step, on the first wake at or past it, and never
-    /// once per wake.
-    #[test]
-    fn a_due_retry_runs_through_sustained_wakes() {
-        let mut port = Scripted::new(
-            (0..20)
-                .map(|_| Step::After(Duration::from_secs(10), Event::Wake))
-                .collect(),
-            outcomes(vec![]),
-        );
-        drive(&mut port, false);
-        let t0 = port.attempts[0];
-        assert_eq!(
-            port.attempts,
-            [0, 10, 20, 40, 80, 160].map(|secs| at(t0, secs)),
-        );
-        assert_eq!(port.forwarded, 20);
+    fn served(mut attempt: impl FnMut() -> Attempt) -> impl FnMut() -> Result<Conn, Unserved> {
+        move || attempt().served(std::path::Path::new(NOWHERE))
     }
 
     enum Step {
         Hear(Event),
         /// `event`, once this long has passed.
         After(Duration, Event),
-        /// Nothing until the backoff is due.
+        /// Nothing until the report is due.
         Idle,
         Do(Box<dyn FnOnce()>),
     }
@@ -521,11 +592,14 @@ mod tests {
         now: Instant,
         script: std::collections::VecDeque<Step>,
         attempt: A,
+        ears: ScriptedEars,
+        hearing: Hearing,
         attempts: Vec<Instant>,
         forwarded: usize,
         local: bool,
         watched: usize,
         handoffs: usize,
+        reports: Vec<(Instant, String)>,
         shared: Option<Conn>,
     }
 
@@ -535,11 +609,14 @@ mod tests {
                 now: Instant::now(),
                 script: script.into(),
                 attempt,
+                ears: ScriptedEars::default(),
+                hearing: Hearing::new(|_| {}),
                 attempts: Vec::new(),
                 forwarded: 0,
                 local: false,
                 watched: 0,
                 handoffs: 0,
+                reports: Vec::new(),
                 shared: None,
             }
         }
@@ -577,15 +654,17 @@ mod tests {
             }
         }
 
-        fn attempt(&mut self) -> Option<Conn> {
+        fn attempt(&mut self) -> Result<Conn, Unserved> {
             self.attempts.push(self.now);
-            match (self.attempt)() {
-                Attempt::Shared(conn) => Some(conn),
-                _ => None,
-            }
+            (self.attempt)().served(std::path::Path::new(NOWHERE))
+        }
+
+        fn arm(&mut self, unserved: &Unserved) -> Result<bool, String> {
+            self.hearing.arm(&self.ears, unserved)
         }
 
         fn adopt(&mut self, conn: Conn) {
+            self.hearing = Hearing::new(|_| {});
             self.shared = Some(conn);
         }
 
@@ -601,6 +680,10 @@ mod tests {
         fn handoff(&mut self) {
             self.local = false;
             self.handoffs += 1;
+        }
+
+        fn report(&mut self, why: String) {
+            self.reports.push((self.now, why));
         }
     }
 
@@ -619,6 +702,10 @@ mod tests {
         }
     }
 
+    fn busy() -> Attempt {
+        Attempt::Busy("another client is already starting one".into())
+    }
+
     /// A shared subscription's loss makes exactly one attempt, with no
     /// repo edit to prompt it, and the successor replaces the subscription.
     #[test]
@@ -635,34 +722,289 @@ mod tests {
         assert_eq!(port.handoffs, 1);
     }
 
-    /// A failed spawn or attach recovers at the next backoff step, with
-    /// nothing else to wake it.
+    /// With nothing moving, a failed attempt is looked at once more as its
+    /// watches are armed, and then nothing is attempted: the outage is
+    /// shown once, at its deadline, and time passing after that starts
+    /// nothing either.
     #[test]
-    fn a_failed_attempt_recovers_quietly_at_the_next_step() {
+    fn an_unattached_keeper_reports_once_at_its_deadline_and_attempts_nothing_more() {
         let mut port = Scripted::new(
-            vec![Step::Idle, Step::Idle],
-            outcomes(vec![|| Attempt::SpawnFailed("no binary".into()), || {
-                Attempt::Shared(conn())
-            }]),
+            (0..4).map(|_| Step::Idle).collect(),
+            outcomes(vec![busy, busy]),
         );
         drive(&mut port, false);
         let t0 = port.attempts[0];
-        assert_eq!(port.attempts, [t0, t0 + FIRST_RETRY]);
-        assert!(port.shared.is_some() && !port.local);
+        assert_eq!(port.attempts, [t0, t0]);
+        assert_eq!(
+            port.reports,
+            [(
+                t0 + super::super::OUTAGE_BUDGET,
+                "another client is already starting one".to_string()
+            )]
+        );
+        assert_eq!(
+            port.ears.armed(),
+            [Source::Permit, Source::Published],
+            "what can end another client's repair"
+        );
     }
 
-    /// Wakes of every kind while the backoff is pending start no attempt.
+    /// Wakes that never stop, across four outage budgets, start nothing and
+    /// do not keep the outage from being shown once, at the first of them
+    /// past its deadline.
     #[test]
-    fn signals_during_a_pending_backoff_start_nothing() {
+    fn wakes_across_the_deadline_cannot_starve_the_report() {
+        let step = super::super::OUTAGE_BUDGET / 2;
+        let mut port = Scripted::new(
+            (0..8).map(|_| Step::After(step, Event::Wake)).collect(),
+            outcomes(vec![busy, busy]),
+        );
+        drive(&mut port, false);
+        let t0 = port.attempts[0];
+        assert_eq!(port.attempts, [t0, t0]);
+        assert_eq!(port.forwarded, 8);
+        assert_eq!(
+            port.reports,
+            [(
+                t0 + super::super::OUTAGE_BUDGET,
+                "another client is already starting one".to_string()
+            )]
+        );
+    }
+
+    /// Moves that keep failing, across the deadline: each is attempted on,
+    /// but the one past the deadline is reported before its attempt.
+    #[test]
+    fn moves_across_the_deadline_are_reported_before_the_next_attempt() {
+        let step = super::super::OUTAGE_BUDGET / 2;
+        let mut port = Scripted::new(
+            (0..4).map(|_| Step::After(step, Event::Moved)).collect(),
+            busy,
+        );
+        drive(&mut port, false);
+        let t0 = port.attempts[0];
+        let at = |n: u32| t0 + step * n;
+        assert_eq!(port.attempts, [at(0), at(0), at(1), at(2), at(3), at(4)]);
+        assert_eq!(port.reports.len(), 1);
+        assert_eq!(
+            port.reports[0].0,
+            at(2),
+            "before the attempt at the deadline"
+        );
+    }
+
+    /// Wakes of every kind while unattached start nothing, and every one
+    /// reaches the panel.
+    #[test]
+    fn wakes_while_unattached_start_nothing() {
         let mut script = vec![];
         for _ in 0..20 {
             script.push(Step::Hear(Event::Wake));
             script.push(Step::Hear(Event::Quiet));
         }
-        let mut port = Scripted::new(script, outcomes(vec![|| Attempt::Busy("busy".into())]));
+        let mut port = Scripted::new(script, outcomes(vec![busy, busy]));
         drive(&mut port, false);
-        assert_eq!(port.attempts.len(), 1, "only the startup attempt");
-        assert_eq!(port.forwarded, 20, "and every wake reached the panel");
+        assert_eq!(port.attempts.len(), 2, "the startup attempt and its look");
+        assert_eq!(port.forwarded, 20);
+    }
+
+    /// After the outage was shown, a source of its failure moving is
+    /// attempted on, and the attach ends the outage.
+    #[test]
+    fn a_moved_source_is_attempted_on_after_the_report() {
+        let mut port = Scripted::new(
+            vec![
+                Step::Idle,
+                Step::Hear(Event::Wake),
+                Step::Idle,
+                Step::Hear(Event::Moved),
+            ],
+            outcomes(vec![busy, busy, || Attempt::Shared(conn())]),
+        );
+        drive(&mut port, false);
+        assert_eq!(port.reports.len(), 1);
+        assert_eq!(port.attempts.len(), 3);
+        assert!(port.shared.is_some() && !port.local);
+        assert_eq!(port.handoffs, 1);
+    }
+
+    /// A keeper whose watches cannot be armed, or whose watch stops, shows
+    /// why at once and attempts nothing more.
+    #[test]
+    fn a_watch_refused_or_stopped_is_shown_and_ends_the_attempts() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let failing = |attempts: Arc<AtomicU64>| {
+            served(move || {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                Attempt::SpawnFailed("starting one failed".into())
+            })
+        };
+        let run = |ears: ScriptedEars| {
+            let (wake, woken) = mpsc::channel();
+            let unattached = Unattached::default();
+            let stop = Arc::new(Hangup::default());
+            let (watch, _, _) = counted_watcher();
+            let live = Live::new(
+                failing(attempts.clone()),
+                watch,
+                ears,
+                None,
+                wake,
+                FreshRebuild::default(),
+                unattached.clone(),
+                stop.clone(),
+            );
+            let keeper = std::thread::spawn(move || {
+                let mut live = live;
+                drive(&mut live, false);
+            });
+            (keeper, woken, unattached, stop)
+        };
+
+        let refused = ScriptedEars::default();
+        refused.refuse("no descriptors left");
+        let (keeper, woken, unattached, stop) = run(refused);
+        while unattached.why().is_none() {
+            woken.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(
+            unattached.why().map(|(_, why)| why).as_deref(),
+            Some("starting one failed, and cannot watch the config files: no descriptors left")
+        );
+        stop.stop();
+        keeper.join().unwrap();
+        assert_eq!(attempts.swap(0, Ordering::AcqRel), 1);
+
+        let ears = ScriptedEars::default();
+        let (keeper, woken, unattached, stop) = run(ears.clone());
+        let giving_up = Instant::now() + Duration::from_secs(5);
+        while attempts.load(Ordering::Acquire) < 2 || ears.armed().len() < 3 {
+            assert!(
+                Instant::now() < giving_up,
+                "it never armed and looked again"
+            );
+            let _ = woken.recv_timeout(Duration::from_millis(10));
+        }
+        ears.end(Source::Published);
+        while unattached.why().is_none() {
+            woken.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(
+            unattached.why().map(|(_, why)| why).as_deref(),
+            Some(
+                "starting one failed, and the watch on the repo's published monitor ended: \
+                 its watch stopped"
+            )
+        );
+        assert!(!ears.fire(Source::Config), "nothing is heard any more");
+        stop.stop();
+        keeper.join().unwrap();
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+    }
+
+    /// After a watch stopped, idle time, wakes and quiet start nothing; the
+    /// person's ask makes one attempt, and its failure is reported at once.
+    #[test]
+    fn only_the_persons_ask_attempts_after_a_watch_stopped() {
+        let mut port = Scripted::new(
+            vec![
+                Step::Hear(Event::Deaf("its watch stopped".into())),
+                Step::Idle,
+                Step::Hear(Event::Wake),
+                Step::Hear(Event::Quiet),
+                Step::Idle,
+                Step::Hear(Event::Asked),
+            ],
+            busy,
+        );
+        drive(&mut port, false);
+        let t0 = port.attempts[0];
+        assert_eq!(port.attempts, [t0, t0, t0], "one attempt for the ask");
+        assert_eq!(port.forwarded, 1);
+        let why = "another client is already starting one".to_string();
+        assert_eq!(
+            port.reports,
+            [(t0, format!("{why}, and its watch stopped")), (t0, why),]
+        );
+    }
+
+    /// The live keeper, its watch stopped: its own watcher's wakes start
+    /// nothing, and the person's ask attempts, arms the failure's watches
+    /// again and reports again at once.
+    #[test]
+    fn an_ask_after_a_stopped_watch_attempts_and_arms_again() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let ears = ScriptedEars::default();
+        let (wake, woken) = mpsc::channel();
+        let unattached = Unattached::default();
+        let stop = Arc::new(Hangup::default());
+        let repo_wakes = Arc::new(Mutex::new(None));
+        let live = Live::new(
+            {
+                let attempts = attempts.clone();
+                served(move || {
+                    attempts.fetch_add(1, Ordering::AcqRel);
+                    Attempt::SpawnFailed("starting one failed".into())
+                })
+            },
+            {
+                let repo_wakes = repo_wakes.clone();
+                move |tx| {
+                    *repo_wakes.lock().unwrap() = Some(tx);
+                    Ok(())
+                }
+            },
+            ears.clone(),
+            None,
+            wake,
+            FreshRebuild::default(),
+            unattached.clone(),
+            stop.clone(),
+        );
+        let keeper = std::thread::spawn(move || {
+            let mut live = live;
+            drive(&mut live, false);
+        });
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let giving_up = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(Instant::now() < giving_up, "{what}");
+                let _ = woken.recv_timeout(Duration::from_millis(10));
+            }
+        };
+        until("armed", &|| ears.armed().len() == 3);
+        ears.end(Source::Published);
+        until("reported", &|| unattached.why().is_some());
+        assert!(ears.armed().is_empty(), "nothing is heard any more");
+        let reported = unattached.why().unwrap().0;
+
+        let repo_wakes = repo_wakes.lock().unwrap().clone().unwrap();
+        for _ in 0..5 {
+            repo_wakes.send(()).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            2,
+            "a wake attempts nothing"
+        );
+
+        unattached.ask();
+        until("reported again", &|| {
+            unattached.why().is_some_and(|(n, _)| n > reported)
+        });
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            4,
+            "the ask, and the look as its watches were armed again"
+        );
+        assert_eq!(ears.armed().len(), 3, "its failure's watches, armed again");
+        assert_eq!(
+            unattached.why().map(|(_, why)| why).as_deref(),
+            Some("starting one failed")
+        );
+        stop.stop();
+        keeper.join().unwrap();
     }
 
     /// The local-to-shared handoff releases the local watcher once and
@@ -671,38 +1013,22 @@ mod tests {
     fn the_handoff_releases_the_watcher_and_owes_one_fresh_rebuild() {
         let (wake, woken) = mpsc::channel();
         let fresh = FreshRebuild::default();
-        let watching = Arc::new(AtomicU64::new(0));
-        struct Watcher(Arc<AtomicU64>);
-        impl Drop for Watcher {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
+        let (watch, watching, _) = counted_watcher();
         let mut live = Live::new(
-            outcomes(vec![|| Attempt::Shared(conn())]),
-            {
-                let watching = watching.clone();
-                move |_| {
-                    watching.fetch_add(1, Ordering::AcqRel);
-                    Ok(Watcher(watching.clone()))
-                }
-            },
+            served(outcomes(vec![|| Attempt::Shared(conn())])),
+            watch,
+            ScriptedEars::default(),
             None,
             wake,
             fresh.clone(),
+            Unattached::default(),
             Arc::new(Hangup::default()),
         );
-        let (mut phase, effects) = start(false);
-        assert_eq!(effects, [Effect::WatchLocally, Effect::Attempt]);
         live.watch_locally();
         assert_eq!(watching.load(Ordering::Acquire), 1);
         assert_eq!(woken.try_iter().count(), 1, "the gap is reconciled");
         let conn = live.attempt().expect("it attaches");
         live.adopt(conn);
-        let effects;
-        (phase, effects) = step(phase, Event::Settled { attached: true }, Instant::now());
-        assert_eq!(phase, Phase::Shared);
-        assert_eq!(effects, [Effect::Handoff]);
         live.handoff();
         assert_eq!(
             watching.load(Ordering::Acquire),
@@ -744,39 +1070,47 @@ mod tests {
         (factory, live, made)
     }
 
-    /// Cancelling during a backoff stops the keeper's loop and leaves
+    /// Cancelling while unattached stops the keeper's loop and leaves
     /// nothing of it: neither subscription nor watcher.
     #[test]
-    fn cancellation_stops_retry_work_and_releases_the_watcher() {
+    fn cancellation_stops_the_keeper_and_releases_the_watcher() {
         let (wake, _woken) = mpsc::channel();
         let stop = Arc::new(Hangup::default());
         let (watch, watching, _) = counted_watcher();
         let (attempted, attempts) = mpsc::channel();
+        let ears = ScriptedEars::default();
         let live = Live::new(
-            move || {
+            served(move || {
                 let _ = attempted.send(());
                 Attempt::NotStarted("lease held".into())
-            },
+            }),
             watch,
+            ears.clone(),
             None,
             wake,
             FreshRebuild::default(),
+            Unattached::default(),
             stop.clone(),
         );
         let keeper = std::thread::spawn(move || {
             let mut live = live;
             drive(&mut live, false);
         });
-        attempts.recv().unwrap();
+        for _ in 0..2 {
+            attempts
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the attempt and the look on arming");
+        }
         stop.stop();
         let began = Instant::now();
         keeper.join().unwrap();
-        assert!(began.elapsed() < FIRST_RETRY, "not held for the backoff");
+        assert!(began.elapsed() < Duration::from_secs(5), "not held");
         assert_eq!(
             watching.load(Ordering::Acquire),
             0,
             "the watcher went with it"
         );
+        assert!(ears.armed().is_empty(), "and so did what it heard");
         assert_eq!(attempts.try_iter().count(), 0, "and no attempt followed");
     }
 
@@ -790,15 +1124,17 @@ mod tests {
         let mut live = Live::new(
             {
                 let attempts = attempts.clone();
-                move || {
+                served(move || {
                     attempts.fetch_add(1, Ordering::AcqRel);
                     Attempt::Shared(conn())
-                }
+                })
             },
             watch,
+            ScriptedEars::default(),
             None,
             wake,
             FreshRebuild::default(),
+            Unattached::default(),
             {
                 let stop = Arc::new(Hangup::default());
                 stop.stop();
@@ -825,15 +1161,17 @@ mod tests {
             {
                 let stop = stop.clone();
                 let mut ours = Some(ours);
-                move || {
+                served(move || {
                     stop.stop();
                     Attempt::Shared(Conn::over(ours.take().expect("one attempt")))
-                }
+                })
             },
             watch,
+            ScriptedEars::default(),
             None,
             wake,
             fresh.clone(),
+            Unattached::default(),
             stop,
         );
         theirs
@@ -1047,8 +1385,8 @@ mod tests {
     }
 
     /// Busy, newer, other and unproven peers are never a reason to start,
-    /// across every backoff step, and an old client facing a newer monitor
-    /// makes one attempt per step and no more.
+    /// and with nothing moving each is attempted once and looked at once
+    /// more as its watches are armed, then shown at its deadline.
     #[test]
     fn peers_never_cause_a_start() {
         let starts = Arc::new(AtomicU64::new(0));
@@ -1082,33 +1420,23 @@ mod tests {
             let _peer = peer(repo.path());
             let path = repo.path().to_path_buf();
             let spawn = counted(starts.clone());
-            let mut port = Scripted::new(
-                vec![Step::Idle, Step::Idle, Step::Idle, Step::Idle],
-                move || observer_attempt(&path, &spawn),
-            );
+            let mut port = Scripted::new((0..4).map(|_| Step::Idle).collect(), move || {
+                observer_attempt(&path, &spawn)
+            });
             drive(&mut port, false);
             assert_eq!(starts.load(Ordering::Acquire), 0, "{name}: nothing started");
             let t0 = port.attempts[0];
-            assert_eq!(
-                port.attempts,
-                [
-                    t0,
-                    t0 + Duration::from_secs(5),
-                    t0 + Duration::from_secs(15),
-                    t0 + Duration::from_secs(35),
-                    t0 + Duration::from_secs(75),
-                ],
-                "{name}: one reclassification per step"
-            );
+            assert_eq!(port.attempts, [t0, t0], "{name}: no attempt on a clock");
+            assert_eq!(port.reports.len(), 1, "{name}: shown once");
         }
     }
 
-    /// A newer peer refuses the keeper and stays live: the reclassifications
-    /// find it there and start nothing. Once it has exited and the lease is
-    /// free, the next scheduled one starts exactly one monitor and attaches,
-    /// with no repo edit in between.
+    /// A newer peer refuses the keeper and stays live: nothing more is
+    /// attempted while it does. Once it has exited and that is heard, one
+    /// attempt starts exactly one monitor and attaches, with no repo edit
+    /// in between.
     #[test]
-    fn a_rejecting_peer_that_exits_is_succeeded_once_on_the_backoff() {
+    fn a_rejecting_peer_that_exits_is_succeeded_once_its_going_is_heard() {
         let repo = super::super::TempRepo::new();
         let peer = Arc::new(std::sync::Mutex::new(Some(fake_monitor(
             repo.path(),
@@ -1136,20 +1464,15 @@ mod tests {
             vec![
                 Step::Idle,
                 Step::Idle,
-                Step::Idle,
                 Step::Do(exits),
-                Step::Idle,
+                Step::Hear(Event::Moved),
                 Step::Hear(Event::Wake),
                 Step::Hear(Event::Quiet),
             ],
             move || observer_attempt(&path, &spawn),
         );
         drive(&mut port, false);
-        assert_eq!(
-            port.attempts.len(),
-            5,
-            "startup, three while live, one after"
-        );
+        assert_eq!(port.attempts.len(), 3, "two while live, one after");
         assert_eq!(starts.load(Ordering::Acquire), 1, "exactly one start");
         assert!(port.shared.is_some(), "and the keeper attached to it");
         assert!(!port.local);

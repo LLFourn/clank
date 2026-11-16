@@ -681,6 +681,7 @@ async fn a_grok_stop_the_monitor_answers_late_still_arms_its_wait() {
                     .unwrap()
                 }
             },
+            crate::cli::monitor::outage::scripted::Scripted::default(),
         ),
     )
     .await

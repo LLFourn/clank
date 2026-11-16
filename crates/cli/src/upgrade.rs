@@ -186,6 +186,40 @@ impl Authority {
             .as_ref()
             .map(|(installation, _)| installation.path().to_path_buf());
         let watch = installed.and_then(|installed| watch_install(&installed, wake.clone()));
+        self.subscribed(wake, watch)
+    }
+
+    /// Call `moved` on each wake [`Self::subscribe`] gives, and `failed`
+    /// when the watch on the installation fails, after which nothing more
+    /// is heard. A watch that cannot be armed is an error rather than a
+    /// subscription that never wakes; `Ok(None)` when no installation is
+    /// watched, so this process is never replaced.
+    pub(crate) fn hear_installs(
+        &self,
+        moved: impl Fn() + Send + Sync + 'static,
+        failed: impl Fn(String) + Send + Sync + 'static,
+    ) -> Result<Option<Subscription>, String> {
+        let wake: Wake = Arc::new(moved);
+        let Some(installed) = self
+            .inner()
+            .watched
+            .as_ref()
+            .map(|(installation, _)| installation.path().to_path_buf())
+        else {
+            return Ok(None);
+        };
+        let (watch, missed) = install_watcher(&installed, wake.clone(), failed)?;
+        if let Some((dir, e)) = missed.into_iter().next() {
+            return Err(format!("{}: {e}", dir.display()));
+        }
+        Ok(Some(self.subscribed(wake, Some(watch))))
+    }
+
+    fn subscribed(
+        &self,
+        wake: Wake,
+        watch: Option<crate::proc_identity::tree_watch::KernelWatcher>,
+    ) -> Subscription {
         let mut inner = self.inner();
         let id = inner.next_subscriber;
         inner.next_subscriber += 1;
@@ -273,9 +307,6 @@ impl Drop for Subscription {
     }
 }
 
-/// The directories whose entries an install changes: the one holding
-/// the path clank is installed at, and the one holding what that path
-/// resolves to when it is a link.
 /// Watch an installation: the directories holding its path and the file
 /// it resolves to, for an install that renames over it or retargets a
 /// link, and that file's own writes, for one that writes over it in
@@ -284,41 +315,71 @@ fn watch_install(
     installed: &std::path::Path,
     wake: Wake,
 ) -> Option<crate::proc_identity::tree_watch::KernelWatcher> {
-    use notify::Watcher as _;
-    let path = installed.to_path_buf();
-    let watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
-        move |file| file == path || std::fs::canonicalize(&path).is_ok_and(|real| real == file),
-        {
-            let shown = installed.to_path_buf();
-            move |res: notify::Result<notify::Event>| {
-                if let crate::fs_notice::Notice::Failed(why) = crate::fs_notice::notice(&res) {
-                    eprintln!(
-                        "clank: the watch on {} failed: {why}; an install is no longer \
-                         noticed until this process restarts",
-                        shown.display()
-                    );
-                }
-                if crate::fs_notice::notice(&res) != crate::fs_notice::Notice::Read {
-                    wake()
-                }
-            }
-        },
-    );
-    let mut watcher = match watcher {
-        Ok(watcher) => watcher,
-        Err(e) => {
-            tracing::warn!(path = %installed.display(), "cannot watch for an install: {e}");
-            return None;
+    let shown = installed.to_path_buf();
+    let failed = {
+        let wake = wake.clone();
+        move |why: String| {
+            eprintln!(
+                "clank: the watch on {} failed: {why}; an install is no longer \
+                 noticed until this process restarts",
+                shown.display()
+            );
+            wake()
         }
     };
-    for dir in install_dirs(installed) {
-        if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
-            tracing::warn!(dir = %dir.display(), "cannot watch for an install: {e}");
+    match install_watcher(installed, wake, failed) {
+        Ok((watcher, missed)) => {
+            for (dir, e) in missed {
+                tracing::warn!(dir = %dir.display(), "cannot watch for an install: {e}");
+            }
+            Some(watcher)
+        }
+        Err(e) => {
+            tracing::warn!(path = %installed.display(), "cannot watch for an install: {e}");
+            None
         }
     }
-    Some(watcher)
 }
 
+/// [`watch_install`]'s watcher, with `failed` told of a watch that fails
+/// once armed, and the directories it could not watch.
+fn install_watcher(
+    installed: &std::path::Path,
+    wake: Wake,
+    failed: impl Fn(String) + Send + 'static,
+) -> Result<
+    (
+        crate::proc_identity::tree_watch::KernelWatcher,
+        Vec<(std::path::PathBuf, notify::Error)>,
+    ),
+    String,
+> {
+    use notify::Watcher as _;
+    let path = installed.to_path_buf();
+    let mut watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
+        move |file| file == path || std::fs::canonicalize(&path).is_ok_and(|real| real == file),
+        move |res: notify::Result<notify::Event>| match crate::fs_notice::notice(&res) {
+            crate::fs_notice::Notice::Failed(why) => failed(why),
+            crate::fs_notice::Notice::Read => {}
+            _ => wake(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let missed = install_dirs(installed)
+        .into_iter()
+        .filter_map(|dir| {
+            let missed = watcher
+                .watch(&dir, notify::RecursiveMode::NonRecursive)
+                .err();
+            missed.map(|e| (dir, e))
+        })
+        .collect();
+    Ok((watcher, missed))
+}
+
+/// The directories whose entries an install changes: the one holding
+/// the path clank is installed at, and the one holding what that path
+/// resolves to when it is a link.
 fn install_dirs(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> =
         [Some(path.to_path_buf()), std::fs::canonicalize(path).ok()]
