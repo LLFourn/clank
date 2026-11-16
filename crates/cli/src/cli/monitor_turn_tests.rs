@@ -1671,7 +1671,8 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
 
 /// A run whose process exits ends its attendance, and the parked wait is
 /// served again at once with the work that attendance held quiet: no repo
-/// change marks that moment, and nothing about the run itself is shown.
+/// change marks that moment. Claude tells its agent of the run itself, so
+/// nothing about the run is shown.
 #[tokio::test]
 async fn a_run_ending_presents_its_parked_agent_the_work_it_held_quiet() {
     let (repo, author, state) = owed_repo().await;
@@ -1762,6 +1763,136 @@ async fn a_run_ending_presents_its_parked_agent_the_work_it_held_quiet() {
     assert!(clients.is_empty(), "a delivery retires the parked report");
     let g = gathered(repo.path(), &author, &state);
     assert!(turns.projection(&author, &g).attended.is_empty());
+}
+
+/// [`hooked_stop`] from a Codex session.
+fn codex_stop(started: u64, session: &str) -> Report {
+    Report::TurnEnd {
+        stop: clank_core::turn_policy::TurnEndReport {
+            tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            hook_started: Some(started),
+            tool: clank_core::Tool::Codex,
+            session: clank_core::SessionId::parse(session).unwrap(),
+            place: Default::default(),
+        },
+        deadline: u64::MAX,
+        questions: Vec::new(),
+    }
+}
+
+/// A Codex agent bound to [`SESSION`], parked with nothing owed, whose
+/// `clank run` of a live `sleep` is registered.
+async fn a_parked_codex_run() -> (TempRepo, AgentLabel, Turns, std::process::Child, u64) {
+    let (repo, author, _) = timer_repo();
+    crate::agent_store::bind_session_to_agent(
+        repo.path(),
+        &author,
+        clank_core::Tool::Codex,
+        &clank_core::SessionId::parse(SESSION).unwrap(),
+    )
+    .unwrap();
+    let state = folded(repo.path()).await.unwrap();
+    let now = crate::cli::turn_custody::now_ms();
+    let g = gathered(repo.path(), &author, &state).at(now);
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = child.id() as i32;
+    turns
+        .attend(
+            &author,
+            clank_core::turn_policy::AttendRequest::Run {
+                session: clank_core::SessionId::parse(SESSION).unwrap(),
+                proof: crate::cli::turn_custody::shell_proof(
+                    pid,
+                    &crate::proc_identity::token_for(pid).expect("the child's token"),
+                ),
+                desc: "slow build".into(),
+                expect: 600_000,
+            },
+            &g,
+        )
+        .unwrap();
+    let parked = turns
+        .answer(&author, 1, &codex_stop(now, SESSION), true, &g)
+        .unwrap();
+    assert_eq!(parked.verdict, WireVerdict::Park, "nothing is owed");
+    (repo, author, turns, child, now)
+}
+
+/// Codex never continues a parked agent when its background work ends, so
+/// the run's end is the monitor's to tell: the parked wait is served at
+/// once with one notice naming the run, which claims no exit status.
+#[tokio::test]
+async fn a_codex_run_ending_wakes_its_parked_agent() {
+    let (repo, author, mut turns, mut child, now) = a_parked_codex_run().await;
+    let state = folded(repo.path()).await.unwrap();
+    let (out, mut queue) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+    let mut clients = vec![Client {
+        who: Served::Agent {
+            author: author.clone(),
+        },
+        holder: None,
+        out,
+        writer: None,
+        farewell: None,
+        shown: Default::default(),
+        conn: 1,
+        admitted: Default::default(),
+        report: Some(Box::new(Reporting {
+            report: codex_stop(now, SESSION),
+            stepped: true,
+            reader: None,
+        })),
+    }];
+    let mut recovery =
+        crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    retire_gone_runs(
+        repo.path(),
+        &mut clients,
+        Some(&state),
+        &[],
+        &Default::default(),
+        &mut turns,
+        &mut recovery,
+        &author,
+    );
+    let note = queue.try_recv().expect("the parked wait was served");
+    assert!(note.contains(r#"Run \"slow build\" ended"#), "{note}");
+    assert!(
+        !note.contains("exit 0") && !note.contains("succeeded"),
+        "{note}"
+    );
+    assert!(clients.is_empty(), "the notice retires the parked report");
+}
+
+/// The notice belongs to the session that registered the run: once the
+/// label is rebound, the new session's Stop is told nothing about it.
+#[tokio::test]
+async fn a_codex_run_ending_is_never_told_to_a_rebound_session() {
+    const NEXT: &str = "22222222-2222-2222-2222-222222222222";
+    let (repo, author, mut turns, mut child, now) = a_parked_codex_run().await;
+    let state = folded(repo.path()).await.unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let g = gathered(repo.path(), &author, &state).at(now + 1);
+    assert!(turns.end_gone_runs(&author, &g));
+    crate::agent_store::bind_session_to_agent(
+        repo.path(),
+        &author,
+        clank_core::Tool::Codex,
+        &clank_core::SessionId::parse(NEXT).unwrap(),
+    )
+    .unwrap();
+    let g = gathered(repo.path(), &author, &state).at(now + 2);
+    let answer = turns
+        .answer(&author, 2, &codex_stop(now + 2, NEXT), true, &g)
+        .unwrap();
+    assert_eq!(answer.verdict, WireVerdict::Park, "{:?}", answer.verdict);
 }
 
 /// `author`'s Claude record holds a prompt and an answer with no end

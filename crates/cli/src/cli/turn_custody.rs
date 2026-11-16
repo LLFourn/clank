@@ -944,7 +944,10 @@ impl Turns {
         let Some(custody) = self.custody(author, g) else {
             return false;
         };
-        let ended = custody.state.end_gone_runs(&Process);
+        let Some(tool) = g.binding.as_ref().map(|(tool, _)| *tool) else {
+            return false;
+        };
+        let ended = custody.state.end_gone_runs(&Process, tool);
         if ended {
             self.persist(author, None);
         }

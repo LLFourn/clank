@@ -943,10 +943,16 @@ it again while the work runs; new work still wakes it.
   started without blocking the agent's turn (each tool's skill names its
   form). Clank registers the run with the monitor, then becomes the
   command (same pid, stdio and exit status). When that process is gone,
-  by exit, kill or a reused pid, the run is no longer attended, and
-  clank writes and sends nothing about it: the agent's harness reports
-  the end of its own background task, and its output and exit status are
-  wherever it was launched. With no monitor to take the registration,
+  by exit, kill or a reused pid, the run is no longer attended. Claude
+  and Grok report the end of their own background tasks, so clank sends
+  nothing. Codex never continues an agent parked in its synchronous Stop
+  hook when a background command exits, and OpenCode shows no sign of
+  doing so, so on those clank tells the agent's session, at its next
+  Stop, that the run ended. The notice belongs to the session that
+  started the run: a rebind drops it, and a notice whose wake fails to
+  send is not sent again. Clank never knows the exit status: output and status
+  are wherever the run was launched. Background work started without
+  `clank run` never wakes a Codex or OpenCode agent. With no monitor to take the registration,
   the command is refused and does not run.
 - `clank attend "<name>"` declares other work, such as a subagent. It
   takes effect at once. Where the harness's Stop lists its own background

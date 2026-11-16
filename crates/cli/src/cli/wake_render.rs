@@ -834,6 +834,9 @@ pub(crate) fn notice_text(notice: &clank_core::turn_policy::Notice) -> String {
         Notice::MonitorUnanswered => MONITOR_UNANSWERED.to_string(),
         Notice::ArmWait => ARM_WAIT.to_string(),
         Notice::CheckIn(lines) => check_in_text(lines),
+        Notice::RunEnded { desc } => format!(
+            "Run \"{desc}\" ended. Collect its output and exit status where you started it."
+        ),
     }
 }
 

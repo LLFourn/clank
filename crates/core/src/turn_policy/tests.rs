@@ -833,17 +833,17 @@ fn a_gone_run_ends_its_attendance_and_releases_what_it_quieted() {
     let s = session();
     let a = owed("event:a", "read:a");
     let mut st = received_then(&s, &a, run("test run", 7001));
-    assert!(!st.end_gone_runs(&LIVE));
+    assert!(!st.end_gone_runs(&LIVE, Tool::Claude));
     assert_eq!(names(&st), ["test run"]);
     assert_eq!(
         st.recovery_quiet(&dead(T0 + 2 * MINUTE, &s, &a)),
         None,
         "a gone run quiets nothing even before it is retired"
     );
-    assert!(st.end_gone_runs(&DEAD));
+    assert!(st.end_gone_runs(&DEAD, Tool::Claude));
     assert!(st.attendances.is_empty());
     assert!(st.received.is_empty(), "what it quieted is released");
-    assert!(!st.end_gone_runs(&DEAD), "never twice");
+    assert!(!st.end_gone_runs(&DEAD, Tool::Claude), "never twice");
     let (_, identities) = presented(verdict(st.step(stop(), &facts(T0 + 3 * MINUTE, &s, &a))));
     assert_eq!(identities, ["event:a"]);
 }
@@ -857,10 +857,10 @@ fn a_restart_ends_a_run_that_went_while_nobody_watched() {
     st.step(run("test run", 7001), &facts(T0, &s, &[]));
     let saved = serde_json::to_string(&st.persisted()).unwrap();
     let mut back = SessionState::restored(serde_json::from_str(&saved).unwrap());
-    assert!(back.end_gone_runs(&DEAD));
+    assert!(back.end_gone_runs(&DEAD, Tool::Claude));
     let saved = serde_json::to_string(&back.persisted()).unwrap();
     let mut again = SessionState::restored(serde_json::from_str(&saved).unwrap());
-    assert!(!again.end_gone_runs(&DEAD));
+    assert!(!again.end_gone_runs(&DEAD, Tool::Claude));
 }
 
 /// Killing the command is its end like any other.
@@ -880,8 +880,107 @@ fn a_killed_run_ends_like_any_other() {
             }
         }
     }
-    assert!(st.end_gone_runs(&Killed));
+    assert!(st.end_gone_runs(&Killed, Tool::Claude));
     assert_eq!(names(&st), ["build"], "the other run is untouched");
+}
+
+fn run_ended(v: &Verdict) -> Vec<&str> {
+    let notices = match v {
+        Verdict::Notify(n) | Verdict::Deliver { notices: n, .. } => n.as_slice(),
+        _ => &[],
+    };
+    notices
+        .iter()
+        .filter_map(|n| match n {
+            Notice::RunEnded { desc } => Some(desc.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// On a harness that never continues a parked agent when its background
+/// work ends, a run going while the agent is parked wakes that park, once.
+#[test]
+fn a_codex_run_ending_wakes_its_parked_agent_once() {
+    let s = session();
+    let mut st = SessionState::new(s.clone());
+    st.step(run("test run", 7001), &facts(T0, &s, &[]));
+    assert_eq!(verdict(st.step(stop(), &facts(T0, &s, &[]))), Verdict::Park);
+    assert!(st.end_gone_runs(&DEAD, Tool::Codex));
+    let v = verdict(st.step(parked(), &facts(T0 + MINUTE, &s, &[])));
+    assert!(matches!(v, Verdict::Notify(_)), "{v:?}");
+    assert_eq!(run_ended(&v), ["test run"]);
+    let again = verdict(st.step(parked(), &facts(T0 + 2 * MINUTE, &s, &[])));
+    assert_eq!(again, Verdict::Park, "told once");
+}
+
+/// A run that goes while the agent is working, or before its Stop
+/// registers, is told at that Stop rather than lost.
+#[test]
+fn a_codex_run_ending_mid_turn_is_told_at_the_next_stop() {
+    let s = session();
+    let mut st = SessionState::new(s.clone());
+    st.step(run("test run", 7001), &facts(T0, &s, &[]));
+    assert!(st.end_gone_runs(&DEAD, Tool::Codex));
+    let v = verdict(st.step(stop(), &facts(T0 + MINUTE, &s, &[])));
+    assert_eq!(run_ended(&v), ["test run"], "{v:?}");
+}
+
+/// The notice is the binding's: a Stop from another session is stale and
+/// is told nothing.
+#[test]
+fn a_codex_run_ending_is_never_told_to_another_session() {
+    let s = session();
+    let other = other_session();
+    let mut st = SessionState::new(s.clone());
+    st.step(run("test run", 7001), &facts(T0, &s, &[]));
+    assert!(st.end_gone_runs(&DEAD, Tool::Codex));
+    let v = verdict(st.step(stop(), &facts(T0 + MINUTE, &other, &[])));
+    assert!(run_ended(&v).is_empty(), "{v:?}");
+}
+
+/// Each run is looked at once: a run that goes between two looks is either
+/// retired with its notice or kept for its own exit, never retired silently.
+#[test]
+fn a_run_going_mid_retirement_is_never_retired_without_its_notice() {
+    struct Going(std::cell::Cell<u32>);
+    impl Liveness for Going {
+        fn presence(&self, proof: &ShellProof) -> Presence {
+            if proof.pid == 7001 {
+                return Presence::Gone;
+            }
+            let looks = self.0.get();
+            self.0.set(looks + 1);
+            match looks {
+                0 => Presence::Live,
+                _ => Presence::Gone,
+            }
+        }
+    }
+    let s = session();
+    let mut st = SessionState::new(s.clone());
+    st.step(run("first", 7001), &facts(T0, &s, &[]));
+    st.step(run("second", 7002), &facts(T0, &s, &[]));
+    let going = Going(std::cell::Cell::new(0));
+    assert!(st.end_gone_runs(&going, Tool::Codex));
+    assert_eq!(names(&st), ["second"], "kept for its own exit");
+    let v = verdict(st.step(stop(), &facts(T0 + MINUTE, &s, &[])));
+    assert_eq!(run_ended(&v), ["first"]);
+    assert!(st.end_gone_runs(&going, Tool::Codex));
+    let v = verdict(st.step(stop(), &facts(T0 + 2 * MINUTE, &s, &[])));
+    assert_eq!(run_ended(&v), ["second"]);
+}
+
+/// A harness that tells its agent itself gets nothing from clank.
+#[test]
+fn a_claude_run_ending_is_left_to_the_harness() {
+    let s = session();
+    let mut st = SessionState::new(s.clone());
+    st.step(run("test run", 7001), &facts(T0, &s, &[]));
+    assert_eq!(verdict(st.step(stop(), &facts(T0, &s, &[]))), Verdict::Park);
+    assert!(st.end_gone_runs(&DEAD, Tool::Claude));
+    let v = verdict(st.step(parked(), &facts(T0 + MINUTE, &s, &[])));
+    assert_eq!(v, Verdict::Park);
 }
 
 /// A declaration still standing at `--expect` is owed one check-in. Its
@@ -1623,7 +1722,7 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
         ]
     );
     let mut ended = listed.clone();
-    assert!(ended.end_gone_runs(&DEAD));
+    assert!(ended.end_gone_runs(&DEAD, Tool::Claude));
     assert_eq!(ended.attendances.len(), 2, "only the run ends");
     assert_eq!(listed.next_window, 3, "a new window is not an old one");
 
@@ -2434,7 +2533,7 @@ fn an_unseen_run_is_kept_and_never_ended() {
     let s = session();
     let a = owed("event:a", "read:a");
     let mut st = received_then(&s, &a, run("test run", 7001));
-    assert!(!st.end_gone_runs(&UNSEEN));
+    assert!(!st.end_gone_runs(&UNSEEN, Tool::Claude));
     let unseen = Facts {
         liveness: &UNSEEN,
         ..facts(T0 + MINUTE, &s, &a)
@@ -2454,7 +2553,10 @@ fn an_unseen_run_is_kept_and_never_ended() {
         "it may still be running: checked in on"
     );
     assert_eq!(names(&st), ["test run"]);
-    assert!(st.end_gone_runs(&DEAD), "once seen gone, it ends");
+    assert!(
+        st.end_gone_runs(&DEAD, Tool::Claude),
+        "once seen gone, it ends"
+    );
     assert!(st.attendances.is_empty());
 }
 
