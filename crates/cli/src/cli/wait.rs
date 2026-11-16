@@ -1049,22 +1049,18 @@ where
             // its delivery. An unbound wait has nobody's notice to share
             // and fails each time.
             None => {
-                let announced = session.map(|session| {
-                    crate::agent_store::announce_outage(
-                        repo,
-                        author,
-                        session,
-                        time::OffsetDateTime::now_utc(),
-                        &mut || Ok(()),
+                let told_already = session.is_some_and(|session| {
+                    matches!(
+                        crate::agent_store::announce_outage(
+                            repo,
+                            author,
+                            session,
+                            time::OffsetDateTime::now_utc(),
+                        ),
+                        Ok(false)
                     )
                 });
-                if let Some(Ok(crate::agent_store::Announcement::Undelivered(e))) = &announced {
-                    tracing::debug!(%e, "outage diagnostic was not delivered");
-                }
-                if !matches!(
-                    announced,
-                    Some(Ok(crate::agent_store::Announcement::Suppressed))
-                ) {
+                if !told_already {
                     anyhow::bail!("clank cannot start its monitor: {why}");
                 }
                 crate::cli::monitor::OUTAGE_RETRY_CAP

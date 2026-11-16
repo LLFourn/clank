@@ -5,11 +5,12 @@ description: Handle github_event wake items from clank's github wake sources —
 
 # Clank github events
 
-`clank wait` can watch GitHub repos (`wait_events` entries with
-`"kind":"github"`). Every event those sources ingest is written to
-YOUR per-agent event inbox (a write-ahead log under
-`.clank/agents/<label>/events/`) BEFORE it is presented. Events stay
-**unhandled** there until you explicitly mark them handled.
+`clank wait` can watch GitHub repos (watches with `"kind":"github"`).
+Every event a watch ingests is written to that watch's own event log (a
+write-ahead log under `.clank/watch-events/<id>/`, or the agent's
+`events/` for one pinned to it) BEFORE it is presented to the watch's
+recipient. Events stay **unhandled** there until you explicitly mark
+them handled.
 
 ## The loop: react, then ack
 
@@ -73,7 +74,12 @@ stay intact. Pending work follows the new master; already delivered work may
 still be acted on by the old master. Both share acknowledgments, but external
 actions remain at least once. Ingestion continues while there is no master;
 events wait until one is assigned. Legacy watches stay pinned until transferred.
-Never edit `config.json` by hand: `add` refuses, with
+A recipient receives each source from one producer: `add` refuses a
+source its recipient already gets from another watch, naming it. When a
+master change makes two watches deliver one source to the new master,
+the lower watch ID hosts it and the other ingests nothing new; its
+unacked events stay owed under its own ids, and `clank status` says
+which hosts. Never edit `config.json` by hand: `add` refuses, with
 nothing written, anything your next arm would refuse. The JSON is a
 github source in one of two shapes. The flat one names kinds and scopes them with `prs` /
 `branches`:

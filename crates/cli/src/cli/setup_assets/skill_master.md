@@ -104,9 +104,10 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   wake you. Raise one only when you genuinely cannot proceed.
   The human answers with `clank block answer <name> -m "answer"`, without
   an agent name. Questions and answers belong to the repository and follow
-  whoever becomes master. An answer is delivered once, in a wake, and then
-  deleted: `clank block list` shows only what is open or undelivered, so
-  act on an answer when it arrives.
+  whoever becomes master. An answer is delivered once, best effort, in a
+  wake, and deleted as that wake is emitted: no later wake repeats it and
+  `clank block list` shows only what is open or undelivered, so act on an
+  answer when it arrives.
   When something you need was refused by a permission check, raise it
   with `--permission` (and `--suggest "<the message that would lift it>"`):
   the human answers by typing into your terminal, so the answer arrives as

@@ -686,32 +686,19 @@ pub fn resume_checked_in(
     })
 }
 
-/// What announcing an outage to a session came to.
-#[derive(Debug)]
-pub(crate) enum Announcement {
-    /// The announcement was delivered, and the session is now told.
-    Delivered,
-    /// Nothing was said: the session was already told of this outage, or
-    /// no longer holds the label.
-    Suppressed,
-    /// The delivery failed, so the session is not told.
-    Undelivered(std::io::Error),
-}
-
-/// Announce an outage to `session`, at most once until a monitor serves
-/// it ([`outage_served`]).
+/// Record `session` as told of an outage, at most once until a monitor
+/// serves it ([`outage_served`]): `true` when this call is the one that
+/// tells it, `false` when it was told already or no longer holds the
+/// label. A caller given `true` owes the session the telling.
 ///
-/// One transaction under the agent's lock: the binding and the standing
-/// notice are checked, `deliver` runs, and the session is recorded as
-/// told only if it succeeded. Every waiter of a session announces
-/// through here, so two of them cannot both find it untold.
+/// Every waiter of a session announces through here, under the agent's
+/// lock, so two of them cannot both find it untold.
 pub(crate) fn announce_outage(
     repo: &Path,
     label: &AgentLabel,
     session: &SessionId,
     now: OffsetDateTime,
-    deliver: &mut dyn FnMut() -> std::io::Result<()>,
-) -> anyhow::Result<Announcement> {
+) -> anyhow::Result<bool> {
     let at = now.format(&Rfc3339).context("formatting timestamp")?;
     let agent_dir = agents_root(repo).join(label.as_str());
     let permit = crate::upgrade::writing()?;
@@ -719,28 +706,25 @@ pub(crate) fn announce_outage(
         let told: Option<OutageNotified> = txn.bound(session, Bound::Outage)?;
         let bound = txn.binding()?.is_some_and(|s| &s.id == session);
         if !bound || told.is_some() {
-            return Ok(Announcement::Suppressed);
-        }
-        if let Err(e) = deliver() {
-            return Ok(Announcement::Undelivered(e));
+            return Ok(false);
         }
         txn.patch(session, Bound::Outage, Some(&OutageNotified { at }))?;
-        Ok(Announcement::Delivered)
+        Ok(true)
     })
 }
 
 /// `session`, bound to `label`, told its repo has no monitor.
 #[cfg(test)]
 pub(crate) fn told_of_an_outage(repo: &Path, label: &AgentLabel, session: &str) {
-    let told = announce_outage(
-        repo,
-        label,
-        &SessionId::parse(session).unwrap(),
-        OffsetDateTime::now_utc(),
-        &mut || Ok(()),
-    )
-    .unwrap();
-    assert!(matches!(told, Announcement::Delivered), "{told:?}");
+    assert!(
+        announce_outage(
+            repo,
+            label,
+            &SessionId::parse(session).unwrap(),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap()
+    );
 }
 
 /// What serving a session did to its outage notice.
@@ -765,11 +749,10 @@ pub(crate) enum OutageServed {
 /// finds the lock held clears nothing ([`OutageServed::Contended`]), and
 /// the notice is cleared only by a later serve whose attempt succeeds.
 ///
-/// The marker is read under the lock, never before it: an announcement
-/// holds the lock while it delivers and records only afterwards, so a
-/// read taken first would miss the marker that is about to be written
-/// and leave it standing after the recovery. A healthy attach costs the
-/// lock and a read; nothing is written unless a notice stood.
+/// The marker is read under the lock, never before it: a read taken
+/// first could miss an announcement recording it meanwhile and leave it
+/// standing after the recovery. A healthy attach costs the lock and a
+/// read; nothing is written unless a notice stood.
 ///
 /// What serving is belongs to the caller's connection: a verdict for a
 /// hook's report, the first note for a subscription.
@@ -1528,8 +1511,8 @@ mod tests {
             .map(|(_, told)| told)
     }
 
-    fn announce(repo: &Path, l: &AgentLabel, session: &str, at_: &str) -> Announcement {
-        announce_outage(repo, l, &sid(session), at(at_), &mut || Ok(())).unwrap()
+    fn announce(repo: &Path, l: &AgentLabel, session: &str, at_: &str) -> bool {
+        announce_outage(repo, l, &sid(session), at(at_)).unwrap()
     }
 
     #[test]
@@ -1538,24 +1521,15 @@ mod tests {
         let (repo, l) = (dir.path(), label("claude"));
         let now = "2026-11-10T00:00:00Z";
         bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
-        assert!(matches!(
-            announce(repo, &l, SUCCESSOR, now),
-            Announcement::Suppressed
-        ));
+        assert!(!announce(repo, &l, SUCCESSOR, now));
         assert_eq!(told(repo, &l), None, "not the bound session");
         assert_eq!(
             outage_served(repo, &l, &sid(RESUMED)).unwrap(),
             OutageServed::NoneStood
         );
 
-        assert!(matches!(
-            announce(repo, &l, RESUMED, now),
-            Announcement::Delivered
-        ));
-        assert!(matches!(
-            announce(repo, &l, RESUMED, "2026-11-10T00:05:00Z"),
-            Announcement::Suppressed
-        ));
+        assert!(announce(repo, &l, RESUMED, now));
+        assert!(!announce(repo, &l, RESUMED, "2026-11-10T00:05:00Z"));
         assert_eq!(told(repo, &l).unwrap().at, now);
 
         assert_eq!(
@@ -1571,104 +1545,51 @@ mod tests {
             OutageServed::Cleared
         );
         assert_eq!(told(repo, &l), None);
-        assert!(matches!(
-            announce(repo, &l, RESUMED, now),
-            Announcement::Delivered
-        ));
-    }
-
-    #[test]
-    fn an_announcement_that_was_not_delivered_leaves_the_session_untold() {
-        let dir = tempfile::tempdir().unwrap();
-        let (repo, l) = (dir.path(), label("claude"));
-        bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
-        let failed = announce_outage(
-            repo,
-            &l,
-            &sid(RESUMED),
-            at("2026-11-10T00:00:00Z"),
-            &mut || Err(std::io::ErrorKind::BrokenPipe.into()),
-        )
-        .unwrap();
-        assert!(matches!(failed, Announcement::Undelivered(_)), "{failed:?}");
-        assert_eq!(told(repo, &l), None);
-        assert!(matches!(
-            announce(repo, &l, RESUMED, "2026-11-10T00:00:00Z"),
-            Announcement::Delivered
-        ));
+        assert!(announce(repo, &l, RESUMED, now));
     }
 
     /// Two waiters of one session that reach the announcement together
-    /// deliver it once: the second finds the session told, however long
-    /// the first's delivery takes.
+    /// tell it once.
     #[test]
-    fn two_waiters_announcing_together_deliver_once() {
+    fn two_waiters_announcing_together_tell_once() {
         let dir = tempfile::tempdir().unwrap();
         let (repo, l) = (dir.path(), label("claude"));
         bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
-        let delivered = std::sync::atomic::AtomicUsize::new(0);
         let together = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
-            for _ in 0..2 {
-                scope.spawn(|| {
-                    together.wait();
-                    announce_outage(
-                        repo,
-                        &l,
-                        &sid(RESUMED),
-                        at("2026-11-10T00:00:00Z"),
-                        &mut || {
-                            std::thread::sleep(std::time::Duration::from_millis(300));
-                            delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            Ok(())
-                        },
-                    )
-                    .unwrap();
-                });
-            }
+        let told = std::thread::scope(|scope| {
+            let waiters: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        together.wait();
+                        announce(repo, &l, RESUMED, "2026-11-10T00:00:00Z")
+                    })
+                })
+                .collect();
+            waiters
+                .into_iter()
+                .map(|w| w.join().unwrap())
+                .filter(|told| *told)
+                .count()
         });
-        assert_eq!(delivered.into_inner(), 1);
+        assert_eq!(told, 1);
     }
 
-    /// A monitor serving the session while its announcement is still being
-    /// delivered does not wait for it: it clears nothing, the notice the
-    /// announcement records stands, and the next serve ends the outage.
+    /// A serve that finds the agent's lock held clears nothing, and the
+    /// next serve ends the outage.
     #[test]
-    fn a_session_served_during_its_announcement_is_cleared_by_the_next_serve() {
+    fn a_session_served_while_its_lock_is_held_is_cleared_by_the_next_serve() {
         let dir = tempfile::tempdir().unwrap();
         let (repo, l) = (dir.path(), label("claude"));
         bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
-        let (delivering, started) = std::sync::mpsc::channel::<()>();
-        let (served, finish) = std::sync::mpsc::channel::<()>();
-        let during = std::thread::scope(|scope| {
-            let l = &l;
-            let announcing = scope.spawn(move || {
-                announce_outage(
-                    repo,
-                    l,
-                    &sid(RESUMED),
-                    at("2026-11-10T00:00:00Z"),
-                    &mut || {
-                        delivering.send(()).unwrap();
-                        finish.recv().unwrap();
-                        Ok(())
-                    },
-                )
-                .unwrap()
-            });
-            started.recv().unwrap();
-            let (result, serve) = std::sync::mpsc::channel();
-            scope.spawn(move || result.send(outage_served(repo, l, &sid(RESUMED)).unwrap()));
-            let during = serve.recv_timeout(std::time::Duration::from_secs(60));
-            served.send(()).unwrap();
-            assert!(matches!(
-                announcing.join().unwrap(),
-                Announcement::Delivered
-            ));
-            during.expect("the serve waited for the announcement's lock")
-        });
-        assert_eq!(during, OutageServed::Contended);
-        assert!(told(repo, &l).is_some(), "the announcement's notice stands");
+        assert!(announce(repo, &l, RESUMED, "2026-11-10T00:00:00Z"));
+        let held =
+            crate::cli::github::log::tests::hold_paths(&[agents_root(repo).join(l.as_str())]);
+        assert_eq!(
+            outage_served(repo, &l, &sid(RESUMED)).unwrap(),
+            OutageServed::Contended
+        );
+        assert!(told(repo, &l).is_some(), "the notice stands");
+        held.release();
         assert_eq!(
             outage_served(repo, &l, &sid(RESUMED)).unwrap(),
             OutageServed::Cleared

@@ -68,7 +68,6 @@ pub(crate) fn line_rule(line: &str) -> Option<(&'static str, &'static str)> {
             "the general CLI config resolver",
         ),
         ("Gathered::", "monitor fact gathering in a hook process"),
-        ("unmonitored_verdict", "local outage policy"),
         ("announce_outage", "local outage wake authorization"),
         ("outage_served", "monitor recovery state"),
         ("load_agent_config", "an agent's config, read for policy"),

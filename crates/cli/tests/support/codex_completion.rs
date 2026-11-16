@@ -1,4 +1,5 @@
-//! Opt-in observation, not an assertion that native completion must wake.
+//! Opt-in diagnostic: a native command's completion does not continue the
+//! model within the observation window, and a Stop hook's block does.
 //! Uses the question protocol fixture's isolated server and scripted model.
 use super::*;
 use tokio::net::UnixDatagram;
@@ -291,6 +292,11 @@ async fn scenario_in(
     observe(&mut client, &mut trace).await?;
     let calls = model.inputs.lock().unwrap().len();
     trace.record(json!({"kind":"observation_complete","model_requests":calls,"window_ms":OBSERVE.as_millis()}));
+    ensure!(
+        calls == 2,
+        "{}: native completion continued the model: {calls} requests, expected the initial tool call and the final answer",
+        trace.name
+    );
     if phase != "idle" {
         // Positive control: prove that the hook's documented continuation
         // response is effective, separately from native process completion.
@@ -307,11 +313,6 @@ async fn scenario_in(
     }
     client.close().await?;
     drop(server); // Kill/reap owned group before removing its temporary profile.
-    let name = &trace.name;
-    println!(
-        "{name}: {calls} model requests after exit; expected initial tool + final = 2; observation={}ms",
-        OBSERVE.as_millis()
-    );
     Ok(())
 }
 

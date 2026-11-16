@@ -1328,9 +1328,11 @@ clank events watch transfer --from-author claude 1  # legacy watch -> master rol
 explicitly pins a watch to a named agent; `--author master` means the agent
 literally named `master`, not the role. `list` and `remove` default to the same
 master scope. `list -j` returns objects with `n`, `target`, `recipient` and
-`source`; an unassigned recipient is `null`. Invalid or duplicate sources in
-the target scope are refused without a config write. New named targets must
-be on the roster. An unknown entry number is refused; use `list` in that scope.
+`source`; an unassigned recipient is `null`. An invalid source, or one its
+recipient already receives from another watch or its own declaration, is
+refused without a config write, and the error names that producer. New named
+targets must be on the roster. An unknown entry number is refused; use `list`
+in that scope.
 
 `transfer N` moves an existing watch to the master role; `--from-author` selects
 its old named scope, even after that agent left the roster, and `--author`
@@ -1342,7 +1344,13 @@ Removing a repository watch retains its history; adding it again creates a new
 watch with fresh state. Use transfer to change recipients without losing state.
 
 A master change routes pending and subsequent work to the new master without
-restarting unchanged producers. Already handed-off work cannot be recalled:
+restarting unchanged producers, and is never refused because of watches. When
+it leaves the new master receiving one source twice, one producer hosts it: a
+repository watch over the agent's own declaration, and the lower watch ID over
+another watch. The other ingests nothing new while its log, cursor and
+unacknowledged events stay its own, owed under its own key; `clank status`
+names each such suppression, and it lifts when the master changes again.
+Already handed-off work cannot be recalled:
 the old agent may finish its action or acknowledgment while the new agent sees
 the same pending row. Both acknowledge the same log, so an acknowledgment is
 shared, but external actions are **at least once**, not exactly once. An
@@ -1432,10 +1440,8 @@ or retiring, and a waiting `clank wait` or hook learns the monitor is gone from
 its socket closing. A wait following another's command or GitHub source wakes
 when that source's log changes or its lease comes free.
 
-After upgrading clank, restart long-lived monitors, waits and TUIs: updating the
-binary does not update a process already running it. A newer client asks an older
-monitor to retire. Mixed versions writing the same repo, and downgrades, are
-unsupported.
+Long-lived processes pick up an install on their own (see Upgrading). Mixed
+versions writing the same repo, and downgrades, are unsupported.
 
 - `clank wait --peek` — non-blocking, side-effect-free "is there work
   right now?" probe.

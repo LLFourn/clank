@@ -1143,10 +1143,7 @@ async fn a_verdict_that_presents_nothing_answers_nothing() {
             message: "diagnostic".into(),
         }),
         Frame::bare(WireVerdict::RenewWait),
-        Frame::text(
-            WireVerdict::Notify,
-            crate::cli::wake_render::MONITOR_UNANSWERED.into(),
-        ),
+        Frame::text(WireVerdict::Notify, "a notice".into()),
     ] {
         let answered = Answered::default();
         emit_turn(
@@ -1713,10 +1710,7 @@ async fn a_session_starts_context_is_answered_after_its_flush() {
     let answered = Answered::default();
     let mut writer = Writer::new();
     emit_session_start(
-        Frame::text(
-            WireVerdict::Notify,
-            crate::cli::wake_render::monitor_outage("no binary"),
-        ),
+        Frame::text(WireVerdict::Notify, "clank cannot start its monitor".into()),
         &binding,
         answered.clone(),
         &mut writer,

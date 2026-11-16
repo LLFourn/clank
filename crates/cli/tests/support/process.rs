@@ -96,14 +96,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
     match args.first().map(String::as_str) {
-        Some("codex-context") => {
-            println!(
-                "{}",
-                json!({"cwd":std::env::current_dir()?,
-                "sentinel":std::env::var("CLANK_TUI_SENTINEL").ok()})
-            );
-            Ok(())
-        }
         Some("codex-observe") if args.len() == 2 => {
             let input: Value = serde_json::from_reader(std::io::stdin().lock())?;
             let socket = std::os::unix::net::UnixDatagram::unbound()?;
