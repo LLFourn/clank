@@ -126,6 +126,13 @@ pub(crate) enum WireVerdict {
     Diagnostic {
         message: String,
     },
+    /// A report that does not park got no verdict by the time it had to
+    /// be answered: no decision was made, so each adapter frames its own
+    /// timeout. Only ever framed by a hook or its child, never sent by a
+    /// monitor.
+    Unanswered {
+        why: String,
+    },
 }
 
 /// One verdict and the text it carries.
@@ -180,9 +187,21 @@ impl Frame {
             WireVerdict::Recorded => HookOutcome::Diagnostic {
                 message: "hook: a child's acknowledgement reached a Stop".into(),
             },
-            WireVerdict::Diagnostic { message } => HookOutcome::Diagnostic {
-                message: message.clone(),
-            },
+            WireVerdict::Diagnostic { .. } | WireVerdict::Unanswered { .. } => {
+                HookOutcome::Diagnostic {
+                    message: self.diagnostic().unwrap_or_default(),
+                }
+            }
+        }
+    }
+
+    /// What an adapter that arms no wait of its own writes for this frame
+    /// on its diagnostic channel, or `None` when it is no diagnostic.
+    pub(crate) fn diagnostic(&self) -> Option<String> {
+        match &self.verdict {
+            WireVerdict::Diagnostic { message } => Some(message.clone()),
+            WireVerdict::Unanswered { why } => Some(format!("hook: {why}")),
+            _ => None,
         }
     }
 }

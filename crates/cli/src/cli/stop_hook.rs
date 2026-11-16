@@ -532,10 +532,7 @@ async fn subagent(
         |_| None,
     )
     .await;
-    match frame.verdict {
-        WireVerdict::Diagnostic { message } => Some(message),
-        _ => None,
-    }
+    frame.diagnostic()
 }
 
 /// The SessionStart payload both tools send: claude documents it, codex
@@ -676,23 +673,13 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Carry `report`, which never parks, to the monitor, and hand `emit` its
-/// verdict, or the one its tool takes when none comes within `budget`.
-/// `emit` says how writing it out went, or `None` when it wrote nothing; a
-/// presentation is answered by that, and is delivered only by a write
-/// that succeeded.
-pub(super) async fn answer_once(
-    repo: &Path,
-    label: &AgentLabel,
-    session: &str,
-    report: Report,
-    budget: std::time::Duration,
-    emit: impl FnMut(&Frame) -> Option<std::io::Result<()>>,
-) {
-    answer_with(&Spawner, repo, label, session, report, budget, emit).await;
-}
-
-async fn answer_with(
+/// Carry `report`, which never parks, to the monitor through a child
+/// `spawner` starts, and hand `emit` its verdict. A handoff with no verdict
+/// within `budget` is [`WireVerdict::Unanswered`], as its child's own last
+/// word would be. `emit` says how writing it out went, or `None` when it
+/// wrote nothing; a presentation is answered by that, and is delivered only
+/// by a write that succeeded.
+pub(super) async fn answer_with(
     spawner: &dyn Spawn,
     repo: &Path,
     label: &AgentLabel,
@@ -721,7 +708,9 @@ async fn answer_with(
         Err(frame)
             if frame.verdict == WireVerdict::Park && matches!(report, Report::Handoff { .. }) =>
         {
-            super::turn_child::unanswered(&mut emit)
+            let frame = super::turn_child::unanswered(super::turn_child::NOT_ANSWERED);
+            emit(&frame);
+            frame
         }
         Err(frame) => {
             emit(&frame);
@@ -847,7 +836,7 @@ pub(crate) trait Spawn {
 }
 
 /// This binary, as `clank wait --turn-end`.
-struct Spawner;
+pub(super) struct Spawner;
 
 impl Spawn for Spawner {
     fn spawn(
@@ -1078,8 +1067,12 @@ async fn under_deadline<F: std::future::Future>(
 ///
 /// Owner loss outranks whatever the child found, and the deadline: there
 /// is nobody left to deliver to. A deadline with no verdict frames the
-/// one the tool takes at its deadline, so a slow monitor never puts the
-/// agent to sleep.
+/// one the tool takes at its deadline. For a report that parks that is
+/// [`super::turn_wire::expired_wait`]: OpenCode renews its wait, but Claude
+/// and Codex are told only a diagnostic, and their agent stays idle until
+/// something else wakes it. For one that does not it is the
+/// [`WireVerdict::Park`] sentinel, which the caller frames: Grok's handoff
+/// as [`WireVerdict::Unanswered`], which arms its wait.
 ///
 /// While no terminal verdict has been read the hook is parked, holding
 /// nothing but its report, and that is where `replacing` may turn it into

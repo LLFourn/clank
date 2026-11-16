@@ -842,7 +842,7 @@ pub(crate) fn notice_text(notice: &clank_core::turn_policy::Notice) -> String {
 
 /// Grok's native handoff: the background wait whose completion is the
 /// agent's next wake.
-pub(crate) const ARM_WAIT: &str = "Run `clank wait` as one background terminal task \
+pub(crate) const ARM_WAIT: &str = "Run `clank wait --automatic` as one background terminal task \
      (block_until_ms: 0, with no positive timeout), then finish the turn. Its completion wakes \
      you. Do not poll it or launch a second wait.";
 

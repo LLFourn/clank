@@ -539,3 +539,212 @@ async fn groks_check_in_rides_its_stop_and_never_its_background_wait() {
     );
     assert_eq!(row(&mut turns).as_deref(), Some("checked in"));
 }
+
+/// Starts each of Grok's hook children on a thread of this process, as
+/// `clank wait --turn-end` would run it, reaching the test's monitor over
+/// these connections, one per attempt, and no monitor once they are spent.
+struct InProcess(std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>);
+
+impl InProcess {
+    /// A child with one connection to a monitor, and the monitor's end.
+    fn reaching() -> (Self, tokio::net::UnixStream) {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        theirs.set_nonblocking(true).unwrap();
+        (
+            InProcess(std::sync::Mutex::new(vec![ours])),
+            tokio::net::UnixStream::from_std(theirs).unwrap(),
+        )
+    }
+}
+
+impl crate::cli::stop_hook::Spawn for InProcess {
+    fn spawn(
+        &self,
+        repo: &std::path::Path,
+        label: &AgentLabel,
+        _: &str,
+        _: Tool,
+        report: &crate::cli::turn_wire::Report,
+    ) -> Result<crate::cli::stop_hook::OwnedWait, String> {
+        use tokio::net::unix::pipe;
+        let (owner_read, owner_write) = std::io::pipe().unwrap();
+        let (frames_read, frames_write) = std::io::pipe().unwrap();
+        let ours = std::mem::take(&mut *self.0.lock().unwrap());
+        super::turn_tests::carrier(repo, label, owner_read, frames_write, ours);
+        crate::cli::stop_hook::OwnedWait::over(
+            None,
+            Box::new(pipe::Sender::from_owned_fd(owner_write.into()).unwrap()),
+            Box::new(pipe::Receiver::from_owned_fd(frames_read.into()).unwrap()),
+            None,
+            report,
+        )
+    }
+}
+
+/// What Grok's Stop hook writes, on stdout and stderr, for its routed
+/// handoff, given `budget` and its children started by `spawner`.
+async fn grok_stop(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    spawner: &InProcess,
+    budget: Duration,
+) -> (String, String) {
+    use crate::cli::turn_child::tests::{handoff_by, within};
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    crate::cli::grok_hook::hand_off(
+        spawner,
+        repo,
+        author,
+        handoff_by(within(budget)),
+        budget,
+        &mut out,
+        &mut err,
+    )
+    .await;
+    (
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+/// Grok's Stop blocked with the request for its wait.
+fn arm_wait() -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"decision": "block", "reason": crate::cli::wake_render::ARM_WAIT})
+    )
+}
+
+/// Long enough past the child's last word, which comes two seconds before
+/// the deadline, for the exchange to run in real time.
+const BUDGET: Duration = Duration::from_secs(3);
+
+/// A Grok Stop the monitor admits and does not answer in time still arms
+/// the agent's wait: the hook asks for it, and the wait, attaching to that
+/// monitor once it answers, is handed the work the Stop was owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grok_stop_the_monitor_answers_late_still_arms_its_wait() {
+    use crate::cli::turn_child::tests::{SESSION, repo_with};
+    let (repo, author) = repo_with(Tool::Grok, true);
+    let (spawner, theirs) = InProcess::reaching();
+    let root = repo.path().to_path_buf();
+    let slow = tokio::spawn(async move { admit(theirs, &root).await.unwrap().client() });
+    let (out, err) = grok_stop(repo.path(), &author, &spawner, BUDGET).await;
+    assert_eq!((out, err), (arm_wait(), String::new()));
+    let report = slow.await.unwrap();
+    assert!(
+        report.report.is_some(),
+        "the monitor took the Stop's report"
+    );
+
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    theirs.set_nonblocking(true).unwrap();
+    let theirs = tokio::net::UnixStream::from_std(theirs).unwrap();
+    let root = repo.path().to_path_buf();
+    let monitor = tokio::spawn(async move {
+        let mut clients = vec![admit(theirs, &root).await.unwrap().client()];
+        let state = folded(&root).await.unwrap();
+        serve(&root, &mut clients, &state);
+        clients
+    });
+    let ours = std::sync::Mutex::new(Some(ours));
+    let binding = crate::cli::wait::WaitBinding::automatic_grok(SessionId::parse(SESSION).unwrap());
+    let (items, _) = tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::cli::wait::monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut crate::upgrade::Replacing::never(),
+            |who| {
+                let stream = ours.lock().unwrap().take();
+                let repo = repo.path().to_path_buf();
+                async move {
+                    let Some(stream) = stream else {
+                        return Attempt::Unproven("its monitor is spent".into());
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        settled(greet_at(
+                            "test-socket",
+                            &repo,
+                            who,
+                            std::time::Instant::now() + ATTACH_BUDGET,
+                            move |_, _| stream.try_clone(),
+                        ))
+                        .unwrap_or_else(Attempt::Unproven)
+                    })
+                    .await
+                    .unwrap()
+                }
+            },
+        ),
+    )
+    .await
+    .expect("the wait is answered")
+    .unwrap();
+    drop(monitor.await.unwrap());
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            WaitItem::TimerEvent { content, .. } if content == "scheduled work"
+        )),
+        "{items:?}"
+    );
+}
+
+/// A Grok Stop no monitor ever took, its attempts spent when its deadline
+/// comes, arms the agent's wait just the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grok_stop_no_monitor_took_still_arms_its_wait() {
+    let (repo, author) = crate::cli::turn_child::tests::repo_with(Tool::Grok, true);
+    let spawner = InProcess(std::sync::Mutex::new(Vec::new()));
+    let written = grok_stop(repo.path(), &author, &spawner, BUDGET).await;
+    assert_eq!(written, (arm_wait(), String::new()));
+}
+
+/// A Grok Stop left unanswered while its session lost the label says
+/// nothing: the request for a wait is not the new session's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grok_stop_unanswered_for_a_replaced_session_says_nothing() {
+    let (repo, author) = crate::cli::turn_child::tests::repo_with(Tool::Grok, true);
+    let (spawner, theirs) = InProcess::reaching();
+    let root = repo.path().to_path_buf();
+    let rebinding = author.clone();
+    let slow = tokio::spawn(async move {
+        let report = admit(theirs, &root).await.unwrap().client();
+        let successor = SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+        crate::agent_store::bind_session_to_agent(&root, &rebinding, Tool::Grok, &successor)
+            .unwrap();
+        report
+    });
+    let written = grok_stop(repo.path(), &author, &spawner, BUDGET).await;
+    assert_eq!(written, (String::new(), String::new()));
+    drop(slow.await.unwrap());
+}
+
+/// A verdict the monitor gives in time is what Grok's Stop is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grok_stop_answered_in_time_is_told_what_the_monitor_said() {
+    use crate::cli::turn_wire::{Frame, WireVerdict};
+    let (repo, author) = crate::cli::turn_child::tests::repo_with(Tool::Grok, true);
+    let (spawner, theirs) = InProcess::reaching();
+    let root = repo.path().to_path_buf();
+    let answering = tokio::spawn(async move {
+        let report = admit(theirs, &root).await.unwrap().client();
+        let said = Frame::text(WireVerdict::Notify, "the monitor's own word".into());
+        assert!(send_note(&report, &Note::Verdict(said)));
+        report
+    });
+    let written = grok_stop(repo.path(), &author, &spawner, BUDGET).await;
+    assert_eq!(
+        written,
+        (
+            format!(
+                "{}\n",
+                serde_json::json!({"decision": "block", "reason": "the monitor's own word"})
+            ),
+            String::new()
+        )
+    );
+    drop(answering.await.unwrap());
+}

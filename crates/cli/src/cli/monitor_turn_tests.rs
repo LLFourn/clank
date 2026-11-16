@@ -585,7 +585,7 @@ struct Hook {
 /// process: it reads its owner from `owner`, prints frames to `frames`, and
 /// reaches the test's monitors over `ours`, one connection per attempt in
 /// order, and nothing once they are spent.
-fn carrier(
+pub(super) fn carrier(
     repo: &std::path::Path,
     author: &AgentLabel,
     owner: std::io::PipeReader,

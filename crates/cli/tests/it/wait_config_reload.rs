@@ -40,6 +40,7 @@ fn wait_args(repo: &Path, author: &str) -> WaitArgs {
         die_with_owner: false,
         deliver_to_session: None,
         turn_end: false,
+        automatic: false,
         json: true,
         events: vec![common::idle_source()],
         r#for: None,

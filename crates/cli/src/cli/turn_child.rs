@@ -9,9 +9,12 @@
 //! the only one the monitor will credit with it.
 //!
 //! It never decides anything about work. A monitor that goes away is
-//! followed through the ordinary attach-or-spawn. If none can be had within
-//! the outage budget or report deadline, the child emits a diagnostic. It
-//! never gathers policy, creates a model wake or changes recovery state.
+//! followed through the ordinary attach-or-spawn. An outage it gives up on
+//! within its budget is a diagnostic. A report that does not park and has
+//! no verdict by its deadline, attached or not, ends
+//! [`WireVerdict::Unanswered`], which each adapter frames as its own
+//! timeout. It never gathers policy, creates a model wake or changes
+//! recovery state.
 //!
 //! A child of a build that is no longer the installed one says none of
 //! that. Its hook is about to become the installed build and start the
@@ -155,8 +158,8 @@ pub(crate) async fn carry(
     let mut outage = Outage::default();
     let mut stale = false;
     // The last attempt found a monitor on its way out. A report that
-    // cannot wait that out ends quietly: its agent's next Stop asks the
-    // monitor that follows.
+    // cannot wait that out is told no outage, only that there is still no
+    // monitor: the monitor that follows answers whatever comes next.
     let mut retiring = false;
     let mut why = "no monitor answered before the wait's deadline".to_string();
     loop {
@@ -185,7 +188,7 @@ pub(crate) async fn carry(
                         return;
                     }
                     Hand::Unanswered => {
-                        emit_final(out, &still("the monitor has not answered"));
+                        emit_final(out, &unanswered(NOT_ANSWERED));
                         return;
                     }
                 }
@@ -228,14 +231,21 @@ pub(crate) async fn carry(
     if report.parks() {
         emit_final(out, &super::turn_wire::expired_wait(report.tool()));
     } else if stale || retiring || !report.reaches_agent() {
-        emit_final(out, &still(&format!("clank still has no monitor: {why}")));
+        emit_final(
+            out,
+            &unanswered(&format!("clank still has no monitor: {why}")),
+        );
     } else {
-        emit_final(out, &unavailable(&why));
+        emit_final(out, &unanswered(&unreachable(&why)));
     }
 }
 
+fn unreachable(why: &str) -> String {
+    format!("the monitor is unavailable: {why}")
+}
+
 fn unavailable(why: &str) -> Frame {
-    still(&format!("the monitor is unavailable: {why}"))
+    still(&unreachable(why))
 }
 
 fn still(what: &str) -> Frame {
@@ -244,12 +254,13 @@ fn still(what: &str) -> Frame {
     })
 }
 
-/// An unavailable authority cannot authorize a model turn. These diagnostics
-/// use transport evidence only: no role, auto-mode, block or question reads.
-pub(super) fn unanswered(emit: &mut dyn FnMut(&Frame) -> Option<std::io::Result<()>>) -> Frame {
-    let frame = still("the monitor has not answered");
-    emit(&frame);
-    frame
+/// Why a report a monitor took ended unanswered.
+pub(super) const NOT_ANSWERED: &str = "the monitor has not answered";
+
+/// The end of a report that does not park and had no verdict in time, for
+/// `why`. It authorizes nothing: each adapter frames it as its own timeout.
+pub(super) fn unanswered(why: &str) -> Frame {
+    Frame::bare(WireVerdict::Unanswered { why: why.into() })
 }
 
 /// How long before a report's deadline the child gives its own last word,

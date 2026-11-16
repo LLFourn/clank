@@ -130,38 +130,63 @@ pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
     match routed {
         Ok(None) => {}
         Ok(Some((repo, label, report))) => {
-            let bound = report.session().as_str().to_string();
-            super::stop_hook::answer_once(
+            hand_off(
+                &super::stop_hook::Spawner,
                 &repo,
                 &label,
-                &bound,
                 report,
                 remaining_budget(started.elapsed()),
-                |frame| print(&still_bound(&repo, &label, &bound, frame.clone())),
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
             )
             .await;
         }
         Err(e) => {
-            print(&Frame::bare(WireVerdict::Diagnostic {
-                message: format!("{e:#}"),
-            }));
+            print(
+                &Frame::bare(WireVerdict::Diagnostic {
+                    message: format!("{e:#}"),
+                }),
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            );
         }
     }
     Ok(())
 }
 
+/// Carry a routed Stop's `report` for `label` through a child `spawner`
+/// starts, and write the answer on Grok's wire within `budget`, while the
+/// report's session still holds the label.
+pub(super) async fn hand_off(
+    spawner: &dyn super::stop_hook::Spawn,
+    repo: &Path,
+    label: &AgentLabel,
+    report: Report,
+    budget: std::time::Duration,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) {
+    let bound = report.session().as_str().to_string();
+    super::stop_hook::answer_with(spawner, repo, label, &bound, report, budget, |frame| {
+        print(&still_bound(repo, label, &bound, frame.clone()), out, err)
+    })
+    .await;
+}
+
 /// Write `frame` on Grok's wire: how writing its decision went, or `None`
 /// when it has none.
-fn print(frame: &Frame) -> Option<std::io::Result<()>> {
-    use std::io::Write;
-    let (out, err) = wire(frame);
-    if let Some(err) = err {
-        eprintln!("{err}");
+fn print(
+    frame: &Frame,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> Option<std::io::Result<()>> {
+    let (decision, diagnostic) = wire(frame);
+    if let Some(diagnostic) = diagnostic {
+        let _ = writeln!(err, "{diagnostic}");
     }
-    out.map(|out| {
-        let mut stdout = std::io::stdout().lock();
-        writeln!(stdout, "{out}")?;
-        stdout.flush()
+    decision.map(|decision| {
+        writeln!(out, "{decision}")?;
+        out.flush()
     })
 }
 
@@ -178,20 +203,16 @@ fn still_bound(repo: &Path, label: &AgentLabel, session: &str, frame: Frame) -> 
 }
 
 /// Grok's wire for a verdict: a request for the wait, or a check-in, blocks
-/// the Stop with its reason; a diagnostic goes to stderr; anything else
-/// says nothing.
+/// the Stop with its reason; so does a handoff left unanswered, with the
+/// request for the wait, whose own attach asks the monitor what the Stop
+/// could not; a diagnostic goes to stderr; anything else says nothing.
 pub(super) fn wire(frame: &Frame) -> (Option<String>, Option<String>) {
     match &frame.verdict {
         WireVerdict::Notify | WireVerdict::Deliver { .. } => (
-            Some(
-                serde_json::json!({
-                    "decision": "block",
-                    "reason": frame.rendered.as_deref().unwrap_or_default(),
-                })
-                .to_string(),
-            ),
+            Some(blocking(frame.rendered.as_deref().unwrap_or_default())),
             None,
         ),
+        WireVerdict::Unanswered { .. } => (Some(blocking(super::wake_render::ARM_WAIT)), None),
         WireVerdict::Silent { .. } => (None, None),
         WireVerdict::Diagnostic { message } => (
             None,
@@ -207,6 +228,15 @@ pub(super) fn wire(frame: &Frame) -> (Option<String>, Option<String>) {
             )),
         ),
     }
+}
+
+/// A Stop blocked with `reason`, which continues the turn with it.
+fn blocking(reason: &str) -> String {
+    serde_json::json!({
+        "decision": "block",
+        "reason": reason,
+    })
+    .to_string()
 }
 
 #[cfg(test)]

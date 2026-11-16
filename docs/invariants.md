@@ -33,13 +33,16 @@ whether its assertions protect the invariant. Reviewers check that.
   run until its next Stop that may wake (`Tool::reports_background_completion`).
   The notice claims no exit status. A bare `clank attend` has no process to
   watch: it stands until cleared and checks in at `--expect`. Background work
-  started without `clank run` never wakes a Codex or OpenCode agent.
+  started without `clank run` never wakes a Codex or OpenCode agent. A Grok
+  Stop the monitor does not answer in time still arms Grok's wait, which
+  asks the monitor when it attaches.
 - Tests: `crates/core/src/turn_policy/tests.rs::a_codex_run_ending_wakes_its_parked_agent_once`,
   `crates/core/src/turn_policy/tests.rs::a_codex_run_ending_mid_turn_is_told_at_the_next_stop`,
   `crates/core/src/turn_policy/tests.rs::a_claude_run_ending_is_left_to_the_harness`,
   `crates/core/src/turn_policy/tests.rs::a_run_going_mid_retirement_is_never_retired_without_its_notice`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_codex_run_ending_wakes_its_parked_agent`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_codex_run_ending_is_never_told_to_a_rebound_session`
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_codex_run_ending_is_never_told_to_a_rebound_session`,
+  `crates/cli/src/cli/monitor_grok_tests.rs::a_grok_stop_the_monitor_answers_late_still_arms_its_wait`
 
 ## I2. Reading blocks never changes them.
 

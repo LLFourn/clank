@@ -39,6 +39,7 @@ fn wait_args(repo: &Path, author: &str, peek: bool) -> WaitArgs {
         die_with_owner: false,
         deliver_to_session: None,
         turn_end: false,
+        automatic: false,
         json: true,
         events: match peek {
             true => Vec::new(),
