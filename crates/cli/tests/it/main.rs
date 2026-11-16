@@ -55,6 +55,7 @@ mod standby_wakes;
 mod stash_dwim;
 mod stash_integration;
 mod status_log_integration;
+mod timed_wait_boundary;
 mod tls_trust;
 mod tui_is_the_command;
 mod unsafe_boundary;

@@ -35,25 +35,34 @@ impl BrowserAdmission for Admission {
         let admitted = self
             .0
             .admit(headers.get(COOKIE).and_then(|value| value.to_str().ok()))?;
-        let door = self.0.clone();
         let (revoke, lease) = watch::channel(false);
-        let mut changes = door.watch_revocations();
-        tokio::spawn(async move {
-            loop {
-                if tokio::time::Instant::now() >= admitted.expires
-                    || !door.is_live(&admitted.id_hash)
-                {
-                    let _ = revoke.send(true);
-                    return;
-                }
-                tokio::select! {
-                    _ = revoke.closed() => return,
-                    _ = changes.changed() => {},
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
-                }
-            }
-        });
+        tokio::spawn(hold(self.0.clone(), admitted, revoke));
         Some(BrowserLease::new(lease))
+    }
+}
+
+/// Keep an admitted session's streams open until it expires or another
+/// look at the store finds it gone. A revocation reaches it through
+/// [`Door::watch_revocations`]: this host's own, at once, and another
+/// host's when the store's watch refreshes the door
+/// ([`crate::process::StoreWatch`]).
+async fn hold(door: Arc<Door>, admitted: door::Admitted, revoke: watch::Sender<bool>) {
+    // Subscribed before the first look, so a revocation between that look
+    // and the wait is still pending when the wait begins.
+    let mut changes = door.watch_revocations();
+    loop {
+        if tokio::time::Instant::now() >= admitted.expires || !door.is_live(&admitted.id_hash) {
+            let _ = revoke.send(true);
+            return;
+        }
+        tokio::select! {
+            _ = revoke.closed() => return,
+            changed = changes.changed() => if changed.is_err() {
+                let _ = revoke.send(true);
+                return;
+            },
+            _ = tokio::time::sleep_until(admitted.expires) => {},
+        }
     }
 }
 
@@ -523,4 +532,156 @@ fn reply(status: StatusCode, body: impl Into<Bytes>, content_type: &'static str)
         .header(CONTENT_TYPE, content_type)
         .body(Full::new(body.into()))
         .expect("static response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::door::tests::{cookie, door_at};
+    use std::time::Duration;
+
+    /// An admitted session held by [`hold`], and its lease.
+    fn held(door: &Arc<Door>) -> (door::Admitted, watch::Receiver<bool>) {
+        let token = door.open_session("token").unwrap();
+        let admitted = door.admit(Some(&cookie(&token))).unwrap();
+        let (revoke, lease) = watch::channel(false);
+        tokio::spawn(hold(door.clone(), admitted.clone(), revoke));
+        (admitted, lease)
+    }
+
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_store_is_not_read_again_while_the_session_lasts() {
+        let home = tempfile::tempdir().unwrap();
+        let door = Arc::new(door_at(home.path()));
+        let (_admitted, lease) = held(&door);
+        settle().await;
+        let looked = door.transactions();
+        tokio::time::advance(Duration::from_secs(29 * 24 * 3600)).await;
+        settle().await;
+        assert_eq!(door.transactions(), looked, "no look without a change");
+        assert!(!*lease.borrow());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn another_hosts_revocation_ends_the_stream_when_the_store_watch_refreshes() {
+        let home = tempfile::tempdir().unwrap();
+        let door = Arc::new(door_at(home.path()));
+        let other = door_at(home.path());
+        let (admitted, mut lease) = held(&door);
+        settle().await;
+        other.revoke_session(&admitted.id_hash).unwrap();
+        settle().await;
+        assert!(!*lease.borrow(), "nothing has told this host yet");
+        door.refresh();
+        tokio::time::timeout(Duration::from_secs(1), lease.wait_for(|r| *r))
+            .await
+            .expect("the refresh ends it")
+            .unwrap();
+    }
+
+    /// A revocation written before the store's watch exists is found by
+    /// the look the watch takes once armed.
+    #[tokio::test(start_paused = true)]
+    async fn a_revocation_before_the_watch_is_armed_is_not_lost() {
+        struct Deaf;
+        impl crate::process::StoreWatch for Deaf {
+            fn watch(
+                &self,
+                _: &std::path::Path,
+                _: Box<dyn Fn(crate::process::StoreEvent) + Send + Sync>,
+            ) -> anyhow::Result<Box<dyn Send>> {
+                Ok(Box::new(()))
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let door = Arc::new(door_at(home.path()));
+        let (admitted, mut lease) = held(&door);
+        settle().await;
+        door_at(home.path())
+            .revoke_session(&admitted.id_hash)
+            .unwrap();
+        let _guard = crate::process::watch_sessions(&Deaf, home.path(), door.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), lease.wait_for(|r| *r))
+            .await
+            .expect("arming looks once")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_stream_ends_when_its_session_expires() {
+        let home = tempfile::tempdir().unwrap();
+        let door = Arc::new(door_at(home.path()));
+        let (admitted, mut lease) = held(&door);
+        settle().await;
+        tokio::time::advance(admitted.expires - tokio::time::Instant::now()).await;
+        tokio::time::timeout(Duration::from_secs(1), lease.wait_for(|r| *r))
+            .await
+            .expect("expiry ends it")
+            .unwrap();
+    }
+
+    /// Hands the test what the host would be told.
+    type Heard = Box<dyn Fn(crate::process::StoreEvent) + Send + Sync>;
+
+    struct Told(std::sync::Mutex<Option<Heard>>);
+
+    impl crate::process::StoreWatch for Arc<Told> {
+        fn watch(&self, _: &std::path::Path, heard: Heard) -> anyhow::Result<Box<dyn Send>> {
+            *self.0.lock().unwrap() = Some(heard);
+            Ok(Box::new(()))
+        }
+    }
+
+    impl Told {
+        fn tell(&self, event: crate::process::StoreEvent) {
+            (self.0.lock().unwrap().as_ref().expect("armed"))(event)
+        }
+    }
+
+    /// A write the host is told of but cannot read leaves no revocation it
+    /// can rule out, so the stream ends rather than waiting out its term.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_write_that_cannot_be_read_ends_the_stream() {
+        let home = tempfile::tempdir().unwrap();
+        let door = Arc::new(door_at(home.path()));
+        let told = Arc::new(Told(Default::default()));
+        let _guard = crate::process::watch_sessions(&told, home.path(), door.clone()).unwrap();
+        let (_admitted, mut lease) = held(&door);
+        settle().await;
+        assert!(!*lease.borrow());
+        std::fs::write(crate::door::sessions_path(home.path()), "not json").unwrap();
+        told.tell(crate::process::StoreEvent::Changed);
+        tokio::time::timeout(Duration::from_secs(1), lease.wait_for(|r| *r))
+            .await
+            .expect("an unreadable store ends it")
+            .unwrap();
+    }
+
+    /// A watch that dies can carry no later revocation, so every stream
+    /// ends and nobody is admitted while this door lives.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_store_watch_ends_every_stream_and_admits_nobody() {
+        let home = tempfile::tempdir().unwrap();
+        let door = Arc::new(door_at(home.path()));
+        let told = Arc::new(Told(Default::default()));
+        let _guard = crate::process::watch_sessions(&told, home.path(), door.clone()).unwrap();
+        let (_admitted, mut lease) = held(&door);
+        settle().await;
+        told.tell(crate::process::StoreEvent::Lost("gone".into()));
+        tokio::time::timeout(Duration::from_secs(1), lease.wait_for(|r| *r))
+            .await
+            .expect("a lost watch ends it")
+            .unwrap();
+        let token = door.open_session("token").unwrap();
+        assert!(
+            door.admit(Some(&cookie(&token))).is_none(),
+            "and admits nobody"
+        );
+    }
 }

@@ -130,6 +130,9 @@ pub struct Door {
     /// Bumped whenever the live set changes: a stream holding a
     /// session watches this and asks whether it is still live.
     revoked: tokio::sync::watch::Sender<u64>,
+    /// Another host's revocation can no longer reach this one (its store
+    /// watch died), so no session is live here from now on.
+    blind: std::sync::atomic::AtomicBool,
     /// How many times the store has been opened. The tests assert on
     /// it because "one authority transaction" is not observable from
     /// outcomes alone: a verify-then-open split into two holds gives
@@ -228,6 +231,7 @@ impl Door {
             check,
             inner: Mutex::new(Inner::default()),
             revoked: tokio::sync::watch::channel(0).0,
+            blind: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             transactions: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -237,6 +241,18 @@ impl Door {
 
     pub fn watch_revocations(&self) -> tokio::sync::watch::Receiver<u64> {
         self.revoked.subscribe()
+    }
+
+    /// Revocations made elsewhere can no longer be heard: end every
+    /// stream and admit nobody, for as long as this door lives.
+    pub fn blind(&self, why: &str) {
+        eprintln!("remote: {why}; every browser session here is closed");
+        self.blind.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.revoked.send_modify(|n| *n += 1);
+    }
+
+    fn is_blind(&self) -> bool {
+        self.blind.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     // ---- the store ----
@@ -576,7 +592,12 @@ impl Door {
         let live = match live {
             Ok(live) => live,
             Err(e) => {
+                // Whether a session was revoked cannot be told, so every
+                // stream looks again: a store that cannot be read keeps
+                // none live.
                 eprintln!("remote: {e:#}");
+                self.lock().live.clear();
+                self.revoked.send_modify(|n| *n += 1);
                 return;
             }
         };
@@ -594,6 +615,9 @@ impl Door {
     /// updates the record, to the minute. A store that cannot be
     /// read admits nobody.
     pub fn admit(&self, cookie_header: Option<&str>) -> Option<Admitted> {
+        if self.is_blind() {
+            return None;
+        }
         let token = cookie_value(cookie_header?, COOKIE)?;
         let hash = hash_token(&token);
         let now = now_utc();
@@ -660,8 +684,10 @@ impl Door {
     /// Whether a session is still open — what a stream asks after
     /// each change of the live set.
     pub fn is_live(&self, id_hash: &str) -> bool {
-        self.with_sessions(|sessions| (sessions.iter().any(|s| s.id_hash == id_hash), false))
-            .unwrap_or(false)
+        !self.is_blind()
+            && self
+                .with_sessions(|sessions| (sessions.iter().any(|s| s.id_hash == id_hash), false))
+                .unwrap_or(false)
     }
 
     /// Close a session: its streams end, its cookie admits nothing.
@@ -984,7 +1010,7 @@ pub fn sessions_path(home: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The part of the schema this crate owns, standing in for the CLI's.
@@ -996,13 +1022,13 @@ mod tests {
         Ok(())
     }
 
-    fn cookie(token: &str) -> String {
+    pub(crate) fn cookie(token: &str) -> String {
         format!("other=1; {COOKIE}={token}")
     }
 
     /// The door the tests use: the token in `home`'s own file, never a
     /// keychain.
-    fn door_at(home: &Path) -> Door {
+    pub(crate) fn door_at(home: &Path) -> Door {
         Door::with_secrets(
             home.to_path_buf(),
             remote_reads,

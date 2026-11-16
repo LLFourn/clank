@@ -113,6 +113,11 @@ const UNGATED: &[(&str, &str, &str)] = &[
     ),
     (
         "cli/github/log.rs",
+        "when_released",
+        "OWN: opens a held lock's file to wait for it, and writes nothing",
+    ),
+    (
+        "cli/github/log.rs",
         "load_with",
         "quarantines a log no build can parse, so that it is read once; it writes no row",
     ),

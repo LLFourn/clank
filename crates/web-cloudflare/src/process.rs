@@ -26,14 +26,41 @@ struct Ready<'a> {
     public_url: Option<&'a str>,
 }
 
-/// The host process, starting any tunnel command through `spawn`, and
-/// holding the user config to `check` whenever it writes it.
-pub fn main(spawn: std::sync::Arc<dyn tunnel::Spawn>, check: clank_user_config::Check) {
+/// What a [`StoreWatch`] tells its host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreEvent {
+    /// The store was written.
+    Changed,
+    /// The watch failed, and says nothing more from now on.
+    Lost(String),
+}
+
+/// Tells the host when another process writes the browser sessions
+/// store, which this crate has no way to watch itself.
+pub trait StoreWatch: Send + Sync {
+    /// Call `heard` after each write to `file` from now on, and once with
+    /// [`StoreEvent::Lost`] if the watch fails, for as long as the
+    /// returned guard lives.
+    fn watch(
+        &self,
+        file: &std::path::Path,
+        heard: Box<dyn Fn(StoreEvent) + Send + Sync>,
+    ) -> anyhow::Result<Box<dyn Send>>;
+}
+
+/// The host process, starting any tunnel command through `spawn`,
+/// hearing other hosts' session changes through `store`, and holding the
+/// user config to `check` whenever it writes it.
+pub fn main(
+    spawn: std::sync::Arc<dyn tunnel::Spawn>,
+    store: std::sync::Arc<dyn StoreWatch>,
+    check: clank_user_config::Check,
+) {
     let outcome = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(anyhow::Error::from)
-        .and_then(|runtime| runtime.block_on(run(spawn, check)));
+        .and_then(|runtime| runtime.block_on(run(spawn, store, check)));
     if let Err(error) = outcome {
         let _ = write_line(&serde_json::json!({"error":format!("{error:#}")}));
         std::process::exit(1);
@@ -42,6 +69,7 @@ pub fn main(spawn: std::sync::Arc<dyn tunnel::Spawn>, check: clank_user_config::
 
 async fn run(
     spawn: std::sync::Arc<dyn tunnel::Spawn>,
+    store: std::sync::Arc<dyn StoreWatch>,
     check: clank_user_config::Check,
 ) -> anyhow::Result<()> {
     let mut stdin = std::io::BufReader::new(std::io::stdin());
@@ -62,6 +90,10 @@ async fn run(
     });
 
     let host = Host::start(start.port, start.session, home.clone(), check).await?;
+    let _store_watch = match &home {
+        Some(home) => Some(watch_sessions(&*store, home, host.door.clone())?),
+        None => None,
+    };
     let mut active_tunnel = None;
     let outcome = async {
         let port = url::Url::parse(&host.local_url)?
@@ -102,6 +134,31 @@ async fn run(
     }
     host.stop().await;
     outcome
+}
+
+/// Refresh `door` on every write to its sessions store, and once more
+/// after arming: a write between the door's first read and the watch
+/// would otherwise go unheard. A lost watch blinds the door
+/// ([`crate::door::Door::blind`]): a session another host revokes after
+/// it could stay open here until it expires.
+pub fn watch_sessions(
+    store: &dyn StoreWatch,
+    home: &std::path::Path,
+    door: std::sync::Arc<crate::door::Door>,
+) -> anyhow::Result<Box<dyn Send>> {
+    let refreshed = door.clone();
+    let guard = store.watch(
+        &crate::door::sessions_path(home),
+        Box::new(move |event| match event {
+            StoreEvent::Changed => refreshed.refresh(),
+            StoreEvent::Lost(why) => refreshed.blind(&format!(
+                "the sessions store's watch failed ({why}), so another host's revocation \
+                 cannot reach this one"
+            )),
+        }),
+    )?;
+    door.refresh();
+    Ok(guard)
 }
 
 fn write_line(value: &impl Serialize) -> anyhow::Result<()> {
