@@ -108,7 +108,10 @@ fn an_outage_continuation_still_arms_a_wait_when_the_monitor_recovers() {
         Some(ARM.to_string())
     );
     // The monitor resolves the legacy marker before clearing it.
-    assert!(crate::agent_store::outage_served(&repo, &label, &session).unwrap());
+    assert_eq!(
+        crate::agent_store::outage_served(&repo, &label, &session).unwrap(),
+        crate::agent_store::OutageServed::Cleared
+    );
     assert_eq!(
         handle(&continuation, &repo, &env).unwrap(),
         None,
