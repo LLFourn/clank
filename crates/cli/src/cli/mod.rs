@@ -1094,6 +1094,14 @@ pub struct SetupArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct QuestionHookArgs {
+    /// Carry one question observation, read from stdin, to the monitor
+    /// on the hook's behalf.
+    #[arg(long, hide = true)]
+    pub deliver: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct StopHookArgs {
     /// Which agent CLI is invoking this hook. Set by
     /// `clank setup` in the hook config; agents don't pass it

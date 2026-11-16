@@ -535,7 +535,7 @@ pub(crate) fn trusted_dir(dir: &std::path::Path, me: u32) -> Trust {
 /// its owner or mode ever being looked at (codex on dab07ce). And only
 /// `NotFound` permits creating — any other stat error is a reason to
 /// stop, not a licence to proceed.
-fn ensure_dir(dir: &std::path::Path, me: u32) -> Result<(), String> {
+pub(crate) fn ensure_dir(dir: &std::path::Path, me: u32) -> Result<(), String> {
     ensure_dir_with(dir, me, |_| {})
 }
 

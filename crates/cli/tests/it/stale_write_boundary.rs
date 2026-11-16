@@ -198,6 +198,11 @@ const UNGATED: &[(&str, &str, &str)] = &[
         "OWN: opens a lock file",
     ),
     (
+        "cli/question_hook.rs",
+        "log_failure",
+        "ONE-SHOT: the detached `question-hook --deliver` child appends its own failure to a diagnostic log in its runtime directory; no process reads it as state",
+    ),
+    (
         "cli/remote_control.rs",
         "*",
         "OWN: this TUI's answer to a `clank remote` request, in its runtime directory",

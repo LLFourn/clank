@@ -116,12 +116,23 @@ impl std::fmt::Display for NotDone {
 /// Hand `control` to the repo's monitor, starting one if none is running,
 /// and give its answer.
 pub(crate) async fn submit(repo: &std::path::Path, control: Control) -> Result<String, NotDone> {
-    let attached = crate::cli::monitor::attach_or_spawn_with(
-        repo,
-        crate::cli::monitor::Who::Control { request: control },
-        crate::cli::monitor::spawn_monitor,
-    )
-    .await;
+    submit_by(repo, control, async |repo, who| {
+        crate::cli::monitor::attach_or_spawn_with(repo, who, crate::cli::monitor::spawn_monitor)
+            .await
+    })
+    .await
+}
+
+/// [`submit`], reaching the monitor through `attach`.
+pub(crate) async fn submit_by(
+    repo: &std::path::Path,
+    control: Control,
+    attach: impl AsyncFnOnce(
+        &std::path::Path,
+        crate::cli::monitor::Who,
+    ) -> crate::cli::monitor::Attached,
+) -> Result<String, NotDone> {
+    let attached = attach(repo, crate::cli::monitor::Who::Control { request: control }).await;
     let mut conn = match attached {
         crate::cli::monitor::Attached::Shared(conn) => conn,
         crate::cli::monitor::Attached::Alone(why) => return Err(NotDone::NotTaken(why)),

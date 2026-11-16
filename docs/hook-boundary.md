@@ -9,7 +9,7 @@ recovery policy, even by calling a helper in a monitor module.
 | Claude/Codex Stop, SessionStart, PostCompact, subagent hooks | Native payload and transcript evidence; binding/bootstrap identity; monitor exchange; provider reply framing |
 | Grok lifecycle hooks | Native payload, raw continuation flag, launch/binding identity; monitor exchange; provider reply framing |
 | Recovery hooks | Native failure evidence and delivery results; monitor-authorized retry transport |
-| Claude question hooks | Native question evidence sent to the monitor; connection to the optional question broker for remote replies |
+| Claude question hooks | Native question evidence handed to a detached `question-hook --deliver` child, which sends it to the monitor while the hook answers at once; connection to the optional question broker for remote replies |
 | OpenCode plugin | Native SDK session/events, volatile delivery guards, hook subprocess lifetime and monitor replies; no config-file access |
 | Shared carrier/owner/upgrade handoff | Socket ownership, process lifetime, private upgrade handoff and binding identity; no policy fallback |
 | Git post-rewrite | Git's supplied rewrite pairs and feedback migration; no agent turn policy |

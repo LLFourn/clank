@@ -1050,3 +1050,26 @@ fn spawn_cost() {
     let after = started.elapsed() / N;
     println!("spawn cost: std {before:?}, proc_run {after:?} per /usr/bin/true");
 }
+
+/// A preloaded pipe gives its child every byte and then end of file, with
+/// no writer left for the child to wait on.
+#[test]
+fn a_preloaded_stdin_is_read_whole_then_ends() {
+    let out = run_blocking(
+        Spec::new("/bin/cat")
+            .stdin(Stdin::Fd(preloaded(b"the request\n").unwrap()))
+            .stdout(Out::Capture { cap: 4096 }),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(out.stdout, b"the request\n");
+}
+
+/// More than a pipe holds is refused at once rather than waited out.
+#[test]
+fn a_preload_larger_than_a_pipe_fails_without_waiting() {
+    let started = Instant::now();
+    let err = preloaded(&vec![b'x'; 4 << 20]).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
