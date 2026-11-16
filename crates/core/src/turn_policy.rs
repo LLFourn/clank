@@ -592,12 +592,6 @@ pub enum Notice {
         name: String,
         matches: Vec<TaskSummary>,
     },
-    /// No monitor could be reached or started within the waiter's outage
-    /// budget. `why` is how the last attempt ended.
-    MonitorOutage { why: String },
-    /// A monitor took a report that never parks and gave no verdict
-    /// before its hook had to answer.
-    MonitorUnanswered,
     /// Grok's native handoff: run `clank wait` in the background, whose
     /// completion wakes the agent.
     ArmWait,
@@ -2366,19 +2360,6 @@ pub fn handoff_verdict(handoff: &Handoff, facts: &Facts<'_>) -> Verdict {
         return Verdict::Silent(SilentWhy::WaitArmed);
     }
     Verdict::Notify(vec![Notice::ArmWait])
-}
-
-/// What a hook with no monitor says to `session`: nothing unless clank
-/// drives it, and then `notice`. Never work and never a park, which only a
-/// monitor decides.
-pub fn unmonitored_verdict(session: &SessionId, facts: &Facts<'_>, notice: Notice) -> Verdict {
-    if facts.binding != Some(session) {
-        return Verdict::Silent(SilentWhy::StaleBinding);
-    }
-    if let Some(gated) = drive_gate(facts) {
-        return gated;
-    }
-    Verdict::Notify(vec![notice])
 }
 
 #[cfg(test)]

@@ -47,6 +47,24 @@ All notable changes to clank are recorded here. The format follows
   are delivered once more after upgrading, and `.received` files are no
   longer read and can be deleted.
 
+### Missing from the 0.2.0 notes
+
+Two changes landed in v0.2.0 after its notes were written.
+
+- A hook whose monitor cannot be reached, or does not answer before the hook
+  must, no longer wakes the agent with an outage notice. It emits a diagnostic
+  and leaves pending work undelivered (Grok's Stop asks for its background
+  wait instead), so automatic progress can stop until a monitor is available
+  and a new hook or wait runs. A background `clank wait`
+  fails once per outage with `clank cannot start its monitor: …`; a later wait
+  of the same session retries quietly until a monitor serves it, which ends
+  the outage.
+- Grok's native hooks (`hooks/clank.json`) run with a 30-second timeout rather
+  than 5, to fit the monitor exchange and the hook's cleanup. A file written by
+  an earlier build reports as drifted: `clank doctor` flags it, and an
+  automatic Grok agent will not launch, until `clank setup` (with
+  `--grok-agent <label> --repo <repo>` for an agent's own Grok home) rewrites it.
+
 ## [0.2.0]
 
 The first published release of clank. The previous `0.1.0` version identified

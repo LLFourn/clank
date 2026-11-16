@@ -39,7 +39,7 @@ The versioned [Stop schema and producer][stop] agree with the captured payload.
 background handle. More surprisingly, the shell output's
 [`post_tool_use_response`][context] returns `None` while `process_id` is present.
 In the live TUI probes, neither yielding the handle nor the later automatic exit
-invoked `PostToolUse`. The foreground context command in the fork probe did invoke
+invoked `PostToolUse`. The foreground context command in the since-removed fork probe did invoke
 it, so this is not a broken or untrusted hook fixture.
 
 The [unified-exec exit watcher][exit] emits the completion event separately.
@@ -91,7 +91,7 @@ already owns. `turn/steer` is not a substitute for that reply. An idle thread
 needs a deliberate `turn/start`; an interrupted turn must first finish cancelling.
 These are different policies and must not be retried interchangeably.
 
-## Isolation and fork result
+## Isolation
 
 Two private servers ran concurrently, each with two commands, distinct temporary
 profiles/cwds and harmless environment sentinels. Each command reported its
@@ -99,21 +99,13 @@ expected cwd/sentinel. Each observer verified its own concrete thread ID and
 unique completion item IDs; one server's completions did not advance the other
 model. Wrong-cwd attachment was rejected before subscription.
 
-The fork fixture invokes **Clank's real `run_fork`** in a disposable gix-initialized
-repo, binds a real source transcript, checks the generated Codex fork spec, then
-launches `codex --remote … fork -C DEST SOURCE_THREAD`. It verifies a distinct
-child thread, destination command cwd and server environment, source history,
-and refusal to attach the source thread in the child server. The prototype
-changes the transport at the test launcher: current production `agent start`
-still supplies `--no-daemon`. This is evidence for its fork arguments/spec, not
-a claim that the production launcher already supports private servers.
-
-The first attempted remote fork failed explicitly with “Permission overrides
-are not supported when forking a remote task.” Omitting the extra permission
-override worked: remote forks inherit the source profile. A launcher must preserve
-that policy rather than append permission overrides on every path. The fixture's
-initial source alone uses an isolated permissive profile for its own generated
-command; this is not a production trust or sandbox recommendation.
+A fork probe once launched `codex --remote … fork -C DEST SOURCE_THREAD` from
+Clank's real fork spec. Production launches Codex with `--no-daemon`, so the
+probe measured a launch Clank does not make, and it was removed. One finding
+from it stands: Codex refuses permission overrides when forking a remote task
+("Permission overrides are not supported when forking a remote task."), because
+a remote fork inherits the source's permission profile. A launcher that moves to
+a private server must not append them on that path.
 
 The earlier repository record in
 `.clank/finished/a-codex-stop-hook-ends-with-its-session.md` documents a daemon
@@ -174,13 +166,16 @@ CLANK_CODEX_PROBE_TRACE_DIR=/tmp/clank-codex-evidence \
 cargo test -p clank --test it codex_question_protocol::tui:: -- --ignored --nocapture
 ```
 
-`installed_codex_tui_background_probe` covers eight embedded parked controls;
-32 private native/wrapper cases (active model, final-answer/hook-entry boundary,
+`installed_codex_tui_background_probe` covers 32 private native/wrapper cases (active model, final-answer/hook-entry boundary,
 parked hook, and idle/no-hook; exits 0/7; twice each); two simultaneous two-command
 agents; a yielded cell; and immediate bridge, missed-exit reconnect, steering and
 interrupt controls. The boundary is triggered by the final-answer event, not an
 assertion about the exact instruction at which another process has parked.
-Separate tests cover a subagent and the Clank fork. Feature settings are explicit:
+A separate test covers a subagent. Each case asserts its negatives: no agent
+request in the two-second window after a native exit (or, for the subagent, after
+the child's completion) until the Stop hook is released, and no `PostToolUse` for
+a yielded or exited background command. Embedded `--no-daemon` cases are not
+run: with no external endpoint they cannot see the exit they would follow. Feature settings are explicit:
 native uses `code_mode=false, code_mode_only=false`; wrapper/cell uses
 `code_mode=true, code_mode_only=true, code_mode_host=true`.
 

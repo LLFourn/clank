@@ -1787,38 +1787,6 @@ fn check_ins_saved_by_a_typing_build_load_as_owed_or_spent() {
 }
 
 #[test]
-fn a_hook_with_no_monitor_says_its_notice_only_to_a_session_clank_drives() {
-    let s = session();
-    let owed = [OwedItem {
-        identity: "gate:plan:abc".into(),
-        receipts: vec!["r1".into()],
-    }];
-    let notice = || Notice::MonitorOutage {
-        why: "no binary".into(),
-    };
-    let mut asking = facts(T0, &s, &owed);
-    asking.asking = true;
-    let mut blocked = facts(T0, &s, &owed);
-    blocked.blocked = true;
-    for f in [facts(T0, &s, &owed), facts(T0, &s, &[]), asking, blocked] {
-        assert_eq!(
-            unmonitored_verdict(&s, &f, notice()),
-            Verdict::Notify(vec![notice()])
-        );
-    }
-    assert_eq!(
-        unmonitored_verdict(&other_session(), &facts(T0, &s, &owed), notice()),
-        Verdict::Silent(SilentWhy::StaleBinding)
-    );
-    let mut off = facts(T0, &s, &owed);
-    off.auto = Ok(AutoMode::Off);
-    assert_eq!(
-        unmonitored_verdict(&s, &off, notice()),
-        Verdict::Silent(SilentWhy::AutoOff)
-    );
-}
-
-#[test]
 fn repeated_deliveries_count_and_a_human_turn_resets() {
     let items = vec!["a".to_string()];
     let place = |turn: &str, human| TurnPlace {

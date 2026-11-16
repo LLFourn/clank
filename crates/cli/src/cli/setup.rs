@@ -163,12 +163,12 @@ const WORK_LOOP_GROK: WorkLoop = WorkLoop {
   manual operation. Waiting never acknowledges work.",
 };
 
-/// opencode is plugin-driven (opencode-agent-tool M1/M2): the clank
-/// plugin long-polls `clank stop-hook` when a turn ends and INJECTS
-/// work as a new prompt — from the agent's seat, work simply
-/// arrives. No arming, no reminder; the skill must forbid
-/// self-arming (a parked wait duplicates the plugin's deliveries
-/// and litters processes).
+/// opencode is plugin-driven (opencode-agent-tool M1/M2): when an
+/// execution succeeds, the clank plugin parks `clank stop-hook` on the
+/// monitor and INJECTS the work it returns as a new prompt — from the
+/// agent's seat, work simply arrives. The skill must forbid
+/// self-arming: the monitor serves one wait per session, so a wait the
+/// agent starts supersedes the plugin's.
 const WORK_LOOP_OPENCODE: WorkLoop = WorkLoop {
     arrival: "\
 - **Work arrives on its own.** When you end a turn, clank's opencode
@@ -179,9 +179,9 @@ const WORK_LOOP_OPENCODE: WorkLoop = WorkLoop {
   Each item is a one-line hint: kind, plan, short sha.",
     prohibition: "\
 - **NEVER run `clank wait` yourself**, foreground or background — the
-  plugin already holds this session's one wait; a second duplicates
-  deliveries. Do not re-run `clank status` waiting for state to
-  change. End your turn; work finds you.",
+  plugin holds this session's one wait, and yours would replace it.
+  Do not re-run `clank status` waiting for state to change. End your
+  turn; work finds you.",
 };
 
 /// How a tool starts `clank run` without blocking its own turn: the run

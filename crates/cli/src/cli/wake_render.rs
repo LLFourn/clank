@@ -786,22 +786,6 @@ pub(crate) fn receipt_candidates<'a>(
 pub(crate) const REARM_REASON: &str = "clank: no work pending — the wait reached its ceiling and \
 is re-arming. This is a heartbeat, not a task. End your turn; the next hook parks a fresh wait.";
 
-/// What a waiter that could get no monitor wakes its agent with. It must
-/// not read as work or as "nothing pending": nothing was checked.
-pub(crate) fn monitor_outage(why: &str) -> String {
-    format!(
-        "clank cannot start its monitor: {why}. This is a notice, not work: nothing was checked \
-         for you, because only the monitor decides what you are owed. Ending your turn tries \
-         again; if this repeats, tell the user."
-    )
-}
-
-/// What a report that never parks wakes its agent with when a monitor
-/// took it and had not answered by the time its hook must.
-pub(crate) const MONITOR_UNANSWERED: &str = "clank's monitor did not answer in time. This is a \
-notice, not work: nothing was checked for you, because only the monitor decides what you are \
-owed. Ending your turn asks it again; if this repeats, tell the user.";
-
 /// A listed task as a declaration notice names it.
 fn task_line(t: &clank_core::turn_policy::TaskSummary) -> String {
     let mut line = format!("  - {}", t.kind.as_deref().unwrap_or("task"));
@@ -850,8 +834,6 @@ pub(crate) fn notice_text(notice: &clank_core::turn_policy::Notice) -> String {
             matches.len(),
             lines(matches)
         ),
-        Notice::MonitorOutage { why } => monitor_outage(why),
-        Notice::MonitorUnanswered => MONITOR_UNANSWERED.to_string(),
         Notice::ArmWait => ARM_WAIT.to_string(),
         Notice::CheckIn(lines) => check_in_text(lines),
         Notice::RunEnded { desc } => format!(
@@ -1023,25 +1005,6 @@ mod tests {
     fn a_notice_is_its_fixed_text() {
         use clank_core::turn_policy::Notice;
         assert_eq!(notice_text(&Notice::ArmWait), ARM_WAIT);
-    }
-
-    /// A wake with no monitor behind it says why, and cannot be read as
-    /// work or as a finding that none is pending.
-    #[test]
-    fn a_no_monitor_notice_names_its_reason_and_claims_no_finding() {
-        use clank_core::turn_policy::Notice;
-        let outage = notice_text(&Notice::MonitorOutage {
-            why: "starting one failed: no binary".into(),
-        });
-        assert!(
-            outage.starts_with("clank cannot start its monitor: starting one failed: no binary."),
-            "{outage}"
-        );
-        assert_eq!(notice_text(&Notice::MonitorUnanswered), MONITOR_UNANSWERED);
-        for text in [outage.as_str(), MONITOR_UNANSWERED] {
-            assert!(text.contains("a notice, not work"), "{text}");
-            assert!(!text.to_lowercase().contains("no work pending"), "{text}");
-        }
     }
 
     /// The heartbeat a parked hook wakes with at its deadline cannot be
