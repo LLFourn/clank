@@ -237,146 +237,87 @@ fn a_permission_attempt_is_evidence_for_one_session_not_block_ownership() {
     assert_eq!(owed_answers(repo, &label("carol")).len(), 1);
 }
 
+/// The per-agent layout is gone, not migrated: its files, an orphan answer
+/// among them, are never read or touched, and the repository's own blocks
+/// list and answer normally beside them.
 #[test]
-fn legacy_collisions_migrate_all_custody_without_merging_or_replaying_receipts() {
+fn per_agent_block_files_are_ignored_and_left_alone() {
     let repo = tempfile::tempdir().unwrap();
     let repo = repo.path();
     set_master(repo, Some("master"));
     let old = agents_root(repo).join("removed");
-    let other = agents_root(repo).join("second");
-    let occurrence = "0123456789abcdef0123456789abcdef";
-    write(
-        &files(&old, "q").question,
-        stamp(occurrence, None, "old question"),
-    );
-    write(
-        &files(&old, "q").answer,
-        stamp(occurrence, None, "old answer"),
-    );
-    write(
-        &files(&old, "q").marker,
-        serde_json::to_vec(&Marker {
-            occurrence: occurrence.into(),
-            question_digest: digest("old question"),
-            answer_digest: digest("old answer"),
-            destination: None,
-        })
-        .unwrap(),
-    );
-    write(&files(&other, "q").question, "another question");
-    write(&files(&other, "q").attempt, b"unreadable attempt");
-    let entries = scan_blocks(repo);
-    assert_eq!(entries.len(), 1);
-    assert_ne!(entries[0].name, "q");
-    assert!(entries[0].unreadable.is_some());
-    assert!(owed_answers(repo, &label("master")).is_empty());
+    let orphan = old.join("unblocks/gone.md");
+    write(&orphan, "an answer with no question");
+    write(&old.join("blocks/old.md"), "an old question");
+    write(&files(&root(repo), "q").question, "Which?");
+    let blocks = scan_blocks(repo);
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert_eq!(blocks[0].name, "q");
+    assert!(blocks[0].unreadable.is_none());
+    answer_block(repo, "q", "B", None).unwrap();
+    assert_eq!(owed_answers(repo, &label("master")).len(), 1);
     assert_eq!(
-        Pair::read(&root(repo), "q").unwrap().answer.as_deref(),
-        Some("old answer")
+        std::fs::read_to_string(&orphan).unwrap(),
+        "an answer with no question"
     );
-    assert!(!files(&old, "q").question.exists());
-    let journal = std::fs::read(root(repo).join("block-migration.json")).unwrap();
-    scan_blocks(repo);
-    assert_eq!(
-        std::fs::read(root(repo).join("block-migration.json")).unwrap(),
-        journal
-    );
-    assert!(clean(repo).unwrap() > 0);
-    assert_eq!(
-        scan_blocks(repo).len(),
-        1,
-        "corrupt custody survives cleanup"
-    );
+    assert!(old.join("blocks/old.md").exists());
 }
 
 #[test]
-fn orphaned_legacy_delivery_evidence_is_visible_and_never_cleaned() {
-    let repo = tempfile::tempdir().unwrap();
-    let attempt = agents_root(repo.path()).join("removed/blocks/q.attempt");
-    write(&attempt, b"torn unknown delivery");
-    let blocks = scan_blocks(repo.path());
-    assert_eq!(blocks.len(), 1);
-    assert!(blocks[0].pending());
-    assert!(
-        blocks[0]
-            .unreadable
-            .as_deref()
-            .unwrap()
-            .contains("no question")
-    );
-    assert!(clean(repo.path()).is_err());
-    assert_eq!(std::fs::read(attempt).unwrap(), b"torn unknown delivery");
-}
-
-#[test]
-fn damaged_receipts_preserve_custody_in_repository_and_legacy_storage() {
-    for legacy in [false, true] {
-        for damage in ["malformed", "unreadable", "dangling"] {
-            let temp = tempfile::tempdir().unwrap();
-            let repo = temp.path();
-            set_master(repo, Some("master"));
-            let dir = if legacy {
-                agents_root(repo).join("removed")
-            } else {
-                root(repo)
-            };
-            let f = files(&dir, "q");
-            let occurrence = "0123456789abcdef0123456789abcdef";
-            write(&f.question, stamp(occurrence, None, "Which?"));
-            write(&f.answer, stamp(occurrence, None, "B"));
-            // A delivery may have captured this answer before its receipt was damaged.
-            let carries = Pair::read(&dir, "q").unwrap().carries("q").unwrap();
-            match damage {
-                "malformed" => write(&f.marker, b"{torn receipt"),
-                "unreadable" => std::fs::create_dir(&f.marker).unwrap(),
-                "dangling" => std::os::unix::fs::symlink("missing-receipt", &f.marker).unwrap(),
-                _ => unreachable!(),
-            }
-            let blocks = scan_blocks(repo);
-            assert_eq!(blocks.len(), 1, "legacy={legacy}, {damage}");
-            assert!(blocks[0].pending());
-            assert!(blocks[0].unreadable.is_some());
-            assert!(owed_answers(repo, &label("master")).is_empty());
-            assert!(ended(repo, &label("master")).is_empty());
-            let received = receive(
-                repo,
-                &carries,
-                &destination(repo).unwrap(),
-                || true,
-                &crate::upgrade::process().settling(),
-            );
-            assert!(
-                matches!(received, Ok(Receipt::Stale) | Err(_)),
-                "legacy={legacy}, {damage}"
-            );
-            assert!(ask_with(repo, None, "q", "replacement", &Kind::Plain).is_err());
-            assert!(matches!(clean(repo), Ok(0) | Err(_)));
-            // Malformed bytes migrate unchanged; an unreadable source stops migration.
-            let marker = if damage == "malformed" {
-                files(&root(repo), "q").marker
-            } else {
-                f.marker
-            };
-            match damage {
-                "malformed" => {
-                    assert_eq!(std::fs::read(&marker).unwrap(), b"{torn receipt");
-                    std::fs::remove_file(&marker).unwrap();
-                }
-                "unreadable" => std::fs::remove_dir(&marker).unwrap(),
-                "dangling" => {
-                    assert!(
-                        std::fs::symlink_metadata(&marker)
-                            .unwrap()
-                            .file_type()
-                            .is_symlink()
-                    );
-                    std::fs::remove_file(&marker).unwrap();
-                }
-                _ => unreachable!(),
-            }
-            // Only explicit repair makes the absent-receipt case deliverable again.
-            assert_eq!(owed_answers(repo, &label("master")).len(), 1);
-            assert!(!scan_blocks(repo)[0].pending());
+fn damaged_receipts_preserve_custody() {
+    for damage in ["malformed", "unreadable", "dangling"] {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        set_master(repo, Some("master"));
+        let dir = root(repo);
+        let f = files(&dir, "q");
+        let occurrence = "0123456789abcdef0123456789abcdef";
+        write(&f.question, stamp(occurrence, None, "Which?"));
+        write(&f.answer, stamp(occurrence, None, "B"));
+        // A delivery may have captured this answer before its receipt was damaged.
+        let carries = Pair::read(&dir, "q").unwrap().carries("q").unwrap();
+        match damage {
+            "malformed" => write(&f.marker, b"{torn receipt"),
+            "unreadable" => std::fs::create_dir(&f.marker).unwrap(),
+            "dangling" => std::os::unix::fs::symlink("missing-receipt", &f.marker).unwrap(),
+            _ => unreachable!(),
         }
+        let blocks = scan_blocks(repo);
+        assert_eq!(blocks.len(), 1, "{damage}");
+        assert!(blocks[0].pending());
+        assert!(blocks[0].unreadable.is_some());
+        assert!(owed_answers(repo, &label("master")).is_empty());
+        assert!(ended(repo, &label("master")).is_empty());
+        let received = receive(
+            repo,
+            &carries,
+            &destination(repo).unwrap(),
+            || true,
+            &crate::upgrade::process().settling(),
+        );
+        assert!(matches!(received, Ok(Receipt::Stale) | Err(_)), "{damage}");
+        assert!(ask_with(repo, None, "q", "replacement", &Kind::Plain).is_err());
+        assert!(matches!(clean(repo), Ok(0) | Err(_)));
+        let marker = f.marker;
+        match damage {
+            "malformed" => {
+                assert_eq!(std::fs::read(&marker).unwrap(), b"{torn receipt");
+                std::fs::remove_file(&marker).unwrap();
+            }
+            "unreadable" => std::fs::remove_dir(&marker).unwrap(),
+            "dangling" => {
+                assert!(
+                    std::fs::symlink_metadata(&marker)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                std::fs::remove_file(&marker).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        // Only explicit repair makes the absent-receipt case deliverable again.
+        assert_eq!(owed_answers(repo, &label("master")).len(), 1);
+        assert!(!scan_blocks(repo)[0].pending());
     }
 }

@@ -671,7 +671,6 @@ itself or they exist for one-off upgrades. They still work:
   a newer monitor stands in the way. `clank status --watch` only subscribes
   and never starts one. `monitor upgrade` replaces monitors from
   builds that predate self-retirement; run it once after upgrading from one.
-- `block migrate` flattens the legacy plan-scoped block layout.
 
 ### Messages: send, interrupt, nudge
 
@@ -703,9 +702,9 @@ A block pauses the repo's review cycle, while messages and events still arrive.
 Names are unique across the repository. The original asker is attribution only.
 Answers follow the current master, survive its removal or replacement, and stay
 readable with `clank block list` until `clank block clean` removes settled state.
-Without a master, questions and answers remain stored. Legacy agent-owned blocks
-are migrated with their answers and delivery records; name collisions receive
-stable suffixes, and migration reports the new names.
+Without a master, questions and answers remain stored. Blocks from before
+v0.2.0's repository layout, under `.clank/agents/<label>/blocks` and
+`unblocks`, are not read or carried over: ask them again.
 
 ### Permission blocks
 

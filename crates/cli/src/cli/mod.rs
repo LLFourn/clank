@@ -1855,18 +1855,6 @@ pub enum BlockCmd {
     Clean(BlockCleanArgs),
     /// Read repository questions and answers, including received decisions.
     List(BlockCleanArgs),
-    /// Migrate legacy agent and plan-scoped blocks to repository storage.
-    #[command(hide = true)]
-    Migrate(BlockMigrateArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct BlockMigrateArgs {
-    /// Print what would change without touching anything.
-    #[arg(long = "dry-run")]
-    pub dry: bool,
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

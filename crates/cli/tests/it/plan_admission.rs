@@ -91,11 +91,7 @@ fn occupied_slot_refuses_both_promotion_surfaces_without_consuming_queue_or_inde
     write(repo, ".clank/plans/live.md", "# live\n");
     commit(repo, "[live] intro");
     // A blocked plan still owns the slot. Admission does not exempt it.
-    write(
-        repo,
-        ".clank/agents/master/blocks/hold.md",
-        "waiting for a human\n",
-    );
+    write(repo, ".clank/blocks/hold.md", "waiting for a human\n");
     write(
         repo,
         ".clank/queue/100-next.md",

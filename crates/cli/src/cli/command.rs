@@ -1228,7 +1228,6 @@ mod tests {
         ("", "rewire", &["rewire", "--from-stdin"]),
         ("", "monitor", &["monitor", "start"]),
         ("monitor", "upgrade", &["monitor", "upgrade"]),
-        ("block", "migrate", &["block", "migrate", "--dry-run"]),
     ];
 
     /// Hiding is presentation only: every installed hook string and
