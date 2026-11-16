@@ -53,6 +53,7 @@ async fn cli_addresses_repository_questions_without_an_agent_or_binding() {
     assert_eq!(
         Pair::read(&root(repo.path()), "schema")
             .unwrap()
+            .unwrap()
             .answer
             .as_deref(),
         Some("Yes")
@@ -84,12 +85,18 @@ fn an_answer_follows_the_master_and_a_rebind_replays_nothing() {
     let first = owed_answers(repo, &label("alice")).remove(0).carries;
     set_master(repo, None);
     assert!(owed_answers(repo, &label("alice")).is_empty());
-    assert!(Pair::read(&root(repo), "q").unwrap().answer.is_some());
+    assert!(
+        Pair::read(&root(repo), "q")
+            .unwrap()
+            .unwrap()
+            .answer
+            .is_some()
+    );
     set_master(repo, Some("bob"));
     let owed = owed_answers(repo, &label("bob")).remove(0);
     assert_eq!(owed.carries, first, "the same answer, to the new master");
     assert!(complete(repo, &owed.carries, &crate::upgrade::process().settling()).unwrap());
-    assert!(Pair::read(&root(repo), "q").is_none());
+    assert!(Pair::read(&root(repo), "q").unwrap().is_none());
     crate::agent_store::bind_session_to_agent(
         repo,
         &label("bob"),
@@ -167,7 +174,7 @@ fn a_submitted_nudge_completes_across_a_handover() {
         .unwrap(),
         Resolved::Delivered
     ));
-    assert!(Pair::read(&root(repo), "publish").is_none());
+    assert!(Pair::read(&root(repo), "publish").unwrap().is_none());
     assert_eq!(
         crate::cli::nudge_log::read(&agents_root(repo).join("alice")).len(),
         1,
@@ -289,7 +296,7 @@ fn nothing_raised(repo: &Path) -> bool {
     [&f.question, &f.answer, &f.attempt, &f.creator]
         .iter()
         .all(|p| absent(p))
-        && question_names(&root(repo)).is_empty()
+        && question_names(&root(repo)).unwrap().is_empty()
 }
 
 #[test]
@@ -322,7 +329,7 @@ fn the_master_raises_a_block() {
     let (author, path) = raise_as(repo.path(), &in_session(MASTER_SID), &permission()).unwrap();
     assert_eq!(author, Some(label("boss")));
     assert_eq!(path, files(&root(repo.path()), "q").question);
-    let pair = Pair::read(&root(repo.path()), "q").unwrap();
+    let pair = Pair::read(&root(repo.path()), "q").unwrap().unwrap();
     assert_eq!(pair.question, "Which API shape?");
 }
 
@@ -336,7 +343,7 @@ fn a_caller_with_no_identity_raises_a_block() {
     )
     .unwrap();
     assert_eq!(author, None);
-    assert!(Pair::read(&root(repo.path()), "q").is_some());
+    assert!(Pair::read(&root(repo.path()), "q").unwrap().is_some());
     assert!(absent(&files(&root(repo.path()), "q").creator));
 }
 

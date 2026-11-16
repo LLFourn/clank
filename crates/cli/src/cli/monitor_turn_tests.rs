@@ -2940,6 +2940,79 @@ fn a_held_binding_lock_stalls_no_serve_and_leaves_the_notice() {
     holder.join().unwrap();
 }
 
+/// A process holding `blocks.lock` for the whole test stalls no serve: with
+/// a block pending, each agent's report is served held back by it, and once
+/// the block is gone each is served without it, the monitor retiring after
+/// each serve, and recovery's facts are gathered, all before the lock is
+/// released.
+#[test]
+fn a_held_blocks_lock_stalls_no_serve() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (repo, authors, state) = runtime.block_on(two_agents_claude_told());
+    crate::cli::block::asked(repo.path(), "claude", "pause", "Proceed?");
+    let holding = repo.path().to_path_buf();
+    let (held_tx, held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _lock = crate::cli::block::lock(&holding).unwrap();
+        held_tx.send(()).unwrap();
+        let _ = released.recv();
+    });
+    held.recv().unwrap();
+
+    let (shutdown, held_back) = served_then_retired(repo.path(), state.clone(), &authors)
+        .expect("the monitor waited on the blocks lock with a block pending");
+    assert!(
+        matches!(
+            shutdown,
+            Shutdown::ReadyToRelease(Retired { drained: 2, .. })
+        ),
+        "{shutdown:?}"
+    );
+    assert!(
+        held_back[0].contains("blocked: pause") && held_back[0].contains("timer:"),
+        "the block holds the master's report back: {held_back:?}"
+    );
+
+    std::fs::remove_file(repo.path().join(".clank/blocks/pause.md")).unwrap();
+    let state_for_facts = state.clone();
+    let (shutdown, free) = served_then_retired(repo.path(), state, &authors)
+        .expect("the monitor waited on the blocks lock with no block pending");
+    assert!(
+        matches!(
+            shutdown,
+            Shutdown::ReadyToRelease(Retired { drained: 2, .. })
+        ),
+        "{shutdown:?}"
+    );
+    assert!(
+        free[0].contains("timer:") && !free[0].contains("blocked:"),
+        "{free:?}"
+    );
+
+    let (facts_repo, facts_state) = (repo.path().to_path_buf(), state_for_facts);
+    let (facts_tx, facts) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut turns = Turns::new(facts_repo.clone());
+        let found = recovery_facts(
+            &facts_repo,
+            &facts_state,
+            &Default::default(),
+            &mut Default::default(),
+            &[],
+            &mut turns,
+        );
+        let _ = facts_tx.send(found.len());
+    });
+    assert!(
+        facts.recv_timeout(Duration::from_secs(60)).is_ok(),
+        "recovery waited on the blocks lock"
+    );
+
+    release.send(()).unwrap();
+    holder.join().unwrap();
+}
+
 /// With the binding lock free, the first serve ends the outage.
 #[test]
 fn a_free_binding_lock_lets_the_serve_clear_the_notice() {
