@@ -651,7 +651,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `stash` | Set a plan's commits aside (bare or `push`, like `git stash`) / `pop` restores / `show` / `drop` / `list` |
 | `pick` | Copy plans (commits + files) from another branch (`--from`) |
 | `purge` | Strip a plan's `.clank/` artifacts from history (`--drop` = all of it) |
-| `block` | Questions only the human can answer: an agent's `block ask` (`--permission` for a refused permission, see *Permission blocks*), the human's `block answer` (`--nudge` types the answer into the agent's terminal), `block list` to inspect decisions, and `block clean` to tidy away delivered ones. The wake carrying an answer is its receipt; the agent acknowledges nothing |
+| `block` | Questions only the human can answer: an agent's `block ask` (`--permission` for a refused permission, see *Permission blocks*), the human's `block answer` (`--nudge` types the answer into the agent's terminal), and `block list` to read what is still open or undelivered. Delivering an answer deletes its block; the agent acknowledges nothing |
 | `config` | Read/write typed config values (repo or `--global`): `review.adhoc_feedback`, `review.plan_feedback`, `review.require_commit_prefix`, `hooks.blocked`, `diff.editor.command`, `diff.wait`, `finish.autosquash`, `recovery.blind_nudge`, `recovery.stall_warn`, `recovery.stall_nudge` |
 | `export` | Dump the repo's roster config as JSON |
 
@@ -699,10 +699,15 @@ Blocks belong to the repository. The master asks with
 when progress needs to stop; the master decides whether to ask the human.
 A block pauses the repo's review cycle, while messages and events still arrive.
 
-Names are unique across the repository. The original asker is attribution only.
-Answers follow the current master, survive its removal or replacement, and stay
-readable with `clank block list` until `clank block clean` removes settled state.
-Without a master, questions and answers remain stored. Blocks from before
+Names are unique across the repository, and a name is reused only once its
+block is delivered: asking it again while its question is pending, or answered
+and undelivered, is refused. The original asker is attribution only. An answer
+follows the current master and survives its removal or replacement until a
+wake delivers it. Delivery is best effort and records nothing: once the wake
+carrying the answer is emitted, the question and answer are deleted, and no
+later session or master is shown it again. A wake that failed to emit deletes
+nothing, and the next one carries the answer. Until delivery, `clank block
+list` shows it. Without a master, questions and answers remain stored. Blocks from before
 v0.2.0's repository layout, under `.clank/agents/<label>/blocks` and
 `unblocks`, are not read or carried over: ask them again.
 
@@ -721,12 +726,16 @@ turn. A permission block is answered by typing your answer there for you.
 - `clank block answer <name> --nudge --override-permission-classifier
   -m "<text>"` types the text
   into the agent's pane as your message, through the same pane discovery,
-  input path and nudge history as `clank nudge`, and records the answer
-  only once it was submitted. It is the only way to answer a permission
-  block: a plain `block answer`, from the CLI or the browser, is refused
-  with an error naming `--nudge`. `--nudge` works on an ordinary block too,
-  and answers it by typing. The TUI's answer on a permission block always
-  nudges, its input starting as the suggestion.
+  input path and nudge history as `clank nudge`. Once the text is
+  submitted the agent has it, so the block is delivered and deleted. A
+  plain `block answer` to a permission block, from the CLI or the browser,
+  is refused with an error naming `--nudge`. `--nudge` works on an ordinary
+  block too, and delivers it by typing. The TUI's answer on a permission
+  block always nudges, its input starting as the suggestion.
+- If you type the answer into the agent's terminal yourself, clank cannot
+  see it. Run `clank block answer <name> --delivered
+  --override-permission-classifier` once you have: nothing else completes
+  the block.
 - Answering a permission block from the CLI (`--nudge`, `--resend` or
   `--delivered`) also needs `--override-permission-classifier`; without it
   the command is refused, naming the flag and saying a person must run it.
@@ -743,16 +752,16 @@ turn. A permission block is answered by typing your answer there for you.
   unknown: <reason>" with the text and when it was typed. Nothing resends
   it, and every other answer is refused until you settle it:
   `clank block answer <name> --delivered` if you saw the text
-  arrive (it is recorded, nothing is typed), or `--nudge --resend -m
+  arrive (the block is deleted, nothing is typed), or `--nudge --resend -m
   "<text>"` if it did not, or a duplicate is acceptable (each with
   `--override-permission-classifier` on a permission block).
-- Stored block state clank cannot read (a damaged header, an unknown kind or
-  disposition, an attempt record that is malformed or cannot be read) is
-  never taken for absent or plain. The block stays visible with the reason
-  (`unreadable` in `status -j`), is neither answered, retried, owed,
-  received nor cleaned, and waits for a person to repair the files.
-- At most one delivery is made per ask unless you pass `--resend`. A
-  nudged answer is never delivered again as a wake: the agent saw it typed.
+- Stored block state clank cannot read (a damaged header, an unknown kind, an
+  attempt record that is malformed or cannot be read) is never taken for
+  absent or plain. The block stays visible with the reason (`unreadable` in
+  `status -j`), is neither answered, retried, delivered nor deleted, and
+  waits for a person to repair the files.
+- At most one nudge is typed per ask unless you pass `--resend`. A nudged
+  answer is never delivered again as a wake: the agent saw it typed.
 - In `status -j`, every block carries `kind` (`plain` or `permission`),
   `suggestion`, and `nudge`: `null`, or for an unsettled nudge
   `{"outcome": "unknown", "reason", "diagnostic", "attempt", "text",

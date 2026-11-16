@@ -118,9 +118,10 @@ impl EventPresentation {
     }
 }
 
-/// The exact answered ask a wake carries: the asking agent, the block
-/// name, the ask occurrence and digests of the question and answer bytes
-/// it rendered. Receipt retires only a pair that still matches all of it.
+/// The exact answered ask a wake carries: the block name, the ask
+/// occurrence and digests of the question and answer bytes it rendered.
+/// A completed delivery deletes only a pair that still matches all of it.
+/// Transport metadata: never stored.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AnswerRef {
     pub name: String,
@@ -319,8 +320,8 @@ pub enum WaitItem {
         name: String,
         question: String,
     },
-    /// A human's answer to one of this agent's blocks. Delivering it is
-    /// what receives it; there is nothing to acknowledge.
+    /// A human's answer to a repository block. Delivering it deletes the
+    /// block; there is nothing to acknowledge.
     Unblocked {
         answer: String,
         carries: AnswerRef,

@@ -59,25 +59,7 @@ pub(crate) struct Pane<'a> {
 }
 
 impl crate::cli::block::Nudger for Pane<'_> {
-    fn nudge(&mut self, text: &str, destination: &crate::cli::block::Destination) -> Outcome {
-        let _binding = match crate::agent_store::hold_binding(self.repo, &destination.agent) {
-            Ok(guard) => guard,
-            Err(e) => {
-                return Outcome::Refused {
-                    reason: format!("cannot hold master session for delivery: {e}"),
-                };
-            }
-        };
-        if !crate::agent_store::binding_matches(
-            self.repo,
-            &destination.agent,
-            destination.tool,
-            destination.session.as_str(),
-        ) {
-            return Outcome::Refused {
-                reason: "master session changed before typing".into(),
-            };
-        }
+    fn nudge(&mut self, text: &str, to: &crate::lifecycle::AgentLabel) -> Outcome {
         // A thread of its own, so the caller's runtime flavor, or having
         // none, never decides whether the delivery can run.
         let tried = std::thread::scope(|s| {
@@ -86,7 +68,7 @@ impl crate::cli::block::Nudger for Pane<'_> {
                     .enable_all()
                     .build()
                     .map_err(|e| Unconfirmed::Refused(format!("starting a runtime: {e}")))?;
-                runtime.block_on(attempt(self.repo, &destination.agent, text))
+                runtime.block_on(attempt(self.repo, to, text))
             })
             .join()
         });

@@ -355,7 +355,7 @@ fn a_release_while_no_monitor_ran_is_dated_by_the_block_not_the_restart() {
         Obligation::Owed {
             owed_since: Since::Unknown { held: RESTART }
         },
-        "a block cleaned away dates nothing: unknown, not the restart"
+        "a block deleted on delivery dates nothing: unknown, not the restart"
     );
     assert_eq!(undated.owed_since(), Some(4000), "and it ages no clock");
     let later = fold_stored(

@@ -1502,8 +1502,15 @@ fn owed_blocks(repo: &Path, who: &str) -> Vec<clank_core::wait::WaitItem> {
     crate::cli::wait::block_items(repo, &label(who))
 }
 
-fn receipt_marker(repo: &Path, name: &str) -> PathBuf {
-    repo.join(format!(".clank/unblocks/{name}.received"))
+/// Whether any file of block `name` is left.
+fn block_left(repo: &Path, name: &str) -> bool {
+    [
+        format!(".clank/blocks/{name}.md"),
+        format!(".clank/unblocks/{name}.md"),
+        format!(".clank/blocks/{name}.creator"),
+    ]
+    .iter()
+    .any(|p| repo.join(p).exists())
 }
 
 fn idle_stop() -> Report {
@@ -1523,10 +1530,11 @@ fn present_owed(turns: &mut Turns, repo: &Path, conn: u64) -> (Frame, Option<Com
     (frame, commit)
 }
 
-/// A delivered answer is received: its marker names that exact pair and
-/// the next turn end carries no `unblocked` item.
+/// An answer delivered in one emitted wake deletes its block: nothing of
+/// it is left, and the next turn end, even from a restarted monitor,
+/// carries no `unblocked` item.
 #[tokio::test]
-async fn a_delivered_answer_is_received_and_not_presented_again() {
+async fn a_delivered_answer_leaves_no_block_files() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
     let mut turns = Turns::new(repo.path().to_path_buf());
@@ -1535,7 +1543,7 @@ async fn a_delivered_answer_is_received_and_not_presented_again() {
     assert!(text.contains("unblocked: q: yes"), "{text}");
     assert!(!text.contains("block clean"), "{text}");
     commit.expect("a delivery commits").run(repo.path()).await;
-    assert!(receipt_marker(repo.path(), "q").exists());
+    assert!(!block_left(repo.path(), "q"));
     assert!(owed_blocks(repo.path(), "claude").is_empty());
 
     let mut restarted = Turns::new(repo.path().to_path_buf());
@@ -1548,14 +1556,14 @@ async fn a_delivered_answer_is_received_and_not_presented_again() {
             .rendered
             .as_deref()
             .is_none_or(|t| !t.contains("unblocked")),
-        "a restarted monitor does not present a received answer: {frame:?}"
+        "a restarted monitor does not present a delivered answer: {frame:?}"
     );
 }
 
-/// A presentation that never landed receives nothing: the answer is
-/// presented again.
+/// An emit that failed deletes nothing: the answer stays, and the next
+/// wake delivers it.
 #[tokio::test]
-async fn an_answer_whose_presentation_failed_stays_owed() {
+async fn an_answer_whose_emit_failed_is_delivered_by_the_next_wake() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
     let author = label("claude");
@@ -1571,7 +1579,7 @@ async fn an_answer_whose_presentation_failed_stays_owed() {
     let unanswered = turns.answer(&author, 2, &idle_stop(), true, &g).unwrap();
     assert!(unanswered.presentation().is_some());
     turns.closed(&author, 2, &g);
-    assert!(!receipt_marker(repo.path(), "q").exists());
+    assert!(block_left(repo.path(), "q"));
     let again = owed_blocks(repo.path(), "claude");
     assert!(
         matches!(
@@ -1580,32 +1588,47 @@ async fn an_answer_whose_presentation_failed_stays_owed() {
         ),
         "{again:?}"
     );
-    let (frame, _) = present_owed(&mut turns, repo.path(), 3);
+    let (frame, commit) = present_owed(&mut turns, repo.path(), 3);
     assert!(frame.rendered.unwrap().contains("unblocked: q: yes"));
+    commit.expect("delivered").run(repo.path()).await;
+    assert!(!block_left(repo.path(), "q"));
 }
 
-/// The binding moved on between delivery and commit: nothing is received.
+/// The binding moves on, between the delivery and its commit or after
+/// both: the session that saw the answer was its delivery, so the
+/// successor is shown nothing again.
 #[tokio::test]
-async fn an_answer_delivered_to_a_replaced_session_stays_owed() {
-    let repo = repo_with("claude", Tool::Claude, "session-one");
-    ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
-    let mut turns = Turns::new(repo.path().to_path_buf());
-    let (_, commit) = present_owed(&mut turns, repo.path(), 1);
-    crate::agent_store::bind_session_to_agent(
-        repo.path(),
-        &label("claude"),
-        Tool::Claude,
-        &sid("session-two"),
-    )
-    .unwrap();
-    commit.unwrap().run(repo.path()).await;
-    assert!(!receipt_marker(repo.path(), "q").exists());
-    assert_eq!(owed_blocks(repo.path(), "claude").len(), 1);
+async fn after_a_master_rebind_nothing_is_replayed() {
+    for rebind_before_commit in [true, false] {
+        let repo = repo_with("claude", Tool::Claude, "session-one");
+        ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let (_, commit) = present_owed(&mut turns, repo.path(), 1);
+        let rebind = || {
+            crate::agent_store::bind_session_to_agent(
+                repo.path(),
+                &label("claude"),
+                Tool::Claude,
+                &sid("session-two"),
+            )
+            .unwrap()
+        };
+        if rebind_before_commit {
+            rebind();
+        }
+        commit.unwrap().run(repo.path()).await;
+        if !rebind_before_commit {
+            rebind();
+        }
+        let case = format!("rebind before commit: {rebind_before_commit}");
+        assert!(!block_left(repo.path(), "q"), "{case}");
+        assert!(owed_blocks(repo.path(), "claude").is_empty(), "{case}");
+    }
 }
 
-/// Two answered blocks, one presented: only that one is received.
+/// Two answered blocks, one presented: only that one is deleted.
 #[tokio::test]
-async fn only_the_presented_answer_is_received() {
+async fn only_the_presented_answer_is_deleted() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     ask_and_answer(repo.path(), "claude", "first", "One?", "yes");
     ask_and_answer(repo.path(), "claude", "second", "Two?", "no");
@@ -1617,35 +1640,30 @@ async fn only_the_presented_answer_is_received() {
         "{text}"
     );
     commit.unwrap().run(repo.path()).await;
-    assert!(receipt_marker(repo.path(), "first").exists());
-    assert!(!receipt_marker(repo.path(), "second").exists());
+    assert!(!block_left(repo.path(), "first"));
+    assert!(block_left(repo.path(), "second"));
     let (frame, _) = present_owed(&mut turns, repo.path(), 2);
     assert!(frame.rendered.unwrap().contains("unblocked: second: no"));
 }
 
-/// Present answer A, then ask the same question again and give it the
-/// same answer. A's late receipt is a no-op whether it lands at once,
-/// after a clean, or after the monitor restarted: the new occurrence is
-/// a different item and stays owed.
+/// Present answer A, deliver it another way, then ask the same question
+/// again and give it the same answer. A's delayed commit deletes nothing,
+/// whether it lands at once or after the monitor restarted: the new
+/// occurrence is a different item and stays owed.
 #[tokio::test]
-async fn a_late_receipt_after_identical_reuse_receives_nothing() {
-    for interleave in ["direct", "clean", "restart"] {
+async fn a_delayed_completion_after_identical_reuse_deletes_nothing() {
+    for interleave in ["direct", "restart"] {
         let repo = repo_with("claude", Tool::Claude, "session-one");
         ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
         let mut turns = Turns::new(repo.path().to_path_buf());
         let first_owed = owed_blocks(repo.path(), "claude");
         let (_, commit) = present_owed(&mut turns, repo.path(), 1);
         let late = commit.expect("delivered");
-        // Another delivery receives the first occurrence before its name is reused.
-        crate::cli::block::test_receive(repo.path(), "q");
+        crate::cli::block::test_complete(repo.path(), "q");
 
         ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
-        match interleave {
-            "clean" => {
-                crate::cli::block::clean(repo.path()).unwrap();
-            }
-            "restart" => turns = Turns::new(repo.path().to_path_buf()),
-            _ => {}
+        if interleave == "restart" {
+            turns = Turns::new(repo.path().to_path_buf());
         }
         let second_owed = owed_blocks(repo.path(), "claude");
         let identity = |items: &[clank_core::wait::WaitItem]| {
@@ -1658,7 +1676,7 @@ async fn a_late_receipt_after_identical_reuse_receives_nothing() {
         );
 
         late.run(repo.path()).await;
-        assert!(!receipt_marker(repo.path(), "q").exists(), "{interleave}");
+        assert!(block_left(repo.path(), "q"), "{interleave}");
         assert_eq!(
             owed_blocks(repo.path(), "claude"),
             second_owed,

@@ -292,7 +292,7 @@ impl Commit {
         &self.carried.delivered.identities
     }
 
-    /// Record the presentation and run its receipt callbacks, while the
+    /// Record the presentation, and run its receipt callbacks while the
     /// session that saw it still holds the label.
     pub(crate) async fn run(self, repo: &Path) {
         let Commit { author, carried } = self;
@@ -304,9 +304,6 @@ impl Commit {
                 carried.session.as_str(),
             )
         };
-        if !current() {
-            return;
-        }
         super::presentation::record_delivered(
             repo,
             &author,
@@ -316,6 +313,9 @@ impl Commit {
             current,
             &carried.settling,
         );
+        if !current() {
+            return;
+        }
         super::wake_receipt::dispatch(
             repo,
             &author,

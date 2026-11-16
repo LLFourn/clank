@@ -6932,13 +6932,13 @@ mod tests {
             [Standing::Owed, Standing::Owed],
             "no block withholds nothing"
         );
-        let received = standings(answered(), Vec::new());
+        let undelivered = standings(answered(), Vec::new());
         assert!(
             matches!(
-                received.as_slice(),
+                undelivered.as_slice(),
                 [Standing::Owed, Standing::Withheld { by }] if by.len() == 1
             ),
-            "an answer is owed, and review waits for its receipt: {received:?}"
+            "an answer is owed, and review waits for its delivery: {undelivered:?}"
         );
     }
 
@@ -7275,8 +7275,8 @@ mod tests {
         (dir, author, binding)
     }
 
-    fn received(repo: &Path) -> bool {
-        repo.join(".clank/unblocks/q.received").exists()
+    fn completed(repo: &Path) -> bool {
+        !repo.join(".clank/blocks/q.md").exists() && !repo.join(".clank/unblocks/q.md").exists()
     }
 
     struct Broken;
@@ -7309,10 +7309,10 @@ mod tests {
         }
     }
 
-    /// Grok's wait is a delivery boundary: the answer its wake prints is
-    /// received once the print lands, and only then.
+    /// Grok's wait is a delivery boundary: the block its wake prints the
+    /// answer to is deleted once the print lands, and only then.
     #[test]
-    fn a_grok_wake_receives_the_answer_it_printed() {
+    fn a_grok_wake_completes_the_answer_it_printed() {
         let (dir, author, binding) = grok_repo();
         let items = block_items(dir.path(), &author);
         assert!(matches!(items.as_slice(), [WaitItem::Unblocked { .. }]));
@@ -7323,12 +7323,12 @@ mod tests {
                 .unwrap()
                 .contains("\"answer\":\"yes\"")
         );
-        assert!(received(dir.path()));
+        assert!(completed(dir.path()));
         assert!(block_items(dir.path(), &author).is_empty());
     }
 
     #[test]
-    fn a_grok_wake_that_failed_to_print_receives_nothing() {
+    fn a_grok_wake_that_failed_to_print_deletes_nothing() {
         let (dir, author, binding) = grok_repo();
         let items = block_items(dir.path(), &author);
         assert!(
@@ -7343,36 +7343,21 @@ mod tests {
             )
             .is_err()
         );
-        assert!(!received(dir.path()));
+        assert!(!completed(dir.path()));
         assert_eq!(block_items(dir.path(), &author), items, "owed again");
     }
 
+    /// A print that landed is a delivery even if the session lost the
+    /// label straight after: the answer is not replayed to its successor.
     #[test]
-    fn a_grok_wake_whose_binding_went_stale_receives_nothing() {
+    fn a_grok_wake_whose_binding_went_stale_still_completes_what_it_printed() {
         let (dir, author, binding) = grok_repo();
         let items = block_items(dir.path(), &author);
         let mut out = Rebinds(dir.path(), Vec::new());
         deliver_grok_wake(dir.path(), &author, &binding, &items, true, None, &mut out).unwrap();
         assert!(!out.1.is_empty(), "the wake printed");
-        assert!(
-            !received(dir.path()),
-            "but its session no longer holds the label"
-        );
-
-        let mut never = Vec::new();
-        assert!(
-            deliver_grok_wake(
-                dir.path(),
-                &author,
-                &binding,
-                &items,
-                true,
-                None,
-                &mut never
-            )
-            .is_err()
-        );
-        assert!(never.is_empty() && !received(dir.path()));
+        assert!(completed(dir.path()));
+        assert!(block_items(dir.path(), &author).is_empty());
     }
 
     #[test]
