@@ -134,6 +134,12 @@ const UNGATED: &[(&str, &str, &str)] = &[
     ("cli/init.rs", "*", "ONE-SHOT: `clank init`"),
     (
         "cli/monitor.rs",
+        "remove_private_test_runtime",
+        "OWN: a test process's private runtime root, removed as that process exits; \
+         compiled only into test builds",
+    ),
+    (
+        "cli/monitor.rs",
         "bind_listener_with",
         "OWN: the monitor's socket",
     ),

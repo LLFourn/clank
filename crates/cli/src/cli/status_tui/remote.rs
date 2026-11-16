@@ -1327,6 +1327,71 @@ mod tests {
         off_during_listing(crate::cli::web::STOP_GRACE).await;
     }
 
+    /// Past the grace, off aborts AND joins the remote's async tasks: the
+    /// supervisor stuck on a listing is gone while the listing still runs,
+    /// and once off returns no task of the remote's is alive.
+    ///
+    /// One worker thread, because tokio wakes a task's joiner before it
+    /// drops the task from the live count; on a second worker the count
+    /// could lag the join it is meant to observe.
+    #[tokio::test(flavor = "current_thread")]
+    async fn off_joins_every_async_task_not_only_the_listing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        let repo = repo_with_config();
+        let (mut r, _) = remote_with(repo.path(), true, Duration::ZERO, Duration::ZERO);
+        let panes = Arc::new(HeldListing {
+            next: Mutex::new(None),
+            finished: AtomicBool::new(false),
+        });
+        r.panes = Arc::new({
+            let panes = panes.clone();
+            move || Ok(panes.clone() as Arc<dyn Panes>)
+        });
+        let snap = snap();
+        r.toggle(&snap);
+        settle(&mut r, &snap).await;
+        assert_eq!(r.shown(), Shown::On);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        *panes.next.lock().unwrap() = Some((entered, held));
+        r.panes_changed();
+        tokio::time::timeout(Duration::from_secs(10), started)
+            .await
+            .unwrap()
+            .unwrap();
+        r.toggle(&snap);
+        assert_eq!(r.shown(), Shown::Stopping);
+        let only_the_stop_task = baseline + 1;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while metrics.num_alive_tasks() != only_the_stop_task
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            only_the_stop_task,
+            "the supervisor waiting on the listing was not aborted and joined"
+        );
+        assert!(!panes.finished.load(Ordering::SeqCst));
+        let mut stopped = Box::pin(r.stop());
+        assert!(futures_util::poll!(stopped.as_mut()).is_pending());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), stopped)
+            .await
+            .unwrap();
+        assert!(panes.finished.load(Ordering::SeqCst));
+        assert_eq!(r.shown(), Shown::Off);
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            baseline,
+            "off left a task of the remote's alive"
+        );
+    }
+
     /// A provider whose "tunnel" is the loopback itself: its URL is
     /// wherever the test points it, and it records whether it was
     /// started and stopped. A `pending` one never finishes starting.

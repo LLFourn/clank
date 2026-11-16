@@ -27,6 +27,7 @@ fn main() -> anyhow::Result<()> {
                 std::path::Path::new(&args[1]),
                 &args[2],
                 args.get(3).map(std::path::Path::new),
+                &support::release::Cargo,
             )?;
         }
         _ => anyhow::bail!(
