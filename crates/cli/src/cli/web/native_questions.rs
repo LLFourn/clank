@@ -109,9 +109,7 @@ struct Target {
 }
 
 fn target(repo: &Path, label: &AgentLabel, default_home: Option<&Path>) -> Option<Target> {
-    let session = crate::agent_store::load_agent_config(repo, label)
-        .ok()??
-        .session?;
+    let session = crate::agent_store::binding(repo, label).ok()??;
     if session.tool != Tool::Codex {
         return None;
     }
@@ -402,14 +400,12 @@ fn target_is_current(repo: &Path, expected: &Target, home: Option<&Path>) -> boo
     std::iter::once(&roster.master)
         .chain(roster.members.iter().map(|m| &m.label))
         .filter(|label| *label != &expected.label)
-        .all(
-            |label| match crate::agent_store::load_agent_config(repo, label) {
-                Ok(cfg) => !cfg.and_then(|cfg| cfg.session).is_some_and(|session| {
-                    session.tool == Tool::Codex && session.id == expected.session.id
-                }),
-                Err(_) => false,
-            },
-        )
+        .all(|label| match crate::agent_store::binding(repo, label) {
+            Ok(bound) => !bound.is_some_and(|session| {
+                session.tool == Tool::Codex && session.id == expected.session.id
+            }),
+            Err(_) => false,
+        })
 }
 
 struct Native<S> {
@@ -1482,9 +1478,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        crate::agent_store::update_agent_config(repo.path(), &label, |cfg| {
-            cfg.session.as_mut().unwrap().id = SessionId::parse("replacement").unwrap()
-        })
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &label,
+            Tool::Codex,
+            &SessionId::parse("replacement").unwrap(),
+        )
         .unwrap();
         let changed = target_is_current(
             repo.path(),

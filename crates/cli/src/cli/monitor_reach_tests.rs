@@ -345,9 +345,9 @@ impl Reached {
 #[tokio::test]
 async fn a_stopped_turn_with_no_waiter_is_unreachable_and_recovered_as_idle() {
     let (a, _parked) = Reached::stopped_codex();
-    let stored = std::fs::read_to_string(a.dir().join("turn.json")).unwrap();
-    assert!(
-        stored.contains(r#""stopped":{"turn":"t1""#),
+    let stored = crate::cli::turn_custody::stored_record(&a.dir()).unwrap();
+    assert_eq!(
+        stored["stopped"]["turn"], "t1",
         "the Stop is in the turn state: {stored}"
     );
 
@@ -706,8 +706,8 @@ async fn a_hook_woken_at_its_deadline_is_past_its_stop() {
     let _ = expire_reports(&mut a.clients, Some(&mut a.turns), 2_000_000);
     assert!(a.clients.is_empty(), "told to re-arm, and retired");
     assert_eq!(a.turns.state(&agent()).unwrap().stopped, None);
-    let stored = std::fs::read_to_string(a.dir().join("turn.json")).unwrap();
-    assert!(!stored.contains("stopped"), "{stored}");
+    let stored = crate::cli::turn_custody::stored_record(&a.dir()).unwrap();
+    assert!(stored.get("stopped").is_none(), "{stored}");
 }
 
 /// A Claude or Codex Stop's report has no deadline: the monitor arms no
@@ -837,9 +837,10 @@ async fn an_unplaced_stop_is_never_working_under_this_monitor_or_the_next() {
         Some(&Case::Recovering),
         "an idle agent's standing, not an active turn's"
     );
-    let stored = std::fs::read_to_string(a.dir().join("turn.json")).unwrap();
-    assert!(
-        stored.contains(r#""stopped":{"turn":"p1","position":null"#),
+    let stored = crate::cli::turn_custody::stored_record(&a.dir()).unwrap();
+    assert_eq!(
+        (&stored["stopped"]["turn"], &stored["stopped"]["position"]),
+        (&serde_json::json!("p1"), &serde_json::Value::Null),
         "{stored}"
     );
 
@@ -1211,11 +1212,10 @@ async fn a_stop_captured_before_the_agent_went_on_never_ends_what_followed() {
 async fn an_unplaced_stop_kept_without_what_its_hook_saw_ends_no_turn() {
     let mut a = Reached::new(Tool::Claude);
     a.write(&[claude_prompt("p1")], 1000);
-    std::fs::write(
-        a.dir().join("turn.json"),
+    crate::cli::turn_custody::place_stored(
+        &a.dir(),
         include_str!("../../tests/fixtures/formats/turn-stopped-unobserved.json"),
-    )
-    .unwrap();
+    );
     let mut a = a.restart();
     a.round(Some(1000), 50_000, SETTLED);
     let kept = a.turns.state(&agent()).unwrap().stopped.clone().unwrap();

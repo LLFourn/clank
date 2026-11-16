@@ -11205,26 +11205,19 @@ pub(crate) mod tests {
     }
 
     fn bind(repo: &std::path::Path, label: &str, id: &str) {
-        let cfg = clank_core::AgentConfig {
-            session: Some(bound(clank_core::vocab::Tool::Codex, id)),
-            ..Default::default()
-        };
-        crate::agent_store::update_agent_config(
+        crate::agent_store::bind_session_to_agent(
             repo,
             &clank_core::ids::AgentLabel::parse(label).unwrap(),
-            |stored| *stored = cfg,
+            clank_core::vocab::Tool::Codex,
+            &clank_core::SessionId::parse(id).unwrap(),
         )
         .unwrap();
     }
 
     fn bound_id(repo: &std::path::Path, label: &str) -> Option<String> {
-        crate::agent_store::load_agent_config(
-            repo,
-            &clank_core::ids::AgentLabel::parse(label).unwrap(),
-        )
-        .unwrap()
-        .and_then(|c| c.session)
-        .map(|s| s.id.as_str().to_string())
+        crate::agent_store::binding(repo, &clank_core::ids::AgentLabel::parse(label).unwrap())
+            .unwrap()
+            .map(|s| s.id.as_str().to_string())
     }
 
     fn target(label: &str, id: &str) -> crate::cli::status_tui::input::ClearTarget {
@@ -11546,13 +11539,16 @@ pub(crate) mod tests {
         att: &crate::cli::agent_state::Attended,
     ) {
         let dir = repo.join(".clank/agents").join(label);
-        std::fs::create_dir_all(&dir).unwrap();
-        crate::cli::agent_state::store(
+        let bound = crate::agent_store::binding_in(&dir)
+            .unwrap()
+            .unwrap_or_else(|| {
+                crate::agent_store::state::tests::bind(&dir, clank_core::Tool::Claude, "attending");
+                crate::agent_store::binding_in(&dir).unwrap().unwrap()
+            });
+        assert!(crate::cli::agent_state::store(
             &dir,
+            &bound.id,
             &crate::cli::agent_state::AgentState {
-                role: "master".into(),
-                session: "s".into(),
-                tool: clank_core::Tool::Claude,
                 monitor: crate::cli::agent_state::Observer::me(),
                 activity: crate::cli::agent_state::Activity::Idle,
                 since: 0,
@@ -11565,7 +11561,7 @@ pub(crate) mod tests {
                 repeated: None,
             },
             &crate::upgrade::process().permit().unwrap(),
-        );
+        ));
     }
 
     fn snap_attending(

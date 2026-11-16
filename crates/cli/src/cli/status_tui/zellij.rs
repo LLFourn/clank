@@ -830,18 +830,17 @@ impl PaneIo for ZellijPaneIo<'_> {
     fn lost_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
         let mut panes = snap.live_labels();
         panes.extend(snap.seen().ambiguous_labels());
-        let Ok(configs) = crate::agent_store::load_all_agent_configs(self.repo) else {
+        let Ok(bindings) = crate::agent_store::identity::bindings(self.repo, false) else {
             return Default::default();
         };
-        let bound: Vec<(String, Tool, String)> = configs
+        let bound: Vec<(String, Tool, String)> = bindings
             .into_iter()
-            .filter_map(|(label, cfg)| {
-                let session = cfg.session?;
-                Some((
+            .map(|(label, session)| {
+                (
                     label.as_str().to_string(),
                     session.tool,
                     session.id.to_string(),
-                ))
+                )
             })
             .filter(|(label, _, _)| !panes.contains(label))
             .collect();

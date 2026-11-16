@@ -1,33 +1,97 @@
 {
-  "role": "master",
-  "session": "00000000-0000-4000-8000-000000000001",
-  "tool": "claude",
-  "monitor": {
-    "pid": 10010,
-    "birth": {
-      "v": "mac1",
-      "sec": 1793844431,
-      "usec": 124634
-    }
+  "version": 1,
+  "binding": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "tool": "claude",
+    "updated_at": "2026-11-17T00:00:00Z",
+    "transcript": "/home/user/.claude/projects/example/transcript.jsonl"
   },
-  "activity": {
-    "is": "unobserved"
+  "resume_pending": {
+    "at": "2026-11-17T00:00:05Z"
   },
-  "since": 1793845193,
-  "suppressors": [
-    "attending"
-  ],
-  "nudge": {
-    "is": "nothing"
-  },
-  "attending": {
-    "task": "a0000000000000001",
-    "expect": {
-      "since": "2026-11-05T02:19:50.33Z",
-      "secs": 7200
+  "bound": {
+    "turn": {
+      "attendances": [
+        {
+          "work": {"Declared": {"name": "Implement the example plan", "task": "a0000000000000001"}},
+          "desc": "Implement the example plan",
+          "started": 1793845190330,
+          "window": 1,
+          "since": 1793845190330,
+          "expect": 7200000,
+          "check_in": "Armed"
+        }
+      ],
+      "repeat": null,
+      "outstanding": null,
+      "outstanding_episode_broken": false,
+      "resolved": null,
+      "next_seq": 38,
+      "next_window": 1,
+      "received": ["event messages@1 k:message#claude/24b0857ddad36a442fff4ff8"],
+      "unwatched": null,
+      "feedback": [{"RunEnded": {"desc": "test run"}}]
     },
-    "desc": "Implement the example plan",
-    "at": "2026-11-05T02:19:50.33Z",
-    "subagent": true
-  }
+    "questions": {
+      "pending": [
+        {
+          "prompt": "10000000-0000-4000-8000-000000000003",
+          "tool_use": "toolu_example_1",
+          "header": "Which tunnel should the remote use?",
+          "input": "0000000000000000000000000000000000000000000000000000000000000001"
+        }
+      ],
+      "over": ["10000000-0000-4000-8000-000000000001"],
+      "returned": [
+        {"prompt": "10000000-0000-4000-8000-000000000003", "tool_use": "toolu_example_0"}
+      ]
+    },
+    "recovery": {
+      "opened_by": "t1",
+      "failed_turn": "t1",
+      "class": "server_error",
+      "attempts": [
+        {
+          "n": 7,
+          "claimed_at": 1793845300,
+          "transport": "typed",
+          "target": "t1",
+          "tag": "clank-recovery-t1-7",
+          "started": null,
+          "disposition": "submitted"
+        }
+      ],
+      "next_at": 1793845400,
+      "state": "dispatched",
+      "unobserved": 0,
+      "kind": "failed",
+      "role": "master",
+      "bound": {"at": "2026-11-17T00:00:00Z"}
+    },
+    "delivered": {
+      "event messages@1 k:message#claude/24b0857ddad36a442fff4ff8": 1793845200
+    },
+    "projection": {
+      "monitor": {"pid": 10010, "birth": {"v": "mac1", "sec": 1793844431, "usec": 124634}},
+      "activity": {"is": "idle"},
+      "since": 1793845193,
+      "reachability": {"by": "waiter", "since": 1793845190},
+      "nudge": {"is": "nothing"},
+      "attending": [
+        {
+          "task": "Implement the example plan",
+          "expect": {"since": "2026-11-05T02:19:50.33Z", "secs": 7200},
+          "desc": "Implement the example plan",
+          "at": "2026-11-05T02:19:50.33Z",
+          "declared": true
+        }
+      ],
+      "asking": "Which tunnel should the remote use?"
+    },
+    "outage": {"at": "2026-11-17T00:00:10Z"}
+  },
+  "issued": 79,
+  "ledger": [
+    {"identity": "event messages@1 k:message#claude/24b0857ddad36a442fff4ff8", "owed_since": {"at": 1793845100}}
+  ]
 }

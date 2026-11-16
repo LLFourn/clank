@@ -1,5 +1,6 @@
 //! File-IO for per-agent (`.clank/agents/<label>/config.json`)
-//! and repo-level (`.clank/config.json`) typed configs.
+//! and repo-level (`.clank/config.json`) typed configs, and for which
+//! session holds each agent's label (its `state.json`, [`state`]).
 //!
 //! Pure types live in `clank_core::agent_config`; this module is
 //! the only place that knows where they sit on disk and how to
@@ -15,9 +16,11 @@ use clank_core::agent_config::{AgentConfig, OutageNotified, ResumePending, Sessi
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::{AutoMode, Tool};
 use clank_user_config::versioned::{self, Refusal};
+pub(crate) use state::Bound;
 
 pub(crate) mod identity;
 pub mod repo_config;
+pub(crate) mod state;
 
 /// The newest version of an agent's `config.json` this build reads and
 /// writes.
@@ -68,19 +71,28 @@ pub(crate) fn agent_config_document(
         .flatten()
 }
 
-/// The session bound to the agent whose directory is `agent_dir`.
+/// The session bound to the agent whose directory is `agent_dir`. A state
+/// written before the binding was kept there binds nothing.
 pub(crate) fn binding_in(agent_dir: &Path) -> anyhow::Result<Option<Session>> {
     #[derive(serde::Deserialize)]
     struct Binding {
-        session: Option<Session>,
+        binding: Option<Session>,
     }
-    let path = config_in(agent_dir);
-    let Some(doc) = versioned::read(&path, AGENT_CONFIG_VERSION)? else {
+    let path = state::path(agent_dir);
+    let Some(stored) = versioned::read_stored(&path, state::VERSION)? else {
         return Ok(None);
     };
-    let binding: Binding = serde_json::from_value(serde_json::Value::Object(doc))
+    if !stored.versioned {
+        return Ok(None);
+    }
+    let binding: Binding = serde_json::from_value(serde_json::Value::Object(stored.doc))
         .map_err(|e| Refusal::malformed(&path, e))?;
-    Ok(binding.session)
+    Ok(binding.binding)
+}
+
+/// The session bound to `label`, if any.
+pub fn binding(repo: &Path, label: &AgentLabel) -> anyhow::Result<Option<Session>> {
+    identity::binding(repo, label)
 }
 
 /// Whether the current binding still assigns this label to this tool and session.
@@ -95,15 +107,14 @@ pub(crate) fn binding_matches(repo: &Path, label: &AgentLabel, tool: Tool, sessi
 /// Only [`mutate_locked`] may call this: a write of a config loaded
 /// outside the label's lock puts back whatever another writer changed
 /// in between.
-fn save_agent_config(guard: &BindingGuard, cfg: &AgentConfig) -> anyhow::Result<()> {
-    let path = agent_config_path(guard.repo, guard.label);
+fn save_agent_config(guard: &StateGuard, cfg: &AgentConfig) -> anyhow::Result<()> {
+    let path = config_in(&guard.agent_dir);
     save_json(&path, cfg).with_context(|| format!("writing `{}`", path.display()))?;
     Ok(())
 }
 
 /// Edit one agent's config in place, defaulting a missing file. Every
-/// writer of the file, binding transitions included, serializes on the
-/// same per-label lock, so an edit always starts from the last
+/// writer of the file serializes on the agent's lock, so an edit always starts from the last
 /// committed state and never reverts another writer's field. An
 /// unreadable config is an error, never replaced.
 pub fn update_agent_config(
@@ -111,7 +122,7 @@ pub fn update_agent_config(
     label: &AgentLabel,
     edit: impl FnOnce(&mut AgentConfig),
 ) -> anyhow::Result<()> {
-    let guard = BindingGuard::acquire(repo, label)?;
+    let guard = StateGuard::acquire(repo, label)?;
     mutate_locked(&guard, edit)
 }
 
@@ -122,27 +133,26 @@ pub fn try_update_agent_config<T>(
     label: &AgentLabel,
     edit: impl FnOnce(&mut AgentConfig) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let guard = BindingGuard::acquire(repo, label)?;
+    let guard = StateGuard::acquire(repo, label)?;
     try_mutate_locked(&guard, edit)
 }
 
 fn mutate_locked<T>(
-    guard: &BindingGuard,
+    guard: &StateGuard,
     edit: impl FnOnce(&mut AgentConfig) -> T,
 ) -> anyhow::Result<T> {
     try_mutate_locked(guard, |cfg| Ok(edit(cfg)))
 }
 
 /// The one config transaction: load under `guard`, edit, and replace
-/// the file only if the edit succeeded and changed it. Taking the guard
-/// rather than the lock is what lets the binding transactions run their
-/// checks and side effects under the same acquisition without
-/// re-locking.
+/// the file only if the edit succeeded and changed it.
 fn try_mutate_locked<T>(
-    guard: &BindingGuard,
+    guard: &StateGuard,
     edit: impl FnOnce(&mut AgentConfig) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let loaded = load_agent_config(guard.repo, guard.label)?;
+    let path = config_in(&guard.agent_dir);
+    let loaded: Option<AgentConfig> =
+        load_json(&path).with_context(|| format!("reading `{}`", path.display()))?;
     let mut cfg = loaded.clone().unwrap_or_default();
     let out = edit(&mut cfg)?;
     #[cfg(test)]
@@ -159,21 +169,6 @@ fn try_mutate_locked<T>(
 /// `wait_events` on a flip.
 pub fn set_auto_mode(repo: &Path, label: &AgentLabel, mode: AutoMode) -> anyhow::Result<()> {
     update_agent_config(repo, label, |cfg| cfg.auto_mode = Some(mode))
-}
-
-/// List every agent in this repo's `.clank/agents/`, propagating
-/// parse / I/O errors. Use this when a partial result would be
-/// dangerous — `clank as` (must see ALL existing bindings to
-/// safely clear stale ones), `clank auto`, `clank doctor`.
-pub fn load_all_agent_configs(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, AgentConfig)>> {
-    let mut out = Vec::new();
-    for entry in iter_agent_dirs(repo)? {
-        let (label, _) = entry?;
-        if let Some(cfg) = load_agent_config(repo, &label)? {
-            out.push((label, cfg));
-        }
-    }
-    Ok(out)
 }
 
 /// Error returned by the roster resolvers when a repo has no
@@ -432,23 +427,12 @@ fn no_repo_config(repo: &Path) -> anyhow::Error {
     )
 }
 
-/// Same as [`load_all_agent_configs`] but silently drops agents
-/// whose `config.json` failed to parse. Use this for the identity
-/// resolver path where a single broken config shouldn't take
-/// down every other lookup. `clank doctor` is the place that
-/// surfaces the broken file.
-pub fn load_all_agent_configs_lossy(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, AgentConfig)>> {
-    let mut out = Vec::new();
-    for entry in iter_agent_dirs(repo)? {
-        let Ok((label, _)) = entry else {
-            continue;
-        };
-        match load_agent_config(repo, &label) {
-            Ok(Some(cfg)) => out.push((label, cfg)),
-            Ok(None) | Err(_) => continue,
-        }
-    }
-    Ok(out)
+/// The label of every agent directory under `.clank/agents/`, whatever
+/// files it holds.
+pub(crate) fn agent_labels(repo: &Path) -> anyhow::Result<Vec<AgentLabel>> {
+    iter_agent_dirs(repo)?
+        .map(|entry| entry.map(|(label, _)| label))
+        .collect()
 }
 
 /// Iterate `.clank/agents/*` returning each (label, dir-path)
@@ -509,35 +493,27 @@ pub struct BindOutcome {
     pub cleared_from: Vec<AgentLabel>,
 }
 
-/// Bind a session to an agent label, atomically updating the
-/// target agent's `config.json` AND clearing the same session id
-/// from any OTHER agent's config that currently holds it.
-///
-/// Single source of truth for the bind operation — used by
-/// `clank as` AND `clank init` phase 2 so the two-shells-one-
-/// session uniqueness invariant can't be re-introduced by a
-/// caller that forgets the clear-stale step.
-///
 /// Release `label` only while `session` still holds it. The compare
-/// and clear run under the label's binding lock, so an old pane cannot
-/// clear a successor's binding. Waiters check this config before they
-/// present work and stop when it changes.
+/// and clear run under the agent's lock, so an old pane cannot clear a
+/// successor's binding. Waiters check the binding before they present
+/// work and stop when it changes.
 pub fn release_binding(
     repo: &Path,
     label: &AgentLabel,
     session: &SessionId,
 ) -> anyhow::Result<bool> {
-    let guard = BindingGuard::acquire(repo, label)?;
-    identity::mutate(&guard, |cfg| {
-        if cfg.session.as_ref().is_none_or(|s| &s.id != session) {
+    let guard = StateGuard::acquire(repo, label)?;
+    identity::mutate(&guard, |id| {
+        if id.binding.as_ref().is_none_or(|s| &s.id != session) {
             return false;
         }
-        cfg.session = None;
+        id.binding = None;
         true
     })
 }
 
-/// Serializes every ownership transition on ONE label's binding.
+/// Serializes every write of ONE agent's `state.json` and `config.json`:
+/// its binding's transitions and every other part.
 ///
 /// Comparing the session before clearing is not enough on its own:
 /// read, compare and write are separate steps, and a replacement
@@ -547,71 +523,65 @@ pub fn release_binding(
 /// take this lock, so the compare and everything it authorises happen
 /// against the same state.
 ///
-/// The same lock covers every other edit of the label's config, so a
-/// field write cannot land between a binding's read and its write, nor
-/// a binding's write revert the field.
-///
 /// BLOCKING, unlike the leases elsewhere: a caller here is not
 /// choosing whether to drive, it is performing a short file write it
 /// must not do concurrently. The monitor's serve loop is the exception:
 /// an agent's process may hold this lock across a side effect, so the
-/// loop only [`try_acquire`](Self::try_acquire)s it. Held for one label
-/// only, and never across another label's, so there is no lock order to
-/// get wrong.
-pub(crate) struct BindingGuard<'a> {
-    repo: &'a Path,
-    label: &'a AgentLabel,
-    _lock: std::fs::File,
+/// loop only ever tries it ([`state::try_transact`]). Held for one agent
+/// only, and never across another's, so there is no lock order to get
+/// wrong.
+pub(crate) struct StateGuard {
+    agent_dir: PathBuf,
+    label: AgentLabel,
+    _lock: state::Lock,
 }
 
-impl<'a> BindingGuard<'a> {
-    fn acquire(repo: &'a Path, label: &'a AgentLabel) -> anyhow::Result<Self> {
-        let dir = agents_root(repo).join(label.as_str());
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
+impl StateGuard {
+    fn acquire(repo: &Path, label: &AgentLabel) -> anyhow::Result<Self> {
+        let agent_dir = agents_root(repo).join(label.as_str());
         Ok(Self {
-            repo,
-            label,
-            _lock: exclusive_lock(&dir.join("binding.lock"))?,
+            _lock: state::Lock::acquire(&agent_dir)?,
+            agent_dir,
+            label: label.clone(),
         })
     }
 
-    /// [`acquire`](Self::acquire) without waiting: `None` when another
-    /// holder has the lock.
-    fn try_acquire(repo: &'a Path, label: &'a AgentLabel) -> anyhow::Result<Option<Self>> {
-        let dir = agents_root(repo).join(label.as_str());
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
-        let path = dir.join("binding.lock");
-        let lock =
-            try_exclusive_lock(&path).with_context(|| format!("locking `{}`", path.display()))?;
-        Ok(lock.map(|lock| Self {
-            repo,
-            label,
-            _lock: lock,
-        }))
+    #[cfg(test)]
+    pub(crate) fn in_dir(agent_dir: &Path) -> anyhow::Result<Self> {
+        let name = agent_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("an agent's directory is named for its label")?;
+        Ok(Self {
+            _lock: state::Lock::acquire(agent_dir)?,
+            agent_dir: agent_dir.to_path_buf(),
+            label: AgentLabel::parse(name).or_else(|_| AgentLabel::parse("agent"))?,
+        })
     }
-}
 
-impl BindingGuard<'_> {
-    /// Where the label keeps its files.
-    pub(crate) fn agent_dir(&self) -> PathBuf {
-        agents_root(self.repo).join(self.label.as_str())
+    pub(crate) fn agent_dir(&self) -> &Path {
+        &self.agent_dir
+    }
+
+    pub(crate) fn lock(&self) -> &state::Lock {
+        &self._lock
     }
 
     /// Whether `session` of `tool` holds the label. True until the guard
     /// is dropped: no binding commits while it is held.
     pub(crate) fn bound_to(&self, tool: Tool, session: &str) -> bool {
-        binding_matches(self.repo, self.label, tool, session)
+        binding_in(&self.agent_dir)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.tool == tool && s.id.as_str() == session)
     }
 }
 
-/// Hold `label`'s binding lock: no bind, rebind or release of the label
-/// commits until the guard is dropped, so a binding checked under it stays
-/// the binding until then.
-pub(crate) fn hold_binding<'a>(
-    repo: &'a Path,
-    label: &'a AgentLabel,
-) -> anyhow::Result<BindingGuard<'a>> {
-    BindingGuard::acquire(repo, label)
+/// Hold `label`'s lock: no bind, rebind or release of the label, and no
+/// other write of its state, commits until the guard is dropped, so a
+/// binding checked under it stays the binding until then.
+pub(crate) fn hold_state(repo: &Path, label: &AgentLabel) -> anyhow::Result<StateGuard> {
+    StateGuard::acquire(repo, label)
 }
 
 /// Block until this process holds `path`'s exclusive flock, creating
@@ -632,19 +602,8 @@ pub(crate) fn exclusive_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
-/// [`exclusive_lock`] without waiting: `None` when the lock is held by
-/// another open file, which may be a spawned child's passing copy of
-/// one. Any other failure is an error, never `None`.
-pub(crate) fn try_exclusive_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    Ok(clank_user_config::lease::take_now(&file)?.then_some(file))
-}
-
 /// Record where `session`'s transcript lives — only while that session
-/// still holds the label. Compare-and-set under the binding lock for
+/// still holds the label. Compare-and-set under the agent's lock for
 /// the same reason release is: a path arriving after the label was
 /// rebound belongs to a session that is no longer this agent.
 pub fn record_transcript(
@@ -653,9 +612,9 @@ pub fn record_transcript(
     session: &SessionId,
     transcript: &str,
 ) -> anyhow::Result<bool> {
-    let guard = BindingGuard::acquire(repo, label)?;
-    identity::mutate(&guard, |cfg| {
-        let Some(bound) = cfg.session.as_mut().filter(|s| &s.id == session) else {
+    let guard = StateGuard::acquire(repo, label)?;
+    identity::mutate(&guard, |id| {
+        let Some(bound) = id.binding.as_mut().filter(|s| &s.id == session) else {
             return false;
         };
         bound.transcript = Some(transcript.to_string());
@@ -667,25 +626,29 @@ pub fn record_transcript(
 /// hook) before the next start forgets it.
 pub const CHECK_IN_WITHIN: time::Duration = time::Duration::seconds(60);
 
-/// Whether `pending` records a resume of `bound` that has gone
+/// Whether `pending`, a resume of the bound session, has gone
 /// [`CHECK_IN_WITHIN`] without checking in. An unreadable `at` is not
 /// evidence of anything.
-pub fn resume_unconfirmed(
-    pending: Option<&ResumePending>,
-    bound: &SessionId,
-    now: OffsetDateTime,
-) -> bool {
+pub fn resume_unconfirmed(pending: Option<&ResumePending>, now: OffsetDateTime) -> bool {
     pending.is_some_and(|p| {
-        &p.session == bound
-            && OffsetDateTime::parse(&p.at, &Rfc3339).is_ok_and(|at| now - at >= CHECK_IN_WITHIN)
+        OffsetDateTime::parse(&p.at, &Rfc3339).is_ok_and(|at| now - at >= CHECK_IN_WITHIN)
     })
 }
 
+/// The bound session and its unconfirmed resume, if one stands.
+pub fn resume_pending(
+    repo: &Path,
+    label: &AgentLabel,
+) -> anyhow::Result<(Option<Session>, Option<ResumePending>)> {
+    let state = state::State::load(&agents_root(repo).join(label.as_str()))?;
+    Ok((state.binding()?, state.resume_pending()?))
+}
+
 /// Record, before `session` is resumed, that it has yet to check in.
-/// A marker already standing for `session` is kept, so the window runs
-/// from the first unconfirmed attempt. Only a binding with a recorded
-/// transcript is armed: that field is written by the same hook that
-/// checks in, so for any other binding silence proves nothing.
+/// A marker already standing is kept, so the window runs from the first
+/// unconfirmed attempt. Only a binding with a recorded transcript is
+/// armed: that field is written by the same hook that checks in, so for
+/// any other binding silence proves nothing.
 pub fn arm_resume(
     repo: &Path,
     label: &AgentLabel,
@@ -693,25 +656,16 @@ pub fn arm_resume(
     now: OffsetDateTime,
 ) -> anyhow::Result<bool> {
     let at = now.format(&Rfc3339).context("formatting timestamp")?;
-    let guard = BindingGuard::acquire(repo, label)?;
-    mutate_locked(&guard, |cfg| {
-        let hook_ran = cfg
-            .session
+    let guard = StateGuard::acquire(repo, label)?;
+    identity::mutate(&guard, |id| {
+        let hook_ran = id
+            .binding
             .as_ref()
             .is_some_and(|s| &s.id == session && s.transcript.is_some());
         if !hook_ran {
             return false;
         }
-        if cfg
-            .resume_pending
-            .as_ref()
-            .is_none_or(|p| &p.session != session)
-        {
-            cfg.resume_pending = Some(ResumePending {
-                session: session.clone(),
-                at,
-            });
-        }
+        id.resume_pending.get_or_insert(ResumePending { at });
         true
     })
 }
@@ -722,16 +676,12 @@ pub fn resume_checked_in(
     label: &AgentLabel,
     session: &SessionId,
 ) -> anyhow::Result<bool> {
-    let guard = BindingGuard::acquire(repo, label)?;
-    identity::mutate(&guard, |cfg| {
-        if cfg
-            .resume_pending
-            .as_ref()
-            .is_none_or(|p| &p.session != session)
-        {
+    let guard = StateGuard::acquire(repo, label)?;
+    identity::mutate(&guard, |id| {
+        if id.binding.as_ref().is_none_or(|s| &s.id != session) || id.resume_pending.is_none() {
             return false;
         }
-        cfg.resume_pending = None;
+        id.resume_pending = None;
         true
     })
 }
@@ -751,10 +701,10 @@ pub(crate) enum Announcement {
 /// Announce an outage to `session`, at most once until a monitor serves
 /// it ([`outage_served`]).
 ///
-/// One transaction under the label's binding lock: the binding and the
-/// standing notice are checked, `deliver` runs, and the session is
-/// recorded as told only if it succeeded. Every waiter of a session
-/// announces through here, so two of them cannot both find it untold.
+/// One transaction under the agent's lock: the binding and the standing
+/// notice are checked, `deliver` runs, and the session is recorded as
+/// told only if it succeeded. Every waiter of a session announces
+/// through here, so two of them cannot both find it untold.
 pub(crate) fn announce_outage(
     repo: &Path,
     label: &AgentLabel,
@@ -763,21 +713,34 @@ pub(crate) fn announce_outage(
     deliver: &mut dyn FnMut() -> std::io::Result<()>,
 ) -> anyhow::Result<Announcement> {
     let at = now.format(&Rfc3339).context("formatting timestamp")?;
-    let guard = BindingGuard::acquire(repo, label)?;
-    mutate_locked(&guard, |cfg| {
-        let bound = cfg.session.as_ref().is_some_and(|s| &s.id == session);
-        if !bound || outage_told(cfg, session) {
-            return Announcement::Suppressed;
+    let agent_dir = agents_root(repo).join(label.as_str());
+    let permit = crate::upgrade::writing()?;
+    state::transact(&agent_dir, &permit, |txn| {
+        let told: Option<OutageNotified> = txn.bound(session, Bound::Outage)?;
+        let bound = txn.binding()?.is_some_and(|s| &s.id == session);
+        if !bound || told.is_some() {
+            return Ok(Announcement::Suppressed);
         }
         if let Err(e) = deliver() {
-            return Announcement::Undelivered(e);
+            return Ok(Announcement::Undelivered(e));
         }
-        cfg.outage_notified = Some(OutageNotified {
-            session: session.clone(),
-            at,
-        });
-        Announcement::Delivered
+        txn.patch(session, Bound::Outage, Some(&OutageNotified { at }))?;
+        Ok(Announcement::Delivered)
     })
+}
+
+/// `session`, bound to `label`, told its repo has no monitor.
+#[cfg(test)]
+pub(crate) fn told_of_an_outage(repo: &Path, label: &AgentLabel, session: &str) {
+    let told = announce_outage(
+        repo,
+        label,
+        &SessionId::parse(session).unwrap(),
+        OffsetDateTime::now_utc(),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert!(matches!(told, Announcement::Delivered), "{told:?}");
 }
 
 /// What serving a session did to its outage notice.
@@ -787,8 +750,8 @@ pub(crate) enum OutageServed {
     Cleared,
     /// No notice stood for the session.
     NoneStood,
-    /// The label's binding lock was held elsewhere, so nothing was read
-    /// or cleared: a notice standing for the session stays until a later
+    /// The agent's lock was held elsewhere, so nothing was read or
+    /// cleared: a notice standing for the session stays until a later
     /// serve finds the lock free.
     Contended,
 }
@@ -796,7 +759,7 @@ pub(crate) enum OutageServed {
 /// A monitor served `session`, so its outage is over and the next one is
 /// announced again.
 ///
-/// Never waits for the binding lock: an agent's process may hold it
+/// Never waits for the agent's lock: an agent's process may hold it
 /// across a side effect, and a server that waited would stall serving
 /// for every agent. Clearing is therefore best effort; a serve that
 /// finds the lock held clears nothing ([`OutageServed::Contended`]), and
@@ -815,22 +778,17 @@ pub(crate) fn outage_served(
     label: &AgentLabel,
     session: &SessionId,
 ) -> anyhow::Result<OutageServed> {
-    let Some(guard) = BindingGuard::try_acquire(repo, label)? else {
-        return Ok(OutageServed::Contended);
-    };
-    mutate_locked(&guard, |cfg| {
-        if !outage_told(cfg, session) {
-            return OutageServed::NoneStood;
+    let agent_dir = agents_root(repo).join(label.as_str());
+    let permit = crate::upgrade::writing()?;
+    let served = state::try_transact(&agent_dir, &permit, |txn| {
+        let told: Option<OutageNotified> = txn.bound(session, Bound::Outage)?;
+        if told.is_none() {
+            return Ok(OutageServed::NoneStood);
         }
-        cfg.outage_notified = None;
-        OutageServed::Cleared
-    })
-}
-
-fn outage_told(cfg: &AgentConfig, session: &SessionId) -> bool {
-    cfg.outage_notified
-        .as_ref()
-        .is_some_and(|told| &told.session == session)
+        txn.patch::<OutageNotified>(session, Bound::Outage, None)?;
+        Ok(OutageServed::Cleared)
+    })?;
+    Ok(served.unwrap_or(OutageServed::Contended))
 }
 
 /// Unbind `session` from `label` with its unconfirmed resume, only while
@@ -843,15 +801,14 @@ pub fn release_unconfirmed_resume(
     session: &SessionId,
     now: OffsetDateTime,
 ) -> anyhow::Result<bool> {
-    let guard = BindingGuard::acquire(repo, label)?;
-    mutate_locked(&guard, |cfg| {
-        if cfg.session.as_ref().is_none_or(|s| &s.id != session)
-            || !resume_unconfirmed(cfg.resume_pending.as_ref(), session, now)
+    let guard = StateGuard::acquire(repo, label)?;
+    identity::mutate(&guard, |id| {
+        if id.binding.as_ref().is_none_or(|s| &s.id != session)
+            || !resume_unconfirmed(id.resume_pending.as_ref(), now)
         {
             return false;
         }
-        cfg.session = None;
-        cfg.resume_pending = None;
+        id.binding = None;
         true
     })
 }
@@ -868,22 +825,22 @@ pub fn reserve_opencode_session(
     superseded: Option<&Session>,
     mint: impl FnOnce() -> SessionId,
 ) -> anyhow::Result<Session> {
-    let guard = BindingGuard::acquire(repo, label)?;
+    let guard = StateGuard::acquire(repo, label)?;
     reserve_opencode_locked(&guard, superseded, mint)
 }
 
 /// [`reserve_opencode_session`] for a caller already holding the label's
-/// binding lock, which it needs held across work before the bind.
+/// lock, which it needs held across work before the bind.
 pub(crate) fn reserve_opencode_locked(
-    guard: &BindingGuard,
+    guard: &StateGuard,
     superseded: Option<&Session>,
     mint: impl FnOnce() -> SessionId,
 ) -> anyhow::Result<Session> {
-    let label = guard.label;
+    let label = &guard.label;
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("formatting timestamp")?;
-    mutate_locked(guard, |cfg| match &cfg.session {
+    identity::mutate(guard, |id| match &id.binding {
         Some(s) if s.tool == Tool::OpenCode => Ok(s.clone()),
         Some(s) if Some(s) != superseded => Err(anyhow::anyhow!(
             "`{label}` was bound to {} session {} while it was starting",
@@ -897,12 +854,20 @@ pub(crate) fn reserve_opencode_locked(
                 updated_at: now,
                 transcript: None,
             };
-            cfg.session = Some(s.clone());
+            id.binding = Some(s.clone());
             Ok(s)
         }
     })?
 }
 
+/// Bind a session to an agent label, and clear the same session id from
+/// any OTHER agent that holds it. A different session than the one bound
+/// starts with nothing known of it ([`identity::mutate`]).
+///
+/// Single source of truth for the bind operation — used by
+/// `clank as` AND `clank init` phase 2 so the two-shells-one-
+/// session uniqueness invariant can't be re-introduced by a
+/// caller that forgets the clear-stale step.
 pub fn bind_session_to_agent(
     repo: &Path,
     label: &AgentLabel,
@@ -923,7 +888,7 @@ pub fn bind_session_to_agent(
     //
     // Under the label's lock, so a release that read this binding a
     // moment ago cannot land its clear on top of the claim.
-    let owned = BindingGuard::acquire(repo, label)?;
+    let owned = StateGuard::acquire(repo, label)?;
     let consume_grok_fork = if tool == Tool::Grok {
         crate::cli::grok_launch::check_binding(repo, label, session_id.as_str())?
     } else {
@@ -932,8 +897,8 @@ pub fn bind_session_to_agent(
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("formatting timestamp")?;
-    identity::mutate(&owned, |cfg| {
-        cfg.session = Some(Session {
+    identity::mutate(&owned, |id| {
+        id.binding = Some(Session {
             id: session_id.clone(),
             tool,
             updated_at: now,
@@ -1060,12 +1025,7 @@ mod tests {
     /// wait right now. Non-blocking: a fresh open of the lock file is a
     /// separate flock owner even within this process.
     fn domain_is_held(repo: &Path, l: &AgentLabel) -> bool {
-        let path = agents_root(repo).join(l.as_str()).join("binding.lock");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
+        let file = std::fs::File::open(agents_root(repo).join(l.as_str())).unwrap();
         !clank_user_config::lease::take(&file).unwrap()
     }
 
@@ -1137,7 +1097,7 @@ mod tests {
 
         set_auto_mode(&repo, &l, AutoMode::Off).unwrap();
         let cfg = load_agent_config(&repo, &l).unwrap().unwrap();
-        let bound = cfg.session.expect("binding kept");
+        let bound = identity::binding(&repo, &l).unwrap().expect("binding kept");
         assert_eq!(bound.id, session);
         assert_eq!(bound.transcript.as_deref(), Some("/t/a.jsonl"), "A's edit");
         assert_eq!(cfg.auto_mode, Some(AutoMode::Off), "B's edit");
@@ -1155,16 +1115,6 @@ mod tests {
 
         assert!(set_auto_mode(repo, &l, AutoMode::Off).is_err());
         assert!(update_agent_config(repo, &l, |_| {}).is_err());
-        assert!(release_binding(repo, &l, &sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3")).is_err());
-        assert!(
-            bind_session_to_agent(
-                repo,
-                &l,
-                Tool::Claude,
-                &sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3")
-            )
-            .is_err()
-        );
         assert_eq!(std::fs::read(&path).unwrap(), garbage);
     }
 
@@ -1183,10 +1133,8 @@ mod tests {
         bind_session_to_agent(repo, &l, Tool::Claude, &old).unwrap();
         assert!(record_transcript(repo, &l, &old, "/t/old.jsonl").unwrap());
         assert_eq!(
-            load_agent_config(repo, &l)
+            identity::binding(repo, &l)
                 .unwrap()
-                .unwrap()
-                .session
                 .unwrap()
                 .transcript
                 .as_deref(),
@@ -1203,12 +1151,7 @@ mod tests {
             "the old session's path does not land on the new binding"
         );
         assert_eq!(
-            load_agent_config(repo, &l)
-                .unwrap()
-                .unwrap()
-                .session
-                .unwrap()
-                .transcript,
+            identity::binding(repo, &l).unwrap().unwrap().transcript,
             None,
             "a fresh binding starts without a transcript until its own session reports one"
         );
@@ -1554,33 +1497,7 @@ mod tests {
     }
 
     fn pending(repo: &Path, l: &AgentLabel) -> Option<ResumePending> {
-        load_agent_config(repo, l)
-            .unwrap()
-            .and_then(|c| c.resume_pending)
-    }
-
-    #[test]
-    fn a_config_from_before_the_marker_parses_and_the_marker_round_trips() {
-        let old: AgentConfig = serde_json::from_str(&format!(
-            r#"{{ "session": {{ "id": "{RESUMED}", "tool": "claude", "updated_at": "x" }} }}"#
-        ))
-        .unwrap();
-        assert_eq!(old.resume_pending, None);
-        assert!(
-            !serde_json::to_string(&old)
-                .unwrap()
-                .contains("resume_pending")
-        );
-        let armed = AgentConfig {
-            resume_pending: Some(ResumePending {
-                session: sid(RESUMED),
-                at: "2026-11-03T00:00:00Z".into(),
-            }),
-            ..old
-        };
-        let back: AgentConfig =
-            serde_json::from_str(&serde_json::to_string(&armed).unwrap()).unwrap();
-        assert_eq!(back, armed);
+        resume_pending(repo, l).unwrap().1
     }
 
     #[test]
@@ -1598,47 +1515,17 @@ mod tests {
         assert_eq!(
             pending(repo, &l),
             Some(ResumePending {
-                session: sid(RESUMED),
                 at: "2026-11-03T00:00:00Z".into(),
             })
         );
     }
 
     fn told(repo: &Path, l: &AgentLabel) -> Option<OutageNotified> {
-        load_agent_config(repo, l)
+        state::State::load(&agents_root(repo).join(l.as_str()))
             .unwrap()
-            .and_then(|c| c.outage_notified)
-    }
-
-    #[test]
-    fn a_config_from_before_the_outage_notice_parses_and_the_notice_round_trips() {
-        let bytes =
-            format!(r#"{{"session":{{"id":"{RESUMED}","tool":"claude","updated_at":"x"}}}}"#);
-        let old: AgentConfig = serde_json::from_str(&bytes).unwrap();
-        assert_eq!(old.outage_notified, None);
-        assert_eq!(
-            serde_json::to_string(&old).unwrap(),
-            bytes,
-            "a config never told of an outage keeps its bytes"
-        );
-        let noted = AgentConfig {
-            outage_notified: Some(OutageNotified {
-                session: sid(RESUMED),
-                at: "2026-11-10T00:00:00Z".into(),
-            }),
-            ..old
-        };
-        let written = serde_json::to_string(&noted).unwrap();
-        assert!(
-            written.ends_with(&format!(
-                r#""outage_notified":{{"session":"{RESUMED}","at":"2026-11-10T00:00:00Z"}}}}"#
-            )),
-            "{written}"
-        );
-        assert_eq!(
-            serde_json::from_str::<AgentConfig>(&written).unwrap(),
-            noted
-        );
+            .current(Bound::Outage)
+            .unwrap()
+            .map(|(_, told)| told)
     }
 
     fn announce(repo: &Path, l: &AgentLabel, session: &str, at_: &str) -> Announcement {
@@ -1789,27 +1676,6 @@ mod tests {
         assert_eq!(told(repo, &l), None);
     }
 
-    /// Once dropped, the lock is freed when the last copy of its fd closes:
-    /// a spawn on another test's thread may hold one until its exec, so
-    /// that is waited for rather than tried at an unknown moment.
-    #[test]
-    fn a_held_lock_is_not_taken_and_a_free_one_is() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("held.lock");
-        let held = try_exclusive_lock(&path).unwrap().expect("free");
-        assert!(try_exclusive_lock(&path).unwrap().is_none(), "contended");
-        drop(held);
-        crate::cli::github::log::tests::within("the dropped lock", move || {
-            exclusive_lock(&path).expect("freed by the drop")
-        });
-    }
-
-    #[test]
-    fn a_lock_that_cannot_be_opened_is_an_error_not_contention() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(try_exclusive_lock(&dir.path().join("missing/held.lock")).is_err());
-    }
-
     #[test]
     fn re_arming_the_same_session_keeps_the_first_attempt() {
         let dir = tempfile::tempdir().unwrap();
@@ -1821,7 +1687,6 @@ mod tests {
         assert_eq!(pending(repo, &l).unwrap().at, "2026-11-03T00:00:00Z");
         assert!(resume_unconfirmed(
             pending(repo, &l).as_ref(),
-            &sid(RESUMED),
             at("2026-11-03T00:01:00Z")
         ));
     }

@@ -545,11 +545,14 @@ mod tests {
             tool_response: None,
         };
         let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
+        let state_path = crate::agent_store::state::path(&dir);
+        let questions = || {
+            crate::agent_store::state::tests::raw(&dir)
+                .pointer("/bound/questions")
+                .cloned()
+        };
         let (_, request) = evidence(&hook).unwrap().unwrap();
-        assert!(
-            !super::super::question_state::path(&dir).exists(),
-            "the adapter writes nothing"
-        );
+        assert_eq!(questions(), None, "the adapter writes nothing");
         super::super::monitor::question_control(repo.path(), &request).unwrap();
         assert_eq!(
             super::super::question_state::asking(&dir, &hook.session_id)
@@ -561,14 +564,16 @@ mod tests {
         let (_, finished) = evidence(&hook).unwrap().unwrap();
         super::super::monitor::question_control(repo.path(), &finished).unwrap();
         assert!(super::super::question_state::asking(&dir, &hook.session_id).is_none());
-        let before = std::fs::read(super::super::question_state::path(&dir)).unwrap();
-        std::fs::write(super::super::question_state::path(&dir), "not json").unwrap();
+        let before = std::fs::read(&state_path).unwrap();
+        let mut unreadable = crate::agent_store::state::tests::raw(&dir);
+        unreadable["bound"]["questions"] = "not questions".into();
+        std::fs::write(&state_path, unreadable.to_string()).unwrap();
         assert!(
             super::super::monitor::question_control(repo.path(), &request)
                 .unwrap_err()
-                .contains("unreadable")
+                .contains("malformed")
         );
-        std::fs::write(super::super::question_state::path(&dir), &before).unwrap();
+        std::fs::write(&state_path, &before).unwrap();
         crate::agent_store::bind_session_to_agent(
             repo.path(),
             &author,
@@ -576,10 +581,8 @@ mod tests {
             &clank_core::SessionId::parse("replacement").unwrap(),
         )
         .unwrap();
+        let rebound = std::fs::read(&state_path).unwrap();
         assert!(super::super::monitor::question_control(repo.path(), &request).is_err());
-        assert_eq!(
-            std::fs::read(super::super::question_state::path(&dir)).unwrap(),
-            before
-        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), rebound);
     }
 }

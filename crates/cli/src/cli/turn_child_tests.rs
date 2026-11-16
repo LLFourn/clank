@@ -112,9 +112,13 @@ pub(crate) fn within(ahead: std::time::Duration) -> u64 {
 }
 
 pub(crate) fn told(repo: &Path, author: &AgentLabel) -> bool {
-    crate::agent_store::load_agent_config(repo, author)
-        .unwrap()
-        .is_some_and(|cfg| cfg.outage_notified.is_some())
+    crate::agent_store::state::State::load(
+        &crate::agent_store::agents_root(repo).join(author.as_str()),
+    )
+    .unwrap()
+    .current::<serde_json::Value>(crate::agent_store::Bound::Outage)
+    .unwrap()
+    .is_some()
 }
 
 fn outage_notice() -> Frame {
@@ -1173,12 +1177,14 @@ async fn malformed_monitor_policy_cannot_change_a_hook_outage_into_a_wake() {
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     doc["auto_mode"] = serde_json::json!(["invalid"]);
     doc["wait_events"] = serde_json::json!("invalid");
-    doc["outage_notified"] = serde_json::json!(42);
     std::fs::write(&path, doc.to_string()).unwrap();
-    // No role, block or question state can be read successfully either.
+    // No role, block, outage or question state can be read successfully
+    // either.
     std::fs::write(repo.path().join(".clank/config.json"), "not json").unwrap();
     let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
-    std::fs::write(dir.join("question.json"), "not json").unwrap();
+    let mut state = crate::agent_store::state::tests::raw(&dir);
+    state["bound"] = serde_json::json!({"outage": 42, "questions": "not json"});
+    std::fs::write(crate::agent_store::state::path(&dir), state.to_string()).unwrap();
     let attach = |_: Who| -> Attaching<'_> { Box::pin(async { no_binary() }) };
     assert_eq!(
         carried(repo.path(), &author, &handoff(), &attach).await,

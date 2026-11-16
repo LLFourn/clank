@@ -155,9 +155,8 @@ fn a_declaration_is_in_force_at_once_and_shown() {
             "{tool:?}"
         );
         assert!(
-            crate::agent_store::agents_root(repo.path())
-                .join("agent/turn.json")
-                .exists(),
+            super::stored_record(&crate::agent_store::agents_root(repo.path()).join("agent"))
+                .is_some(),
             "the monitor keeps it beside the agent"
         );
     }
@@ -273,8 +272,9 @@ fn reborn() -> clank_core::turn_policy::ShellProof {
     )
 }
 
-/// Every file under `who`'s agent directory but its turn state, with its
-/// bytes: whatever a run's end could have written anywhere for the agent.
+/// Every file under `who`'s agent directory with its bytes, its state
+/// without its turn record: whatever a run's end could have written
+/// anywhere for the agent.
 fn written_for(repo: &Path, who: &str) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     fn walk(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -284,7 +284,14 @@ fn written_for(repo: &Path, who: &str) -> std::collections::BTreeMap<PathBuf, Ve
             let path = entry.unwrap().path();
             if path.is_dir() {
                 walk(&path, out);
-            } else if path.file_name() != Some(std::ffi::OsStr::new("turn.json")) {
+            } else if path.file_name() == Some(std::ffi::OsStr::new("state.json")) {
+                let mut doc: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                if let Some(bound) = doc.get_mut("bound").and_then(|b| b.as_object_mut()) {
+                    bound.remove("turn");
+                }
+                out.insert(path.clone(), doc.to_string().into_bytes());
+            } else {
                 out.insert(path.clone(), std::fs::read(&path).unwrap());
             }
         }
@@ -360,7 +367,9 @@ fn a_restart_retires_a_run_that_ended_unwatched() {
             &g,
         )
         .unwrap();
-    let saved = crate::agent_store::agents_root(repo.path()).join("claude/turn.json");
+    let saved = crate::agent_store::state::path(
+        &crate::agent_store::agents_root(repo.path()).join("claude"),
+    );
     let stale = std::fs::read(&saved).unwrap();
     let before = written_for(repo.path(), "claude");
 
@@ -422,26 +431,33 @@ fn old_run_ended_bytes_load_and_are_never_owed_shown_or_presented() {
     let author = label("claude");
     let dir = crate::agent_store::agents_root(repo.path()).join("claude");
     std::fs::create_dir_all(dir.join("events")).unwrap();
-    for (name, bytes) in [
-        (
-            "events/messages.jsonl",
-            include_str!("../../tests/fixtures/formats/events-run-ended.jsonl"),
-        ),
-        (
-            "turn.json",
-            include_str!("../../tests/fixtures/formats/turn-run-ended-owed.json"),
-        ),
-        (
-            "ledger.json",
-            include_str!("../../tests/fixtures/formats/ledger-run-ended.json"),
-        ),
-        (
-            "delivered.json",
-            include_str!("../../tests/fixtures/formats/delivered-run-ended.json"),
-        ),
-    ] {
-        std::fs::write(dir.join(name), bytes).unwrap();
-    }
+    std::fs::write(
+        dir.join("events/messages.jsonl"),
+        include_str!("../../tests/fixtures/formats/events-run-ended.jsonl"),
+    )
+    .unwrap();
+    super::place_stored(
+        &dir,
+        include_str!("../../tests/fixtures/formats/turn-run-ended-owed.json"),
+    );
+    let ledger: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/formats/ledger-run-ended.json"
+    ))
+    .unwrap();
+    let delivered: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/formats/delivered-run-ended.json"
+    ))
+    .unwrap();
+    let permit = crate::upgrade::writing().unwrap();
+    crate::agent_store::state::transact(&dir, &permit, |txn| {
+        txn.keep(crate::agent_store::state::Kept::Ledger, Some(&ledger))?;
+        txn.patch(
+            &sid(SESSION),
+            crate::agent_store::state::Bound::Delivered,
+            Some(&delivered["delivered"]),
+        )
+    })
+    .unwrap();
     let events = dir.join("events");
 
     let loaded = EventLog::open(&events, crate::inbox::MESSAGES_SOURCE)
@@ -1202,7 +1218,7 @@ fn a_stops_question_evidence_ends_the_question() {
         }],
     );
     assert!(super::super::question_state::asking(&dir, "session-one").is_some());
-    let turns = Turns::new(repo.path().to_path_buf());
+    let mut turns = Turns::new(repo.path().to_path_buf());
     let Report::TurnEnd { stop, deadline, .. } = stop(Tool::Claude, "session-one", None) else {
         unreachable!()
     };
@@ -1786,7 +1802,8 @@ async fn a_delayed_completion_after_identical_reuse_deletes_nothing() {
 }
 
 /// While attending, a delivery renders only the work this session has not
-/// received, and what it received survives a monitor restart in turn.json.
+/// received, and what it received survives a monitor restart in its turn
+/// record.
 #[test]
 fn an_attending_delivery_renders_only_unreceived_work_across_a_restart() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
@@ -1952,8 +1969,8 @@ fn a_registration_that_cannot_be_written_is_refused() {
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "claude", &[]);
-    let stored = crate::agent_store::agents_root(repo.path()).join("claude/turn.json");
-    std::fs::create_dir_all(&stored).unwrap();
+    let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+    let unwritable = crate::agent_store::state::tests::unwritable(&dir);
     let refused = turns
         .attend(
             &author,
@@ -1966,7 +1983,7 @@ fn a_registration_that_cannot_be_written_is_refused() {
     assert_eq!(turns.next_deadline(), None);
     assert!(!turns.end_gone_runs(&author, &g));
 
-    std::fs::remove_dir(&stored).unwrap();
+    drop(unwritable);
     turns
         .attend(
             &author,
@@ -1974,7 +1991,7 @@ fn a_registration_that_cannot_be_written_is_refused() {
             &g,
         )
         .expect("once it can be written, it is accepted");
-    assert!(stored.is_file());
+    assert!(super::stored_record(&dir).is_some());
 }
 
 fn presented(turns: &mut Turns, conn: u64, g: &Gathered) -> PresentationId {
@@ -2223,7 +2240,6 @@ async fn a_committed_delivery_leaves_the_bound_sessions_receipt() {
         "the session that saw it holds its receipt"
     );
 
-    std::fs::remove_file(crate::cli::presentation::receipts_path(&dir)).unwrap();
     let commit = deliver(&mut turns, 2);
     crate::agent_store::bind_session_to_agent(
         repo.path(),
@@ -2233,16 +2249,19 @@ async fn a_committed_delivery_leaves_the_bound_sessions_receipt() {
     )
     .unwrap();
     commit.run(repo.path()).await;
-    assert!(
-        !crate::cli::presentation::receipts_path(&dir).exists(),
+    assert_eq!(
+        crate::agent_store::state::tests::raw(&dir).pointer("/bound/delivered"),
+        None,
         "a session that no longer holds the label is given no receipt"
     );
 }
 
-fn turn_file(fixture: &super::super::wake_receipt::fixtures::Fixture) -> PathBuf {
-    crate::agent_store::agents_root(&fixture.repo)
-        .join(fixture.author.as_str())
-        .join("turn.json")
+fn turn_record(
+    fixture: &super::super::wake_receipt::fixtures::Fixture,
+) -> Option<serde_json::Value> {
+    super::stored_record(
+        &crate::agent_store::agents_root(&fixture.repo).join(fixture.author.as_str()),
+    )
 }
 
 /// A newer clank installed after a presentation left and before its
@@ -2263,7 +2282,7 @@ async fn an_install_between_a_presentation_and_its_result_loses_neither() {
     let mut turns = Turns::new(fixture.repo.clone()).guarded_by(authority.clone());
     let (frame, g) = present_receipt(&fixture, &mut turns, Tool::Claude, 1);
     let presentation = frame.presentation().expect("presented").clone();
-    let in_flight = std::fs::read(turn_file(&fixture)).unwrap();
+    let in_flight = turn_record(&fixture);
 
     installed.replace(1);
     assert!(
@@ -2282,7 +2301,7 @@ async fn an_install_between_a_presentation_and_its_result_loses_neither() {
         None,
         "a stale monitor answers nothing new"
     );
-    assert_eq!(std::fs::read(turn_file(&fixture)).unwrap(), in_flight);
+    assert_eq!(turn_record(&fixture), in_flight);
 
     std::fs::write(fixture.marker(), "flushed").unwrap();
     let commit = turns
@@ -2294,8 +2313,7 @@ async fn an_install_between_a_presentation_and_its_result_loses_neither() {
         )
         .unwrap()
         .expect("the delivery commits");
-    let stored: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(turn_file(&fixture)).unwrap()).unwrap();
+    let stored = turn_record(&fixture).unwrap();
     assert!(
         stored["outstanding"].is_null(),
         "the result was not written: {stored}"
@@ -2331,8 +2349,7 @@ fn a_stale_monitors_failed_presentation_is_written_and_frees_it() {
     assert!(matches!(authority.look(), Standing::Quiescing { .. }));
 
     turns.closed(&fixture.author, 1, &g);
-    let stored: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(turn_file(&fixture)).unwrap()).unwrap();
+    let stored = turn_record(&fixture).unwrap();
     assert!(stored["outstanding"].is_null(), "{stored}");
     assert!(matches!(authority.standing(), Standing::Replaceable { .. }));
 }
@@ -2363,28 +2380,7 @@ fn a_stale_monitor_answers_no_report_and_writes_no_turn_state() {
         assert_eq!(turns.answer(&fixture.author, 1, &report, true, &g), None);
     }
     assert!(!turns.presenting(&fixture.author));
-    assert!(!turn_file(&fixture).exists());
-}
-
-/// An agent that lost its binding under a stale monitor keeps its turn
-/// state on disk for the monitor that follows, which retires it the same
-/// way; on its own build the monitor removes it.
-#[test]
-fn a_stale_monitor_leaves_an_unbound_agents_turn_state_for_its_successor() {
-    let fixture = receipt_fixture(Tool::Claude);
-    let installed = crate::upgrade::tests::Installed::current();
-    let mut turns = Turns::new(fixture.repo.clone()).guarded_by(installed.authority());
-    let (_, g) = present_receipt(&fixture, &mut turns, Tool::Claude, 1);
-    turns.closed(&fixture.author, 1, &g);
-    assert!(turn_file(&fixture).exists());
-
-    installed.replace(1);
-    turns.retire(&fixture.author);
-    assert!(turn_file(&fixture).exists(), "a stale monitor removed it");
-
-    installed.install(crate::build_stamp::running());
-    turns.retire(&fixture.author);
-    assert!(!turn_file(&fixture).exists());
+    assert!(turn_record(&fixture).is_none());
 }
 
 const IMPLEMENT_X: &str = "Implement X";
@@ -2475,7 +2471,7 @@ fn recorded(turns: &mut Turns, author: &AgentLabel, report: &Report, g: &Gathere
 /// task; where the agent's turn was open it adds that the task may be the
 /// agent's own; after a start that could not be ordered it says the
 /// subagent may be running again. A running one says none of it. Each is
-/// taken with no fold, is written to `turn.json`, and reads the same to a
+/// taken with no fold, is written to its turn record, and reads the same to a
 /// monitor started afterwards.
 #[test]
 fn a_parked_attendance_says_what_it_rests_on() {
@@ -2594,7 +2590,7 @@ fn a_parked_attendance_says_what_it_rests_on() {
     }
 }
 
-/// `turn.json` as the last build before listings were remembered wrote
+/// A turn record as the last build before listings were remembered wrote
 /// it, read from disk by the monitor: the declaration is still attended,
 /// as a task running. It names no kind, so it keeps the rule it was bound
 /// by: its subagent's stop, which still lists it, leaves it attended with
@@ -2605,7 +2601,8 @@ fn a_turn_state_written_before_listings_were_remembered_is_kept() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let dir = crate::agent_store::agents_root(repo.path()).join("claude");
-    std::fs::write(dir.join("turn.json"), OLD).unwrap();
+    super::place_stored(&dir, OLD);
+    let placed = std::fs::read(crate::agent_store::state::path(&dir)).unwrap();
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "claude", &[]).at(1_000_000 + MINUTE);
     let attended = turns.projection(&author, &g).attended;
@@ -2614,8 +2611,8 @@ fn a_turn_state_written_before_listings_were_remembered_is_kept() {
         "{attended:?}"
     );
     assert_eq!(
-        std::fs::read_to_string(dir.join("turn.json")).unwrap(),
-        OLD,
+        std::fs::read(crate::agent_store::state::path(&dir)).unwrap(),
+        placed,
         "reading it rewrites nothing"
     );
     let stops = child_stop(
@@ -2760,4 +2757,245 @@ fn a_stop_replayed_to_a_new_monitor_keeps_an_unsettled_barrier() {
             .is_some_and(|t| t.contains("message: 7")),
         "{woke:?}"
     );
+}
+
+/// The question a Claude agent in `session` asks in prompt `p1`.
+fn asked_in(session: &str) -> super::super::question_state::Observation {
+    super::super::question_state::Observation::Asked {
+        key: super::super::question_state::Key {
+            session: session.into(),
+            prompt: "p1".into(),
+            tool_use: "t1".into(),
+        },
+        header: "Which?".into(),
+        input: "h".into(),
+    }
+}
+
+/// A monitor holding custody of a session from before a rebind persists
+/// its turn record after it: the stale patch is refused, the new binding
+/// stands, and what is known of the new session stays reset.
+#[test]
+fn a_stale_turn_record_restores_no_binding_and_no_old_state() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let before_rebind = gathered(repo.path(), "claude", &[]);
+    turns
+        .attend(
+            &author,
+            run_request("session-one", "test run", this_process()),
+            &before_rebind,
+        )
+        .unwrap();
+    super::super::question_state::observe(&dir, [asked_in("session-one")]);
+    assert!(super::stored_record(&dir).is_some());
+
+    crate::agent_store::bind_session_to_agent(
+        repo.path(),
+        &author,
+        Tool::Claude,
+        &sid("session-two"),
+    )
+    .unwrap();
+    let rebound = std::fs::read(crate::agent_store::state::path(&dir)).unwrap();
+
+    let refused = turns
+        .attend(
+            &author,
+            run_request("session-one", "another run", this_process()),
+            &before_rebind,
+        )
+        .expect_err("a stale session's record is not written");
+    assert!(refused.contains("no longer holds the label"), "{refused}");
+    turns.answer(
+        &author,
+        3,
+        &stop(Tool::Claude, "session-one", None),
+        true,
+        &before_rebind,
+    );
+    assert_eq!(
+        std::fs::read(crate::agent_store::state::path(&dir)).unwrap(),
+        rebound,
+        "nothing of the stale session was written"
+    );
+    assert_eq!(
+        crate::agent_store::binding_in(&dir).unwrap().unwrap().id,
+        sid("session-two"),
+        "the new binding stands"
+    );
+    assert_eq!(super::stored_record(&dir), None, "its turn record is reset");
+    assert!(
+        super::super::question_state::asking(&dir, "session-two").is_none(),
+        "its questions are reset"
+    );
+}
+
+/// A question update and the monitor's turn record each land between the
+/// other's computing its change and committing it: both survive, since
+/// each writer reloads the document under the lock and patches its own
+/// part.
+#[test]
+fn a_question_update_and_a_turn_record_landing_together_both_survive() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "claude", &[]);
+
+    let asking = dir.clone();
+    crate::agent_store::state::tests::interleave(move || {
+        super::super::question_state::observe(&asking, [asked_in("session-one")])
+    });
+    turns
+        .attend(
+            &author,
+            run_request("session-one", "test run", this_process()),
+            &g,
+        )
+        .unwrap();
+    assert!(
+        super::super::question_state::asking(&dir, "session-one").is_some(),
+        "the question landed inside the turn record's write, and stands"
+    );
+    let attended = |dir: &Path| {
+        super::load_stored(dir)
+            .map(|r| r.attendances.len())
+            .unwrap_or(0)
+    };
+    assert_eq!(attended(&dir), 1, "and so does the turn record");
+
+    let monitor = repo.path().to_path_buf();
+    crate::agent_store::state::tests::interleave(move || {
+        let g = gathered(&monitor, "claude", &[]);
+        Turns::new(monitor.clone())
+            .attend(
+                &label("claude"),
+                AttendRequest::Declare {
+                    session: sid("session-one"),
+                    name: IMPLEMENT_X.into(),
+                    desc: None,
+                    expect: 10 * MINUTE,
+                },
+                &g,
+            )
+            .unwrap();
+    });
+    super::super::question_state::observe(
+        &dir,
+        [super::super::question_state::Observation::TurnOver {
+            session: "session-one".into(),
+            prompt: "p1".into(),
+        }],
+    );
+    assert!(
+        super::super::question_state::asking(&dir, "session-one").is_none(),
+        "the question's end stands"
+    );
+    assert_eq!(
+        attended(&dir),
+        2,
+        "the turn record that landed inside the question's write stands"
+    );
+}
+
+/// A fresh agent, bound and with every runtime part written by its own
+/// writer, keeps exactly its configuration, its state and its history in
+/// its directory, and names its session once.
+#[test]
+fn a_fresh_agent_keeps_exactly_its_files_and_names_its_session_once() {
+    const SESSION: &str = "0f3e5c2a-1b4d-4e6f-8a9b-0c1d2e3f4a5b";
+    let repo = repo_with("claude", Tool::Claude, SESSION);
+    let author = label("claude");
+    let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+    let session = sid(SESSION);
+    let permit = crate::upgrade::writing().unwrap();
+
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "claude", &[]);
+    turns
+        .attend(
+            &author,
+            run_request(SESSION, "test run", this_process()),
+            &g,
+        )
+        .unwrap();
+    super::super::question_state::observe(&dir, [asked_in(SESSION)]);
+    crate::agent_store::told_of_an_outage(repo.path(), &author, SESSION);
+    let guard = crate::agent_store::hold_state(repo.path(), &author).unwrap();
+    assert!(
+        super::super::presentation::receive(
+            &guard,
+            Tool::Claude,
+            SESSION,
+            &["item".into()],
+            9,
+            &permit
+        )
+        .unwrap()
+    );
+    drop(guard);
+    crate::cli::recovery::store_issued(&dir, 4).unwrap();
+    assert!(
+        crate::cli::ledger::store(
+            &dir,
+            &[(
+                "item".to_string(),
+                crate::cli::ledger::Obligation::Owed {
+                    owed_since: crate::cli::ledger::Since::At(1)
+                }
+            )]
+            .into()
+        )
+        .unwrap()
+    );
+    assert!(crate::cli::agent_state::store(
+        &dir,
+        &session,
+        &crate::cli::agent_state::AgentState {
+            monitor: crate::cli::agent_state::Observer::me(),
+            activity: crate::cli::agent_state::Activity::Idle,
+            since: 0,
+            reachability: Default::default(),
+            owed: None,
+            nudge: crate::cli::agent_state::Nudge::Nothing,
+            cannot_resume: None,
+            attending: Vec::new(),
+            asking: None,
+            repeated: None,
+        },
+        &permit,
+    ));
+    crate::cli::nudge_log::append(
+        &dir,
+        &crate::cli::nudge_log::Record {
+            at: 1,
+            attempt: crate::cli::nudge_log::manual_attempt(),
+            trigger: crate::cli::nudge_log::Trigger::Manual,
+            text: "go on".into(),
+            outcome: crate::cli::nudge_log::Outcome::Submitted,
+        },
+    )
+    .unwrap();
+
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["config.json", "nudges.jsonl", "state.json"]);
+    let state = std::fs::read_to_string(crate::agent_store::state::path(&dir)).unwrap();
+    for part in ["turn", "questions", "delivered", "projection", "outage"] {
+        assert!(
+            crate::agent_store::state::tests::raw(&dir)["bound"]
+                .get(part)
+                .is_some(),
+            "{part}: {state}"
+        );
+    }
+    assert_eq!(state.matches(SESSION).count(), 1, "{state}");
+    let config = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    assert!(!config.contains(SESSION), "{config}");
 }

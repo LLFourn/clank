@@ -4731,9 +4731,10 @@ fn unavailable_somewhere(
 }
 
 /// A lock the loop found held was released ([`Releases`]): re-run each
-/// hosted timer's contended arm or acceptance, and serve again every
-/// waiting client and held report, whose reads went without a held log's
-/// items.
+/// hosted timer's contended arm or acceptance, write what an agent's held
+/// lock left unwritten of its turn record and questions, and serve again
+/// every waiting client and held report, whose reads went without a held
+/// log's items.
 #[allow(clippy::too_many_arguments)]
 fn retry_contended(
     repo: &std::path::Path,
@@ -4749,6 +4750,7 @@ fn retry_contended(
             timers.retry_contended();
         }
     }
+    turns.retry_unwritten();
     let mut leaving = Vec::new();
     if let Some(state) = state {
         leaving.extend(serve_to_cached(
@@ -4880,10 +4882,9 @@ struct LoopAgents<'a> {
 
 impl crate::cli::user_command::dispatch::Agents for LoopAgents<'_> {
     fn binding(&self, label: &AgentLabel) -> Option<(clank_core::Tool, clank_core::SessionId)> {
-        crate::agent_store::load_agent_config(self.repo, label)
+        crate::agent_store::binding(self.repo, label)
             .ok()
             .flatten()
-            .and_then(|c| c.session)
             .map(|s| (s.tool, s.id))
     }
 
@@ -4985,11 +4986,7 @@ fn recovery_facts(
             continue;
         };
         let dir = crate::agent_store::agents_root(repo).join(author.as_str());
-        if crate::cli::question_state::path(&dir).exists() {
-            // A question of a session no longer the agent's is over.
-            crate::cli::question_state::observe(&dir, []);
-        }
-        let Some(session) = cfg.as_ref().and_then(|c| c.session.clone()) else {
+        let Ok(Some(session)) = crate::agent_store::binding(repo, &author) else {
             continue;
         };
         bound.insert(author.clone());
@@ -5332,20 +5329,32 @@ fn recovery_gate(
     session: &str,
     owed: &[WaitItem],
 ) -> crate::cli::recovery::Gate {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    recovery_gate_in(repo, home.as_deref(), clients, turns, author, session, owed)
+}
+
+fn recovery_gate_in(
+    repo: &std::path::Path,
+    home: Option<&std::path::Path>,
+    clients: &[Client],
+    turns: &mut crate::cli::turn_custody::Turns,
+    author: &AgentLabel,
+    session: &str,
+    owed: &[WaitItem],
+) -> crate::cli::recovery::Gate {
     use crate::cli::recovery::Gate;
-    let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, author) else {
+    let Ok(cfg) = crate::agent_store::load_agent_config(repo, author) else {
         return Gate::SessionChanged;
     };
-    if cfg
-        .session
-        .as_ref()
+    if crate::agent_store::binding(repo, author)
+        .ok()
+        .flatten()
         .is_none_or(|s| s.id.as_str() != session)
     {
         return Gate::SessionChanged;
     }
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if !matches!(
-        crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home.as_deref()),
+        crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home),
         Ok(clank_core::AutoMode::On)
     ) {
         return Gate::AutoOff;
@@ -5463,10 +5472,9 @@ fn may_send_now(
     let live = crate::cli::recovery::Live {
         role: role.to_string(),
         work: identities(&owed),
-        bound: crate::agent_store::load_agent_config(repo, &a.author)
+        bound: crate::agent_store::binding(repo, &a.author)
             .ok()
             .flatten()
-            .and_then(|c| c.session)
             .as_ref()
             .map(crate::cli::recovery::Bound::of),
         transport: a.transport,
@@ -8560,7 +8568,7 @@ fn serve_reports(
             }
             match crate::agent_store::outage_served(repo, &author, &session) {
                 Ok(crate::agent_store::OutageServed::Contended) => {
-                    tracing::debug!("the binding lock is held; the outage notice stands")
+                    tracing::debug!("the agent's state lock is held; the outage notice stands")
                 }
                 Ok(_) => {}
                 Err(e) => tracing::debug!(%e, "could not clear the served outage"),
@@ -8733,12 +8741,17 @@ pub(crate) fn question_control(
     if observed_session != session.as_str() {
         return Err("question session does not match sender".into());
     }
-    super::question_state::try_observe(
+    let recorded = super::question_state::try_observe(
         &crate::agent_store::agents_root(repo).join(author.as_str()),
         [observation.clone()],
     )
     .map_err(|e| format!("question evidence could not be recorded: {e:#}"))?;
-    Ok("recorded".into())
+    match recorded {
+        true => Ok("recorded".into()),
+        false => Err(
+            "another clank process holds the agent's state; the evidence was not recorded".into(),
+        ),
+    }
 }
 
 /// Carry out a recovery transport's request: record a turn the harness
@@ -9159,12 +9172,9 @@ mod recovery_tests {
                 author: self.codex.clone(),
                 agent_dir: crate::agent_store::agents_root(self.repo.path()).join("codex"),
                 session: {
-                    let bound =
-                        crate::agent_store::load_agent_config(self.repo.path(), &self.codex)
-                            .unwrap()
-                            .unwrap()
-                            .session
-                            .unwrap();
+                    let bound = crate::agent_store::binding(self.repo.path(), &self.codex)
+                        .unwrap()
+                        .unwrap();
                     let mut session = serde_json::to_value(bound).unwrap();
                     session["transcript"] = serde_json::json!(self.record);
                     serde_json::from_value(session).unwrap()
@@ -9985,7 +9995,7 @@ mod recovery_tests {
         bind(clank_core::Tool::Codex, "session-one");
         facts();
         assert!(
-            crate::cli::question_state::load(&qdir)
+            crate::cli::question_state::load(&qdir, "session-one")
                 .unwrap()
                 .pending
                 .is_empty()
@@ -10151,6 +10161,46 @@ mod recovery_tests {
             handled[0].ledger.owed().is_empty(),
             "handled work owes nothing: {handled:?}"
         );
+    }
+
+    /// Binding writes no `config.json`, so an agent on the user's default
+    /// has none: its binding alone says whose the attempt is, and its auto
+    /// mode is inherited.
+    #[test]
+    fn a_binding_without_agent_config_is_its_session_and_inherits_auto_mode() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let codex = AgentLabel::parse("codex").unwrap();
+        let mut turns = crate::cli::turn_custody::Turns::new(repo.path().to_path_buf());
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &codex,
+            clank_core::Tool::Codex,
+            &clank_core::ids::SessionId::parse("session-one").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !crate::agent_store::agent_config_path(repo.path(), &codex).exists(),
+            "binding wrote no config"
+        );
+        let mut gate = |home: &std::path::Path| {
+            recovery_gate_in(
+                repo.path(),
+                Some(home),
+                &[],
+                &mut turns,
+                &codex,
+                "session-one",
+                &[],
+            )
+        };
+        assert_eq!(gate(home.path()), Gate::AutoOff, "the builtin default");
+        crate::cli::team::mutate_user_config(home.path(), |c| {
+            c.auto = Some(clank_core::AutoMode::On);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(gate(home.path()), Gate::Go, "the user's default");
     }
 
     /// A due attempt is decided against the agent as it is now: its
@@ -10575,7 +10625,7 @@ mod recovery_tests {
 
         let identity = before.ledger.owed()[0].entry.identity.clone();
         let recorded = crate::cli::presentation::receive(
-            &crate::agent_store::hold_binding(s.repo.path(), &s.artist).unwrap(),
+            &crate::agent_store::hold_state(s.repo.path(), &s.artist).unwrap(),
             clank_core::Tool::Codex,
             "session-one",
             &[identity],

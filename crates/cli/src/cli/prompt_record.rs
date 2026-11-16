@@ -30,9 +30,8 @@ pub(crate) struct Stored {
 
 impl Stored {
     fn bound(&self) -> Result<clank_core::agent_config::Session, String> {
-        crate::agent_store::load_agent_config(&self.repo, &self.label)
+        crate::agent_store::binding(&self.repo, &self.label)
             .map_err(|e| format!("its binding could not be read: {e:#}"))?
-            .and_then(|c| c.session)
             .ok_or_else(|| "it has no bound session".to_string())
     }
 }

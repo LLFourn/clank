@@ -9,19 +9,24 @@ fn init_repo() -> TestEnv {
     TestEnv::init()
 }
 
-/// Build a skeleton with optional session. Skeletons are
-/// STATE-ONLY under `teams-based-agent-registration`.
+/// An agent's config and the session bound to it, if any.
+struct Skeleton {
+    config: clank_core::agent_config::AgentConfig,
+    session: Option<clank_core::agent_config::Session>,
+}
+
+/// Build a skeleton with optional session.
 fn skeleton(
     auto_mode: clank_core::vocab::AutoMode,
     session: Option<clank_core::agent_config::Session>,
-) -> clank_core::agent_config::AgentConfig {
-    clank_core::agent_config::AgentConfig {
-        auto_mode: Some(auto_mode),
+) -> Skeleton {
+    Skeleton {
+        config: clank_core::agent_config::AgentConfig {
+            auto_mode: Some(auto_mode),
+            wait_events: Vec::new(),
+            extra: Default::default(),
+        },
         session,
-        wait_events: Vec::new(),
-        resume_pending: None,
-        outage_notified: None,
-        extra: Default::default(),
     }
 }
 
@@ -35,15 +40,15 @@ fn session(tool: clank_core::vocab::Tool, id: &str) -> clank_core::agent_config:
     }
 }
 
-/// Write the per-machine skeleton via the existing typed
-/// update_agent_config — no JSON literals.
-fn write_skeleton(repo: &Path, label: &str, cfg: &clank_core::agent_config::AgentConfig) {
-    clank::agent_store::update_agent_config(
-        repo,
-        &clank_core::ids::AgentLabel::parse(label).unwrap(),
-        |stored| *stored = cfg.clone(),
-    )
-    .unwrap();
+/// Write the per-machine skeleton through the typed config writer, and
+/// bind its session through the binding writer — no JSON literals.
+fn write_skeleton(repo: &Path, label: &str, skeleton: &Skeleton) {
+    let label = clank_core::ids::AgentLabel::parse(label).unwrap();
+    let cfg = skeleton.config.clone();
+    clank::agent_store::update_agent_config(repo, &label, |stored| *stored = cfg).unwrap();
+    if let Some(session) = &skeleton.session {
+        clank::agent_store::bind_session_to_agent(repo, &label, session.tool, &session.id).unwrap();
+    }
 }
 
 /// Register agents through the REAL cores
@@ -241,14 +246,9 @@ fn doctor_warns_when_launch_command_missing_from_path() {
 }
 
 #[test]
-fn doctor_warns_on_missing_skeleton() {
-    // Phase 7: declaration says agent X is registered, but no
-    // skeleton at .clank/agents/<X>/config.json. Doctor surfaces
-    // a Warn naming the label + diagnostic mentioning
-    // `clank init`.
+fn doctor_warns_on_a_registered_agent_never_bound() {
     let env = init_repo();
     register_agents(&env, &[("phantom", clank_core::vocab::Role::Reviewer)]);
-    // No skeleton written.
 
     let parsed = run_doctor(&env);
     let checks = parsed.as_array().expect("array");
@@ -258,7 +258,7 @@ fn doctor_warns_on_missing_skeleton() {
         .expect("expected agent: phantom check");
     assert_eq!(
         phantom_check["status"], "warn",
-        "missing skeleton must be Warn; got {phantom_check}"
+        "an unbound agent is a Warn; got {phantom_check}"
     );
     let msg = phantom_check["message"].as_str().unwrap_or("");
     assert!(
@@ -266,8 +266,8 @@ fn doctor_warns_on_missing_skeleton() {
         "diagnostic should name the registered role; got: {msg}"
     );
     assert!(
-        msg.contains("config.json"),
-        "diagnostic should mention the missing skeleton path; got: {msg}"
+        msg.contains("unbound"),
+        "diagnostic should say it is unbound; got: {msg}"
     );
     assert!(
         msg.contains("clank agent start phantom"),
@@ -438,16 +438,16 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
     write_skeleton(
         env.repo(),
         "grok",
-        &clank_core::agent_config::AgentConfig {
-            auto_mode: None,
+        &Skeleton {
+            config: clank_core::agent_config::AgentConfig {
+                auto_mode: None,
+                wait_events: Vec::new(),
+                extra: Default::default(),
+            },
             session: Some(session(
                 clank_core::vocab::Tool::Grok,
                 "11111111-2222-3333-4444-555555555555",
             )),
-            wait_events: Vec::new(),
-            resume_pending: None,
-            outage_notified: None,
-            extra: Default::default(),
         },
     );
     // Seed the user-global default-on in the test HOME.
@@ -470,16 +470,16 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
     write_skeleton(
         env.repo(),
         "grok",
-        &clank_core::agent_config::AgentConfig {
-            auto_mode: Some(clank_core::vocab::AutoMode::Off),
+        &Skeleton {
+            config: clank_core::agent_config::AgentConfig {
+                auto_mode: Some(clank_core::vocab::AutoMode::Off),
+                wait_events: Vec::new(),
+                extra: Default::default(),
+            },
             session: Some(session(
                 clank_core::vocab::Tool::Grok,
                 "11111111-2222-3333-4444-555555555555",
             )),
-            wait_events: Vec::new(),
-            resume_pending: None,
-            outage_notified: None,
-            extra: Default::default(),
         },
     );
     let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);

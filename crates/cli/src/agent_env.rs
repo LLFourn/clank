@@ -17,8 +17,6 @@ use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::Tool;
 use clank_core::{Caller, ResolveError, resolve_agent_identity};
 
-use crate::agent_store::load_all_agent_configs_lossy;
-
 const ENV_CLAUDE_SESSION: &str = "CLAUDE_CODE_SESSION_ID";
 const ENV_CODEX_SESSION: &str = "CODEX_THREAD_ID";
 /// Grok's marker is present in tool subprocesses. Older versions did
@@ -396,8 +394,8 @@ pub(crate) fn identify_in(repo: &Path, env: &dyn Ambient) -> anyhow::Result<Iden
             named => Caller::Outside { named },
         },
     };
-    let agent_configs = load_all_agent_configs_lossy(repo)?;
-    resolve_agent_identity(&caller, &agent_configs)
+    let bindings = crate::agent_store::identity::bindings(repo, true)?;
+    resolve_agent_identity(&caller, &bindings)
         .map(Identity::Agent)
         .map_err(|e| match e {
             ResolveError::NoSession => no_session(),

@@ -164,7 +164,7 @@ fn lost_reply(label: &AgentLabel, source: &str) -> String {
 }
 
 /// Fork the source (once per intent), place the child in `backend.cwd`,
-/// and bind `label` to it. The intent is kept: the launch consumes it. All under the label's binding lock, so
+/// and bind `label` to it. The intent is kept: the launch consumes it. All under the agent's state lock, so
 /// concurrent starts serialize and later ones find the binding.
 pub(crate) fn prepare(
     repo: &Path,
@@ -173,8 +173,8 @@ pub(crate) fn prepare(
     superseded: Option<&Session>,
     api: &dyn Api,
 ) -> anyhow::Result<Session> {
-    let guard = crate::agent_store::hold_binding(repo, label)?;
-    let bound = crate::agent_store::load_agent_config(repo, label)?.and_then(|c| c.session);
+    let guard = crate::agent_store::hold_state(repo, label)?;
+    let bound = crate::agent_store::binding(repo, label)?;
     match bound {
         Some(s) if s.tool == Tool::OpenCode => return Ok(s),
         Some(s) if Some(&s) != superseded => anyhow::bail!(
@@ -283,8 +283,8 @@ pub(crate) fn recover(
     label: &AgentLabel,
     recovery: Recovery,
 ) -> anyhow::Result<String> {
-    let _guard = crate::agent_store::hold_binding(repo, label)?;
-    if let Some(s) = crate::agent_store::load_agent_config(repo, label)?.and_then(|c| c.session) {
+    let _guard = crate::agent_store::hold_state(repo, label)?;
+    if let Some(s) = crate::agent_store::binding(repo, label)? {
         anyhow::bail!(
             "`{label}` is bound to {} session {}; there is no fork to recover",
             s.tool.as_str(),

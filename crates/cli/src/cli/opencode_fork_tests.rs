@@ -136,9 +136,8 @@ fn intent(repo: &Path) -> Option<Option<String>> {
 }
 
 fn bound(repo: &Path) -> Option<String> {
-    crate::agent_store::load_agent_config(repo, &label())
+    crate::agent_store::binding(repo, &label())
         .unwrap()
-        .and_then(|c| c.session)
         .map(|s| s.id.as_str().to_string())
 }
 
@@ -249,7 +248,9 @@ fn placing() -> (std::sync::Arc<Mutex<Option<String>>>, Fake) {
 #[test]
 fn a_failed_bind_after_a_good_move_reuses_the_same_child() {
     let (_d, repo) = fork_repo();
-    let config = crate::agent_store::agent_config_path(&repo, &label());
+    let config = crate::agent_store::state::path(
+        &crate::agent_store::agents_root(&repo).join(label().as_str()),
+    );
     let opencode = Fake::opencode();
     let api = Fake::new({
         let config = config.clone();

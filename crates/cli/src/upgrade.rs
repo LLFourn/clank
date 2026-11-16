@@ -831,8 +831,20 @@ pub(crate) mod tests {
         let agent = tempfile::tempdir().unwrap();
         let turn: clank_core::turn_policy::Persisted =
             serde_json::from_str(include_str!("../tests/fixtures/formats/turn.json")).unwrap();
-        let state: crate::cli::agent_state::AgentState =
+        crate::agent_store::state::tests::bind(
+            agent.path(),
+            clank_core::Tool::Claude,
+            turn.binding.as_str(),
+        );
+        let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/formats/state.json")).unwrap();
+        let state: crate::cli::agent_state::AgentState =
+            serde_json::from_value(fixture["bound"]["projection"].clone()).unwrap();
+        let bound = |part: &str| {
+            crate::agent_store::state::tests::raw(agent.path())
+                .pointer(&format!("/bound/{part}"))
+                .is_some()
+        };
         let account = crate::cli::source_status::Account {
             monitor: std::process::id() as i32,
             birth: crate::proc_identity::token_for(std::process::id() as i32).unwrap(),
@@ -853,28 +865,28 @@ pub(crate) mod tests {
         let events = agent.path().join("events");
         let written = || {
             [
-                ("turn state", agent.path().join("turn.json")),
-                ("agent state", agent.path().join("state.json")),
+                ("turn state", bound("turn")),
+                ("agent state", bound("projection")),
                 (
                     "source account",
-                    crate::cli::source_status::path(repo.path()),
+                    crate::cli::source_status::path(repo.path()).exists(),
                 ),
-                ("event log", events.join("messages.jsonl")),
+                ("event log", events.join("messages.jsonl").exists()),
             ]
             .into_iter()
-            .filter(|(_, path)| path.exists())
+            .filter(|(_, written)| *written)
             .map(|(kind, _)| kind)
             .collect::<Vec<_>>()
         };
         let write_each = || -> Vec<bool> {
             let permitted = || authority.permit().map_err(std::io::Error::from);
             vec![
-                permitted()
-                    .and_then(|p| crate::cli::turn_custody::write_stored(agent.path(), &turn, &p))
-                    .is_ok(),
-                permitted()
-                    .map(|p| crate::cli::agent_state::store(agent.path(), &state, &p))
-                    .is_ok(),
+                permitted().is_ok_and(|p| {
+                    crate::cli::turn_custody::write_stored(agent.path(), &turn, &p).is_ok()
+                }),
+                permitted().is_ok_and(|p| {
+                    crate::cli::agent_state::store(agent.path(), &turn.binding, &state, &p)
+                }),
                 permitted()
                     .and_then(|p| crate::cli::source_status::publish(repo.path(), &account, &p))
                     .is_ok(),
@@ -922,11 +934,12 @@ pub(crate) mod tests {
                 (
                     "ledger",
                     crate::cli::ledger::store(&agent, &Default::default())
-                        .map_err(|e| said(e.into())),
+                        .map(drop)
+                        .map_err(said),
                 ),
                 (
                     "recovery's issued number",
-                    crate::cli::recovery::store_issued(&agent, 3).map_err(|e| said(e.into())),
+                    crate::cli::recovery::store_issued(&agent, 3).map_err(said),
                 ),
                 (
                     "user config",
@@ -1007,7 +1020,7 @@ pub(crate) mod tests {
             }
         }
         let written = tree(repo.path());
-        for name in ["config.json", "recovery-issued.json"] {
+        for name in ["config.json", "state.json"] {
             assert!(written.contains(&agent.join(name)), "{name}: {written:?}");
         }
         assert_eq!(tree(home.path()).len(), 1);

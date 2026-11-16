@@ -377,31 +377,13 @@ fn a_release_while_no_monitor_ran_is_dated_by_the_block_not_the_restart() {
         &none(),
         RESTART + 9000,
     );
-    assert!(!path(dir.path()).exists(), "nothing owed keeps no file");
-}
-
-/// A ledger stored before each withholding block was named apart kept
-/// them as one line, and still says which they were.
-#[test]
-fn a_ledger_that_kept_its_blocks_as_one_line_still_names_them() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        path(dir.path()),
-        r#"[{"identity":"a","withheld":"claude/stork, codex/q (answered, not yet received)"},{"identity":"b","withheld":["claude/stork"]}]"#,
-    )
-    .unwrap();
-    let stored = load(dir.path());
     assert_eq!(
-        stored["a"],
-        Obligation::Withheld {
-            by: vec!["claude/stork".into(), "codex/q".into()]
-        }
-    );
-    assert_eq!(
-        stored["b"],
-        Obligation::Withheld {
-            by: vec!["claude/stork".into()]
-        }
+        crate::agent_store::state::State::load(dir.path())
+            .unwrap()
+            .kept::<serde_json::Value>(Kept::Ledger)
+            .unwrap(),
+        None,
+        "nothing owed keeps nothing"
     );
 }
 
@@ -478,7 +460,7 @@ fn a_receipt_from_another_session_counts_for_nothing() {
         .unwrap();
     };
     let record = |session: &str, identity: &str, at| {
-        let guard = crate::agent_store::hold_binding(repo.path(), &agent).unwrap();
+        let guard = crate::agent_store::hold_state(repo.path(), &agent).unwrap();
         receive(
             &guard,
             Tool::Codex,
@@ -521,8 +503,7 @@ fn a_receipt_from_another_session_counts_for_nothing() {
 
 /// An event log written before deliveries named their session says a
 /// message was presented, and to nobody in particular: with no receipt
-/// for the bound session it is not delivered to it. The stored receipts
-/// and ledger keep reading as they were written.
+/// for the bound session it is not delivered to it.
 #[test]
 fn old_presentation_bytes_prove_nothing_about_the_current_binding() {
     let dir = tempfile::tempdir().unwrap();
@@ -543,40 +524,6 @@ fn old_presentation_bytes_prove_nothing_about_the_current_binding() {
     assert_eq!(
         delivery(MESSAGE, &evidence, 1790650000),
         Delivery::NotDelivered
-    );
-
-    std::fs::write(
-        crate::cli::presentation::receipts_path(dir.path()),
-        include_str!("../../tests/fixtures/formats/delivered.json"),
-    )
-    .unwrap();
-    let delivered = crate::cli::presentation::delivered_to(dir.path(), SESSION);
-    assert_eq!(delivered[MESSAGE], 1790648060);
-    assert_eq!(delivered[REVIEW], 1790649000);
-
-    std::fs::write(
-        path(dir.path()),
-        include_str!("../../tests/fixtures/formats/ledger.json"),
-    )
-    .unwrap();
-    let stored = load(dir.path());
-    assert_eq!(
-        stored[MESSAGE],
-        Obligation::Owed {
-            owed_since: Since::At(1790648000)
-        }
-    );
-    assert_eq!(
-        stored[REVIEW],
-        Obligation::Withheld {
-            by: vec!["claude/stork-retakes".into()]
-        }
-    );
-    assert_eq!(
-        stored["promote_from_queue plan= sha= next= reason= name=next-plan handle="],
-        Obligation::Owed {
-            owed_since: Since::Unknown { held: 1790650000 }
-        }
     );
 }
 

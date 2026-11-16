@@ -8,7 +8,9 @@
 //! applies.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::agent_store::state::Kept;
 
 use clank_core::wait::WaitItem;
 
@@ -329,48 +331,19 @@ pub(crate) fn what(item: &WaitItem) -> Option<String> {
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Stored {
     identity: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "blocks"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     withheld: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owed_since: Option<Since>,
 }
 
-/// The withholding blocks, which a ledger stored before each was named
-/// apart kept as one line: `claude/a, codex/b (answered, not yet
-/// received)`.
-fn blocks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum Shape {
-        Each(Vec<String>),
-        Line(String),
-    }
-    Ok(
-        <Option<Shape> as serde::Deserialize>::deserialize(d)?.map(|shape| match shape {
-            Shape::Each(blocks) => blocks,
-            Shape::Line(line) => line
-                .replace(" (answered, not yet received)", "")
-                .split(", ")
-                .map(str::to_string)
-                .collect(),
-        }),
-    )
-}
-
-pub(crate) fn path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("ledger.json")
-}
-
-/// The obligations last stored in `agent_dir`; none when there is no
-/// ledger there or it cannot be read.
+/// The obligations last stored in `agent_dir`, the agent's
+/// [`Kept::Ledger`] part: across sessions, since what an agent is owed is
+/// not its session's. None when there are none or they cannot be read.
 pub(crate) fn load(agent_dir: &Path) -> Obligations {
-    std::fs::read(path(agent_dir))
+    crate::agent_store::state::State::load(agent_dir)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<Stored>>(&bytes).ok())
+        .and_then(|state| state.kept::<Vec<Stored>>(Kept::Ledger).ok().flatten())
         .unwrap_or_default()
         .into_iter()
         .filter_map(|s| {
@@ -384,16 +357,11 @@ pub(crate) fn load(agent_dir: &Path) -> Obligations {
         .collect()
 }
 
-/// Store `obligations`, or remove the file when there are none.
-pub(crate) fn store(agent_dir: &Path, obligations: &Obligations) -> std::io::Result<()> {
-    let _permit = crate::upgrade::writing()?;
-    let path = path(agent_dir);
-    if obligations.is_empty() {
-        return match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
-    }
+/// Store `obligations`, or remove them when there are none. Never waits
+/// for the agent's lock (I9): `false`, storing nothing, while another
+/// holds it.
+pub(crate) fn store(agent_dir: &Path, obligations: &Obligations) -> anyhow::Result<bool> {
+    let permit = crate::upgrade::writing()?;
     let stored: Vec<Stored> = obligations
         .iter()
         .map(|(identity, obligation)| Stored {
@@ -408,9 +376,11 @@ pub(crate) fn store(agent_dir: &Path, obligations: &Obligations) -> std::io::Res
             },
         })
         .collect();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&stored)?)?;
-    std::fs::rename(&tmp, &path)
+    let stored = (!stored.is_empty()).then_some(stored);
+    let written = crate::agent_store::state::try_transact(agent_dir, &permit, |txn| {
+        txn.keep(Kept::Ledger, stored.as_ref())
+    })?;
+    Ok(written.is_some())
 }
 
 /// [`fold`] against the obligations stored in `agent_dir`, stored again
@@ -425,13 +395,18 @@ pub(crate) fn fold_stored(
     let before = load(agent_dir);
     let after = fold(&before, admitted, evidence, ended, now);
     let obligations = after.obligations();
-    if obligations != before
-        && let Err(e) = store(agent_dir, &obligations)
-    {
-        eprintln!(
-            "monitor: could not record what {} is owed: {e}",
-            agent_dir.display()
-        );
+    if obligations != before {
+        match store(agent_dir, &obligations) {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                "what {} is owed is left for its lock's release",
+                agent_dir.display()
+            ),
+            Err(e) => eprintln!(
+                "monitor: could not record what {} is owed: {e:#}",
+                agent_dir.display()
+            ),
+        }
     }
     after
 }

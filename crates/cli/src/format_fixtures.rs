@@ -275,13 +275,10 @@ fn assert_agent_fixture_meaning(repo: &Path, auto: AutoMode) {
         .unwrap()
         .unwrap();
     assert_eq!(cfg.auto_mode, Some(auto));
-    let session = cfg.session.as_ref().unwrap();
-    assert_eq!(session.id.as_str(), SESSION);
-    assert_eq!(session.tool, Tool::Claude);
-    assert!(session.transcript.as_deref().unwrap().ends_with(".jsonl"));
     assert_eq!(
-        cfg.resume_pending.as_ref().unwrap().session.as_str(),
-        SESSION
+        crate::agent_store::binding(repo, &label("claude")).unwrap(),
+        None,
+        "the binding an older build kept in the config binds nothing: its session restarts"
     );
     let kinds: Vec<&str> = cfg
         .wait_events
@@ -331,14 +328,33 @@ fn an_unversioned_agent_config_keeps_its_meaning_through_every_writer() {
     );
     assert_agent_fixture_meaning(repo.path(), AutoMode::Off);
 
-    crate::agent_store::record_transcript(
+    crate::agent_store::bind_session_to_agent(
         repo.path(),
         &label("claude"),
+        Tool::Claude,
         &SessionId::parse(SESSION).unwrap(),
-        "/home/user/.claude/projects/example/moved.jsonl",
     )
     .unwrap();
-    assert_agent_fixture_meaning(repo.path(), AutoMode::Off);
+    let mut cfg = crate::agent_store::load_agent_config(repo.path(), &label("claude"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cfg.auto_mode,
+        Some(AutoMode::Off),
+        "binding leaves the config"
+    );
+    cfg.extra
+        .retain(|k, _| k != "session" && k != "resume_pending");
+    assert_eq!(
+        raw(&path)["session"],
+        json!({
+            "id": SESSION,
+            "tool": "claude",
+            "updated_at": "2026-11-04T22:22:18.002002Z",
+            "transcript": "/home/user/.claude/projects/example/00000000-0000-4000-8000-000000000001.jsonl"
+        }),
+        "the old binding is left unread, not migrated"
+    );
 }
 
 #[test]
@@ -436,6 +452,14 @@ fn a_status_watch_handoff_reads_as_the_set_it_held() {
     }
 }
 
+/// `fixture`, turn state as an older build wrote it, stored for its
+/// session, bound in `dir`.
+fn place_turn(dir: &Path, fixture: &str) -> Value {
+    crate::agent_store::state::tests::bind(dir, Tool::Claude, SESSION);
+    crate::cli::turn_custody::place_stored(dir, fixture);
+    serde_json::from_str(fixture).unwrap()
+}
+
 /// A check-in presentation in flight when its monitor stopped: the owed
 /// window and the window the presentation carries read back as written,
 /// and a monitor restored from them takes the presentation as failed, so
@@ -444,17 +468,14 @@ fn a_status_watch_handoff_reads_as_the_set_it_held() {
 fn turn_state_with_a_check_in_in_flight_reads_and_round_trips() {
     use clank_core::turn_policy::{CheckIn, CheckInRef, Resolution, SessionState};
     let dir = tempfile::tempdir().unwrap();
-    let path = place(
-        &dir.path().join("turn.json"),
-        fixture!("turn-check-in-in-flight.json"),
-    );
+    let written = place_turn(dir.path(), fixture!("turn-check-in-in-flight.json"));
     let stored = crate::cli::turn_custody::load_stored(dir.path()).unwrap();
     let carried = stored.outstanding.as_ref().expect("in flight");
     assert_eq!(carried.check_ins, [CheckInRef { window: 4 }]);
     assert!(carried.identities.is_empty());
     assert_eq!(stored.attendances[0].window.id, 4);
     assert_eq!(stored.attendances[0].window.check_in, CheckIn::Due);
-    assert_eq!(serde_json::to_value(&stored).unwrap(), raw(&path));
+    assert_eq!(serde_json::to_value(&stored).unwrap(), written);
     let restored = SessionState::restored(stored.clone());
     assert_eq!(restored.outstanding, None);
     assert_eq!(
@@ -472,10 +493,7 @@ fn turn_state_with_a_check_in_in_flight_reads_and_round_trips() {
 fn a_check_in_in_flight_from_before_windows_loads_owed() {
     use clank_core::turn_policy::{CheckIn, CheckInRef, Resolution, SessionState};
     let dir = tempfile::tempdir().unwrap();
-    place(
-        &dir.path().join("turn.json"),
-        fixture!("turn-check-in-in-flight-keyed.json"),
-    );
+    place_turn(dir.path(), fixture!("turn-check-in-in-flight-keyed.json"));
     let stored = crate::cli::turn_custody::load_stored(dir.path()).unwrap();
     let carried = stored.outstanding.as_ref().expect("in flight");
     assert_eq!(carried.check_ins, [CheckInRef { window: 0 }]);
@@ -496,11 +514,11 @@ fn a_check_in_in_flight_from_before_windows_loads_owed() {
 #[test]
 fn turn_state_with_turn_scoped_declarations_reads_and_round_trips() {
     let dir = tempfile::tempdir().unwrap();
-    place(&dir.path().join("turn.json"), fixture!("turn.json"));
+    let written = place_turn(dir.path(), fixture!("turn.json"));
     let stored = crate::cli::turn_custody::load_stored(dir.path()).unwrap();
     assert_eq!(stored.binding.as_str(), SESSION);
     assert_eq!(stored.next_seq, 38);
-    let mut expected = raw(&dir.path().join("turn.json"))["attendances"].clone();
+    let mut expected = written["attendances"].clone();
     expected[0]["work"]["Declared"]
         .as_object_mut()
         .unwrap()
@@ -529,10 +547,7 @@ fn turn_state_with_turn_scoped_declarations_reads_and_round_trips() {
 #[test]
 fn turn_state_with_listed_attendances_reads_as_declared_work() {
     let dir = tempfile::tempdir().unwrap();
-    place(
-        &dir.path().join("turn.json"),
-        fixture!("turn-listed-attendances.json"),
-    );
+    place_turn(dir.path(), fixture!("turn-listed-attendances.json"));
     let stored = crate::cli::turn_custody::load_stored(dir.path()).unwrap();
     assert_eq!(stored.next_seq, 38);
     assert_eq!(
@@ -573,10 +588,7 @@ fn turn_state_with_listed_attendances_reads_as_declared_work() {
 #[test]
 fn turn_state_with_one_old_attendance_reads_as_its_entries() {
     let dir = tempfile::tempdir().unwrap();
-    place(
-        &dir.path().join("turn.json"),
-        fixture!("turn-single-attendance.json"),
-    );
+    place_turn(dir.path(), fixture!("turn-single-attendance.json"));
     let stored = crate::cli::turn_custody::load_stored(dir.path()).unwrap();
     assert_eq!(
         serde_json::to_value(&stored.attendances).unwrap(),
@@ -614,16 +626,152 @@ fn turn_state_with_one_old_attendance_reads_as_its_entries() {
         Some(stored)
     );
     assert!(
-        raw(&dir.path().join("turn.json"))
+        crate::cli::turn_custody::stored_record(dir.path())
+            .unwrap()
             .get("attendance")
             .is_none()
     );
 }
 
+/// What the state fixture says, as each part's reader must see it.
+fn assert_state_fixture_meaning(dir: &Path) {
+    let session = SessionId::parse(SESSION).unwrap();
+    let bound = crate::agent_store::binding_in(dir).unwrap().unwrap();
+    assert_eq!((bound.id.as_str(), bound.tool), (SESSION, Tool::Claude));
+    let state = crate::agent_store::state::State::load(dir).unwrap();
+    assert_eq!(
+        state.resume_pending().unwrap().unwrap().at,
+        "2026-11-17T00:00:05Z"
+    );
+    let turn = crate::cli::turn_custody::load_stored(dir).unwrap();
+    assert_eq!((turn.binding.as_str(), turn.next_seq), (SESSION, 38));
+    assert_eq!(
+        turn.feedback,
+        [clank_core::turn_policy::Notice::RunEnded {
+            desc: "test run".into()
+        }],
+        "its run-ended notice"
+    );
+    let asking = crate::cli::question_state::asking(dir, SESSION).unwrap();
+    assert_eq!(asking.header, "Which tunnel should the remote use?");
+    assert_eq!(asking.key.session, SESSION);
+    let episode = crate::cli::recovery::load(dir).unwrap();
+    assert_eq!(episode.session, SESSION);
+    assert_eq!(episode.attempts[0].n, 7);
+    assert_eq!(episode.bound.as_ref().unwrap().session, SESSION);
+    assert_eq!(crate::cli::recovery::load_issued(dir).unwrap(), 79);
+    assert_eq!(
+        crate::cli::presentation::delivered_to(dir, SESSION)["event messages@1 k:message#claude/24b0857ddad36a442fff4ff8"],
+        1793845200
+    );
+    let shown = crate::cli::agent_state::load(dir).unwrap();
+    assert_eq!(shown.attending[0].task, "Implement the example plan");
+    assert_eq!(
+        shown.asking.as_deref(),
+        Some("Which tunnel should the remote use?")
+    );
+    assert_eq!(
+        crate::cli::ledger::load(dir)["event messages@1 k:message#claude/24b0857ddad36a442fff4ff8"],
+        crate::cli::ledger::Obligation::Owed {
+            owed_since: crate::cli::ledger::Since::At(1793845100)
+        }
+    );
+    assert!(
+        state
+            .bound::<clank_core::agent_config::OutageNotified>(
+                &session,
+                crate::agent_store::Bound::Outage
+            )
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// The agent's state: each part reads through its own reader, every
+/// writer changes its own part and keeps the rest byte for byte, and the
+/// session is stored once.
 #[test]
-fn a_question_record_reads_and_takes_a_new_observation() {
-    use crate::cli::question_state::{Observation, load, observe};
+fn the_state_document_reads_through_every_part_and_each_writer_keeps_the_rest() {
     let repo = tempfile::tempdir().unwrap();
+    let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+    let path = place(
+        &crate::agent_store::state::path(&dir),
+        fixture!("state.json"),
+    );
+    assert_eq!(fixture!("state.json").matches(SESSION).count(), 1);
+    assert_state_fixture_meaning(&dir);
+    let part = |at: &str| raw(&path).pointer(at).cloned().unwrap();
+    let session = SessionId::parse(SESSION).unwrap();
+
+    let others = |except: &str| {
+        let mut doc = raw(&path);
+        let (parent, key) = except.rsplit_once('/').unwrap();
+        doc.pointer_mut(if parent.is_empty() { "" } else { parent })
+            .and_then(|v| v.as_object_mut())
+            .unwrap()
+            .remove(key);
+        doc
+    };
+    let before = others("/binding");
+    crate::agent_store::record_transcript(
+        repo.path(),
+        &label("claude"),
+        &session,
+        "/t/moved.jsonl",
+    )
+    .unwrap();
+    assert_eq!(others("/binding"), before);
+    assert_eq!(part("/binding/transcript"), json!("/t/moved.jsonl"));
+
+    let before = others("/bound/questions");
+    crate::cli::question_state::observe(
+        &dir,
+        [crate::cli::question_state::Observation::TurnOver {
+            session: SESSION.into(),
+            prompt: "10000000-0000-4000-8000-000000000009".into(),
+        }],
+    );
+    assert_eq!(others("/bound/questions"), before);
+
+    let before = others("/issued");
+    crate::cli::recovery::store_issued(&dir, 80).unwrap();
+    assert_eq!(others("/issued"), before);
+    assert_eq!(crate::cli::recovery::load_issued(&dir).unwrap(), 80);
+
+    let before = others("/bound/projection");
+    let mut shown = crate::cli::agent_state::load(&dir).unwrap();
+    shown.since += 1;
+    let permit = crate::upgrade::writing().unwrap();
+    assert!(crate::cli::agent_state::store(
+        &dir, &session, &shown, &permit
+    ));
+    assert_eq!(others("/bound/projection"), before);
+
+    let before = others("/bound/turn");
+    let mut turn = crate::cli::turn_custody::load_stored(&dir).unwrap();
+    turn.next_seq += 1;
+    crate::cli::turn_custody::write_stored(&dir, &turn, &permit).unwrap();
+    assert_eq!(others("/bound/turn"), before);
+    assert_eq!(crate::cli::turn_custody::load_stored(&dir), Some(turn));
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after.matches(SESSION).count(), 1, "{after}");
+}
+
+/// A `state.json` an older build published, the projection alone and no
+/// version: the upgrade reads it as no state, binds nothing from it, and
+/// the first write of the new document replaces it.
+#[test]
+fn an_older_builds_published_state_reads_as_none_and_is_replaced() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+    let path = place(
+        &crate::agent_store::state::path(&dir),
+        fixture!("state-unversioned.json"),
+    );
+    assert_eq!(crate::agent_store::binding_in(&dir).unwrap(), None);
+    assert_eq!(crate::cli::agent_state::load(&dir), None);
+    assert_eq!(crate::cli::agent_state::read(&dir), Ok(None));
     crate::agent_store::bind_session_to_agent(
         repo.path(),
         &label("claude"),
@@ -631,64 +779,10 @@ fn a_question_record_reads_and_takes_a_new_observation() {
         &SessionId::parse(SESSION).unwrap(),
     )
     .unwrap();
-    let dir = crate::agent_store::agents_root(repo.path()).join("claude");
-    place(&dir.join("question.json"), fixture!("question.json"));
-    let before = load(&dir).unwrap();
-    assert_eq!(before.session.as_deref(), Some(SESSION));
-    assert_eq!(before.pending.len(), 1);
-    assert_eq!(
-        before.pending[0].header,
-        "Which tunnel should the remote use?"
-    );
-    assert_eq!(before.over.len(), 2);
-    assert_eq!(before.returned.len(), 1);
-
-    let ended = "10000000-0000-4000-8000-000000000009".to_string();
-    observe(
-        &dir,
-        [Observation::TurnOver {
-            session: SESSION.into(),
-            prompt: ended.clone(),
-        }],
-    );
-    let after = load(&dir).unwrap();
-    assert_eq!(after.pending, before.pending);
-    assert_eq!(after.returned, before.returned);
-    assert_eq!(after.over, [before.over.clone(), vec![ended]].concat());
-}
-
-#[test]
-fn the_issued_recovery_count_reads_and_counts_on() {
-    let dir = tempfile::tempdir().unwrap();
-    place(
-        &dir.path().join("recovery-issued.json"),
-        fixture!("recovery-issued.json"),
-    );
-    assert_eq!(crate::cli::recovery::load_issued(dir.path()).unwrap(), 79);
-    crate::cli::recovery::store_issued(dir.path(), 80).unwrap();
-    assert_eq!(crate::cli::recovery::load_issued(dir.path()).unwrap(), 80);
-}
-
-#[test]
-fn a_published_state_with_one_attendance_reads_as_a_list() {
-    let dir = tempfile::tempdir().unwrap();
-    place(&dir.path().join("state.json"), fixture!("state.json"));
-    let state = crate::cli::agent_state::load(dir.path()).unwrap();
-    assert_eq!(state.session, SESSION);
-    assert_eq!(state.attending.len(), 1, "the single attendance");
-    assert_eq!(state.attending[0].task, "a0000000000000001");
-    assert_eq!(
-        state.attending[0].desc.as_deref(),
-        Some("Implement the example plan")
-    );
-    assert!(state.attending[0].declared);
-    crate::cli::agent_state::store(
-        dir.path(),
-        &state,
-        &crate::upgrade::process().permit().unwrap(),
-    );
-    assert_eq!(crate::cli::agent_state::load(dir.path()), Some(state));
-    assert!(raw(&dir.path().join("state.json"))["attending"].is_array());
+    let doc = raw(&path);
+    assert_eq!(doc["version"], 1);
+    assert_eq!(doc.get("role"), None, "nothing of the old shape is kept");
+    assert_eq!(doc.get("attending"), None);
 }
 
 #[test]
@@ -1113,13 +1207,15 @@ fn an_unreadable_identity_stops_identity_writers_without_changing_bytes() {
     for body in [
         MALFORMED,
         TOO_NEW,
-        r#"{"version": 1, "session": false}"#,
+        r#"{"version": 1, "binding": false}"#,
         r#"{"version": 1, "resume_pending": false}"#,
     ] {
         let repo = tempfile::tempdir().unwrap();
         let l = label("claude");
         let path = place(
-            &crate::agent_store::agent_config_path(repo.path(), &l),
+            &crate::agent_store::state::path(
+                &crate::agent_store::agents_root(repo.path()).join(l.as_str()),
+            ),
             body,
         );
         let session = SessionId::parse(SESSION).unwrap();
@@ -1147,20 +1243,31 @@ fn an_unreadable_identity_stops_identity_writers_without_changing_bytes() {
 fn identity_writers_preserve_policy_they_cannot_interpret() {
     let repo = tempfile::tempdir().unwrap();
     let l = label("claude");
-    let path = place(
+    let config = place(
         &crate::agent_store::agent_config_path(repo.path(), &l),
         BAD_AGENT_SETTING,
     );
-    let before = raw(&path);
+    let state = place(
+        &crate::agent_store::state::path(
+            &crate::agent_store::agents_root(repo.path()).join(l.as_str()),
+        ),
+        r#"{"version": 1, "issued": "unparsed", "ledger": {"kept": true}}"#,
+    );
+    let before = raw(&state);
     let session = SessionId::parse(SESSION).unwrap();
     crate::agent_store::bind_session_to_agent(repo.path(), &l, Tool::Claude, &session).unwrap();
-    let mut bound = raw(&path);
-    let identity = bound.as_object_mut().unwrap().remove("session").unwrap();
+    let mut bound = raw(&state);
+    let identity = bound.as_object_mut().unwrap().remove("binding").unwrap();
     assert_eq!(identity["id"], SESSION);
     assert_eq!(identity["tool"], "claude");
     assert_eq!(bound, before, "binding changes only session identity");
     assert!(crate::agent_store::release_binding(repo.path(), &l, &session).unwrap());
-    assert_eq!(raw(&path), before, "release preserves all opaque policy");
+    assert_eq!(raw(&state), before, "release preserves every opaque part");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        BAD_AGENT_SETTING,
+        "a binding never touches the config"
+    );
 }
 
 #[test]

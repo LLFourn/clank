@@ -48,7 +48,7 @@ is no tool-call registration handshake.
 8. Grok owns the background task and its completion notification. The agent acts
    on the returned work, acknowledges only after handling it, and starts the next
    ordinary background wait when appropriate. Native SessionEnd releases only
-   that session's binding, under the existing binding lock; a delayed end cannot
+   that session's binding, under the agent's state lock; a delayed end cannot
    release a successor's binding.
 
 ## Ownership, cancellation and resource use

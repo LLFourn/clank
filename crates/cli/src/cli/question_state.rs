@@ -4,11 +4,14 @@
 //!
 //! One reducer ([`apply`]) takes every observation of a question's
 //! lifecycle, from the question hook and from the agent's own record, and
-//! keeps one durable projection per agent (`question.json`). It is
-//! separate from the native answer channel: recording a pending question
-//! never claims a live remote answer request exists.
+//! keeps one durable projection of the bound session's questions, its
+//! [`Bound::Questions`] part of the agent's state. It is separate from the
+//! native answer channel: recording a pending question never claims a
+//! live remote answer request exists.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::agent_store::state::{self, Bound};
 
 /// A question's native identity: its session, the prompt (turn) it was
 /// asked in, and the tool call.
@@ -29,14 +32,11 @@ pub(crate) struct Question {
     pub(crate) input: String,
 }
 
-/// The projection, about one session: the agent's Claude binding when it
-/// was last written. What ended is kept for as long as that session is
-/// the agent's, so a late or replayed hook cannot make it pending again;
-/// a new binding makes every observation of the old session unacceptable,
-/// and so drops them all.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The projection, about the session bound to the agent. What ended is
+/// kept for as long as that session is the agent's, so a late or replayed
+/// hook cannot make it pending again; a new binding starts with none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct State {
-    pub(crate) session: Option<String>,
     pub(crate) pending: Vec<Question>,
     /// Prompts known to be over, whether or not anything was asked in them.
     pub(crate) over: Vec<String>,
@@ -63,14 +63,83 @@ pub(crate) enum Observation {
     Behind { session: String, older: Vec<String> },
 }
 
-/// Make `state` about `bound`, the agent's session now.
-pub(crate) fn rebind(state: State, bound: Option<&str>) -> State {
-    if state.session.as_deref() == bound {
-        return state;
+/// [`State`] as stored under its session, whose keys name no session.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Stored {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<StoredQuestion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    over: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    returned: Vec<Call>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Call {
+    prompt: String,
+    tool_use: String,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StoredQuestion {
+    #[serde(flatten)]
+    call: Call,
+    header: String,
+    input: String,
+}
+
+impl Call {
+    fn of(key: &Key) -> Self {
+        Call {
+            prompt: key.prompt.clone(),
+            tool_use: key.tool_use.clone(),
+        }
     }
-    State {
-        session: bound.map(str::to_string),
-        ..State::default()
+
+    fn key(self, session: &str) -> Key {
+        Key {
+            session: session.to_string(),
+            prompt: self.prompt,
+            tool_use: self.tool_use,
+        }
+    }
+}
+
+impl State {
+    fn stored(&self) -> Stored {
+        Stored {
+            pending: self
+                .pending
+                .iter()
+                .map(|q| StoredQuestion {
+                    call: Call::of(&q.key),
+                    header: q.header.clone(),
+                    input: q.input.clone(),
+                })
+                .collect(),
+            over: self.over.clone(),
+            returned: self.returned.iter().map(Call::of).collect(),
+        }
+    }
+
+    fn restored(stored: Stored, session: &str) -> State {
+        State {
+            pending: stored
+                .pending
+                .into_iter()
+                .map(|q| Question {
+                    key: q.call.key(session),
+                    header: q.header,
+                    input: q.input,
+                })
+                .collect(),
+            over: stored.over,
+            returned: stored
+                .returned
+                .into_iter()
+                .map(|c| c.key(session))
+                .collect(),
+        }
     }
 }
 
@@ -84,14 +153,14 @@ fn end_prompts(state: &mut State, prompts: &[String]) {
     }
 }
 
-/// Apply one observation. One about a session other than the projection's
-/// is a stale producer's, and changes nothing.
-pub(crate) fn apply(mut state: State, observation: Observation) -> State {
+/// Apply one observation to the questions of `bound`. One about another
+/// session is a stale producer's, and changes nothing.
+pub(crate) fn apply(mut state: State, bound: &str, observation: Observation) -> State {
     let session = match &observation {
         Observation::Asked { key, .. } | Observation::Result { key } => &key.session,
         Observation::TurnOver { session, .. } | Observation::Behind { session, .. } => session,
     };
-    if state.session.as_ref() != Some(session) {
+    if session != bound {
         return state;
     }
     match observation {
@@ -115,68 +184,69 @@ pub(crate) fn apply(mut state: State, observation: Observation) -> State {
     state
 }
 
-pub(crate) fn path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("question.json")
+/// The questions of `session` while it holds the label, none otherwise. A
+/// record that cannot be read is unavailable: `None`, which shows nothing,
+/// holds nothing and is never taken for an answer.
+pub(crate) fn load(agent_dir: &Path, session: &str) -> Option<State> {
+    let state = state::State::load(agent_dir).ok()?;
+    let session_id = clank_core::SessionId::parse(session).ok()?;
+    let stored: Option<Stored> = state.bound(&session_id, Bound::Questions).ok()?;
+    Some(
+        stored
+            .map(|s| State::restored(s, session))
+            .unwrap_or_default(),
+    )
 }
 
-/// What is known of the agent's questions. A record that cannot be read is
-/// unavailable: `None`, which shows nothing, holds nothing and is never
-/// taken for an answer.
-pub(crate) fn load(agent_dir: &Path) -> Option<State> {
-    match std::fs::read_to_string(path(agent_dir)) {
-        Ok(raw) => serde_json::from_str(&raw).ok(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(State::default()),
-        Err(_) => None,
-    }
-}
-
-/// Apply `observations` to the stored projection, under the agent's lock,
-/// against the binding read under that lock: a producer that read an
-/// older binding cannot write over the current session's state. With none,
-/// it only settles the projection on the binding. An unreadable record or
-/// binding leaves the record as it is.
+/// Apply `observations` to the bound session's questions, under the
+/// agent's lock, against the binding read under that lock: a producer that
+/// read an older binding cannot write over the current session's state.
+/// Best effort: what is not recorded is logged.
 pub(crate) fn observe(agent_dir: &Path, observations: impl IntoIterator<Item = Observation>) {
-    if let Err(e) = try_observe(agent_dir, observations) {
-        tracing::debug!(%e, "question evidence was not recorded");
+    match try_observe(agent_dir, observations) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!("question evidence was not recorded: the agent's lock is held")
+        }
+        Err(e) => tracing::debug!(%e, "question evidence was not recorded"),
     }
 }
 
-/// Control requests acknowledge persistence only after the write succeeds.
+/// [`observe`], saying whether the evidence was recorded. Never waits for
+/// the agent's lock, as the monitor's loop must not (I9): `false`, with
+/// nothing recorded, while another holds it. An unreadable record is an
+/// error and is left as it is.
 pub(crate) fn try_observe(
     agent_dir: &Path,
     observations: impl IntoIterator<Item = Observation>,
-) -> anyhow::Result<()> {
-    let _permit = crate::upgrade::writing()?;
-    std::fs::create_dir_all(agent_dir)?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(agent_dir.join("question.lock"))?;
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
-    let binding = crate::agent_store::binding_in(agent_dir)?;
-    let bound = binding
-        .filter(|s| s.tool == clank_core::vocab::Tool::Claude)
-        .map(|s| s.id.as_str().to_string());
-    let state = load(agent_dir).ok_or_else(|| anyhow::anyhow!("question state is unreadable"))?;
-    let next = observations
-        .into_iter()
-        .fold(rebind(state.clone(), bound.as_deref()), apply);
-    if next != state {
-        let tmp = path(agent_dir).with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(&next)?)?;
-        std::fs::rename(&tmp, path(agent_dir))?;
-    }
-    Ok(())
+) -> anyhow::Result<bool> {
+    let permit = crate::upgrade::writing()?;
+    let done = state::try_transact(agent_dir, &permit, |txn| {
+        let Some(binding) = txn
+            .binding()?
+            .filter(|s| s.tool == clank_core::vocab::Tool::Claude)
+        else {
+            return Ok(());
+        };
+        let session = binding.id.as_str();
+        let stored: Option<Stored> = txn.bound(&binding.id, Bound::Questions)?;
+        let before = stored
+            .map(|s| State::restored(s, session))
+            .unwrap_or_default();
+        let after = observations
+            .into_iter()
+            .fold(before.clone(), |s, o| apply(s, session, o));
+        if after != before {
+            txn.patch(&binding.id, Bound::Questions, Some(&after.stored()))?;
+        }
+        Ok(())
+    })?;
+    Ok(done.is_some())
 }
 
 /// The question the agent is waiting on in `session`, if one is pending.
 pub(crate) fn asking(agent_dir: &Path, session: &str) -> Option<Question> {
-    let state = load(agent_dir)?;
-    if state.session.as_deref() != Some(session) {
-        return None;
-    }
-    state.pending.into_iter().next_back()
+    load(agent_dir, session)?.pending.into_iter().next_back()
 }
 
 fn prompt_id(line: &str) -> Option<String> {
@@ -324,7 +394,7 @@ mod tests {
     /// Observations of an agent bound to session `s` throughout.
     fn run(obs: impl IntoIterator<Item = Observation>) -> State {
         obs.into_iter()
-            .fold(rebind(State::default(), Some("s")), apply)
+            .fold(State::default(), |s, o| apply(s, "s", o))
     }
 
     fn pending(state: &State) -> Vec<Key> {
@@ -336,7 +406,7 @@ mod tests {
         let q = key("s", "p1", "t1");
         let state = run([asked(&q), result_of(&key("s", "p1", "t2"))]);
         assert_eq!(pending(&state), vec![q.clone()], "another call's result");
-        assert!(pending(&apply(state, result_of(&q))).is_empty());
+        assert!(pending(&apply(state, "s", result_of(&q))).is_empty());
     }
 
     /// Whatever order a question's hooks and its endings arrive in, and
@@ -388,14 +458,14 @@ mod tests {
             behind("s", &["p2"]),
         ]);
         assert_eq!(pending(&state), vec![q], "another turn's end");
-        let state = apply(state, turn_over("s", "p1"));
+        let state = apply(state, "s", turn_over("s", "p1"));
         assert!(state.pending.is_empty());
         assert!(state.returned.is_empty());
         assert_eq!(state.over, vec!["p0", "p2", "p1"]);
     }
 
     /// A producer that read an older binding cannot touch the current
-    /// session's state, and a new binding retires everything of the old.
+    /// session's state.
     #[test]
     fn only_the_bound_session_is_observed() {
         let old = key("old", "p1", "t1");
@@ -408,21 +478,14 @@ mod tests {
         ]);
         assert_eq!(pending(&state), vec![q.clone()]);
         assert!(state.over.is_empty());
-        let rebound = rebind(state.clone(), Some("new"));
-        assert_eq!(rebound.session.as_deref(), Some("new"));
-        assert!(rebound.pending.is_empty());
-        assert!(apply(rebound, asked(&q)).pending.is_empty(), "a stale hook");
-        assert_eq!(rebind(state.clone(), Some("s")), state);
-        assert!(rebind(state, None).pending.is_empty(), "unbound");
+        assert!(
+            apply(State::default(), "new", asked(&q)).pending.is_empty(),
+            "a stale hook"
+        );
     }
 
     fn bind(dir: &Path, session: &str) {
-        std::fs::write(
-            dir.join("config.json"),
-            serde_json::json!({"session": {"tool": "claude", "id": session, "updated_at": "2026-10-06T00:00:00Z"}})
-                .to_string(),
-        )
-        .unwrap();
+        crate::agent_store::state::tests::bind(dir, clank_core::Tool::Claude, session);
     }
 
     /// The record survives on disk and follows the binding read under its
@@ -446,23 +509,34 @@ mod tests {
         assert_eq!(asking(dir.path(), "session-s"), None, "a stale producer");
         bind(dir.path(), "session-s");
         observe(dir.path(), [asked(&q)]);
-        std::fs::write(dir.path().join("config.json"), "not json").unwrap();
-        observe(dir.path(), []);
-        assert!(
-            asking(dir.path(), "session-s").is_some(),
-            "an unreadable binding"
-        );
-        std::fs::write(path(dir.path()), "not json").unwrap();
+        assert!(asking(dir.path(), "session-s").is_some());
+        let mut raw = crate::agent_store::state::tests::raw(dir.path());
+        raw["bound"]["questions"] = "not questions".into();
+        let unreadable = raw.to_string();
+        std::fs::write(crate::agent_store::state::path(dir.path()), &unreadable).unwrap();
         assert_eq!(asking(dir.path(), "session-s"), None);
-        bind(dir.path(), "session-s");
-        observe(dir.path(), [result_of(&q)]);
+        assert!(try_observe(dir.path(), [result_of(&q)]).is_err());
         assert_eq!(
-            std::fs::read_to_string(path(dir.path())).unwrap(),
-            "not json"
+            std::fs::read_to_string(crate::agent_store::state::path(dir.path())).unwrap(),
+            unreadable
         );
     }
 
-    fn transcript(dir: &Path, prompts: &[&str], filler: usize) -> PathBuf {
+    /// Recorded questions name their session once, in the binding.
+    #[test]
+    fn stored_questions_name_no_session_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        bind(dir.path(), "session-s");
+        let (q, done) = (key("session-s", "p1", "t1"), key("session-s", "p1", "t0"));
+        observe(dir.path(), [asked(&q), result_of(&done)]);
+        let stored = std::fs::read_to_string(crate::agent_store::state::path(dir.path())).unwrap();
+        assert_eq!(stored.matches("session-s").count(), 1, "{stored}");
+        let state = load(dir.path(), "session-s").unwrap();
+        assert_eq!(pending(&state), vec![q]);
+        assert_eq!(state.returned, vec![done]);
+    }
+
+    fn transcript(dir: &Path, prompts: &[&str], filler: usize) -> std::path::PathBuf {
         let t = dir.join("t.jsonl");
         let pad = "x".repeat(filler);
         let body: String = prompts

@@ -14,7 +14,7 @@
 //! guessing by tool: writing feedback under the wrong label is worse
 //! than refusing to act.
 
-use crate::agent_config::AgentConfig;
+use crate::agent_config::Session;
 use crate::ids::{AgentLabel, SessionId};
 use crate::vocab::Tool;
 
@@ -67,28 +67,24 @@ impl std::error::Error for ResolveError {}
 pub fn bound_to(
     tool: Tool,
     id: &SessionId,
-    agent_configs: &[(AgentLabel, AgentConfig)],
+    bindings: &[(AgentLabel, Session)],
 ) -> Option<AgentLabel> {
-    agent_configs
+    bindings
         .iter()
-        .find(|(_, cfg)| {
-            cfg.session
-                .as_ref()
-                .is_some_and(|s| &s.id == id && s.tool == tool)
-        })
+        .find(|(_, s)| &s.id == id && s.tool == tool)
         .map(|(label, _)| label.clone())
 }
 
-/// Resolve the calling agent's label.
+/// Resolve the calling agent's label from every agent's binding.
 pub fn resolve_agent_identity(
     caller: &Caller<'_>,
-    agent_configs: &[(AgentLabel, AgentConfig)],
+    bindings: &[(AgentLabel, Session)],
 ) -> Result<AgentLabel, ResolveError> {
     match caller {
         Caller::Outside { named: Some(label) } => Ok(label.clone()),
         Caller::Outside { named: None } => Err(ResolveError::NoSession),
         Caller::Session { tool, id } => {
-            bound_to(*tool, id, agent_configs).ok_or_else(|| ResolveError::NoAgentForSession {
+            bound_to(*tool, id, bindings).ok_or_else(|| ResolveError::NoAgentForSession {
                 session_id: (*id).clone(),
                 tool: *tool,
             })
@@ -100,7 +96,6 @@ pub fn resolve_agent_identity(
 mod tests {
     use super::*;
     use crate::agent_config::Session;
-    use crate::vocab::AutoMode;
 
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
@@ -108,22 +103,18 @@ mod tests {
     fn sid(s: &str) -> SessionId {
         SessionId::parse(s).unwrap()
     }
-    fn cfg_with_session(id: &str, tool: Tool) -> AgentConfig {
-        AgentConfig {
-            auto_mode: Some(AutoMode::On),
-            session: Some(Session {
-                id: sid(id),
-                tool,
-                updated_at: "2026-05-23T00:00:00+00:00".into(),
-                transcript: None,
-            }),
-            ..Default::default()
+    fn bound(id: &str, tool: Tool) -> Session {
+        Session {
+            id: sid(id),
+            tool,
+            updated_at: "2026-05-23T00:00:00+00:00".into(),
+            transcript: None,
         }
     }
 
     #[test]
     fn outside_a_session_the_name_is_the_identity() {
-        let configs = [(label("alice"), cfg_with_session("abc12345", Tool::Claude))];
+        let configs = [(label("alice"), bound("abc12345", Tool::Claude))];
         let caller = Caller::Outside {
             named: Some(label("zoe")),
         };
@@ -139,8 +130,8 @@ mod tests {
 
     #[test]
     fn session_lookup_matches_id_and_tool() {
-        let alice = (label("alice"), cfg_with_session("abc12345", Tool::Claude));
-        let bob = (label("bob"), cfg_with_session("def67890", Tool::Codex));
+        let alice = (label("alice"), bound("abc12345", Tool::Claude));
+        let bob = (label("bob"), bound("def67890", Tool::Codex));
         let configs = [alice, bob];
         let id = sid("def67890");
         let caller = Caller::Session {
@@ -155,7 +146,7 @@ mod tests {
 
     #[test]
     fn session_lookup_requires_matching_tool() {
-        let configs = [(label("alice"), cfg_with_session("abc12345", Tool::Claude))];
+        let configs = [(label("alice"), bound("abc12345", Tool::Claude))];
         let id = sid("abc12345");
         let caller = Caller::Session {
             tool: Tool::Codex,
@@ -171,10 +162,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_without_session_is_skipped_not_short_circuited() {
-        let alice_no_session = (label("alice"), AgentConfig::default());
-        let bob = (label("bob"), cfg_with_session("abc12345", Tool::Claude));
-        let configs = [alice_no_session, bob];
+    fn another_agents_binding_is_skipped_not_short_circuited() {
+        let alice = (label("alice"), bound("zzz99999", Tool::Claude));
+        let bob = (label("bob"), bound("abc12345", Tool::Claude));
+        let configs = [alice, bob];
         let id = sid("abc12345");
         let caller = Caller::Session {
             tool: Tool::Claude,

@@ -8,10 +8,9 @@
 //! `agent add` is ONE step (definition + role); `agent make-master`
 //! picks the master; the ROLE RESOLVER
 //! (`agent_store::try_resolve_via_team`) reads the roster directly.
-//! The per-agent skeleton at `.clank/agents/<label>/config.json`
-//! holds ONLY per-machine state (`auto_mode`,
-//! `session`). `list` joins the resolved set with each agent's
-//! skeleton session.
+//! Per machine, `.clank/agents/<label>/config.json` holds the agent's
+//! settings and `state.json` its session. `list` joins the resolved set
+//! with each agent's binding.
 
 use std::path::{Path, PathBuf};
 
@@ -119,23 +118,23 @@ fn list(args: AgentListArgs) -> anyhow::Result<()> {
     let mut rows: Vec<AgentRow> = Vec::new();
     // Master first.
     {
-        let skeleton = load_agent_config(&repo, &set.master)?;
+        let bound = crate::agent_store::binding(&repo, &set.master)?;
         rows.push(AgentRow::from_join(
             &set.master,
             "master",
             "—",
             set.master_desc.tool,
-            skeleton.as_ref().and_then(|c| c.session.as_ref()),
+            bound.as_ref(),
         ));
     }
     for r in &set.members {
-        let skeleton = load_agent_config(&repo, &r.label)?;
+        let bound = crate::agent_store::binding(&repo, &r.label)?;
         rows.push(AgentRow::from_join(
             &r.label,
             r.role.resolved().as_str(),
             role_word(r.role),
             r.desc.tool,
-            skeleton.as_ref().and_then(|c| c.session.as_ref()),
+            bound.as_ref(),
         ));
     }
     if args.json {
@@ -184,16 +183,16 @@ fn print_human(rows: &[AgentRow]) {
 /// Two paths:
 /// - **Resume** (declaration + bound session): exec with the
 ///   configured launch profile + session-restore suffix.
-/// - **Bootstrap** (declaration but no bound session — skeleton
-///   missing OR `session: None`): exec the bare tool, which binds its
+/// - **Bootstrap** (declaration but no bound session): exec the bare
+///   tool, which binds its
 ///   session as it starts; an OpenCode session is bound by clank
 ///   before the exec ([`compose_unbound_launch`]). Subsequent calls hit
 ///   the resume path.
 ///   Plan: `agent-start-bootstraps-missing-skeleton`.
 ///
 /// Launch profile source: the merged declaration's `launch`
-/// field (per `agent-add-cli-and-repo-scope`). Session binding
-/// state comes from the per-agent skeleton.
+/// field (per `agent-add-cli-and-repo-scope`). The session comes from
+/// the agent's binding.
 async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     start_with(
         args,
@@ -304,7 +303,7 @@ async fn start_with(
 
     // Registration is the resolved roster set. The agent's
     // description (tool / launch / initial_prompt) comes from
-    // there; the skeleton supplies only session + auto_mode.
+    // there; the agent's own files supply only session + auto_mode.
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
         anyhow::bail!(
             "this repo has no master agent. Run `clank init --team <name>` or \
@@ -320,7 +319,8 @@ async fn start_with(
     })?;
 
     let cfg = load_agent_config(&repo, &label)?;
-    let bound = cfg.as_ref().and_then(|c| c.session.as_ref());
+    let (bound, resume_pending) = crate::agent_store::resume_pending(&repo, &label)?;
+    let bound = bound.as_ref();
     let superseded = superseded_session(desc.tool, bound);
     let bound_session = bound.filter(|_| superseded.is_none());
     if let Some(old) = superseded {
@@ -483,12 +483,7 @@ async fn start_with(
             let now = time::OffsetDateTime::now_utc();
             let unconfirmed = !print
                 && session.tool == Tool::Claude
-                && never_checked_in(
-                    cfg.as_ref().and_then(|c| c.resume_pending.as_ref()),
-                    session,
-                    now,
-                    &holder,
-                );
+                && never_checked_in(resume_pending.as_ref(), now, &holder);
             match holder {
                 Holder::Pane {
                     session: held_in,
@@ -636,21 +631,20 @@ async fn start_with(
     .map(|()| None)
 }
 
-/// Whether the last resume of `bound` never checked in, so this start
-/// forgets it: its marker is for `bound`, at least
+/// Whether the last resume of the bound session never checked in, so this
+/// start forgets it: its marker is at least
 /// [`crate::agent_store::CHECK_IN_WITHIN`] old, and nobody holds it.
 /// A policy, not proof the conversation is gone.
 fn never_checked_in(
     marker: Option<&clank_core::agent_config::ResumePending>,
-    bound: &Session,
     now: time::OffsetDateTime,
     holder: &Holder,
 ) -> bool {
-    *holder == Holder::Nobody && crate::agent_store::resume_unconfirmed(marker, &bound.id, now)
+    *holder == Holder::Nobody && crate::agent_store::resume_unconfirmed(marker, now)
 }
 
 /// The bootstrap launch that replaces `session`, judged
-/// [`never_checked_in`]. The judgment is re-made under the binding lock
+/// [`never_checked_in`]. The judgment is re-made under the agent's lock
 /// as the binding is cleared; if anything changed since, nothing is
 /// cleared and nothing launches.
 fn start_fresh_after_unconfirmed(
@@ -1545,7 +1539,7 @@ fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
 //     RosterAgent with the `--review` role;
 //   - repo by-name (no `--tool`): copy a description from the
 //     user-scope library → insert a RosterAgent with the role.
-// Per-agent skeletons hold only state (session / auto_mode /
+// Per-agent files hold only machine state (session / auto_mode /
 // wake sources) — never declaration.
 
 /// `clank agent add <label> [--tool ...] [--review ...]`
@@ -3948,11 +3942,11 @@ mod tests {
     fn bound_and_running() -> (tempfile::TempDir, String) {
         let (repo, _) = seeded();
         crate::git_plumbing::init_repo(repo.path()).unwrap();
-        let skeleton = repo.path().join(".clank/agents/web/config.json");
-        std::fs::create_dir_all(skeleton.parent().unwrap()).unwrap();
+        let state = repo.path().join(".clank/agents/web/state.json");
+        std::fs::create_dir_all(state.parent().unwrap()).unwrap();
         std::fs::write(
-            &skeleton,
-            r#"{ "session": { "id": "019a0000-0000-7000-8000-000000000001",
+            &state,
+            r#"{ "version": 1, "binding": { "id": "019a0000-0000-7000-8000-000000000001",
                              "tool": "codex", "updated_at": "2026-10-20T00:00:00Z" } }"#,
         )
         .unwrap();
@@ -3963,7 +3957,7 @@ mod tests {
     #[tokio::test]
     async fn a_running_agent_can_be_shown_and_changed_for_its_next_start() {
         let (repo, path) = bound_and_running();
-        let skeleton = repo.path().join(".clank/agents/web/config.json");
+        let skeleton = repo.path().join(".clank/agents/web/state.json");
         let bound = std::fs::read_to_string(&skeleton).unwrap();
         launch_with(launch_args(&["web", "--repo", &path]), running_in_a_pane)
             .await
@@ -4108,12 +4102,12 @@ mod tests {
                 }} }}"#
             ),
         );
-        let skeleton = repo.path().join(".clank/agents/browser2/config.json");
-        std::fs::create_dir_all(skeleton.parent().unwrap()).unwrap();
+        let state = repo.path().join(".clank/agents/browser2/state.json");
+        std::fs::create_dir_all(state.parent().unwrap()).unwrap();
         std::fs::write(
-            &skeleton,
+            &state,
             format!(
-                r#"{{ "session": {{ "id": "{OLD_SESSION}", "tool": "{bound_tool}",
+                r#"{{ "version": 1, "binding": {{ "id": "{OLD_SESSION}", "tool": "{bound_tool}",
                                    "updated_at": "2026-10-20T00:00:00Z" }} }}"#
             ),
         )
@@ -4225,7 +4219,7 @@ mod tests {
             "claude",
         );
         let label = AgentLabel::parse("browser2").unwrap();
-        std::fs::remove_file(repo.path().join(".clank/agents/browser2/config.json")).unwrap();
+        std::fs::remove_file(repo.path().join(".clank/agents/browser2/state.json")).unwrap();
         crate::cli::fork::save_fork_spec(
             repo.path(),
             &label,
@@ -4276,9 +4270,8 @@ mod tests {
         );
         assert!(intent.exists(), "a preview retires nothing");
 
-        let cfg = load_agent_config(repo.path(), &label).unwrap();
-        let old = cfg.as_ref().and_then(|c| c.session.as_ref());
-        let superseded = superseded_session(Tool::Grok, old);
+        let old = crate::agent_store::binding(repo.path(), &label).unwrap();
+        let superseded = superseded_session(Tool::Grok, old.as_ref());
         assert!(superseded.is_some());
         let chosen = fork_intent(repo.path(), &label, Tool::Grok, superseded, false).unwrap();
         assert!(chosen.is_none(), "set aside");
@@ -4287,11 +4280,12 @@ mod tests {
         let fresh =
             clank_core::ids::SessionId::parse("019a0000-0000-7000-8000-000000000012").unwrap();
         crate::agent_store::bind_session_to_agent(repo.path(), &label, Tool::Grok, &fresh).unwrap();
-        let cfg = load_agent_config(repo.path(), &label).unwrap();
-        let now = cfg.as_ref().and_then(|c| c.session.as_ref()).unwrap();
+        let now = crate::agent_store::binding(repo.path(), &label)
+            .unwrap()
+            .unwrap();
         assert_eq!(now.tool, Tool::Grok);
         assert_eq!(
-            superseded_session(Tool::Grok, Some(now)),
+            superseded_session(Tool::Grok, Some(&now)),
             None,
             "the switch is done"
         );
@@ -4301,7 +4295,7 @@ mod tests {
     fn a_matching_fork_intent_is_followed_and_kept() {
         let repo = changed_tool(r#"{ "tool": "codex", "role": "standby" }"#, "codex");
         let label = AgentLabel::parse("browser2").unwrap();
-        std::fs::remove_file(repo.path().join(".clank/agents/browser2/config.json")).unwrap();
+        std::fs::remove_file(repo.path().join(".clank/agents/browser2/state.json")).unwrap();
         let spec = crate::cli::fork::ForkSpec {
             opencode: None,
             tool: Tool::Codex,
@@ -4971,7 +4965,7 @@ mod tests {
     }
 
     fn binding(repo: &Path, name: &str) -> Option<Session> {
-        load_agent_config(repo, &label(name)).unwrap()?.session
+        crate::agent_store::binding(repo, &label(name)).unwrap()
     }
 
     /// `ses_` + 12 hex + 14 base62, as `ses_039d60658ffe0RPgue3noZ0Qqf`.
@@ -5119,7 +5113,7 @@ mod tests {
     #[test]
     fn an_opencode_binding_that_cannot_be_recorded_launches_nothing() {
         let repo = tempfile::tempdir().unwrap();
-        let config = repo.path().join(".clank/agents/kimi/config.json");
+        let config = repo.path().join(".clank/agents/kimi/state.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(&config, "{ not json").unwrap();
         let err = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false).unwrap_err();
@@ -5130,7 +5124,7 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&config).unwrap(), "{ not json");
 
-        let claude = r#"{ "session": { "id": "01a156a7-f516-7dc0-8b58-520faf122796",
+        let claude = r#"{ "version": 1, "binding": { "id": "01a156a7-f516-7dc0-8b58-520faf122796",
                          "tool": "claude", "updated_at": "2026-10-20T00:00:00Z" } }"#;
         std::fs::write(&config, claude).unwrap();
         let err = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false).unwrap_err();
@@ -5144,7 +5138,7 @@ mod tests {
     #[tokio::test]
     async fn an_opencode_agent_started_again_resumes_its_recorded_session() {
         let repo = changed_tool(r#"{ "tool": "opencode", "role": "standby" }"#, "claude");
-        std::fs::remove_file(repo.path().join(".clank/agents/browser2/config.json")).unwrap();
+        std::fs::remove_file(repo.path().join(".clank/agents/browser2/state.json")).unwrap();
         let before = snapshot(repo.path());
         let preview = next_start(repo.path(), Purpose::Start).await;
         assert!(
@@ -5165,11 +5159,7 @@ mod tests {
         let again = next_start(repo.path(), Purpose::Start).await;
         assert_eq!(session_arg(&again), Some(id), "{again:?}");
 
-        let config = repo.path().join(".clank/agents/browser2/config.json");
-        let mut value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
-        value["auto_mode"] = serde_json::json!("on");
-        std::fs::write(&config, value.to_string()).unwrap();
+        crate::agent_store::set_auto_mode(repo.path(), &label("browser2"), AutoMode::On).unwrap();
         let auto = next_start(repo.path(), Purpose::Start).await;
         assert_eq!(session_arg(&auto), Some(id), "{auto:?}");
         assert!(
@@ -6148,25 +6138,12 @@ mod tests {
         time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
     }
 
-    fn marker(session: &str, at: &str) -> clank_core::agent_config::ResumePending {
-        clank_core::agent_config::ResumePending {
-            session: SessionId::parse(session).unwrap(),
-            at: at.into(),
-        }
-    }
-
-    fn bound_claude(id: &str) -> Session {
-        Session {
-            id: SessionId::parse(id).unwrap(),
-            tool: Tool::Claude,
-            updated_at: "2026-11-03T00:00:00Z".into(),
-            transcript: Some("/t/a.jsonl".into()),
-        }
+    fn marker(at: &str) -> clank_core::agent_config::ResumePending {
+        clank_core::agent_config::ResumePending { at: at.into() }
     }
 
     #[test]
-    fn a_resume_is_forgotten_only_when_its_own_marker_is_old_and_nobody_holds_it() {
-        let bound = bound_claude(OLD_SESSION);
+    fn a_resume_is_forgotten_only_when_its_marker_is_old_and_nobody_holds_it() {
         let now = instant("2026-11-03T00:01:00Z");
         let pane = Holder::Pane {
             session: "s".into(),
@@ -6176,30 +6153,20 @@ mod tests {
             session: "s".into(),
             why: "w".into(),
         };
-        let old = marker(OLD_SESSION, "2026-11-03T00:00:00Z");
+        let old = marker("2026-11-03T00:00:00Z");
         for (marker, holder, forgotten, why) in [
             (Some(&old), &Holder::Nobody, true, "60s old, nobody"),
             (
-                Some(&marker(OLD_SESSION, "2026-11-03T00:00:01Z")),
+                Some(&marker("2026-11-03T00:00:01Z")),
                 &Holder::Nobody,
                 false,
                 "younger",
-            ),
-            (
-                Some(&marker(SUCCESSOR, "2026-11-03T00:00:00Z")),
-                &Holder::Nobody,
-                false,
-                "another id",
             ),
             (Some(&old), &pane, false, "a live holder"),
             (Some(&old), &uncertain, false, "an uncertain holder"),
             (None, &Holder::Nobody, false, "no marker"),
         ] {
-            assert_eq!(
-                never_checked_in(marker, &bound, now, holder),
-                forgotten,
-                "{why}"
-            );
+            assert_eq!(never_checked_in(marker, now, holder), forgotten, "{why}");
         }
     }
 
@@ -6258,13 +6225,32 @@ mod tests {
         }
     }
 
-    fn set_marker(repo: &Path, m: Option<clank_core::agent_config::ResumePending>) {
-        crate::agent_store::update_agent_config(repo, &browser2(), |c| c.resume_pending = m)
-            .unwrap();
+    /// Arm `browser2`'s resume of `OLD_SESSION` as of `m.at`.
+    fn set_marker(repo: &Path, m: clank_core::agent_config::ResumePending) {
+        assert!(
+            crate::agent_store::arm_resume(
+                repo,
+                &browser2(),
+                &SessionId::parse(OLD_SESSION).unwrap(),
+                instant(&m.at),
+            )
+            .unwrap()
+        );
     }
 
-    fn stored(repo: &Path) -> AgentConfig {
-        load_agent_config(repo, &browser2()).unwrap().unwrap()
+    #[derive(Debug, PartialEq)]
+    struct Stored {
+        session: Option<Session>,
+        resume_pending: Option<clank_core::agent_config::ResumePending>,
+    }
+
+    fn stored(repo: &Path) -> Stored {
+        let (session, resume_pending) =
+            crate::agent_store::resume_pending(repo, &browser2()).unwrap();
+        Stored {
+            session,
+            resume_pending,
+        }
     }
 
     async fn start_browser2(repo: &Path, print: bool) -> Option<ComposedLaunch> {
@@ -6302,8 +6288,9 @@ mod tests {
             panic!("one launch")
         };
         assert!(resumes(launch, OLD_SESSION), "{launch:?}");
-        let armed = stored(repo.path()).resume_pending.unwrap();
-        assert_eq!(armed.session.as_str(), OLD_SESSION);
+        let armed = stored(repo.path());
+        assert!(armed.resume_pending.is_some());
+        assert_eq!(armed.session.unwrap().id.as_str(), OLD_SESSION);
     }
 
     #[tokio::test]
@@ -6321,8 +6308,8 @@ mod tests {
     async fn a_young_marker_resumes_and_keeps_its_first_attempt() {
         let repo = claude_agent();
         bind_claude(repo.path(), OLD_SESSION, true);
-        let first = marker(OLD_SESSION, &ago(10));
-        set_marker(repo.path(), Some(first.clone()));
+        let first = marker(&ago(10));
+        set_marker(repo.path(), first.clone());
         start_browser2(repo.path(), false).await;
         assert!(resumes(&launched()[0], OLD_SESSION));
         assert_eq!(stored(repo.path()).resume_pending, Some(first));
@@ -6332,7 +6319,7 @@ mod tests {
     async fn a_resume_that_never_checked_in_is_forgotten_and_starts_fresh() {
         let repo = claude_agent();
         bind_claude(repo.path(), OLD_SESSION, true);
-        set_marker(repo.path(), Some(marker(OLD_SESSION, &ago(120))));
+        set_marker(repo.path(), marker(&ago(120)));
         start_browser2(repo.path(), false).await;
         let [launch] = &launched()[..] else {
             panic!("one launch")
@@ -6360,7 +6347,7 @@ mod tests {
         let shown = start_browser2(repo.path(), true).await.unwrap();
         assert!(resumes(&shown, OLD_SESSION));
         assert_eq!(stored(repo.path()), before, "unarmed");
-        set_marker(repo.path(), Some(marker(OLD_SESSION, &ago(120))));
+        set_marker(repo.path(), marker(&ago(120)));
         let before = stored(repo.path());
         let shown = start_browser2(repo.path(), true).await.unwrap();
         assert!(resumes(&shown, OLD_SESSION), "not judged: {shown:?}");
@@ -6390,28 +6377,13 @@ mod tests {
             "{launch:?}"
         );
         assert!(!crate::cli::fork::fork_spec_path(repo.path(), &browser2()).exists());
-        assert_eq!(
-            load_agent_config(repo.path(), &browser2())
-                .unwrap()
-                .and_then(|c| c.resume_pending),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unbound_start_leaves_a_standing_marker() {
-        let repo = claude_agent();
-        let left = marker(OLD_SESSION, &ago(120));
-        set_marker(repo.path(), Some(left.clone()));
-        start_browser2(repo.path(), false).await;
-        assert!(!resumes(&launched()[0], OLD_SESSION));
-        assert_eq!(stored(repo.path()).resume_pending, Some(left));
+        assert_eq!(stored(repo.path()).resume_pending, None);
     }
 
     /// Bound to `OLD_SESSION`, armed at 00:00:00, judged at 00:01:00:
     /// `race` lands between that judgment and the release, which must
     /// then clear nothing and launch nothing.
-    fn a_change_after_the_judgment(race: impl FnOnce(&Path)) -> (AgentConfig, AgentConfig) {
+    fn a_change_after_the_judgment(race: impl FnOnce(&Path)) -> (Stored, Stored) {
         let repo = tempfile::tempdir().unwrap();
         bind_claude(repo.path(), OLD_SESSION, true);
         crate::agent_store::arm_resume(
@@ -6426,7 +6398,6 @@ mod tests {
         let session = judged.session.clone().unwrap();
         assert!(never_checked_in(
             judged.resume_pending.as_ref(),
-            &session,
             now,
             &Holder::Nobody
         ));
@@ -6479,10 +6450,7 @@ mod tests {
             )
             .unwrap();
         });
-        assert_eq!(
-            after.resume_pending,
-            Some(marker(OLD_SESSION, "2026-11-03T00:00:30Z"))
-        );
+        assert_eq!(after.resume_pending, Some(marker("2026-11-03T00:00:30Z")));
         assert_eq!(after.session.as_ref().unwrap().id.as_str(), OLD_SESSION);
         assert_eq!(after, raced);
     }

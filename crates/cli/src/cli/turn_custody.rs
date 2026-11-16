@@ -3,9 +3,10 @@
 //! One [`SessionState`] per agent, keyed by its bound session, decides
 //! what each Stop, attendance request, check-in and delivery result means
 //! ([`clank_core::turn_policy`]). The monitor owns it alone: it persists
-//! it beside the agent, renders every verdict's text, and commits a
-//! presentation's receipts only on the `Delivered` its own connection
-//! carries. The hooks report evidence and frame what they are told.
+//! it as the bound session's [`Bound::Turn`] part of the agent's state,
+//! renders every verdict's text, and commits a presentation's receipts
+//! only on the `Delivered` its own connection carries. The hooks report
+//! evidence and frame what they are told.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,8 @@ use clank_core::turn_policy::{
     Verdict,
 };
 use clank_core::{AgentLabel, AutoMode, Role, SessionId, SilentReason, Tool};
+
+use crate::agent_store::state::{self, Bound};
 
 use super::turn_wire::{Frame, Report, TurnResult, WireVerdict};
 use super::wake_render::WaitItem;
@@ -54,13 +57,19 @@ impl Gathered {
         author: &AgentLabel,
         owed: Option<(&[clank_core::wait::WaitItem], Option<&Path>)>,
     ) -> Self {
-        let config = crate::agent_store::load_agent_config(repo, author);
-        let binding = config
+        let dir = crate::agent_store::agents_root(repo).join(author.as_str());
+        let stored = state::State::load(&dir).ok();
+        let bound = stored.as_ref().and_then(|s| s.binding().ok().flatten());
+        let binding = bound.as_ref().map(|s| (s.tool, s.id.clone()));
+        let outage_session = stored
             .as_ref()
-            .ok()
-            .and_then(|c| c.as_ref())
-            .and_then(|c| c.session.as_ref())
-            .map(|s| (s.tool, s.id.clone()));
+            .and_then(|s| {
+                s.current::<clank_core::agent_config::OutageNotified>(Bound::Outage)
+                    .ok()
+                    .flatten()
+            })
+            .map(|(bound, _)| bound.id);
+        let config = crate::agent_store::load_agent_config(repo, author);
         let home = match &binding {
             Some((Tool::Grok, _)) => super::grok_setup::launch_home(repo, author),
             _ => std::env::var_os("HOME").map(PathBuf::from),
@@ -74,7 +83,6 @@ impl Gathered {
             });
         let role =
             crate::agent_store::resolve_role(repo, author).map_err(|e| role_failure(author, &e));
-        let dir = crate::agent_store::agents_root(repo).join(author.as_str());
         let asking = binding
             .as_ref()
             .and_then(|(_, s)| super::question_state::asking(&dir, s.as_str()))
@@ -88,11 +96,7 @@ impl Gathered {
             blocked: super::wait::blocked(repo, author),
             owed: owed.map(|(items, cwd)| owed_items(items, cwd)),
             waiter: false,
-            outage_session: config
-                .ok()
-                .flatten()
-                .and_then(|c| c.outage_notified)
-                .map(|n| n.session),
+            outage_session,
         }
     }
 
@@ -342,43 +346,97 @@ struct Custody {
     stored: Option<Persisted>,
 }
 
-fn refused_as_stale(e: &std::io::Error) -> bool {
-    e.get_ref()
-        .is_some_and(|inner| inner.is::<crate::upgrade::Stale>())
+fn refused_as_stale(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<crate::upgrade::Stale>())
 }
 
 /// Every agent's turn-end state, as the monitor's loop drives it.
 pub(crate) struct Turns {
     repo: PathBuf,
     agents: BTreeMap<AgentLabel, Custody>,
+    /// Question evidence a held lock left unrecorded, by agent.
+    questions: BTreeMap<AgentLabel, Vec<super::question_state::Observation>>,
     /// The agents whose park a verified user command is waiting on.
     user_commands: std::collections::BTreeSet<AgentLabel>,
     authority: crate::upgrade::Authority,
 }
 
-fn store_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("turn.json")
-}
-
-/// The turn state saved in `agent_dir`, `None` when there is none or it
-/// cannot be read: an unreadable record starts the binding afresh.
+/// The turn record stored for whichever session holds the label, `None`
+/// when there is none or it cannot be read: an unreadable record starts
+/// the binding afresh.
 pub(crate) fn load_stored(agent_dir: &Path) -> Option<Persisted> {
-    std::fs::read(store_path(agent_dir))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    let (bound, record) = state::State::load(agent_dir)
+        .ok()?
+        .current::<serde_json::Map<String, serde_json::Value>>(Bound::Turn)
+        .ok()??;
+    restored(record, &bound.id)
 }
 
+/// `record` as stored, naming no session: the binding is its session.
+fn stored(record: &Persisted) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(record)?;
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("binding");
+    }
+    Ok(value)
+}
+
+fn restored(
+    mut record: serde_json::Map<String, serde_json::Value>,
+    session: &SessionId,
+) -> Option<Persisted> {
+    record.insert("binding".into(), serde_json::to_value(session).ok()?);
+    serde_json::from_value(serde_json::Value::Object(record)).ok()
+}
+
+/// Store `json`, a turn record as any build wrote it, as its session's.
+#[cfg(test)]
+pub(crate) fn place_stored(agent_dir: &Path, json: &str) {
+    let record: Persisted = serde_json::from_str(json).unwrap();
+    let permit = crate::upgrade::writing().unwrap();
+    assert_eq!(
+        write_stored(agent_dir, &record, &permit).unwrap(),
+        Persist::Written
+    );
+}
+
+/// The turn record as stored, if one is.
+#[cfg(test)]
+pub(crate) fn stored_record(agent_dir: &Path) -> Option<serde_json::Value> {
+    state::State::load(agent_dir)
+        .unwrap()
+        .current::<serde_json::Value>(Bound::Turn)
+        .unwrap()
+        .map(|(_, record)| record)
+}
+
+/// What persisting a turn record came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Persist {
+    Written,
+    /// Its session no longer holds the label: nothing was written.
+    Refused,
+    /// Another process held the agent's lock: nothing was written, and
+    /// the monitor's loop retries on its release (I9).
+    Contended,
+}
+
+/// Write `record` as its session's turn record, only while that session
+/// holds the label, without waiting for the agent's lock.
 pub(crate) fn write_stored(
     agent_dir: &Path,
-    state: &Persisted,
-    _permit: &crate::upgrade::Permit,
-) -> std::io::Result<()> {
-    let path = store_path(agent_dir);
-    let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(state).map_err(std::io::Error::other)?;
-    std::fs::create_dir_all(agent_dir)?;
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, &path)
+    record: &Persisted,
+    permit: &crate::upgrade::Permit,
+) -> anyhow::Result<Persist> {
+    let value = stored(record)?;
+    let written = state::try_transact(agent_dir, permit, |txn| {
+        txn.patch(&record.binding, Bound::Turn, Some(&value))
+    })?;
+    Ok(match written {
+        Some(true) => Persist::Written,
+        Some(false) => Persist::Refused,
+        None => Persist::Contended,
+    })
 }
 
 impl Turns {
@@ -386,6 +444,7 @@ impl Turns {
         Turns {
             repo,
             agents: BTreeMap::new(),
+            questions: BTreeMap::new(),
             user_commands: Default::default(),
             authority: crate::upgrade::process().clone(),
         }
@@ -436,19 +495,11 @@ impl Turns {
 
     /// `author` holds no binding: its attendance, the check-in that owes,
     /// its repeat count and any presentation in flight all described a
-    /// session that is no longer its, so they end here and on disk.
+    /// session that is no longer its, so they end here. On disk they ended
+    /// with the binding.
     pub(crate) fn retire(&mut self, author: &AgentLabel) {
         self.agents.remove(author);
-        // Left for the monitor that follows, which retires it the same way.
-        let Ok(_permit) = self.authority.permit() else {
-            return;
-        };
-        match std::fs::remove_file(store_path(&self.agent_dir(author))) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                eprintln!("monitor: could not retire `{author}`'s turn state: {e}")
-            }
-            _ => {}
-        }
+        self.questions.remove(author);
     }
 
     /// Retire every agent held here that `bound` no longer names.
@@ -466,29 +517,37 @@ impl Turns {
 
     fn persist(&mut self, author: &AgentLabel, held: Option<&crate::upgrade::Permit>) {
         match self.try_persist(author, held) {
-            Ok(()) => {}
+            Ok(Persist::Written) => {}
+            Ok(Persist::Refused) => {
+                tracing::debug!(%author, "turn state of a session that lost the label left unwritten")
+            }
+            Ok(Persist::Contended) => {
+                tracing::debug!(%author, "turn state left for the agent's lock's release")
+            }
             Err(e) if refused_as_stale(&e) => {
                 tracing::debug!(%author, %e, "turn state left unwritten")
             }
-            Err(e) => eprintln!("monitor: could not record `{author}`'s turn state: {e}"),
+            Err(e) => eprintln!("monitor: could not record `{author}`'s turn state: {e:#}"),
         }
     }
 
     /// Write `author`'s state if it changed, under `held`, else under its
-    /// presentation in flight's permit, else under a new one.
+    /// presentation in flight's permit, else under a new one. Never waits
+    /// for the agent's lock: a record left unwritten is written again by
+    /// [`Self::retry_unwritten`].
     fn try_persist(
         &mut self,
         author: &AgentLabel,
         held: Option<&crate::upgrade::Permit>,
-    ) -> std::io::Result<()> {
+    ) -> anyhow::Result<Persist> {
         let dir = self.agent_dir(author);
         let authority = &self.authority;
         let Some(custody) = self.agents.get_mut(author) else {
-            return Ok(());
+            return Ok(Persist::Written);
         };
         let now = custody.state.persisted();
         if custody.stored.as_ref() == Some(&now) {
-            return Ok(());
+            return Ok(Persist::Written);
         }
         let fresh;
         let permit = match held.or(custody.carried.as_ref().map(|c| &c.settling)) {
@@ -498,9 +557,29 @@ impl Turns {
                 &fresh
             }
         };
-        write_stored(&dir, &now, permit)?;
-        custody.stored = Some(now);
-        Ok(())
+        let persisted = write_stored(&dir, &now, permit)?;
+        if persisted == Persist::Written {
+            custody.stored = Some(now);
+        }
+        Ok(persisted)
+    }
+
+    /// Write every turn record and question evidence a held lock left
+    /// unwritten. The loop calls this when a lock it found held is
+    /// released.
+    pub(crate) fn retry_unwritten(&mut self) {
+        let authors: Vec<AgentLabel> = self
+            .agents
+            .iter()
+            .filter(|(_, c)| c.stored.as_ref() != Some(&c.state.persisted()))
+            .map(|(author, _)| author.clone())
+            .collect();
+        for author in authors {
+            self.persist(&author, None);
+        }
+        for (author, observations) in std::mem::take(&mut self.questions) {
+            self.record_questions(&author, observations);
+        }
     }
 
     fn step(
@@ -581,12 +660,29 @@ impl Turns {
     }
 
     /// Apply what a Stop proves about the agent's questions, before its
-    /// facts are gathered: the question it ended is over.
-    pub(crate) fn observe_questions(&self, author: &AgentLabel, report: &Report) {
+    /// facts are gathered: the question it ended is over. Evidence a held
+    /// lock leaves unrecorded is kept for [`Self::retry_unwritten`].
+    pub(crate) fn observe_questions(&mut self, author: &AgentLabel, report: &Report) {
         if let Report::TurnEnd { questions, .. } = report
             && !questions.is_empty()
         {
-            super::question_state::observe(&self.agent_dir(author), questions.clone());
+            self.record_questions(author, questions.clone());
+        }
+    }
+
+    fn record_questions(
+        &mut self,
+        author: &AgentLabel,
+        observations: Vec<super::question_state::Observation>,
+    ) {
+        match super::question_state::try_observe(&self.agent_dir(author), observations.clone()) {
+            Ok(true) => {}
+            Ok(false) => self
+                .questions
+                .entry(author.clone())
+                .or_default()
+                .extend(observations),
+            Err(e) => tracing::debug!(%author, %e, "question evidence was not recorded"),
         }
     }
 
@@ -918,15 +1014,23 @@ impl Turns {
         };
         let before = self.custody(author, g).map(|c| c.state.clone());
         let out = self.step_in_memory(author, g, None, Event::Attend(request));
-        // A run acknowledged here execs at once, and only turn.json brings
-        // its registration back after a restart: an unwritten one is not
-        // accepted, and is undone so memory never claims more than disk.
-        if let Err(e) = self.try_persist(author, None) {
+        // A run acknowledged here execs at once, and only the turn record
+        // brings its registration back after a restart: an unwritten one is
+        // not accepted, and is undone so memory never claims more than disk.
+        let unwritten = match self.try_persist(author, None) {
+            Ok(Persist::Written) => None,
+            Ok(Persist::Refused) => Some("this session no longer holds the label".to_string()),
+            Ok(Persist::Contended) => Some(
+                "another clank process holds the agent's state; try again in a moment".to_string(),
+            ),
+            Err(e) => Some(format!("{e:#}")),
+        };
+        if let Some(why) = unwritten {
             if let (Some(custody), Some(before)) = (self.agents.get_mut(author), before) {
                 custody.state = before;
             }
             return Err(format!(
-                "could not record this in `{author}`'s turn state ({e}), so nothing was recorded"
+                "could not record this in `{author}`'s turn state ({why}), so nothing was recorded"
             ));
         }
         match out {

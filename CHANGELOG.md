@@ -9,6 +9,17 @@ All notable changes to clank are recorded here. The format follows
 
 ### Breaking
 
+- An agent's runtime state is one file, `.clank/agents/<label>/state.json`:
+  the session bound to it, the monitor's turn record, its questions, its
+  recovery episode and attempt numbers, what reached it and what status
+  shows of it. `config.json` holds only what you set. Nothing is migrated:
+  after upgrading every agent is unbound and its hooks go quiet, so restart
+  every agent (a pane `clank open` launched binds again as it starts).
+  `turn.json`, `question.json`, `recovery.json`, `recovery-issued.json`,
+  `delivered.json`, `ledger.json`, `binding.lock` and `question.lock` are no
+  longer read or written and can be deleted, with the long-dead
+  `repeat.json`, `repeat.lock` and `attending.holder`, as can a `session`,
+  `resume_pending` or `outage_notified` left in an agent's `config.json`.
 - The monitor protocol is 25. v0.2.0 and the development builds before it
   speak 23 or 24, so they and this release do not serve each other: a newer
   client replaces an older monitor, and an older client is declined. Restart

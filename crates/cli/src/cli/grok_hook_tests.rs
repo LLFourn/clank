@@ -93,13 +93,7 @@ fn an_outage_continuation_still_arms_a_wait_when_the_monitor_recovers() {
     )
     .unwrap();
     // Legacy releases could emit an outage continuation without asking for a wait.
-    crate::agent_store::update_agent_config(&repo, &label, |config| {
-        config.outage_notified = Some(clank_core::agent_config::OutageNotified {
-            session: session.clone(),
-            at: "2026-11-12T00:00:00Z".into(),
-        });
-    })
-    .unwrap();
+    crate::agent_store::told_of_an_outage(&repo, &label, session.as_str());
     let mut continuation = input(&repo, &session, "stop", json!([]));
     continuation.stop_hook_active = true;
     assert_eq!(handle_with(&continuation, &repo, &env, true).unwrap(), None);

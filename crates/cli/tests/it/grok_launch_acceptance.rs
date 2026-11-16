@@ -376,10 +376,10 @@ async fn cycles_after_setup(f: &Fixture, expected: Option<&str>, expected_probes
     if let Some(expected) = expected {
         assert_eq!(sid, expected);
     }
-    let cfg = clank::agent_store::load_agent_config(&f.root, &label())
+    let bound = clank::agent_store::binding(&f.root, &label())
         .unwrap()
         .unwrap();
-    assert_eq!(cfg.session.unwrap().id.as_str(), sid);
+    assert_eq!(bound.id.as_str(), sid);
     let summary: Value =
         serde_json::from_slice(&std::fs::read(f.summary_path(&f.root, sid)).unwrap()).unwrap();
     assert_eq!(summary["info"]["cwd"], f.root.to_string_lossy().as_ref());
@@ -556,13 +556,13 @@ async fn a_native_outage_continuation_requests_one_wait_after_recovery() {
     f.setup().await;
     f.bind(RESUME);
     let pending = f.deliver(0);
-    clank::agent_store::update_agent_config(&f.root, &label(), |config| {
-        config.outage_notified = Some(clank_core::agent_config::OutageNotified {
-            session: SessionId::parse(RESUME).unwrap(),
-            at: "2026-11-12T00:00:00Z".into(),
-        });
-    })
-    .unwrap();
+    let state = clank::agent_store::agents_root(&f.root)
+        .join(label().as_str())
+        .join("state.json");
+    let mut doc: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert_eq!(doc["binding"]["id"], RESUME);
+    doc["bound"]["outage"] = json!({"at": "2026-11-12T00:00:00Z"});
+    std::fs::write(&state, doc.to_string()).unwrap();
     let hooks: Value =
         serde_json::from_slice(&std::fs::read(f.grok.join("hooks/clank.json")).unwrap()).unwrap();
     let ceiling = Duration::from_secs(

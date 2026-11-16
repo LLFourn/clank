@@ -269,14 +269,18 @@ async fn lost_automatic_wait(registered_before_close: bool) {
         "{\"type\":\"turn_started\",\"turn_number\":1}\n",
     )
     .unwrap();
-    crate::agent_store::update_agent_config(repo.path(), &author, |config| {
-        config.session.as_mut().unwrap().transcript = Some(history.display().to_string());
-    })
+    let bound = crate::agent_store::binding(repo.path(), &author)
+        .unwrap()
+        .unwrap();
+    crate::agent_store::record_transcript(
+        repo.path(),
+        &author,
+        &bound.id,
+        &history.display().to_string(),
+    )
     .unwrap();
-    let binding = crate::agent_store::load_agent_config(repo.path(), &author)
+    let binding = crate::agent_store::binding(repo.path(), &author)
         .unwrap()
-        .unwrap()
-        .session
         .unwrap();
     let mut recovery =
         crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());

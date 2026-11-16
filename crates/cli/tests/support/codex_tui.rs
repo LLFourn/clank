@@ -261,14 +261,9 @@ async fn installed_codex_tui_fork_probe() -> Result<()> {
     drop(parent_terminal);
     drop(server);
     let _ = std::fs::remove_file(&socket);
-    clank::agent_store::update_agent_config(&root, &label, |config| {
-        config.session = Some(clank_core::agent_config::Session {
-            id: clank_core::ids::SessionId::parse(&parent).unwrap(),
-            tool: Tool::Codex,
-            updated_at: "2026-11-13T00:00:00Z".into(),
-            transcript: Some(transcript),
-        });
-    })?;
+    let parent_id = clank_core::ids::SessionId::parse(&parent)?;
+    clank::agent_store::bind_session_to_agent(&root, &label, Tool::Codex, &parent_id)?;
+    clank::agent_store::record_transcript(&root, &label, &parent_id, &transcript)?;
     let dest = clank::cli::fork::run_fork(
         &clank::cli::ForkCreateArgs {
             name: Some("private-tui".into()),

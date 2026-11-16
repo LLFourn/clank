@@ -50,9 +50,6 @@ pub(crate) fn working_view() -> crate::cli::agent_state::View {
     let now = crate::cli::recovery::unix_now();
     View::at(
         AgentState {
-            role: String::new(),
-            session: "s1".into(),
-            tool: clank_core::Tool::Claude,
             monitor: Observer {
                 pid: 1,
                 birth: None,

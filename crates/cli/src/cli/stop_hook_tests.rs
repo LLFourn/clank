@@ -1431,9 +1431,8 @@ fn start_input(session: &str, source: &str) -> SessionStartInput {
 
 fn bound_session(repo: &Path, label: &str) -> Option<(Tool, String)> {
     let label = AgentLabel::parse(label).unwrap();
-    crate::agent_store::load_agent_config(repo, &label)
+    crate::agent_store::binding(repo, &label)
         .unwrap()
-        .and_then(|c| c.session)
         .map(|s| (s.tool, s.id.as_str().to_string()))
 }
 
@@ -1665,9 +1664,9 @@ fn a_hand_started_session_is_identified_by_its_id_and_never_bound_here() {
     let sid = "9c96eb03-1458-4bac-abbb-90243cfd422c";
     assert!(session_started(repo, Tool::Claude, &start_input(sid, "startup"), None,).is_none());
     assert!(
-        crate::agent_store::load_all_agent_configs(repo)
+        crate::agent_store::binding(repo, &AgentLabel::parse("claude").unwrap())
             .unwrap()
-            .is_empty()
+            .is_none()
     );
     bind_tool(repo, "claude", sid, Tool::Claude);
     let got = session_started(repo, Tool::Claude, &start_input(sid, "clear"), None);
@@ -1748,12 +1747,11 @@ fn arm_resume_of(repo: &Path, label: &str, session: &str) {
     );
 }
 
+/// The session whose resume has yet to check in, if one has.
 fn resume_pending(repo: &Path, label: &str) -> Option<String> {
     let label = AgentLabel::parse(label).unwrap();
-    crate::agent_store::load_agent_config(repo, &label)
-        .unwrap()
-        .and_then(|c| c.resume_pending)
-        .map(|p| p.session.as_str().to_string())
+    let (bound, pending) = crate::agent_store::resume_pending(repo, &label).unwrap();
+    pending.and(bound).map(|s| s.id.as_str().to_string())
 }
 
 #[test]
@@ -1768,10 +1766,11 @@ fn a_resumed_claude_session_checks_in_at_its_start() {
     assert_eq!(resume_pending(repo, "claude"), None);
 }
 
-/// The marker is for the session the label was bound to when it was
-/// armed; the session bound since checking in says nothing about that one.
+/// The marker belongs to the session the label was bound to when it was
+/// armed: another session's binding ends it with the rest of what was
+/// known of that session, and checking in clears nothing of the new one.
 #[test]
-fn another_sessions_check_in_leaves_the_marker() {
+fn another_sessions_binding_ends_the_marker() {
     let dir = init_repo();
     let repo = dir.path();
     let (armed, successor) = (
@@ -1780,14 +1779,18 @@ fn another_sessions_check_in_leaves_the_marker() {
     );
     bind_tool(repo, "claude", armed, Tool::Claude);
     arm_resume_of(repo, "claude", armed);
+    assert_eq!(resume_pending(repo, "claude"), Some(armed.into()));
     bind_tool(repo, "claude", successor, Tool::Claude);
+    assert_eq!(resume_pending(repo, "claude"), None);
     let got = session_started(repo, Tool::Claude, &start_input(successor, "resume"), None);
     assert_eq!(got.as_ref().map(|(l, _)| l.as_str()), Some("claude"));
-    assert_eq!(resume_pending(repo, "claude"), Some(armed.into()));
+    assert_eq!(resume_pending(repo, "claude"), None);
 }
 
+/// A released session's marker goes with its binding: the bootstrap
+/// start that follows binds afresh, with no marker.
 #[test]
-fn a_bootstrap_start_leaves_the_marker() {
+fn a_bootstrap_start_after_a_release_has_no_marker() {
     let dir = init_repo();
     let repo = dir.path();
     let (armed, fresh) = (
@@ -1814,7 +1817,7 @@ fn a_bootstrap_start_leaves_the_marker() {
         bound_session(repo, "claude"),
         Some((Tool::Claude, fresh.into()))
     );
-    assert_eq!(resume_pending(repo, "claude"), Some(armed.into()));
+    assert_eq!(resume_pending(repo, "claude"), None);
 }
 
 /// A [`crate::upgrade::Replacing`] over `installed` whose every attempt

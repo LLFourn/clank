@@ -46,7 +46,7 @@ pub(crate) fn line_rule(line: &str) -> Option<(&'static str, &'static str)> {
         ("recovery-reply.json", "a recovery reply"),
         ("turns.jsonl", "a harness's observed turns"),
         ("turn.json", "the monitor's turn state"),
-        ("state.json", "the monitor's published state"),
+        ("state.json", "the agent's runtime state"),
     ];
     const APIS: &[(&str, &str)] = &[
         ("question_state::observe", "a question-state write"),
