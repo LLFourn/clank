@@ -6,6 +6,64 @@ use serde_json::json;
 
 const ARM: &str = crate::cli::wake_render::ARM_WAIT;
 
+/// The wait a continuation asks for, parsed as Grok would run it.
+fn armed_wait(continuation: &str) -> super::super::WaitArgs {
+    use clap::Parser;
+    let command = continuation.split('`').nth(1).expect("a quoted command");
+    let argv: Vec<&str> = command.split_whitespace().collect();
+    match crate::cli::command::Cli::try_parse_from(argv)
+        .unwrap()
+        .command
+    {
+        crate::cli::command::Command::Wait(w) => w.wait,
+        _ => panic!("{command} is not a wait"),
+    }
+}
+
+/// An unanswered Stop arms its wait without asking about policy, so the
+/// wait it arms is where auto-off is honoured: with auto off, whether off
+/// at the Stop or switched off before the wait starts, it neither waits
+/// automatically nor falls through to a manual wait that would deliver.
+#[test]
+fn an_armed_wait_under_auto_off_is_quiet_not_manual() {
+    let (_temp, repo, label, session, env) = fixture();
+    handle(
+        &input(&repo, &session, "session_start", json!([])),
+        &repo,
+        &env,
+    )
+    .unwrap();
+    let (out, _) = wire(&crate::cli::turn_wire::Frame::bare(
+        WireVerdict::Unanswered {
+            why: "the monitor has not answered".into(),
+        },
+    ));
+    let reason = serde_json::from_str::<serde_json::Value>(&out.expect("a continuation")).unwrap()
+        ["reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let args = armed_wait(&reason);
+    assert!(args.automatic, "{reason}");
+    assert!(matches!(
+        super::super::wait::route(&args, &env).unwrap(),
+        super::super::wait::Route::Automatic(..)
+    ));
+    crate::agent_store::set_auto_mode(&repo, &label, AutoMode::Off).unwrap();
+    assert!(matches!(
+        super::super::wait::route(&args, &env).unwrap(),
+        super::super::wait::Route::Quiet
+    ));
+    let manual = armed_wait("`clank wait`");
+    assert!(
+        matches!(
+            super::super::wait::route(&manual, &env).unwrap(),
+            super::super::wait::Route::Manual
+        ),
+        "a wait the person asked for still runs"
+    );
+}
+
 #[test]
 fn routing_time_consumes_the_handoff_budget_instead_of_extending_it() {
     let (_temp, repo, _, session, _) = fixture();
@@ -274,6 +332,7 @@ fn automatic_wait_accepts_same_repo_and_rejects_other_repo_or_stale_session() {
         die_with_owner: false,
         deliver_to_session: None,
         turn_end: false,
+        automatic: false,
         json: false,
         events: vec![],
         r#for: None,
@@ -442,11 +501,11 @@ async fn the_childs_diagnostic_still_blocks_nothing() {
     assert!(err.is_some_and(|e| e.contains("did not parse")));
 }
 
-/// A handoff with no monitor is told so before its hook stops waiting:
-/// the hook gives up at the instant its report names. The carrier normally
-/// has enough margin to announce the outage before the hook must do so.
+/// A handoff no monitor ever took asks for the wait before its hook stops
+/// waiting, at the instant its report names: the carrier's last word comes
+/// with margin enough for the hook to read it.
 #[tokio::test(start_paused = true)]
-async fn a_handoff_with_no_monitor_is_told_so_before_its_hook_gives_up() {
+async fn a_handoff_no_monitor_took_asks_for_its_wait_before_its_hook_gives_up() {
     use crate::cli::turn_child::tests::{handoff_by, no_binary, unserved, within};
     let began = tokio::time::Instant::now();
     let [frame] = unserved(&handoff_by(within(HANDOFF_BUDGET)), no_binary)
@@ -458,7 +517,14 @@ async fn a_handoff_with_no_monitor_is_told_so_before_its_hook_gives_up() {
         spare >= std::time::Duration::from_secs(1),
         "the hook had {spare:?} of its wait left to read it in"
     );
+    assert!(
+        matches!(&frame.verdict, WireVerdict::Unanswered { why } if why.contains("monitor is unavailable")),
+        "{frame:?}"
+    );
     let (out, err) = wire(&frame);
-    assert!(out.is_none());
-    assert!(err.unwrap().contains("monitor is unavailable"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out.expect("a decision")).unwrap(),
+        json!({"decision": "block", "reason": ARM})
+    );
+    assert_eq!(err, None);
 }

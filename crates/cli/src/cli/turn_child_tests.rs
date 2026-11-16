@@ -325,15 +325,18 @@ async fn a_newer_monitor_with_no_newer_install_is_an_outage() {
     );
 }
 
-/// A report that never parks is told of a retry still failing at its
-/// deadline, inside the outage budget and ahead of its hook's giving up:
-/// it has no later chance.
+/// A report that never parks, still retrying inside the outage budget at
+/// its deadline, ends unanswered then, ahead of its hook's giving up: it
+/// has no later chance.
 #[tokio::test(start_paused = true)]
-async fn a_report_that_never_parks_is_told_at_its_deadline_of_a_retry_still_failing() {
+async fn a_report_that_never_parks_ends_unanswered_at_its_deadline_of_a_retry_still_failing() {
     let left = std::time::Duration::from_secs(10);
     let began = tokio::time::Instant::now();
     let printed = unserved(&handoff_by(within(left)), no_binary).await;
-    assert_eq!(printed, vec![outage_notice()]);
+    assert_eq!(
+        printed,
+        vec![unanswered(&unreachable("starting one failed: no binary"))]
+    );
     let early = left - began.elapsed();
     let second = std::time::Duration::from_secs(1);
     assert!(
@@ -624,8 +627,8 @@ fn child_report(left: std::time::Duration) -> Report {
 /// is carried holding nothing, so the monitor supersedes no park for it.
 /// Its hook passes nothing on, so an outage it meets is not announced on
 /// it, with no monitor to be had or with one that took it and never
-/// answered: it ends on a diagnostic, and the session's one announcement
-/// is still there for the agent's own Stop.
+/// answered: it ends unanswered, and the session's one announcement is
+/// still there for the agent's own Stop.
 #[tokio::test(start_paused = true)]
 async fn a_childs_report_holds_no_wait_and_spends_no_announcement() {
     let five = std::time::Duration::from_secs(5);
@@ -665,8 +668,8 @@ async fn a_childs_report_holds_no_wait_and_spends_no_announcement() {
     assert!(
         matches!(
             printed.as_slice(),
-            [Frame { verdict: WireVerdict::Diagnostic { message }, .. }]
-                if message.contains("still has no monitor")
+            [Frame { verdict: WireVerdict::Unanswered { why }, .. }]
+                if why.contains("still has no monitor")
         ),
         "{printed:?}"
     );
@@ -682,8 +685,8 @@ async fn a_childs_report_holds_no_wait_and_spends_no_announcement() {
     assert!(
         matches!(
             printed.as_slice(),
-            [Frame { verdict: WireVerdict::Diagnostic { message }, .. }]
-                if message.contains("has not answered")
+            [Frame { verdict: WireVerdict::Unanswered { why }, .. }]
+                if why == NOT_ANSWERED
         ),
         "{printed:?}"
     );
@@ -699,8 +702,8 @@ async fn a_childs_report_holds_no_wait_and_spends_no_announcement() {
     assert!(
         matches!(
             printed.as_slice(),
-            [Frame { verdict: WireVerdict::Diagnostic { message }, .. }]
-                if message.contains("still has no monitor")
+            [Frame { verdict: WireVerdict::Unanswered { why }, .. }]
+                if why.contains("still has no monitor")
         ),
         "{printed:?}"
     );
@@ -723,9 +726,9 @@ fn monitor_only_beating() -> (Conn, std::os::unix::net::UnixStream) {
     (Conn::over(mine), theirs)
 }
 
-/// A handoff a monitor took and did not answer is told so before its hook
-/// gives up, like one no monitor took: being connected does not put the
-/// exchange outside the report's deadline. Every attempt ends in a diagnostic.
+/// A handoff a monitor took and did not answer ends unanswered before its
+/// hook gives up, like one no monitor took: being connected does not put
+/// the exchange outside the report's deadline. Every attempt ends so.
 #[tokio::test(start_paused = true)]
 async fn a_handoff_a_monitor_took_and_never_answered_is_told_so_before_its_deadline() {
     let (repo, author) = repo_with(clank_core::Tool::Grok, true);
@@ -738,7 +741,7 @@ async fn a_handoff_a_monitor_took_and_never_answered_is_told_so_before_its_deadl
     let ten = std::time::Duration::from_secs(10);
     let began = tokio::time::Instant::now();
     let first = carried(repo.path(), &author, &handoff_by(within(ten)), &attach).await;
-    assert_eq!(first, vec![still("the monitor has not answered")]);
+    assert_eq!(first, vec![unanswered(NOT_ANSWERED)]);
     let spare = ten.saturating_sub(began.elapsed());
     assert!(
         spare >= std::time::Duration::from_secs(1),
@@ -746,18 +749,11 @@ async fn a_handoff_a_monitor_took_and_never_answered_is_told_so_before_its_deadl
     );
     assert!(
         !told(repo.path(), &author),
-        "a diagnostic writes no policy state"
+        "an unanswered handoff writes no policy state"
     );
 
     let second = carried(repo.path(), &author, &handoff_by(within(ten)), &attach).await;
-    assert!(
-        matches!(
-            second.as_slice(),
-            [Frame { verdict: WireVerdict::Diagnostic { message }, .. }]
-                if message.contains("has not answered")
-        ),
-        "{second:?}"
-    );
+    assert_eq!(second, vec![unanswered(NOT_ANSWERED)]);
 }
 
 /// A parked report whose monitor is there and says nothing at its
@@ -882,9 +878,10 @@ pub(crate) fn announcements(out: &HookPipe) -> usize {
         .count()
 }
 
-/// Concurrent carriers can print diagnostics, but neither can wake a model.
+/// Concurrent carriers each end unanswered, and neither presents anything
+/// or writes policy.
 #[test]
-fn concurrent_outage_diagnostics_never_authorize_a_turn() {
+fn concurrent_unanswered_carriers_present_nothing_and_write_no_policy() {
     let (repo, author) = repo_with(clank_core::Tool::Grok, false);
     std::thread::scope(|scope| {
         for _ in 0..2 {
@@ -897,7 +894,10 @@ fn concurrent_outage_diagnostics_never_authorize_a_turn() {
                 };
                 handoff_child(repo.path(), &author, &mut out);
                 assert_eq!(announcements(&out), 0);
-                assert_eq!(frames(out.bytes), vec![outage_notice()]);
+                assert_eq!(
+                    frames(out.bytes),
+                    vec![unanswered(&unreachable("starting one failed: no binary"))]
+                );
             });
         }
     });
@@ -1053,19 +1053,19 @@ async fn a_retirement_that_never_ends_is_told_at_its_own_bound() {
     );
 }
 
-/// A report that cannot park, caught by a retirement, costs its agent no
-/// turn either way it meets it: unattached behind the old monitor's
-/// lease until its deadline, or attached to an old monitor that answers
-/// nothing new while it settles. Each ends with a diagnostic, which wakes
-/// nobody, and no notice is recorded as given.
+/// A report that cannot park, caught by a retirement, is told no outage
+/// either way it meets it: unattached behind the old monitor's lease until
+/// its deadline, or attached to an old monitor that answers nothing new
+/// while it settles. Each ends unanswered, with nothing rendered, and no
+/// notice is recorded as given.
 #[tokio::test(start_paused = true)]
-async fn a_report_that_cannot_wait_out_a_retirement_ends_quietly() {
+async fn a_report_that_cannot_wait_out_a_retirement_ends_unanswered() {
     use super::super::monitor::{DescribedBuild, Descriptor};
     let quiet = |printed: &[Frame]| {
         matches!(
             printed,
             [Frame {
-                verdict: WireVerdict::Diagnostic { .. },
+                verdict: WireVerdict::Unanswered { .. },
                 rendered: None
             }]
         )
@@ -1182,6 +1182,7 @@ async fn a_carrier_requires_the_hooks_routed_identity() {
         die_with_owner: false,
         deliver_to_session: None,
         turn_end: true,
+        automatic: false,
         json: false,
         events: vec![],
         r#for: None,

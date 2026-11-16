@@ -611,7 +611,7 @@ async fn a_native_outage_continuation_requests_one_wait_after_recovery() {
                 decision["reason"]
                     .as_str()
                     .unwrap()
-                    .contains("Run `clank wait`")
+                    .contains("Run `clank wait --automatic`")
             );
         } else {
             assert!(

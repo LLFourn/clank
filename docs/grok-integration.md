@@ -19,14 +19,18 @@ is no tool-call registration handshake.
    wait connected for that session and still open. It decides: nothing if a
    wait is registered, this is the continuation (whose just-armed wait may not
    have registered yet), or the drive gate (auto off, a block) says so; otherwise
-   Stop blocks with the request to run `clank wait` as one background terminal
-   task (`block_until_ms: 0`, no positive timeout). The hook never rewrites a
+   Stop blocks with the request to run `clank wait --automatic` as one
+   background terminal task (`block_until_ms: 0`, no positive timeout). A
+   handoff the monitor does not answer in time gets the same request, decided
+   by no one: the wait it arms asks the monitor. The hook never rewrites a
    tool call or waits for work itself.
 4. The wait gets Grok's native `GROK_SESSION_ID`, its agent binding and the launch
-   repository. Bare `clank wait` and `clank wait --repo <the same repository>` are
-   equivalent. An automatic wait cannot change its author or move to another
-   repository/worktree. Auto-off, inspection and observer waits keep their own
-   existing semantics.
+   repository. `clank wait --automatic` runs only as that session's automatic
+   wait: with auto mode off, at the Stop or by the time it starts, it exits
+   without waiting, and never becomes a manual wait. An automatic wait cannot
+   change its author or move to another repository/worktree. A bare
+   `clank wait` a person runs keeps its existing semantics: automatic while
+   auto is on, manual otherwise.
 5. Before selecting even immediately pending work, the automatic wait connects
    to the shared monitor using the existing author and tool/session fields. The
    monitor derives current roster role, checks the binding, and refuses a second

@@ -52,6 +52,17 @@ struct WaitSuperseded(String);
 #[error("wait --peek found no work for this agent")]
 pub(crate) struct WaitNoWork;
 
+#[cfg(test)]
+impl WaitBinding {
+    /// The binding a bare `clank wait` takes in automatic Grok `session`.
+    pub(crate) fn automatic_grok(session: clank_core::SessionId) -> Self {
+        WaitBinding(
+            Some((clank_core::Tool::Grok, session)),
+            WaitPolicy::AutomaticGrok { home: None },
+        )
+    }
+}
+
 impl WaitBinding {
     /// The pair this wait speaks for, as the monitor's hello wants it:
     /// both halves or neither, never a half.
@@ -129,8 +140,12 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     if args.turn_end {
         return super::turn_child::run(args).await;
     }
-    if let Some((repo, author, binding)) = automatic_grok(&args, &crate::agent_env::Process)? {
-        return run_automatic_grok(args, &repo, &author, &binding).await;
+    match route(&args, &crate::agent_env::Process)? {
+        Route::Automatic(repo, author, binding) => {
+            return run_automatic_grok(args, &repo, &author, &binding).await;
+        }
+        Route::Quiet => return Ok(()),
+        Route::Manual => {}
     }
     let json = args.json;
     let peek = args.peek;
@@ -169,6 +184,25 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         emit_with_context(&items, json, source_cwd.as_deref());
     }
     Ok(())
+}
+
+/// How a `clank wait` runs.
+#[derive(Debug)]
+pub(super) enum Route {
+    Automatic(PathBuf, AgentLabel, WaitBinding),
+    /// An `--automatic` wait with no automatic session to wait for: auto
+    /// mode is off, or this is no Grok session. Its continuation was
+    /// decided before auto changed, or by a hook that could not ask.
+    Quiet,
+    Manual,
+}
+
+pub(super) fn route(args: &WaitArgs, env: &dyn crate::agent_env::Ambient) -> anyhow::Result<Route> {
+    Ok(match automatic_grok(args, env)? {
+        Some((repo, author, binding)) => Route::Automatic(repo, author, binding),
+        None if args.automatic => Route::Quiet,
+        None => Route::Manual,
+    })
 }
 
 /// Native session identity is enough. The launch cwd fixes the repository;
@@ -948,7 +982,7 @@ impl WakeSources {
 /// both, and fails for no outage: an upgrade costs the agent no turn.
 ///
 /// The attaching is a parameter because no test may start a monitor.
-async fn monitored<F>(
+pub(crate) async fn monitored<F>(
     repo: &Path,
     author: &AgentLabel,
     binding: &WaitBinding,
@@ -3814,25 +3848,26 @@ mod shared_tests {
         assert!(told());
     }
 
-    /// A hook diagnostic does not spend the background wait's outage notice,
-    /// even when the wait announces while the hook is still writing.
+    /// A hook's unanswered handoff does not spend the background wait's
+    /// outage notice, even when the wait announces while the hook is still
+    /// writing.
     #[test]
-    fn a_hook_diagnostic_leaves_the_background_waits_outage_notice_available() {
+    fn a_hooks_unanswered_handoff_leaves_the_background_waits_outage_notice_available() {
         use crate::cli::monitor::Attempt;
         use crate::cli::turn_child::tests::{handoff_child, repo_with, told};
 
-        struct HeldDiagnostic {
+        struct HeldLastWord {
             bytes: Vec<u8>,
             writing: Option<std::sync::mpsc::Sender<()>>,
             release: std::sync::mpsc::Receiver<()>,
         }
-        impl std::io::Write for HeldDiagnostic {
+        impl std::io::Write for HeldLastWord {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 if let Some(writing) = self.writing.take() {
                     writing.send(()).unwrap();
                     self.release
                         .recv_timeout(std::time::Duration::from_secs(30))
-                        .expect("the wait finishes while the diagnostic is held");
+                        .expect("the wait finishes while the last word is held");
                 }
                 self.bytes.extend_from_slice(bytes);
                 Ok(bytes.len())
@@ -3849,7 +3884,7 @@ mod shared_tests {
         let before = std::fs::read(&config).unwrap();
         let (writing, began) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
-        let mut hook = HeldDiagnostic {
+        let mut hook = HeldLastWord {
             bytes: Vec::new(),
             writing: Some(writing),
             release: released,
@@ -3858,7 +3893,7 @@ mod shared_tests {
             scope.spawn(|| handoff_child(repo.path(), &author, &mut hook));
             began
                 .recv_timeout(std::time::Duration::from_secs(30))
-                .expect("the hook's child reaches its diagnostic");
+                .expect("the hook's child reaches its last word");
             assert_eq!(std::fs::read(&config).unwrap(), before);
             assert!(!told(repo.path(), &author));
             let attempts = std::sync::atomic::AtomicUsize::new(0);
@@ -3900,11 +3935,11 @@ mod shared_tests {
             matches!(
                 frames.as_slice(),
                 [crate::cli::turn_wire::Frame {
-                    verdict: crate::cli::turn_wire::WireVerdict::Diagnostic { .. },
+                    verdict: crate::cli::turn_wire::WireVerdict::Unanswered { .. },
                     ..
                 }]
             ),
-            "the hook emits only a diagnostic: {frames:?}"
+            "the hook's child ends only unanswered: {frames:?}"
         );
         assert_eq!(
             waited

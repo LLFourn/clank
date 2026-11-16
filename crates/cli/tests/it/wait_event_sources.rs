@@ -42,6 +42,7 @@ fn wait_args(repo: &Path, mut events: Vec<String>) -> WaitArgs {
         die_with_owner: false,
         deliver_to_session: None,
         turn_end: false,
+        automatic: false,
         json: true,
         events,
         r#for: None,

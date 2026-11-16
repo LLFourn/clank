@@ -521,9 +521,10 @@ fn stop_report() -> Report {
 
 /// Exercise the real parent exchange with an in-memory carrier that never
 /// answers. Both an expired pre-arm deadline and a deadline during the wait
-/// must reach Grok as a diagnostic, with no work receipt invented.
+/// reach Grok as the request for its wait, with no work receipt invented
+/// and no policy written.
 #[tokio::test(start_paused = true)]
-async fn groks_own_deadline_reports_failure_without_a_model_turn() {
+async fn groks_own_deadline_asks_for_its_wait_and_writes_nothing() {
     use crate::cli::turn_child::tests::{SESSION, handoff, repo_with, told};
     for budget in [
         std::time::Duration::ZERO,
@@ -544,13 +545,14 @@ async fn groks_own_deadline_reports_failure_without_a_model_turn() {
                 |frame| {
                     assert!(frame.presentation().is_none());
                     let (out, err) = crate::cli::grok_hook::wire(frame);
-                    assert!(out.is_none());
-                    assert!(err.unwrap().contains("not answered"));
+                    let block: serde_json::Value = serde_json::from_str(&out.unwrap()).unwrap();
+                    assert_eq!(block["reason"], crate::cli::wake_render::ARM_WAIT);
+                    assert_eq!(err, None);
                     None
                 },
             )
             .await;
-            assert!(matches!(frame.verdict, WireVerdict::Diagnostic { .. }));
+            assert!(matches!(frame.verdict, WireVerdict::Unanswered { .. }));
         }
         assert!(!told(repo.path(), &author));
         assert_eq!(
@@ -564,6 +566,7 @@ async fn groks_own_deadline_reports_failure_without_a_model_turn() {
             die_with_owner: false,
             deliver_to_session: None,
             turn_end: false,
+            automatic: false,
             json: false,
             events: vec![],
             r#for: None,
@@ -601,13 +604,16 @@ async fn groks_deadline_does_not_record_an_unwritten_notice() {
             },
         )
         .await;
-        assert!(matches!(frame.verdict, WireVerdict::Diagnostic { .. }));
+        assert!(matches!(frame.verdict, WireVerdict::Unanswered { .. }));
         assert!(!told(repo.path(), &author));
     }
 }
 
+/// The hook's own deadline is unanswered whatever the agent's policy or
+/// binding: it reads neither, and leaves the binding to Grok's adapter
+/// and the policy to the monitor the wait asks.
 #[tokio::test(start_paused = true)]
-async fn groks_deadline_needs_no_policy_or_current_binding_to_diagnose_failure() {
+async fn groks_deadline_is_unanswered_whatever_its_policy_or_binding() {
     use crate::cli::turn_child::tests::{SESSION, handoff, repo_with, told};
     for replaced in [false, true] {
         let (repo, author) = repo_with(Tool::Grok, true);
@@ -625,12 +631,12 @@ async fn groks_deadline_needs_no_policy_or_current_binding_to_diagnose_failure()
             handoff(),
             std::time::Duration::ZERO,
             |frame| {
-                assert!(crate::cli::grok_hook::wire(frame).0.is_none());
+                assert!(matches!(frame.verdict, WireVerdict::Unanswered { .. }));
                 None
             },
         )
         .await;
-        assert!(matches!(frame.verdict, WireVerdict::Diagnostic { .. }));
+        assert!(matches!(frame.verdict, WireVerdict::Unanswered { .. }));
         assert!(!told(repo.path(), &author));
     }
 }
@@ -671,13 +677,10 @@ async fn groks_installed_timeout_covers_the_exchange_cleanup_and_emission() {
         assert!(matches!(got, Err(ref frame) if frame.verdict == WireVerdict::Park));
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));
         tokio::time::sleep(std::time::Duration::from_secs(1)).await; // framing/filesystem margin
-        let frame = crate::cli::turn_child::unanswered(&mut |frame| {
-            let (out, err) = crate::cli::grok_hook::wire(frame);
-            assert!(err.is_some());
-            assert!(out.is_none());
-            Some(Ok(()))
-        });
-        assert!(matches!(frame.verdict, WireVerdict::Diagnostic { .. }));
+        let frame = crate::cli::turn_child::unanswered(crate::cli::turn_child::NOT_ANSWERED);
+        let (out, err) = crate::cli::grok_hook::wire(&frame);
+        assert!(out.is_some());
+        assert!(err.is_none());
     })
     .await
     .expect("the native runner must receive the decision before its ceiling");
@@ -1030,6 +1033,66 @@ async fn the_childs_diagnostic_still_wakes_nobody_on_any_adapter() {
             "{tool:?}"
         );
         assert_eq!(answered.got(), Some(None), "{tool:?}");
+    }
+}
+
+/// Off Grok, a report left unanswered is written byte for byte as the
+/// diagnostic that stood for one before it was a verdict of its own: on a
+/// Stop's wire for every adapter, and by a subagent's hook.
+#[tokio::test]
+async fn an_unanswered_report_is_written_off_grok_as_its_old_timeout_diagnostic() {
+    use super::super::SubagentArg;
+    use crate::cli::turn_child::unanswered;
+    let dir = init_repo();
+    let repo = dunce::canonicalize(dir.path()).unwrap();
+    bind_tool(&repo, "claude", "sess-child", Tool::Claude);
+    let start = documented_start(&repo, "sess-child", RECORDED_A).to_string();
+    for (why, wrote) in [
+        (
+            crate::cli::turn_child::NOT_ANSWERED,
+            "hook: the monitor has not answered",
+        ),
+        (
+            "clank still has no monitor: no binary",
+            "hook: clank still has no monitor: no binary",
+        ),
+        (
+            "the monitor is unavailable: no binary",
+            "hook: the monitor is unavailable: no binary",
+        ),
+    ] {
+        let old = || {
+            Frame::bare(WireVerdict::Diagnostic {
+                message: wrote.into(),
+            })
+        };
+        for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+            let mut written = Vec::new();
+            for frame in [unanswered(why), old()] {
+                let answered = Answered::default();
+                let mut stdout = Writer::new();
+                let mut stderr = Writer::new();
+                let code =
+                    emit_turn(turn_of(frame, &answered), tool, &mut stdout, &mut stderr).await;
+                written.push((code, stdout.bytes, stderr.bytes, answered.got()));
+            }
+            assert_eq!(written[0], written[1], "{tool:?}: {why}");
+        }
+        let mut said = Vec::new();
+        for frame in [unanswered(why), old()] {
+            said.push(
+                subagent(
+                    Tool::Claude,
+                    Some(&repo),
+                    SubagentArg::Start,
+                    &start,
+                    HOOK_STARTED,
+                    &Spawns(&Fed::new(String::new(), vec![frame])),
+                )
+                .await,
+            );
+        }
+        assert_eq!(said, vec![Some(wrote.to_string()); 2], "{why}");
     }
 }
 

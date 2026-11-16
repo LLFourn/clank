@@ -612,6 +612,11 @@ pub struct WaitArgs {
     /// delivery result the hook writes on stdin after it.
     #[arg(long, hide = true, requires = "die_with_owner")]
     pub turn_end: bool,
+    /// The wait a Grok Stop continuation asked for. It runs only as this
+    /// session's automatic wait, and exits quietly, never becoming a
+    /// manual wait, when the agent is not in auto mode.
+    #[arg(long, hide = true)]
+    pub automatic: bool,
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
