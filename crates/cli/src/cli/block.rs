@@ -22,16 +22,13 @@ fn root(repo: &Path) -> PathBuf {
 /// answer is not listed: delivery deletes its block.
 fn list(repo: Option<&Path>) -> anyhow::Result<()> {
     let repo = resolve_repo(repo)?;
-    let _lock = lock(&repo)?;
-    for name in question_names(&root(&repo)) {
-        if let Some(pair) = Pair::read(&root(&repo), &name) {
-            println!("{name}: {}", pair.question);
-            if let Some(answer) = &pair.answer {
-                println!("  answer: {answer}");
-            }
-            if let Some(why) = pair.damage() {
-                println!("  unresolved: {why}");
-            }
+    for b in scan_blocks(&repo) {
+        println!("{}: {}", b.name, b.question);
+        if let Some(answer) = &b.answer {
+            println!("  answer: {answer}");
+        }
+        if let Some(why) = &b.unreadable {
+            println!("  unresolved: {why}");
         }
     }
     Ok(())
@@ -463,61 +460,200 @@ struct Pair {
     answer: Option<String>,
     /// Why the answer file cannot be read, when it cannot.
     answer_damage: Option<String>,
+    /// Unix seconds, from the same open file the answer was read from.
+    answered_at: Option<u64>,
     attempt: AttemptState,
 }
 
-impl Pair {
-    fn read(agent_dir: &Path, name: &str) -> Option<Pair> {
-        let f = files(agent_dir, name);
-        if !std::fs::symlink_metadata(&f.question).is_ok_and(|m| m.file_type().is_file()) {
-            return None;
+/// Where a lock-free read of one name pauses between its steps: tests land
+/// a write there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    QuestionRead,
+    AnswerRead,
+}
+
+/// A question file's identity. Every publish is a rename and a completion
+/// a removal, so the same generation before and after a read means no
+/// write to the question landed in between.
+#[derive(PartialEq, Eq)]
+struct Generation {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Generation {
+    /// `Ok(None)` only when the question path is `NotFound`. A path that
+    /// exists but is not a regular file is an error, never followed or
+    /// read: it still holds the name, so it must block, not vanish.
+    fn of(path: &Path) -> std::io::Result<Option<Generation>> {
+        use std::os::unix::fs::MetadataExt as _;
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+            Ok(m) if !m.file_type().is_file() => Err(std::io::Error::other(format!(
+                "{} is not a regular file",
+                path.display()
+            ))),
+            Ok(m) => Ok(Some(Generation {
+                dev: m.dev(),
+                ino: m.ino(),
+                len: m.len(),
+                modified: m.modified().ok(),
+            })),
         }
-        let (raw, question_error) = match std::fs::read_to_string(&f.question) {
-            Ok(raw) => (raw, None),
-            Err(e) => (
-                String::new(),
-                Some(format!("the question cannot be read: {e}")),
+    }
+}
+
+/// One name as a lock-free read found it.
+enum Read {
+    Absent,
+    /// Every part from one generation of the question, or a question that
+    /// cannot be inspected, which reads as damage.
+    Coherent(Box<Pair>),
+    /// The question was replaced or removed during every try.
+    Unsettled,
+}
+
+/// How many times a read that saw its question change is tried again.
+const RETRIES: usize = 4;
+
+/// `None` when the question changed while it was being read.
+fn read_once(f: &Files, between: &mut dyn FnMut(Step)) -> Option<Read> {
+    let before = match Generation::of(&f.question) {
+        Ok(None) => return Some(Read::Absent),
+        Err(e) => return Some(Read::Coherent(Box::new(Pair::uninspectable(f, &e)))),
+        Ok(Some(g)) => g,
+    };
+    let (raw, question_error) = match std::fs::read_to_string(&f.question) {
+        Ok(raw) => (raw, None),
+        Err(e) => (
+            String::new(),
+            Some(format!("the question cannot be read: {e}")),
+        ),
+    };
+    between(Step::QuestionRead);
+    let q = unstamp(&raw);
+    let occurrence = q.occurrence;
+    let (answer, answer_damage, answered_at) = match read_answer(&f.answer) {
+        Ok(None) => (None, None, None),
+        Err(e) => (None, Some(format!("the answer cannot be read: {e}")), None),
+        Ok(Some((raw, at))) => {
+            let a = unstamp(&raw);
+            if !belongs(occurrence, a.occurrence) {
+                (None, None, None)
+            } else if a.torn {
+                (
+                    None,
+                    Some("the answer's header is cut short".to_string()),
+                    None,
+                )
+            } else {
+                (Some(a.body.to_string()), None, at)
+            }
+        }
+    };
+    between(Step::AnswerRead);
+    let attempt = match read_attempt(&f.attempt) {
+        None => AttemptState::Absent,
+        Some(Stored::Unreadable(why)) => AttemptState::Unreadable(why),
+        // An unread question names no occurrence to judge it against.
+        Some(Stored::Valid(a)) if question_error.is_some() => AttemptState::Live(a),
+        Some(Stored::Valid(a)) if Some(a.occurrence.as_str()) != occurrence || answer.is_some() => {
+            AttemptState::Inert
+        }
+        Some(Stored::Valid(a)) => AttemptState::Live(a),
+    };
+    match Generation::of(&f.question) {
+        Err(e) => return Some(Read::Coherent(Box::new(Pair::uninspectable(f, &e)))),
+        Ok(after) if after.as_ref() != Some(&before) => return None,
+        Ok(_) => {}
+    }
+    Some(Read::Coherent(Box::new(Pair {
+        occurrence: occurrence.map(str::to_owned),
+        question: q.body.to_string(),
+        kind: match question_error {
+            Some(why) => Stored::Unreadable(why),
+            None => q.kind(),
+        },
+        answer,
+        answer_damage,
+        answered_at,
+        attempt,
+    })))
+}
+
+/// The answer's text and its modification time in unix seconds, both
+/// from one open file, so a replacement at the path cannot date it.
+/// `Ok(None)` only when there is no answer file.
+fn read_answer(path: &Path) -> std::io::Result<Option<(String, Option<u64>)>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // O_NONBLOCK so a FIFO planted at the path cannot hang the reader;
+    // O_NOFOLLOW so a symlink is refused rather than read through.
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        file => file?,
+    };
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::other("the answer is not a regular file"));
+    }
+    let at = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    Ok(Some((raw, at)))
+}
+
+/// `name`'s files, read without the blocks lock: an answer is paired with
+/// a question only when both come from one generation of it.
+fn read_pair(dir: &Path, name: &str, between: &mut dyn FnMut(Step)) -> Read {
+    let f = files(dir, name);
+    (0..=RETRIES)
+        .find_map(|_| read_once(&f, between))
+        .unwrap_or(Read::Unsettled)
+}
+
+impl Pair {
+    /// Under the blocks lock, where no write can land mid-read; a read
+    /// that still finds its question changing is an error.
+    fn read(agent_dir: &Path, name: &str) -> anyhow::Result<Option<Pair>> {
+        match read_pair(agent_dir, name, &mut |_| {}) {
+            Read::Absent => Ok(None),
+            Read::Coherent(pair) => Ok(Some(*pair)),
+            Read::Unsettled => anyhow::bail!(
+                "`{name}`'s question kept changing while it was read under the blocks lock"
             ),
-        };
-        let q = unstamp(&raw);
-        let occurrence = q.occurrence;
-        let (answer, answer_damage) = match std::fs::read_to_string(&f.answer) {
-            Ok(raw) => {
-                let a = unstamp(&raw);
-                if !belongs(occurrence, a.occurrence) {
-                    (None, None)
-                } else if a.torn {
-                    (None, Some("the answer's header is cut short".to_string()))
-                } else {
-                    (Some(a.body.to_string()), None)
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
-            Err(e) => (None, Some(format!("the answer cannot be read: {e}"))),
-        };
-        let attempt = match read_attempt(&f.attempt) {
-            None => AttemptState::Absent,
-            Some(Stored::Unreadable(why)) => AttemptState::Unreadable(why),
-            // An unread question names no occurrence to judge it against.
-            Some(Stored::Valid(a)) if question_error.is_some() => AttemptState::Live(a),
-            Some(Stored::Valid(a))
-                if Some(a.occurrence.as_str()) != occurrence || answer.is_some() =>
-            {
-                AttemptState::Inert
-            }
-            Some(Stored::Valid(a)) => AttemptState::Live(a),
-        };
-        Some(Pair {
-            occurrence: occurrence.map(str::to_owned),
-            question: q.body.to_string(),
-            kind: match question_error {
-                Some(why) => Stored::Unreadable(why),
-                None => q.kind(),
+        }
+    }
+
+    /// A question that exists but cannot be inspected: damage, never
+    /// absence. Its attempt record is kept as live, as for an unread
+    /// question.
+    fn uninspectable(f: &Files, e: &std::io::Error) -> Pair {
+        Pair {
+            occurrence: None,
+            question: String::new(),
+            kind: Stored::Unreadable(format!("the question cannot be inspected: {e}")),
+            answer: None,
+            answer_damage: None,
+            answered_at: None,
+            attempt: match read_attempt(&f.attempt) {
+                None => AttemptState::Absent,
+                Some(Stored::Unreadable(why)) => AttemptState::Unreadable(why),
+                Some(Stored::Valid(a)) => AttemptState::Live(a),
             },
-            answer,
-            answer_damage,
-            attempt,
-        })
+        }
     }
 
     /// Every part of the pair that cannot be read. While there is any,
@@ -554,22 +690,30 @@ impl Pair {
     }
 }
 
-/// The names of the questions in `agent_dir`, sorted.
-fn question_names(agent_dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(agent_dir.join("blocks"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .filter_map(|e| {
-            e.file_name()
-                .to_str()
-                .and_then(|s| s.strip_suffix(".md"))
-                .map(str::to_owned)
-        })
-        .collect();
+/// The names of the questions in `agent_dir`, sorted. No block directory
+/// is no questions; any other failure to list it is an error.
+fn question_names(agent_dir: &Path) -> std::io::Result<Vec<String>> {
+    let entries = match std::fs::read_dir(agent_dir.join("blocks")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        entries => entries?,
+    };
+    names_of(entries.map(|e| e.map(|e| e.file_name())))
+}
+
+/// The question names among directory entries, whatever each entry's type:
+/// a question path that is not a regular file is read as damage, not
+/// skipped. An entry that failed fails the whole listing.
+fn names_of(
+    entries: impl Iterator<Item = std::io::Result<std::ffi::OsString>>,
+) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in entries {
+        if let Some(name) = entry?.to_str().and_then(|s| s.strip_suffix(".md")) {
+            names.push(name.to_owned());
+        }
+    }
     names.sort();
-    names
+    Ok(names)
 }
 
 /// Serializes every read-compare-write of repository blocks: ask, answer
@@ -630,7 +774,7 @@ pub(crate) fn complete(
     validate_name(&carries.name)?;
     let _lock = lock(repo)?;
     let dir = root(repo);
-    let Some(pair) = Pair::read(&dir, &carries.name) else {
+    let Some(pair) = Pair::read(&dir, &carries.name)? else {
         return Ok(false);
     };
     if pair.damage().is_some() || pair.carries(&carries.name).as_ref() != Some(carries) {
@@ -705,7 +849,7 @@ pub(crate) fn ask_with(
     let _lock = lock(repo)?;
     let f = files(&root(repo), name);
     if !absent(&f.question) {
-        let state = match Pair::read(&root(repo), name) {
+        let state = match Pair::read(&root(repo), name)? {
             Some(p) if p.damage().is_some() => "its stored state cannot be read",
             Some(p) if p.answer.is_some() => "answered, and not yet delivered to the master",
             Some(p) if p.live_attempt().is_some() => "a nudge answering it is outstanding",
@@ -930,7 +1074,7 @@ struct Open {
 /// saw, wholly readable, and unanswered. An inert attempt record is
 /// removed on the way.
 fn open_pair(dir: &Path, f: &Files, name: &str, shown: Option<Shown<'_>>) -> anyhow::Result<Open> {
-    let Some(pair) = Pair::read(dir, name) else {
+    let Some(pair) = Pair::read(dir, name)? else {
         anyhow::bail!("the repository has no pending block named `{name}`");
     };
     if shown
@@ -1040,7 +1184,7 @@ fn settle(
                      so nothing was deleted for it"
                 )));
             }
-            let pair = Pair::read(dir, name)
+            let pair = Pair::read(dir, name)?
                 .filter(|p| p.occurrence.as_deref() == Some(claimed.occurrence.as_str()));
             if let Some(why) = pair.as_ref().and_then(Pair::damage) {
                 anyhow::bail!(
@@ -1138,33 +1282,148 @@ impl Stored<Attempt> {
 /// whose state cannot be read. It neither delivers answers nor deletes
 /// questions.
 pub fn scan_blocks(repo: &Path) -> Vec<BlockEntry> {
-    // Inspecting an ordinary Git repo must not initialize Clank storage.
-    if !root(repo).exists() {
-        return Vec::new();
+    Blocks::read(repo).into_entries()
+}
+
+/// One lock-free read of every repository block: what every serve and
+/// admission reader consumes. Storage that cannot be read, a damaged
+/// block and a block whose question changed throughout its read each
+/// stand as a pending entry and owe nothing.
+pub(crate) struct Blocks(Vec<Seen>);
+
+struct Seen {
+    entry: BlockEntry,
+    /// Set only for a wholly readable answered pair.
+    answered: Option<Answered>,
+}
+
+struct Answered {
+    carries: AnswerRef,
+    at: Option<u64>,
+}
+
+impl Blocks {
+    pub(crate) fn read(repo: &Path) -> Blocks {
+        Blocks::read_with(repo, &mut |_, _| {})
     }
-    let _lock = match lock(repo) {
-        Ok(lock) => lock,
-        Err(e) => {
-            return vec![BlockEntry {
+
+    /// `between` runs at each [`Step`] of each name's read.
+    fn read_with(repo: &Path, between: &mut dyn FnMut(&str, Step)) -> Blocks {
+        let dir = root(repo);
+        // Inspecting an ordinary Git repo must not initialize Clank storage.
+        match std::fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Blocks(Vec::new()),
+            Err(e) => return Blocks::storage_damage(&e),
+            Ok(_) => {}
+        }
+        let names = match question_names(&dir) {
+            Ok(names) => names,
+            Err(e) => return Blocks::storage_damage(&e),
+        };
+        Blocks(
+            names
+                .into_iter()
+                .filter_map(|name| {
+                    let read = read_pair(&dir, &name, &mut |step| between(&name, step));
+                    Seen::of(&dir, name, read)
+                })
+                .collect(),
+        )
+    }
+
+    fn storage_damage(e: &std::io::Error) -> Blocks {
+        Blocks(vec![Seen {
+            entry: BlockEntry {
                 creator: String::new(),
                 name: "block-storage".into(),
                 occurrence: None,
                 kind: Stored::Unreadable(e.to_string()),
-                question: format!("Block storage needs repair: {e:#}"),
+                question: format!("Block storage needs repair: {e}"),
                 answer: None,
                 nudge: None,
-                unreadable: Some(e.to_string()),
-            }];
+                unreadable: Some(format!("the block directory cannot be read: {e}")),
+            },
+            answered: None,
+        }])
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &BlockEntry> {
+        self.0.iter().map(|s| &s.entry)
+    }
+
+    pub(crate) fn into_entries(self) -> Vec<BlockEntry> {
+        self.0.into_iter().map(|s| s.entry).collect()
+    }
+
+    /// The answers a wake owes `agent` while it is the master, by name.
+    pub(crate) fn owed(&self, repo: &Path, agent: &clank_core::AgentLabel) -> Vec<OwedAnswer> {
+        if master(repo).ok().as_ref() != Some(agent) {
+            return vec![];
         }
-    };
-    let dir = root(repo);
-    question_names(&dir)
-        .into_iter()
-        .filter_map(|name| {
-            let pair = Pair::read(&dir, &name)?;
-            let unreadable = pair.damage();
-            Some(BlockEntry {
-                creator: std::fs::read_to_string(files(&dir, &name).creator).unwrap_or_default(),
+        self.0
+            .iter()
+            .filter_map(|s| {
+                let carries = s.answered.as_ref()?.carries.clone();
+                let mut answer = s.entry.answer.clone()?;
+                if s.entry.is_permission() {
+                    answer = format!(
+                        "Prior human decision (not permission approval for this session; \
+                         obtain any approval your harness requires): {answer}"
+                    );
+                }
+                Some(OwedAnswer { answer, carries })
+            })
+            .collect()
+    }
+
+    /// When each answered block was answered, by its [`key`]: the date its
+    /// answer file carries, so it reads the same to a monitor that starts
+    /// long after. A delivered block is deleted, and dates nothing.
+    pub(crate) fn ended(&self) -> std::collections::BTreeMap<String, u64> {
+        self.0
+            .iter()
+            .filter_map(|s| Some((key(&s.entry.name), s.answered.as_ref()?.at?)))
+            .collect()
+    }
+}
+
+impl Seen {
+    fn of(dir: &Path, name: String, read: Read) -> Option<Seen> {
+        let pair = match read {
+            Read::Absent => return None,
+            Read::Unsettled => {
+                return Some(Seen {
+                    entry: BlockEntry {
+                        creator: String::new(),
+                        question: format!(
+                            "`{name}` is changing; it is read again on the next pass"
+                        ),
+                        unreadable: Some(format!(
+                            "its question changed on each of {} reads",
+                            RETRIES + 1
+                        )),
+                        name,
+                        occurrence: None,
+                        kind: Stored::Unreadable("its question is changing".into()),
+                        answer: None,
+                        nudge: None,
+                    },
+                    answered: None,
+                });
+            }
+            Read::Coherent(pair) => *pair,
+        };
+        let unreadable = pair.damage();
+        let answered = match unreadable {
+            Some(_) => None,
+            None => pair.carries(&name).map(|carries| Answered {
+                carries,
+                at: pair.answered_at,
+            }),
+        };
+        Some(Seen {
+            entry: BlockEntry {
+                creator: std::fs::read_to_string(files(dir, &name).creator).unwrap_or_default(),
                 name,
                 occurrence: pair.occurrence,
                 kind: pair.kind,
@@ -1176,37 +1435,19 @@ pub fn scan_blocks(repo: &Path) -> Vec<BlockEntry> {
                     _ => None,
                 },
                 unreadable,
-            })
+            },
+            answered,
         })
-        .collect()
+    }
 }
 
 pub(crate) fn key(name: &str) -> String {
     name.to_owned()
 }
 
-/// When each answered block was answered, by its [`key`]: the date its
-/// answer file carries, so it reads the same to a monitor that starts
-/// long after. A delivered block is deleted, and dates nothing.
+/// [`Blocks::ended`] of a fresh read.
 pub(crate) fn ended(repo: &Path) -> std::collections::BTreeMap<String, u64> {
-    let Ok(_lock) = lock(repo) else {
-        return Default::default();
-    };
-    let dir = root(repo);
-    question_names(&dir)
-        .into_iter()
-        .filter_map(|name| {
-            let pair = Pair::read(&dir, &name).filter(|p| p.damage().is_none())?;
-            pair.answer.as_ref()?;
-            let at = std::fs::metadata(files(&dir, &name).answer)
-                .and_then(|m| m.modified())
-                .ok()?;
-            Some((
-                key(&name),
-                at.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs(),
-            ))
-        })
-        .collect()
+    Blocks::read(repo).ended()
 }
 
 /// An answer the master is owed: recorded, and not yet delivered.
@@ -1215,24 +1456,10 @@ pub(crate) struct OwedAnswer {
     pub(crate) carries: AnswerRef,
 }
 
-/// The answers a wake owes `agent` while it is the master, by name.
+/// [`Blocks::owed`] of a fresh read.
+#[cfg(test)]
 pub(crate) fn owed_answers(repo: &Path, agent: &clank_core::AgentLabel) -> Vec<OwedAnswer> {
-    if master(repo).ok().as_ref() != Some(agent) {
-        return vec![];
-    }
-    let Ok(_lock) = lock(repo) else {
-        return vec![];
-    };
-    let dir = root(repo);
-    question_names(&dir).into_iter().filter_map(|name| {
-        let pair = Pair::read(&dir, &name).filter(|p| p.damage().is_none())?;
-        let carries = pair.carries(&name)?;
-        let mut answer = pair.answer?;
-        if matches!(pair.kind, Stored::Valid(Kind::Permission { .. })) {
-            answer = format!("Prior human decision (not permission approval for this session; obtain any approval your harness requires): {answer}");
-        }
-        Some(OwedAnswer { answer, carries })
-    }).collect()
+    Blocks::read(repo).owed(repo, agent)
 }
 
 #[cfg(test)]
@@ -2644,6 +2871,336 @@ mod tests {
         .unwrap();
     }
 
+    fn settling() -> crate::upgrade::Permit {
+        crate::upgrade::process().settling()
+    }
+
+    /// Republishes `path` with the bytes it has: a new generation of it.
+    fn republished(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        publish(path, &bytes).unwrap();
+    }
+
+    /// Runs `land` once, at the first `at` step of a read.
+    fn once_at(at: Step, mut land: impl FnMut()) -> impl FnMut(&str, Step) {
+        let mut landed = false;
+        move |_, step| {
+            if step == at && !landed {
+                landed = true;
+                land();
+            }
+        }
+    }
+
+    /// A completion and a re-ask landing after the question is read and
+    /// before its answer is: the read is taken again, and the old question
+    /// is never presented with the new ask's answer, whether the old
+    /// question was stamped or written before occurrences.
+    #[test]
+    fn a_reuse_mid_read_never_pairs_across_asks() {
+        for stamped in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            let first = if stamped {
+                asked_and_answered(repo, "q", "Proceed?", "yes")
+            } else {
+                write(&question_path(repo, "q"), "Proceed?");
+                write(&answer_path(repo, "q"), "yes");
+                owed(repo).remove(0)
+            };
+            let blocks = Blocks::read_with(
+                repo,
+                &mut once_at(Step::QuestionRead, || {
+                    assert!(complete(repo, &first, &settling()).unwrap());
+                    ask(repo, &alice(), "q", "Deploy?").unwrap();
+                    answer_block(repo, "q", "no", None).unwrap();
+                }),
+            );
+            let read: Vec<_> = blocks
+                .entries()
+                .map(|b| (b.question.as_str(), b.answer.as_deref()))
+                .collect();
+            assert_eq!(read, [("Deploy?", Some("no"))], "stamped: {stamped}");
+            let owed = blocks.owed(repo, &alice());
+            assert_eq!(owed.len(), 1, "stamped: {stamped}");
+            assert_eq!(
+                owed[0].carries.question_digest,
+                digest("Deploy?"),
+                "stamped: {stamped}"
+            );
+        }
+    }
+
+    /// A question replaced during every try is `Unsettled`: pending,
+    /// reported as changing, presenting no answer, owing and dating
+    /// nothing.
+    #[test]
+    fn a_question_changing_on_every_try_is_unsettled_and_owes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        asked_and_answered(repo, "q", "Proceed?", "yes");
+        written_at(&answer_path(repo, "q"), 7000);
+        let mut tries = 0;
+        let blocks = Blocks::read_with(repo, &mut |_, step| {
+            if step == Step::QuestionRead {
+                tries += 1;
+                republished(&question_path(repo, "q"));
+            }
+        });
+        assert_eq!(tries, RETRIES + 1);
+        let entries: Vec<_> = blocks.entries().collect();
+        assert_eq!(entries.len(), 1);
+        let b = entries[0];
+        assert!(b.pending() && b.answer.is_none(), "{b:?}");
+        assert!(
+            b.unreadable
+                .as_deref()
+                .is_some_and(|why| why.contains("changed")),
+            "{b:?}"
+        );
+        assert!(blocks.owed(repo, &alice()).is_empty());
+        assert!(blocks.ended().is_empty());
+    }
+
+    /// A completion landing after the answer is read, before the read
+    /// ends, leaves nothing owed, pending or dated.
+    #[test]
+    fn a_completion_between_reads_owes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let a = asked_and_answered(repo, "q", "Proceed?", "yes");
+        let blocks = Blocks::read_with(
+            repo,
+            &mut once_at(Step::AnswerRead, || {
+                assert!(complete(repo, &a, &settling()).unwrap());
+            }),
+        );
+        assert!(blocks.owed(repo, &alice()).is_empty());
+        assert_eq!(blocks.entries().count(), 0);
+        assert!(blocks.ended().is_empty());
+    }
+
+    /// An answer is dated only from the read that paired it: by the
+    /// re-ask's answer once a re-ask lands mid-read, and by the file it was
+    /// read from when another is put at its path after it was opened.
+    #[test]
+    fn an_answer_is_dated_only_by_its_own_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let first = asked_and_answered(repo, "q", "Proceed?", "yes");
+        written_at(&answer_path(repo, "q"), 7000);
+        let blocks = Blocks::read_with(
+            repo,
+            &mut once_at(Step::AnswerRead, || {
+                assert!(complete(repo, &first, &settling()).unwrap());
+                ask(repo, &alice(), "q", "Deploy?").unwrap();
+                answer_block(repo, "q", "no", None).unwrap();
+                written_at(&answer_path(repo, "q"), 9000);
+            }),
+        );
+        assert_eq!(blocks.ended(), [(key("q"), 9000)].into());
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        asked_and_answered(repo, "q", "Proceed?", "yes");
+        written_at(&answer_path(repo, "q"), 7000);
+        let blocks = Blocks::read_with(
+            repo,
+            &mut once_at(Step::AnswerRead, || {
+                republished(&answer_path(repo, "q"));
+                written_at(&answer_path(repo, "q"), 9000);
+            }),
+        );
+        assert_eq!(blocks.ended(), [(key("q"), 7000)].into());
+    }
+
+    /// Restores a directory's mode when dropped, so the tempdir can be
+    /// removed.
+    struct Mode<'a>(&'a Path, u32);
+
+    impl<'a> Mode<'a> {
+        fn set(path: &'a Path, mode: u32) -> Mode<'a> {
+            use std::os::unix::fs::PermissionsExt as _;
+            let was = std::fs::metadata(path).unwrap().permissions().mode();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            Mode(path, was)
+        }
+    }
+
+    impl Drop for Mode<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    /// Every serve and admission reader holds work back for `repo`'s
+    /// damage, entered under `name`, and owes nothing, though an answer
+    /// sits behind it.
+    fn every_reader_blocks(repo: &Path, name: &str) {
+        use clank_core::wait::PlanStateLookup as _;
+        let blocks = scan_blocks(repo);
+        assert!(
+            matches!(blocks.as_slice(), [b]
+                if b.name == name && b.pending() && b.unreadable.is_some() && b.answer.is_none()),
+            "{name}: {blocks:?}"
+        );
+        assert!(owed_answers(repo, &alice()).is_empty(), "{name}");
+        assert!(ended(repo).is_empty(), "{name}");
+        assert!(crate::cli::wait::blocked(repo, &alice()), "{name}");
+        assert!(
+            matches!(
+                crate::cli::wait::block_items(repo, &alice()).as_slice(),
+                [clank_core::wait::WaitItem::Blocked { .. }, ..]
+            ),
+            "{name}"
+        );
+        let plan = clank_core::ids::PlanKey::parse("p").unwrap();
+        assert!(
+            !crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, None)
+                .blocks_for(&plan)
+                .is_empty(),
+            "{name}"
+        );
+    }
+
+    /// A block directory that cannot be listed, a question that cannot be
+    /// inspected, and a `.clank` that cannot be inspected are each damage
+    /// every reader holds work back for, never an empty set.
+    #[test]
+    fn storage_that_cannot_be_read_blocks_every_reader() {
+        for (mode, name) in [(0o000, "block-storage"), (0o400, "q")] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            asked_and_answered(repo, "q", "Proceed?", "yes");
+            let blocks_dir = root(repo).join("blocks");
+            let _mode = Mode::set(&blocks_dir, mode);
+            every_reader_blocks(repo, name);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        asked_and_answered(&repo, "q", "Proceed?", "yes");
+        let _mode = Mode::set(&repo, 0o600);
+        let blocks = scan_blocks(&repo);
+        assert!(
+            matches!(blocks.as_slice(), [b] if b.pending() && b.unreadable.is_some()),
+            "{blocks:?}"
+        );
+        assert!(crate::cli::wait::blocked(&repo, &alice()));
+    }
+
+    #[test]
+    fn a_failed_directory_entry_fails_the_listing() {
+        let entries = [
+            Ok("a.md".into()),
+            Err(std::io::Error::other("entry")),
+            Ok("b.md".into()),
+        ];
+        assert!(names_of(entries.into_iter()).is_err());
+        let entries = [
+            Ok("b.md".into()),
+            Ok("a.md".into()),
+            Ok("dir.md".into()),
+            Ok("a.attempt".into()),
+        ];
+        assert_eq!(
+            names_of(entries.into_iter()).unwrap(),
+            ["a", "b", "dir"],
+            "a question name is listed whatever its entry's type"
+        );
+    }
+
+    /// A question path that exists but is no regular file still holds its
+    /// name: it is blocking damage to every reader, never followed or read,
+    /// owes nothing, and an ask of the name is refused, so the state is
+    /// consistent. Found at discovery, or swapped in between read steps.
+    #[test]
+    fn a_question_that_is_not_a_regular_file_blocks_as_damage() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_path_buf();
+        test_master(&repo, &alice());
+        let blocks = root(&repo).join("blocks");
+        std::fs::create_dir_all(&blocks).unwrap();
+        let elsewhere = repo.join("elsewhere.md");
+        std::fs::write(&elsewhere, "Not a question").unwrap();
+        use clank_core::wait::PlanStateLookup as _;
+        let assert_blocking = |what: &str| {
+            let found = scan_blocks(&repo);
+            assert!(
+                matches!(found.as_slice(), [b] if b.pending() && b.unreadable.is_some()),
+                "{what}: {found:?}"
+            );
+            assert!(crate::cli::wait::blocked(&repo, &alice()), "{what}");
+            assert!(
+                matches!(
+                    crate::cli::wait::block_items(&repo, &alice()).as_slice(),
+                    [clank_core::wait::WaitItem::Blocked { .. }, ..]
+                ),
+                "{what}"
+            );
+            let plan = clank_core::ids::PlanKey::parse("p").unwrap();
+            assert!(
+                !crate::fs_plan_state_lookup::FsPlanStateLookup::new(&repo, None)
+                    .blocks_for(&plan)
+                    .is_empty(),
+                "{what}"
+            );
+            assert!(
+                Blocks::read(&repo).owed(&repo, &alice()).is_empty(),
+                "{what}"
+            );
+            assert!(Blocks::read(&repo).ended().is_empty(), "{what}");
+        };
+        let q = files(&root(&repo), "q").question;
+        std::fs::create_dir(&q).unwrap();
+        std::fs::create_dir_all(root(&repo).join("unblocks")).unwrap();
+        std::fs::write(files(&root(&repo), "q").answer, "yes").unwrap();
+        assert_blocking("a directory");
+        std::fs::remove_dir(&q).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &q).unwrap();
+        assert_blocking("a symlink");
+        assert!(
+            ask_with(&repo, Some(&alice()), "q", "Again?", &Kind::Plain).is_err(),
+            "the name is held, so an ask is refused"
+        );
+        std::fs::remove_file(&q).unwrap();
+
+        asked(&repo, "alice", "q", "Which?");
+        let swapped = Blocks::read_with(&repo, &mut |_, step| {
+            if step == Step::QuestionRead && std::fs::symlink_metadata(&q).unwrap().is_file() {
+                std::fs::remove_file(&q).unwrap();
+                std::fs::create_dir(&q).unwrap();
+            }
+        });
+        let seen: Vec<_> = swapped.entries().collect();
+        assert!(
+            matches!(seen.as_slice(), [b] if b.pending() && b.unreadable.is_some()),
+            "{seen:?}"
+        );
+        assert!(swapped.owed(&repo, &alice()).is_empty());
+        assert_blocking("swapped mid-read");
+    }
+
+    /// Only a missing file is absence: no `.clank`, no block directory, and
+    /// a question deleted under its answer each read as no block, and
+    /// reading creates nothing.
+    #[test]
+    fn only_not_found_is_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(scan_blocks(repo).is_empty());
+        assert!(!root(repo).exists(), "reading created no storage");
+        std::fs::create_dir_all(root(repo)).unwrap();
+        assert!(scan_blocks(repo).is_empty());
+        asked_and_answered(repo, "q", "Proceed?", "yes");
+        std::fs::remove_file(question_path(repo, "q")).unwrap();
+        assert!(scan_blocks(repo).is_empty());
+        assert!(owed(repo).is_empty() && ended(repo).is_empty());
+        assert!(!crate::cli::wait::blocked(repo, &alice()));
+    }
+
     #[test]
     fn scan_returns_sorted_by_repository_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -2669,6 +3226,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) fn test_complete(repo: &Path, name: &str) {
     let carries = Pair::read(&root(repo), name)
+        .unwrap()
         .unwrap()
         .carries(name)
         .unwrap();

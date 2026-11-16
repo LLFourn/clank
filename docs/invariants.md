@@ -133,14 +133,14 @@ whether its assertions protect the invariant. Reviewers check that.
 - Why: one agent holding a lock would stall serving for every agent.
 - Status: target
 - Today: the binding lock is only tried on the loop (an outage notice
-  stands until a serve finds it free), but serving still blocks on locks
-  agent and CLI processes hold: `.clank/blocks.lock` (`block::owed_answers`,
-  `scan_blocks`, `ended` via `gather` and `recovery_facts`), each agent's
-  event-log sidecar (`EventLog::read_rows` via `gather`, and the timer
-  host's `accept`), and the legacy inbox migration's `inbox/.lock` and
-  `messages.writer.lock` (`inbox::pending`).
-- Plans: the-serve-loop-survives-a-held-blocks-lock,
-  the-serve-loop-survives-a-held-event-log,
+  stands until a serve finds it free), and blocks are read without
+  `.clank/blocks.lock` (only writers take it; a read is checked against
+  its question's generation, and one that cannot settle blocks and owes
+  nothing). Serving still blocks on locks agent and CLI processes hold:
+  each agent's event-log sidecar (`EventLog::read_rows` via `gather`, and
+  the timer host's `accept`), and the legacy inbox migration's
+  `inbox/.lock` and `messages.writer.lock` (`inbox::pending`).
+- Plans: the-serve-loop-survives-a-held-event-log,
   the-serve-loop-survives-a-held-inbox-lock
 
 ## I10. Nothing polls except GitHub.

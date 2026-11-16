@@ -2511,10 +2511,8 @@ pub(crate) fn blocked(repo: &Path, author: &AgentLabel) -> bool {
 }
 
 fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
-    if let Some(owed) = crate::cli::block::owed_answers(repo, author)
-        .into_iter()
-        .next()
-    {
+    let blocks = crate::cli::block::Blocks::read(repo);
+    if let Some(owed) = blocks.owed(repo, author).into_iter().next() {
         return BlockResult {
             items: vec![WaitItem::Unblocked {
                 answer: owed.answer,
@@ -2528,7 +2526,7 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
         suppress_all: false,
     };
 
-    for b in &scan_blocks(repo) {
+    for b in blocks.entries() {
         if !b.pending() {
             continue;
         }
