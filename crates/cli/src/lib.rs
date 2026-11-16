@@ -28,6 +28,7 @@ pub mod repo_watch;
 pub mod shell_quote;
 pub mod signal;
 pub mod state_cache;
+pub mod store_watch;
 pub mod untrusted;
 pub mod upgrade;
 pub mod worktree_facts;

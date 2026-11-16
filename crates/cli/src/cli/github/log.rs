@@ -34,7 +34,8 @@
 //!   ([`Locking::Try`]), and hands that [`Sidecar`] to every step, so no
 //!   step acquires again. A held lock leaves the source unavailable for
 //!   the pass: its items absent, which is neither empty nor handled, and
-//!   the loop's bounded retry armed. Processes off the loop wait.
+//!   loop waiting for its release ([`when_released`]). Processes off the
+//!   loop wait.
 //! - **Failure domains are separate** (codex 899f915): `state.json`
 //!   is cache metadata (ETag / poll-interval floor); corruption there
 //!   resets only the cache. Only the WAL itself corrupting degrades
@@ -588,6 +589,16 @@ mod elsewhere {
         }
     }
 
+    /// How many times a blocking take of each path has gone to sleep on
+    /// its holder here: a take that wakes without a release to see sleeps
+    /// again and counts again.
+    static BLOCKED: Mutex<std::collections::BTreeMap<PathBuf, usize>> =
+        Mutex::new(std::collections::BTreeMap::new());
+
+    pub(super) fn blocked(path: &Path) -> usize {
+        BLOCKED.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+
     pub(super) fn waited(path: &Path) -> bool {
         WAITED.lock().unwrap().contains(path)
     }
@@ -601,6 +612,11 @@ mod elsewhere {
             super::Locking::Try => !held.contains(path),
             super::Locking::Wait => {
                 while held.contains(path) {
+                    *BLOCKED
+                        .lock()
+                        .unwrap()
+                        .entry(path.to_path_buf())
+                        .or_default() += 1;
                     held = RELEASED.wait(held).unwrap();
                 }
                 true
@@ -634,6 +650,7 @@ impl Sidecar {
         ACQUISITIONS.with(|n| n.set(n.get() + 1));
         #[cfg(test)]
         if !elsewhere::admits(path, locking) {
+            held_elsewhere(path, exclusive);
             return Ok(None);
         }
         let file = std::fs::OpenOptions::new()
@@ -661,6 +678,7 @@ impl Sidecar {
             }
         };
         if !held {
+            held_elsewhere(path, exclusive);
             return Ok(None);
         }
         Ok(Some(Self {
@@ -846,6 +864,9 @@ impl IngestLease {
         let path = Self::path(events_dir, source_key);
         #[cfg(test)]
         if !elsewhere::admits_lease(&path, take) {
+            if take == Take::Now {
+                held_elsewhere(&path, true);
+            }
             return Ok(None);
         }
         let file = std::fs::OpenOptions::new()
@@ -865,8 +886,76 @@ impl IngestLease {
                 }
             },
         };
+        if !taken && take == Take::Now {
+            held_elsewhere(&path, true);
+        }
         Ok(taken.then_some(IngestLease { _file: file }))
     }
+}
+
+/// Locks a take that would not wait found held, each with whether it
+/// wanted it exclusive, until a [`when_released`] for it sees it free.
+/// What the monitor's loop waits on instead of a timer (I9, I10).
+static HELD_ELSEWHERE: std::sync::Mutex<std::collections::BTreeMap<PathBuf, bool>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn held_elsewhere(path: &Path, exclusive: bool) {
+    *HELD_ELSEWHERE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_default() |= exclusive;
+}
+
+/// Every lock a take that would not wait has found held and no
+/// [`when_released`] has yet seen free, with whether it was wanted
+/// exclusive.
+pub(crate) fn found_held() -> Vec<(PathBuf, bool)> {
+    HELD_ELSEWHERE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(path, exclusive)| (path.clone(), *exclusive))
+        .collect()
+}
+
+/// Block until `path`'s lock could be taken as wanted, then let it go at
+/// once: the kernel wakes a blocked flock when its holder lets go, by
+/// unlocking or by dying, which is the only release notice there is.
+///
+/// Explicitly unlocked rather than only closed: the lock belongs to the
+/// open file, and a child forked meanwhile holds a copy of its descriptor
+/// until its exec, which would keep it locked past this return.
+pub(crate) fn when_released(path: &Path, exclusive: bool) -> std::io::Result<()> {
+    #[cfg(test)]
+    elsewhere::admits(path, Locking::Wait);
+    let waited = (|| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let op = if exclusive {
+            rustix::fs::FlockOperation::LockExclusive
+        } else {
+            rustix::fs::FlockOperation::LockShared
+        };
+        loop {
+            match rustix::fs::flock(&file, op) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock)?;
+        Ok(())
+    })();
+    HELD_ELSEWHERE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path);
+    waited
 }
 
 /// How an [`IngestLease`] take waits for a holder.
@@ -4379,6 +4468,17 @@ pub(crate) mod tests {
         pub(crate) fn release(self) {
             drop(self);
         }
+
+        /// The held locks' paths.
+        pub(crate) fn paths(&self) -> &[PathBuf] {
+            &self.0
+        }
+    }
+
+    /// How many times a blocking take of `path` has gone to sleep on its
+    /// holder elsewhere.
+    pub(crate) fn blocked(path: &Path) -> usize {
+        super::elsewhere::blocked(path)
     }
 
     impl Drop for Held {

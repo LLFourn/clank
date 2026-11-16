@@ -3706,16 +3706,17 @@ async fn a_held_event_log_holds_a_due_recovery_attempt() {
     );
 }
 
-/// A one-off timer, its log not yet written, whose sidecar another
-/// process holds throughout, and no report reader beside it: the loop's
-/// steps in order (a look arming the retry, the retry re-arming the timer,
-/// a look, the deadline's acceptance meeting the lock again) back off from
-/// 250 ms to 5 s rather than starting over at each re-arm. Once released,
-/// the next retry and deadline accept it exactly once, and the episode
-/// ends.
-#[test]
-fn a_held_timer_backs_off_across_retry_and_deadline_and_is_accepted_once() {
-    let dir = tempfile::tempdir().unwrap();
+/// A one-off timer in `repo`'s events whose acceptance met its sidecar
+/// held elsewhere, with what it emits and the hold.
+fn a_held_timer(
+    repo: &std::path::Path,
+) -> (
+    crate::cli::timer_source::TimerSet,
+    tokio::sync::mpsc::UnboundedReceiver<(WaitItem, crate::cli::event_source::Durability)>,
+    crate::cli::github::log::tests::Held,
+) {
+    let events = crate::agent_store::agents_root(repo).join("claude/events");
+    std::fs::create_dir_all(&events).unwrap();
     let source = clank_core::agent_config::TimerSource {
         interrupt: false,
         interrupt_message: None,
@@ -3725,53 +3726,64 @@ fn a_held_timer_backs_off_across_retry_and_deadline_and_is_accepted_once() {
         content: Some("work".into()),
     };
     let key = source.source_key(None);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut timers = crate::cli::timer_source::TimerSet::new(
         &[(
             clank_core::agent_config::WaitEventSource::Timer(source),
             crate::cli::event_source::SourceOrigin::Config,
         )],
-        dir.path(),
+        &events,
         None,
         tx.into(),
     )
     .unwrap()
     .on_the_loop();
-    let held = crate::cli::github::log::tests::hold(&[(dir.path(), &key)]);
-    let now = tokio::time::Instant::now();
-    let mut contention = ContentionRetry::default();
-    let look = |contention: &mut ContentionRetry, timers: &crate::cli::timer_source::TimerSet| {
-        contention.look(timers.awaiting_retry(), now);
-        contention.due().map(|at| at - now)
-    };
-    let retry = |contention: &mut ContentionRetry,
-                 timers: &mut crate::cli::timer_source::TimerSet| {
-        assert!(contention.due().is_some_and(|at| contention.is_due(at)));
-        contention.ran();
-        timers.retry_contended();
-    };
+    let held = crate::cli::github::log::tests::hold(&[(&events, &key)]);
     timers.due();
-    let mut delays = vec![look(&mut contention, &timers)];
-    for _ in 0..6 {
-        retry(&mut contention, &mut timers);
-        delays.push(look(&mut contention, &timers));
-        timers.due();
-        assert_eq!(
-            look(&mut contention, &timers),
-            *delays.last().unwrap(),
-            "one deadline"
+    assert!(timers.awaiting_retry(), "the acceptance met the lock");
+    (timers, rx, held)
+}
+
+/// The loop's wait for a held sidecar is the kernel's: its waiter sleeps
+/// on the holder and wakes the loop on nothing while the lock stays held.
+/// Released, it wakes the loop once, and the retry accepts the timer once.
+#[tokio::test]
+async fn a_held_sidecar_wakes_the_loop_only_on_its_release() {
+    let repo = tempfile::tempdir().unwrap();
+    let (mut timers, mut rx, held) = a_held_timer(repo.path());
+    let path = held.paths()[0].clone();
+    let asleep = crate::cli::github::log::tests::blocked(&path);
+    let mut releases = Releases::of(repo.path());
+    releases.arm().unwrap();
+    assert_eq!(releases.watching, [path.clone()].into(), "one waiter");
+    let by = std::time::Instant::now() + Duration::from_secs(10);
+    while crate::cli::github::log::tests::blocked(&path) == asleep {
+        assert!(
+            std::time::Instant::now() < by,
+            "the waiter sleeps on the holder"
         );
+        tokio::task::yield_now().await;
     }
+    releases.arm().unwrap();
     assert_eq!(
-        delays,
-        [250, 500, 1000, 2000, 4000, 5000, 5000].map(|ms| Some(Duration::from_millis(ms))),
-        "the pause grows across the episode"
+        releases.watching.len(),
+        1,
+        "armed once however often looked at"
+    );
+    assert!(
+        releases.rx.try_recv().is_err(),
+        "nothing wakes the loop while held"
     );
     assert!(rx.try_recv().is_err(), "nothing accepted while held");
-    held.release();
 
-    retry(&mut contention, &mut timers);
-    look(&mut contention, &timers);
+    held.release();
+    let released = tokio::time::timeout(Duration::from_secs(10), releases.released())
+        .await
+        .expect("the release wakes the loop")
+        .unwrap();
+    assert_eq!(released, [path]);
+    assert!(releases.watching.is_empty());
+    timers.retry_contended();
     timers.due();
     assert!(
         matches!(
@@ -3781,49 +3793,89 @@ fn a_held_timer_backs_off_across_retry_and_deadline_and_is_accepted_once() {
         "accepted once released"
     );
     assert!(!timers.awaiting_retry(), "nothing is left to retry");
-    assert_eq!(look(&mut contention, &timers), None, "the episode is over");
+    releases.arm().unwrap();
+    assert!(releases.watching.is_empty(), "and nothing is waited on");
     timers.retry_contended();
     timers.due();
     assert!(rx.try_recv().is_err(), "and accepted only once");
-    contention.look(true, now);
-    assert_eq!(
-        contention.due(),
-        Some(now + Duration::from_millis(250)),
-        "the next starts over"
-    );
 }
 
-/// The contention retry is armed only while something is unsettled, from
-/// 250 ms doubling to 5 s with each retry while it stays so, and keeps
-/// one deadline however often it is looked at. A look with nothing
-/// unsettled disarms it and starts over.
-#[test]
-fn the_contention_retry_backs_off_within_its_bound_and_disarms() {
-    let now = tokio::time::Instant::now();
-    let ms = Duration::from_millis;
-    let mut retry = ContentionRetry::default();
-    retry.look(false, now);
-    assert_eq!(retry.due(), None, "nothing unsettled, nothing armed");
-    retry.look(true, now);
-    assert_eq!(retry.due(), Some(now + ms(250)));
-    retry.look(true, now + ms(100));
-    assert_eq!(retry.due(), Some(now + ms(250)), "one deadline");
-    assert!(!retry.is_due(now) && retry.is_due(now + ms(250)));
-    let mut pauses = Vec::new();
-    for _ in 0..8 {
-        retry.ran();
-        assert_eq!(retry.due(), None, "a retry disarms until looked at");
-        retry.look(true, now);
-        pauses.push(retry.due().unwrap() - now);
+/// A release between the loop's take and its waiter's flock is not lost:
+/// the waiter finds the lock free and wakes the loop at once.
+#[tokio::test]
+async fn a_release_before_the_waiter_is_armed_still_wakes_the_loop() {
+    let repo = tempfile::tempdir().unwrap();
+    let (_timers, _rx, held) = a_held_timer(repo.path());
+    let path = held.paths()[0].clone();
+    held.release();
+    let mut releases = Releases::of(repo.path());
+    releases.arm().unwrap();
+    let released = tokio::time::timeout(Duration::from_secs(10), releases.released())
+        .await
+        .expect("the waiter finds it free")
+        .unwrap();
+    assert_eq!(released, [path]);
+}
+
+/// A waiter that cannot start leaves its lock unwatched, not taken for
+/// watched: the loop is woken to try again, and gives up with an error
+/// after [`WAITER_STARTS`] tries rather than park on it.
+#[tokio::test]
+async fn a_waiter_that_cannot_start_is_retried_then_ends_the_loop() {
+    fn refuse(_: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        Err(std::io::Error::other("no threads"))
     }
-    assert_eq!(
-        pauses,
-        [500, 1000, 2000, 4000, 5000, 5000, 5000, 5000].map(ms)
-    );
-    retry.look(false, now);
-    assert_eq!(retry.due(), None, "settled, it disarms");
-    retry.look(true, now);
-    assert_eq!(retry.due(), Some(now + ms(250)), "and starts over");
+    let repo = tempfile::tempdir().unwrap();
+    let (_timers, _rx, _held) = a_held_timer(repo.path());
+    let mut releases = Releases::spawning(repo.path(), refuse);
+    for _ in 1..WAITER_STARTS {
+        releases.arm().expect("tried again");
+        assert!(releases.watching.is_empty(), "not taken for watched");
+        assert!(
+            releases.retry_at().is_some(),
+            "the loop is woken to try again"
+        );
+    }
+    let refused = releases.arm().expect_err("the loop ends");
+    assert!(refused.to_string().contains("release"), "{refused}");
+}
+
+/// A waiter that starts on a later try waits as any other.
+#[tokio::test]
+async fn a_waiter_that_starts_on_a_retry_wakes_the_loop_on_the_release() {
+    static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn once(waiter: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        if !REFUSED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("no threads"));
+        }
+        spawn_waiter(waiter)
+    }
+    let repo = tempfile::tempdir().unwrap();
+    let (_timers, _rx, held) = a_held_timer(repo.path());
+    let path = held.paths()[0].clone();
+    let mut releases = Releases::spawning(repo.path(), once);
+    releases.arm().unwrap();
+    assert!(releases.watching.is_empty());
+    releases.arm().unwrap();
+    assert_eq!(releases.watching, [path.clone()].into());
+    assert_eq!(releases.retry_at(), None, "nothing left to retry");
+    held.release();
+    let released = tokio::time::timeout(Duration::from_secs(10), releases.released())
+        .await
+        .expect("the release wakes the loop")
+        .unwrap();
+    assert_eq!(released, [path]);
+}
+
+/// Another repo's held lock, found in this process, is not this loop's to
+/// wait on.
+#[tokio::test]
+async fn a_loop_waits_only_on_its_own_repos_locks() {
+    let (ours, theirs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (_timers, _rx, _held) = a_held_timer(theirs.path());
+    let mut releases = Releases::of(ours.path());
+    releases.arm().unwrap();
+    assert!(releases.watching.is_empty());
 }
 
 /// With the binding lock free, the first serve ends the outage.

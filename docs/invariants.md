@@ -142,8 +142,9 @@ whether its assertions protect the invariant. Reviewers check that.
   nothing), and takes each event-log sidecar and each timer acceptance's
   ingest lease once, without waiting. A held one leaves that source or
   acceptance unavailable for the pass (its items absent, the agent unknown
-  to recovery and its ledger, the timer pending) until a bounded contention
-  retry (250 ms doubling to 5 s) finds it free. A holder may keep a lock
+  to recovery and its ledger, the timer pending) until it is released: a
+  thread blocked in a flock of it as the loop wanted it lets it go at once
+  and wakes the loop, which retries the contended operations then. A holder may keep a lock
   across a side effect, such as signed user-command delivery, because the
   loop never waits on it. The ingest lease's patience (250 ms) remains only
   off the loop: in commands, wait clients, and a hosted GitHub source's own
@@ -164,9 +165,35 @@ whether its assertions protect the invariant. Reviewers check that.
 - Why: many clank processes each polling cost real CPU; work happens only
   when something happens.
 - Status: target
-- Today: production code has timed sleeps nobody has classified as polls or
-  bounded retries.
-- Plans: no-polls-but-github
+- Scope: a poll wakes again while what it observes may be unchanged, with no
+  bound. Scheduled domain work, one-shot deadlines, bounded retries and
+  throttles of an event's work are not polls. Every production timed wait is
+  classified so in `timed_wait_boundary`; the gate sees forms by name, so
+  the classes themselves are the reviewers' check.
+- Today: besides GitHub's, these residual polls remain:
+  - capped-backoff retries of failed work with no bound: a timer occurrence
+    that will not write, the status TUI's and status watch's refresh, a
+    failed self-replacement, a failing command source, a deferred
+    retirement, the web connector's reconnect, a dead pane subscription.
+    Whether each waits for a cause or gives up after a budget and reports
+    is the user's open decision.
+  - recovery's `RETRY_LOOK`, which stands for three different waits (the
+    gate, which only `Driver::due` asks; the record showing the failed
+    turn; a turn it cannot watch) behind one `next_at`.
+  - clients retrying a missing monitor past their outage budget (a parked
+    wait, a turn child, the TUI's keeper), whose failures include ones with
+    no event.
+  A held event-log sidecar or ingest lease wakes the monitor on its release,
+  and a remote's browser streams wake on a sessions-store write or their
+  expiry.
+- Tests: `crates/cli/tests/it/timed_wait_boundary.rs::every_timed_wait_is_classified`,
+  `crates/cli/tests/it/timed_wait_boundary.rs::invariant_status_matches_the_inventory`,
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_sidecar_wakes_the_loop_only_on_its_release`,
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_release_before_the_waiter_is_armed_still_wakes_the_loop`,
+  `crates/web-cloudflare/src/host.rs::an_unchanged_store_is_not_read_again_while_the_session_lasts`,
+  `crates/web-cloudflare/src/host.rs::a_revocation_before_the_watch_is_armed_is_not_lost`
+- Plans: failed-work-waits-for-a-cause, a-missing-monitor-is-heard-not-polled,
+  recovery-looks-when-something-moves
 
 ## I11. `clank open` works when no zellij session exists.
 

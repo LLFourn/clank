@@ -3688,7 +3688,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         asks: mut uc_asks,
         done: mut uc_done,
     } = uc_wakes;
-    let mut contention = ContentionRetry::default();
+    let mut releases = Releases::of(&repo);
     let ended = loop {
         if tenure.standing_down(std::time::Instant::now()) {
             tenure
@@ -3750,14 +3750,17 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             let wait = at.saturating_sub(crate::cli::recovery::unix_now());
             tokio::time::Instant::now() + Duration::from_secs(wait)
         });
-        contention.look(
-            unavailable_somewhere(&hosted, &clients, &recovery),
-            crate::cli::timer_source::clock::now(),
+        releases.arm()?;
+        let waiter_retry = releases.retry_at();
+        debug_assert!(
+            !unavailable_somewhere(&hosted, &clients, &recovery)
+                || !releases.watching.is_empty()
+                || waiter_retry.is_some(),
+            "an operation is unsettled by a held lock nobody waits on"
         );
         let timer_retry = hosted
             .values_mut()
             .filter_map(|host| host.timers.as_mut().and_then(|timers| timers.retry_due()))
-            .chain(contention.due())
             .min();
         // Once: an agent with no waiter is said to have none only after
         // the monitor has served long enough for its waits to arrive.
@@ -3787,6 +3790,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             }
             _ = crate::cli::timer_source::clock::sleep_until(timer_deadline) => Wake::TimersDue,
             _ = crate::cli::timer_source::clock::sleep_until(timer_retry) => Wake::TimerRetry,
+            Some(_) = releases.released() => Wake::Released,
             _ = crate::cli::timer_source::deadline(fold_retry.map(|(at, _)| at)) => Wake::Changed(true),
             _ = crate::cli::timer_source::deadline(settles) => Wake::Settled,
             _ = crate::cli::timer_source::deadline(quiesced) => Wake::Settled,
@@ -3804,6 +3808,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             Some(ask) = uc_asks.recv() => Wake::UserCommandAsk(ask),
             Some(done) = uc_done.recv() => Wake::UserCommandDone(done),
             _ = crate::cli::timer_source::deadline(uc_due) => Wake::UserCommandsDue,
+            _ = crate::cli::timer_source::deadline(waiter_retry) => Wake::Settled,
             accepted = listener.accept() => Wake::Accepted(accepted?.0),
             Some(greeted) = arrivals.recv() => Wake::Arrived(greeted),
             Some((author, emission)) = from_sources.recv() => Wake::Emitted(author, emission),
@@ -3859,11 +3864,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         }
                     }
                 }
-                let retry = contention.is_due(now);
-                if retry {
-                    contention.ran();
-                }
-                if owner && retry {
+            }
+            Wake::Released => {
+                if owner {
                     leaving.extend(retry_contended(
                         &repo,
                         &mut clients,
@@ -4595,57 +4598,119 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     ended
 }
 
-/// The first pause before contended loop operations run again, and its
-/// cap.
-const CONTENTION_FIRST_RETRY: Duration = Duration::from_millis(250);
-const CONTENTION_RETRY_CAP: Duration = Duration::from_secs(5);
-
-/// The loop's one deadline for operations that found an event log's
-/// sidecar held (I9). A bounded retry, not a poll (no-polls-but-github):
-/// it is armed only while such an operation has yet to run again unheld,
-/// a pause from [`CONTENTION_FIRST_RETRY`] doubling to
-/// [`CONTENTION_RETRY_CAP`] with each retry while that lasts, and is
-/// disarmed, starting over, once it does not.
-#[derive(Debug)]
-struct ContentionRetry {
-    at: Option<tokio::time::Instant>,
-    pause: Duration,
+/// What the loop waits on for operations that found an event log's
+/// sidecar or an ingest lease held (I9): a thread per held lock, blocked
+/// in a flock of it as the loop's take wanted it, which lets it go at once
+/// and says so. The kernel wakes that flock when the holder lets go, so
+/// nothing wakes while the lock stays held, and a release between the
+/// loop's take and the thread's flock is a flock that returns at once.
+///
+/// The threads are detached: a flock cannot be cancelled, and one still
+/// blocked when the loop ends sends to nobody and exits on the release.
+struct Releases {
+    /// Where this repo's locks are: another repo's, held in this process
+    /// by a test's monitor, are not this loop's to wait on.
+    under: std::path::PathBuf,
+    watching: std::collections::BTreeSet<std::path::PathBuf>,
+    tx: tokio::sync::mpsc::UnboundedSender<std::path::PathBuf>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<std::path::PathBuf>,
+    spawn: SpawnWaiter,
+    /// Held locks no waiter could be started for, by failed starts.
+    unwaited: std::collections::BTreeMap<std::path::PathBuf, u32>,
+    /// When to try those again: nothing else would wake the loop for them.
+    retry_at: Option<tokio::time::Instant>,
 }
 
-impl Default for ContentionRetry {
-    fn default() -> Self {
+/// Starts a waiter off the loop; a seam so a test can refuse.
+type SpawnWaiter = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+
+fn spawn_waiter(waiter: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("lock-release".into())
+        .spawn(waiter)
+        .map(drop)
+}
+
+/// How many times a waiter for one held lock may fail to start, a pause
+/// apart, before the loop stands down rather than park on a lock nobody
+/// waits for.
+const WAITER_STARTS: u32 = 5;
+const WAITER_RETRY: Duration = Duration::from_secs(1);
+
+impl Releases {
+    fn of(repo: &std::path::Path) -> Self {
+        Self::spawning(repo, spawn_waiter)
+    }
+
+    fn spawning(repo: &std::path::Path, spawn: SpawnWaiter) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            at: None,
-            pause: CONTENTION_FIRST_RETRY,
-        }
-    }
-}
-
-impl ContentionRetry {
-    /// Arm for `unsettled` contention, keeping a deadline already armed;
-    /// with none, the episode is over.
-    fn look(&mut self, unsettled: bool, now: tokio::time::Instant) {
-        if unsettled {
-            self.at.get_or_insert(now + self.pause);
-        } else {
-            self.at = None;
-            self.pause = CONTENTION_FIRST_RETRY;
+            under: repo.join(".clank"),
+            watching: Default::default(),
+            tx,
+            rx,
+            spawn,
+            unwaited: Default::default(),
+            retry_at: None,
         }
     }
 
-    fn due(&self) -> Option<tokio::time::Instant> {
-        self.at
+    /// Wait for the release of every lock found held and not yet waited
+    /// for. Called before the loop sleeps, after every take of its pass.
+    /// An error is a lock that no waiter could be started for within
+    /// [`WAITER_STARTS`], which ends the loop.
+    fn arm(&mut self) -> anyhow::Result<()> {
+        self.retry_at = None;
+        for (path, exclusive) in crate::cli::github::log::found_held() {
+            if !path.starts_with(&self.under) || self.watching.contains(&path) {
+                continue;
+            }
+            let (tx, waited) = (self.tx.clone(), path.clone());
+            let started = (self.spawn)(Box::new(move || {
+                if let Err(e) = crate::cli::github::log::when_released(&waited, exclusive) {
+                    eprintln!("monitor: waiting on {} failed: {e}", waited.display());
+                }
+                let _ = tx.send(waited);
+            }));
+            match started {
+                Ok(()) => {
+                    self.unwaited.remove(&path);
+                    self.watching.insert(path);
+                }
+                Err(e) => {
+                    let failed = self.unwaited.entry(path.clone()).or_default();
+                    *failed += 1;
+                    anyhow::ensure!(
+                        *failed < WAITER_STARTS,
+                        "cannot wait for {}'s release ({failed} tries): {e}",
+                        path.display()
+                    );
+                    eprintln!(
+                        "monitor: cannot wait for {}'s release yet: {e}",
+                        path.display()
+                    );
+                    self.retry_at = Some(tokio::time::Instant::now() + WAITER_RETRY);
+                }
+            }
+        }
+        Ok(())
     }
 
-    fn is_due(&self, now: tokio::time::Instant) -> bool {
-        self.at.is_some_and(|at| at <= now)
+    /// When a waiter that failed to start is tried again.
+    fn retry_at(&self) -> Option<tokio::time::Instant> {
+        self.retry_at
     }
 
-    /// The retry has come: it backs off, and the next look arms it again
-    /// while what it retried is still unsettled.
-    fn ran(&mut self) {
-        self.at = None;
-        self.pause = (self.pause * 2).min(CONTENTION_RETRY_CAP);
+    /// The next released lock, and every other already released.
+    async fn released(&mut self) -> Option<Vec<std::path::PathBuf>> {
+        let mut released = vec![self.rx.recv().await?];
+        while let Ok(more) = self.rx.try_recv() {
+            released.push(more);
+        }
+        for path in &released {
+            self.watching.remove(path);
+        }
+        Some(released)
     }
 }
 
@@ -4665,9 +4730,10 @@ fn unavailable_somewhere(
         || recovery.awaits_a_complete_fold()
 }
 
-/// [`ContentionRetry`] has come: re-run each hosted timer's contended
-/// arm or acceptance, and serve again every waiting client and held
-/// report, whose reads went without a held log's items.
+/// A lock the loop found held was released ([`Releases`]): re-run each
+/// hosted timer's contended arm or acceptance, and serve again every
+/// waiting client and held report, whose reads went without a held log's
+/// items.
 #[allow(clippy::too_many_arguments)]
 fn retry_contended(
     repo: &std::path::Path,
@@ -4733,8 +4799,10 @@ enum Wake {
     /// The repo changed, or a failed fold is due again; `false` once the
     /// watcher is gone.
     Changed(bool),
-    /// A failed timer's retry is due, or the contention retry.
+    /// A failed timer's retry is due.
     TimerRetry,
+    /// A lock a loop operation found held was let go.
+    Released,
     /// A registered run's process exited.
     RunEnded(AgentLabel),
     /// A deadline that only asks the loop to look again: the waiters'
@@ -8847,10 +8915,10 @@ mod recovery_tests {
     use super::*;
     use crate::cli::recovery::{Act, Answer, AttemptRef, Gate, Transport};
 
-    /// Each kind of operation contention left unsettled keeps the retry
-    /// armed: a hosted timer's step, a client's serve, recovery's fold.
+    /// Each kind of operation contention leaves unsettled is seen so: a
+    /// hosted timer's step, a client's serve, recovery's fold.
     #[tokio::test]
-    async fn every_unsettled_operation_keeps_the_contention_retry_armed() {
+    async fn every_unsettled_operation_is_seen_unsettled() {
         let dir = tempfile::tempdir().unwrap();
         let none = std::collections::BTreeMap::new();
         let driver =
@@ -15647,39 +15715,41 @@ mod tests {
     /// monitor: a heartbeat restored as an arm fails here, and an idle
     /// repo with no deadline therefore wakes nothing — no fold, no
     /// serve, no probe, no note to any client.
-    /// Before it computes its retry deadline the loop looks at whether any
-    /// operation is unsettled by contention, and sleeps until the
-    /// contention retry among its timer retries; on that wake the retry
-    /// backs off and then, as owner, runs [`retry_contended`] and
-    /// recovery. Read from the source, since no test may run a monitor.
+    /// Before it sleeps the loop waits for the release of every lock its
+    /// pass found held, and no deadline of its own stands for one; on a
+    /// release, as owner, it runs [`retry_contended`] and recovery. Read
+    /// from the source, since no test may run a monitor.
     #[test]
-    fn the_loop_looks_arms_and_runs_the_contention_retry() {
+    fn the_loop_waits_for_held_locks_releases_and_retries_on_one() {
         let src = include_str!("monitor.rs");
         let body = &src[src.find("    let ended = loop {").expect("the loop")..];
-        let looked = body
-            .find("contention.look(\n            unavailable_somewhere(&hosted, &clients, &recovery),")
-            .expect("the loop looks");
+        let armed = body
+            .find("        releases.arm()?;\n")
+            .expect("the loop arms");
+        let select = body
+            .find("        let wake = tokio::select! {")
+            .expect("the select");
+        assert!(armed < select, "armed before the loop sleeps");
         let deadline = body
             .find("let timer_retry = hosted")
             .expect("the retry deadline");
-        assert!(looked < deadline, "looked before the deadline is computed");
         let computed = &body[deadline..deadline + body[deadline..].find(";").unwrap()];
-        assert!(computed.contains(".chain(contention.due())"), "{computed}");
+        assert!(!computed.contains("contention"), "{computed}");
+        let arms = &body[select..select + body[select..].find("\n        };\n").unwrap()];
+        assert!(
+            arms.contains("Some(_) = releases.released() => Wake::Released,"),
+            "{arms}"
+        );
         let arm = &body[body
-            .find("            Wake::TimerRetry => {")
+            .find("            Wake::Released => {")
             .expect("the arm")..];
         let arm = &arm[..arm.find("            Wake::RunEnded(").expect("its end")];
-        let backs_off = arm
-            .find("let retry = contention.is_due(now);\n                if retry {\n                    contention.ran();")
-            .expect("the retry backs off");
-        let owner = arm
-            .find("if owner && retry {")
-            .expect("only an owner retries");
+        let owner = arm.find("if owner {").expect("only an owner retries");
         let ran = arm
             .find("leaving.extend(retry_contended(")
             .expect("the retry runs");
         let facts = arm.find("recovery_facts(").expect("recovery looks again");
-        assert!(backs_off < owner && owner < ran && ran < facts, "{arm}");
+        assert!(owner < ran && ran < facts, "{arm}");
     }
 
     #[test]
@@ -15728,6 +15798,7 @@ mod tests {
             "deadline(settles)",
             "deadline(quiesced)",
             "deadline(uc_due)",
+            "deadline(waiter_retry)",
         ];
         assert_eq!(deadlines.len(), named.len(), "{deadlines:#?}");
         for deadline in named {
