@@ -9,17 +9,18 @@
 //! the only one the monitor will credit with it.
 //!
 //! It never decides anything about work. A monitor that goes away is
-//! followed through the ordinary attach-or-spawn. An outage it gives up on
-//! within its budget is a diagnostic. A report that does not park and has
-//! no verdict by its deadline, attached or not, ends
-//! [`WireVerdict::Unanswered`], which each adapter frames as its own
-//! timeout. It never gathers policy, creates a model wake or changes
+//! followed through the ordinary attach-or-spawn, and one that cannot be
+//! had is attempted again only when something that can end its failure
+//! moves. An outage still unended at its deadline is a diagnostic. A
+//! report that does not park and has no verdict by its deadline, attached
+//! or not, ends [`WireVerdict::Unanswered`], which each adapter frames as
+//! its own timeout. It never gathers policy, creates a model wake or changes
 //! recovery state.
 //!
 //! A child of a build that is no longer the installed one says none of
 //! that. Its hook is about to become the installed build and start the
-//! child that can follow the new monitor, so it goes on trying quietly
-//! until its pipe closes: an upgrade costs the agent no turn.
+//! child that can follow the new monitor, so it goes on quietly, on the
+//! same events, until its pipe closes: an upgrade costs the agent no turn.
 
 use std::io::Write;
 use std::path::Path;
@@ -28,7 +29,8 @@ use clank_core::AgentLabel;
 
 use clank_core::turn_policy::PresentationId;
 
-use super::monitor::{Attempt, Note, OUTAGE_RETRY_CAP, Outage, Unserved, Who};
+use super::monitor::outage::{Absence, Ears, Next, Unserved};
+use super::monitor::{Attempt, Note, Who};
 use super::turn_wire::{Frame, Report, TurnResult, WireVerdict};
 
 /// What the hook says on the child's stdin.
@@ -108,6 +110,7 @@ pub(crate) async fn run(args: super::WaitArgs) -> anyhow::Result<()> {
         &mut out,
         &attach,
         &crate::upgrade::process(),
+        super::monitor::outage::Kernel::new(&repo, crate::upgrade::process()),
     )
     .await;
     Ok(())
@@ -115,7 +118,9 @@ pub(crate) async fn run(args: super::WaitArgs) -> anyhow::Result<()> {
 
 /// Carry one report: read it, take it to the monitor, print what comes
 /// back, and answer for any presentation on the connection that brought
-/// it. `session` is the session the wait is bound to deliver to.
+/// it. `session` is the session the wait is bound to deliver to; `ears`
+/// hear what can end an outage.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn carry(
     repo: &Path,
     author: &AgentLabel,
@@ -124,6 +129,7 @@ pub(crate) async fn carry(
     out: &mut impl Write,
     attach: Attach<'_>,
     authority: &crate::upgrade::Authority,
+    ears: impl Ears,
 ) {
     let report = match owner.next().await {
         Said::Line(line) => match serde_json::from_str::<Report>(&line) {
@@ -155,14 +161,14 @@ pub(crate) async fn carry(
         true => by.and_then(|by| by.checked_add(DEADLINE_MARGIN * 2)),
         false => by,
     };
-    let mut outage = Outage::default();
+    let mut absence = Absence::new(ears);
     let mut stale = false;
     // The last attempt found a monitor on its way out. A report that
     // cannot wait that out is told no outage, only that there is still no
     // monitor: the monitor that follows answers whatever comes next.
     let mut retiring = false;
     let mut why = "no monitor answered before the wait's deadline".to_string();
-    loop {
+    'attempts: loop {
         let who = Who::Agent {
             author: author.to_string(),
             holder: holder.clone(),
@@ -179,10 +185,17 @@ pub(crate) async fn carry(
         };
         let unserved = match attempt.served(repo) {
             Ok(conn) => {
-                let hand = shared(conn, &report, &mut owner, out, &mut outage, answer_by);
+                let hand = shared(conn, &report, &mut owner, out, &mut absence, answer_by);
                 match hand.await {
                     Hand::Done => return,
-                    Hand::Lost(why) => Unserved::Failed(why),
+                    Hand::Lost(why) if absence.left() => {
+                        tracing::debug!(%why, "the monitor holding this report went");
+                        if by.is_some_and(|by| by <= tokio::time::Instant::now()) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Hand::Lost(why) => Unserved::Unstartable(why),
                     Hand::Unanswered if report.parks() => {
                         emit_final(out, &super::turn_wire::expired_wait(report.tool()));
                         return;
@@ -211,19 +224,29 @@ pub(crate) async fn carry(
         // A monitor lost or an attach refused is when a stale child finds
         // out it is one.
         stale = authority.look().stale().is_some();
-        let pause = match outage.lost(tokio::time::Instant::now(), &unserved) {
-            Some(pause) => pause,
-            None if stale || !report.reaches_agent() => OUTAGE_RETRY_CAP,
-            None => {
-                emit_final(out, &unavailable(&why));
-                return;
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = owner.gone() => return,
+                () = passes(by) => break 'attempts,
+                next = absence.after(&unserved) => next,
+            };
+            match next {
+                Next::Attempt => break,
+                Next::Report if stale || !report.reaches_agent() => absence.reported(),
+                Next::Report => {
+                    emit_final(out, &unavailable(&why));
+                    return;
+                }
+                Next::Deaf(deaf) if stale || !report.reaches_agent() => {
+                    why = format!("{why}, and {deaf}");
+                    break 'attempts;
+                }
+                Next::Deaf(deaf) => {
+                    emit_final(out, &unavailable(&format!("{why}, and {deaf}")));
+                    return;
+                }
             }
-        };
-        tokio::select! {
-            biased;
-            () = owner.gone() => return,
-            () = passes(by) => break,
-            () = tokio::time::sleep(pause) => {}
         }
     }
     // Local expiry can renew OpenCode's transport, but cannot start a
@@ -318,7 +341,7 @@ async fn shared(
     report: &Report,
     owner: &mut Owner,
     out: &mut impl Write,
-    outage: &mut Outage,
+    absence: &mut Absence<impl Ears>,
     by: Option<tokio::time::Instant>,
 ) -> Hand {
     let socket = match conn.cancellation_socket() {
@@ -340,7 +363,7 @@ async fn shared(
             },
             note = notes.recv() => {
                 if matches!(note, Some(Ok(_))) {
-                    outage.answered();
+                    absence.answered();
                 }
                 match note {
                 Some(Ok(Note::Verdict(frame))) => {

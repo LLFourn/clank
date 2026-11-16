@@ -627,6 +627,7 @@ pub(super) fn carrier(
                     &mut frames,
                     &attach,
                     &crate::upgrade::Authority::unwatched(),
+                    crate::cli::monitor::outage::scripted::Scripted::default(),
                 )
                 .await;
             })

@@ -85,6 +85,8 @@ mod wire_golden_tests;
 
 #[path = "monitor_keeper.rs"]
 pub(crate) mod keeper;
+#[path = "monitor_outage.rs"]
+pub(crate) mod outage;
 #[path = "monitor_watchdog.rs"]
 pub(crate) mod watchdog;
 
@@ -1326,54 +1328,6 @@ impl From<Attempt> for Attached {
     }
 }
 
-/// Why a waiter that must have a monitor has none this time. Either way
-/// it tries again; what differs is how long that may go on before its
-/// agent is told.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Unserved {
-    /// A monitor still holds the repo and is known to be going: the
-    /// ordinary course of an upgrade, given [`RETIREMENT_BUDGET`].
-    Retiring(String),
-    /// Anything else, given [`OUTAGE_BUDGET`]. A refusal by a newer
-    /// build's monitor is one: its waiter becomes that build when the
-    /// installation says so, and nothing else explains it.
-    Failed(String),
-}
-
-impl Unserved {
-    pub(crate) fn why(&self) -> &str {
-        match self {
-            Unserved::Retiring(why) | Unserved::Failed(why) => why,
-        }
-    }
-}
-
-impl Attempt {
-    /// The connection, or why a waiter of `repo` that never decides for
-    /// itself has none this time.
-    ///
-    /// A retirement is read from what is known of the repo, not from how
-    /// this client's own attempt happened to end. A lease still held says
-    /// so; so does a monitor of another build still published for the
-    /// repo, whichever client is repairing and however this one's turn
-    /// behind it went. Only a refusal by a newer monitor is left as it
-    /// is: there this process is the one that is out of date.
-    pub(crate) fn served(self, repo: &std::path::Path) -> Result<Conn, Unserved> {
-        match self {
-            Attempt::Shared(conn) => Ok(conn),
-            Attempt::LeaseHeld(why) => Err(Unserved::Retiring(why)),
-            Attempt::Newer(why) => Err(Unserved::Failed(why)),
-            other => {
-                let why = other.why().unwrap_or_default().to_string();
-                Err(match outgoing(repo) {
-                    true => Unserved::Retiring(why),
-                    false => Unserved::Failed(why),
-                })
-            }
-        }
-    }
-}
-
 /// How long a waiter goes on for a monitor known to be on its way out
 /// before it tells its agent: everything that monitor and its successor
 /// are allowed. A stale monitor may hear out the presentations it handed
@@ -1405,256 +1359,14 @@ pub(crate) fn outgoing(repo: &std::path::Path) -> bool {
     }
 }
 
-/// How long a waiter goes on trying for a monitor before it tells its
-/// agent it has none.
+/// How long a waiter goes without a monitor before it tells its agent it
+/// has none.
 ///
 /// One attempt is bounded by `SPAWN_SETTLE + ATTACH_BUDGET`, and a monitor
 /// retiring for an upgrade may hold its lease for `LEASE_RETIREMENT`, so a
-/// minute covers a retirement and several whole start attempts. Longer
+/// minute covers a retirement and the attempts its events cause. Longer
 /// would leave an agent parked behind a monitor that is not coming.
 pub(crate) const OUTAGE_BUDGET: Duration = Duration::from_secs(60);
-
-/// The pause after the first repeated failure, doubled up to
-/// [`OUTAGE_RETRY_CAP`].
-const OUTAGE_FIRST_RETRY: Duration = Duration::from_millis(500);
-
-/// The longest pause between attempts, and the pause of a waiter that
-/// goes on trying past the budget.
-pub(crate) const OUTAGE_RETRY_CAP: Duration = Duration::from_secs(8);
-
-/// A waiter's time without a monitor: from the first attempt or connection
-/// that ended unanswered, until a monitor answers.
-#[derive(Debug, Default)]
-pub(crate) struct Outage {
-    since: Option<tokio::time::Instant>,
-    /// When the attempts began failing for no known reason: a monitor
-    /// seen to be retiring since is a reason, and starts this again.
-    failing_since: Option<tokio::time::Instant>,
-    pause: Duration,
-}
-
-impl Outage {
-    /// A monitor answered, so there is no outage.
-    pub(crate) fn answered(&mut self) {
-        *self = Outage::default();
-    }
-
-    /// An attempt, or a connection, ended without a monitor at `now`,
-    /// for `unserved`: how long to pause before the next attempt, or
-    /// `None` once the outage has outlasted its budget. A retirement has
-    /// [`RETIREMENT_BUDGET`] from the first loss; failures for no known
-    /// reason have [`OUTAGE_BUDGET`] from the first of them.
-    ///
-    /// The first loss since a monitor answered pauses for nothing: a
-    /// monitor that retired is followed at once.
-    pub(crate) fn lost(
-        &mut self,
-        now: tokio::time::Instant,
-        unserved: &Unserved,
-    ) -> Option<Duration> {
-        let since = *self.since.get_or_insert(now);
-        let (from, budget) = match unserved {
-            Unserved::Retiring(_) => {
-                self.failing_since = None;
-                (since, RETIREMENT_BUDGET)
-            }
-            Unserved::Failed(_) => (*self.failing_since.get_or_insert(now), OUTAGE_BUDGET),
-        };
-        if now.saturating_duration_since(from) >= budget {
-            return None;
-        }
-        let pause = self.pause;
-        self.pause = match pause.is_zero() {
-            true => OUTAGE_FIRST_RETRY,
-            false => (pause * 2).min(OUTAGE_RETRY_CAP),
-        };
-        Some(pause)
-    }
-}
-
-#[cfg(test)]
-mod outage_tests {
-    use super::*;
-
-    /// The first loss since a monitor answered is followed at once, later
-    /// ones back off to the cap, and the budget runs from the first loss
-    /// until a monitor answers.
-    #[tokio::test(start_paused = true)]
-    async fn an_outage_backs_off_until_its_budget_and_an_answer_ends_it() {
-        let failed = Unserved::Failed("why".into());
-        let mut outage = Outage::default();
-        let began = tokio::time::Instant::now();
-        let pauses: Vec<_> = (0..7).filter_map(|_| outage.lost(began, &failed)).collect();
-        assert_eq!(
-            pauses,
-            [0, 500, 1000, 2000, 4000, 8000, 8000].map(Duration::from_millis)
-        );
-        let last = began + OUTAGE_BUDGET - Duration::from_millis(1);
-        assert_eq!(outage.lost(last, &failed), Some(OUTAGE_RETRY_CAP));
-        assert_eq!(outage.lost(began + OUTAGE_BUDGET, &failed), None);
-
-        outage.answered();
-        assert_eq!(
-            outage.lost(began + OUTAGE_BUDGET, &failed),
-            Some(Duration::ZERO),
-            "an answer ends the outage, so the next loss begins a new one"
-        );
-    }
-
-    /// A monitor known to be on its way out is waited for as long as it
-    /// and its successor are allowed, which is longer than an outage is;
-    /// failures for no known reason are held to the outage budget from
-    /// the first of them, whenever they begin.
-    #[tokio::test(start_paused = true)]
-    async fn a_retirement_is_given_what_it_is_allowed_and_a_failure_no_more() {
-        let (retiring, failed) = (
-            Unserved::Retiring("its lease is still held".into()),
-            Unserved::Failed("why".into()),
-        );
-        assert_eq!(
-            RETIREMENT_BUDGET,
-            QUIESCE_BUDGET + LEASE_RETIREMENT + SETTLE_BUDGET + SPAWN_SETTLE + ATTACH_BUDGET,
-            "what the old monitor may take, and the new one to start"
-        );
-        assert!(RETIREMENT_BUDGET > OUTAGE_BUDGET);
-
-        let mut outage = Outage::default();
-        let began = tokio::time::Instant::now();
-        let at = |d: Duration| began + d;
-        assert!(outage.lost(began, &retiring).is_some());
-        assert!(
-            outage
-                .lost(at(RETIREMENT_BUDGET - Duration::from_millis(1)), &retiring)
-                .is_some(),
-            "past the outage budget, inside the retirement's"
-        );
-        assert_eq!(outage.lost(at(RETIREMENT_BUDGET), &retiring), None);
-
-        let mut outage = Outage::default();
-        assert!(outage.lost(began, &retiring).is_some());
-        let stopped = at(OUTAGE_BUDGET + Duration::from_secs(5));
-        assert!(
-            outage.lost(stopped, &failed).is_some(),
-            "a failure is counted from when the failing began"
-        );
-        assert!(
-            outage
-                .lost(stopped + OUTAGE_BUDGET - Duration::from_millis(1), &failed)
-                .is_some()
-        );
-        assert_eq!(outage.lost(stopped + OUTAGE_BUDGET, &failed), None);
-    }
-
-    /// A monitor going is known from the repo, whichever way a client's
-    /// own attempt ended: behind another client's repair, unattached,
-    /// unable to start. With a monitor of another build still published
-    /// and alive, each of those is a retirement. A descriptor of this
-    /// build, or of a monitor that is dead, makes none of them one; and a
-    /// newer monitor's refusal never is.
-    #[test]
-    fn a_retirement_is_read_from_the_repo_not_from_who_won_the_repair() {
-        let why = || "why".to_string();
-        let contenders = || {
-            [
-                Attempt::Theirs(why()),
-                Attempt::Unproven(why()),
-                Attempt::Busy(why()),
-                Attempt::SpawnFailed(why()),
-                Attempt::NotStarted(why()),
-                Attempt::Unattached(why()),
-            ]
-        };
-        let me = std::process::id() as i32;
-        let other_build = |repo: &std::path::Path, pid: i32| Descriptor {
-            build: Some(DescribedBuild {
-                running: "00000000000000000000000000000000".into(),
-                version: None,
-                installed_at: "/bin/clank".into(),
-                source: crate::build_stamp::Source::Invocation,
-            }),
-            ..describe(repo, pid, std::path::Path::new("/nowhere.sock"))
-        };
-
-        let going = TempRepo::new();
-        publish(going.path(), &other_build(going.path(), me)).unwrap();
-        assert!(outgoing(going.path()));
-        for attempt in contenders() {
-            assert_eq!(
-                attempt.served(going.path()).err(),
-                Some(Unserved::Retiring(why()))
-            );
-        }
-        assert_eq!(
-            Attempt::Newer(why()).served(going.path()).err(),
-            Some(Unserved::Failed(why())),
-            "there this process is the one out of date"
-        );
-
-        let older = TempRepo::new();
-        publish(
-            older.path(),
-            &Descriptor {
-                proto: PROTO - 1,
-                ..describe(older.path(), me, std::path::Path::new("/nowhere.sock"))
-            },
-        )
-        .unwrap();
-        assert!(outgoing(older.path()), "another protocol is another build");
-
-        let dead = TempRepo::new();
-        publish(dead.path(), &other_build(dead.path(), i32::MAX - 7)).unwrap();
-        let ours = TempRepo::new();
-        publish(
-            ours.path(),
-            &Descriptor {
-                build: Some(DescribedBuild {
-                    running: crate::build_stamp::running().to_string(),
-                    version: None,
-                    installed_at: "/bin/clank".into(),
-                    source: crate::build_stamp::Source::Invocation,
-                }),
-                ..describe(ours.path(), me, std::path::Path::new("/nowhere.sock"))
-            },
-        )
-        .unwrap();
-        for settled in [&dead, &ours] {
-            assert!(!outgoing(settled.path()));
-            for attempt in contenders() {
-                assert_eq!(
-                    attempt.served(settled.path()).err(),
-                    Some(Unserved::Failed(why()))
-                );
-            }
-        }
-    }
-
-    /// Every way an attempt ends without a connection is tried again.
-    #[test]
-    fn every_unattached_attempt_is_retried() {
-        let repo = TempRepo::new();
-        let why = || "why".to_string();
-        for attempt in [
-            Attempt::Newer(why()),
-            Attempt::Theirs(why()),
-            Attempt::Unproven(why()),
-            Attempt::Busy(why()),
-            Attempt::SpawnFailed(why()),
-            Attempt::NotStarted(why()),
-            Attempt::Unattached(why()),
-        ] {
-            assert_eq!(
-                attempt.served(repo.path()).err(),
-                Some(Unserved::Failed(why())),
-                "nothing says a monitor is going"
-            );
-        }
-        assert_eq!(
-            Attempt::LeaseHeld(why()).served(repo.path()).err(),
-            Some(Unserved::Retiring(why())),
-            "a lease still held is a monitor going, not an outage"
-        );
-    }
-}
 
 /// The attempt a classification that ends it is.
 ///
@@ -8619,8 +8331,13 @@ fn registered_waiter(c: &Client) -> Option<(&AgentLabel, &str)> {
 
 /// How long a monitor serves before a missing connection means a missing
 /// waiter: a waiter that outlived the last monitor sees its socket close,
-/// backs off, and attaches again within this.
-const WAITERS_SETTLE: Duration = OUTAGE_RETRY_CAP.saturating_add(ATTACH_BUDGET);
+/// and attaches again within this.
+const WAITERS_SETTLE: Duration = EARLIER_WAITERS_RETRY.saturating_add(ATTACH_BUDGET);
+
+/// The longest a waiter of an earlier build, which retried on a clock,
+/// paused between attempts. One may still be parked when this monitor
+/// starts; a waiter of this build attempts as soon as this one publishes.
+const EARLIER_WAITERS_RETRY: Duration = Duration::from_secs(8);
 
 /// The deliverer `c` is, if it is one: an agent's open connection that
 /// work can be handed down, a wait or a report that parks, with the tool

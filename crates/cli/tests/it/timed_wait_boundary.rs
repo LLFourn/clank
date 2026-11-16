@@ -86,7 +86,6 @@ enum Residual {
 use Class::*;
 
 const FAILURES: Residual = Residual::Plan("failed-work-waits-for-a-cause");
-const MONITOR_GONE: Residual = Residual::Plan("a-missing-monitor-is-heard-not-polled");
 const RECOVERY: Residual = Residual::Plan("recovery-looks-when-something-moves");
 
 struct Site {
@@ -170,7 +169,8 @@ const SITES: &[Site] = &[
     site("cli/src/cli/monitor.rs", "OwnedTasks::end_greetings", "timeout", 0, OneShot, "one bound for ending every greeting at retirement"),
     site("cli/src/cli/monitor.rs", "retire", "sleep", 0, OneShot, "the retirement's budget for writers to drain"),
     site("cli/src/cli/monitor.rs", "retire", "timeout", 1, OneShot, "the retirement's budget for aborted tasks to settle"),
-    site("cli/src/cli/monitor_keeper.rs", "Live::hear", "recv_timeout", 0, Poll(MONITOR_GONE), "while no monitor can be attached the keeper retries with backoff capped at RETRY_CAP, with no bound"),
+    site("cli/src/cli/monitor_keeper.rs", "Live::hear", "recv_timeout", 0, OneShot, "the outage's one report deadline; an attempt waits for its failure's events"),
+    site("cli/src/cli/monitor_outage.rs", "Absence::after", "sleep_until", 0, OneShot, "the outage's one report deadline, which neither events nor failed attempts move; an attempt waits for its failure's events"),
     site("cli/src/cli/monitor_upgrade.rs", "drive", "recv_timeout", 0, OneShot, "discovery, within the upgrade's one deadline"),
     site("cli/src/cli/monitor_upgrade.rs", "drive", "recv_timeout", 1, OneShot, "the next operation ending, within the upgrade's one deadline"),
     site("cli/src/cli/monitor_upgrade.rs", "retire_with", "sleep", 0, BoundedRetry, "looks for an old monitor's exit until the grace or the deadline"),
@@ -210,8 +210,7 @@ const SITES: &[Site] = &[
     site("cli/src/cli/timer_source.rs", "parse", "interval", 0, NotAWait, "parses a timer's recurrence"),
     site("cli/src/cli/timer_source.rs", "deadline", "sleep_until", 0, Helper, "a deadline future that never fires for `None`"),
     site("cli/src/cli/turn_child.rs", "carry", "passes", 0, OneShot, "the report's last word, ending an attach still out"),
-    site("cli/src/cli/turn_child.rs", "carry", "passes", 1, OneShot, "the report's last word, ending an outage pause"),
-    site("cli/src/cli/turn_child.rs", "carry", "sleep", 2, Poll(MONITOR_GONE), "for a stale child or a report that cannot reach the agent, the outage pause re-arms at OUTAGE_RETRY_CAP until the report's deadline, or forever without one"),
+    site("cli/src/cli/turn_child.rs", "carry", "passes", 1, OneShot, "the report's last word, ending its wait for an outage's events"),
     site("cli/src/cli/turn_child.rs", "passes", "sleep_until", 0, Helper, "a deadline future that never fires for `None`"),
     site("cli/src/cli/turn_child.rs", "shared", "passes", 0, OneShot, "the report's last word, while the monitor holds it"),
     site("cli/src/cli/turn_child.rs", "result_of", "timeout", 0, OneShot, "bounds the hook's word on one presentation"),
@@ -219,7 +218,6 @@ const SITES: &[Site] = &[
     site("cli/src/cli/wait.rs", "items_with_context", "sleep_until", 1, Poll(FAILURES), "TimerSet::retry_failed re-arms with backoff capped at RETRY_CAP while an occurrence will not write"),
     site("cli/src/cli/wait.rs", "items_with_context", "sleep", 2, Throttle, "debounces a filesystem wake"),
     site("cli/src/cli/wait.rs", "Beat::settle", "sleep", 0, Throttle, "debounces a filesystem wake"),
-    site("cli/src/cli/wait.rs", "monitored", "sleep", 0, Poll(MONITOR_GONE), "once the outage budget is spent and its notice already delivered, retries the monitor every OUTAGE_RETRY_CAP forever"),
     site("cli/src/cli/wait.rs", "until_retirement_may_settle", "pause_unless_stopped", 0, Poll(FAILURES), "a deferred retirement with no group to watch is retried on a capped backoff, with no bound"),
     site("cli/src/cli/wait.rs", "until_retirement_may_settle", "until_a_member_exits", 1, Poll(FAILURES), "a member's exit, or the capped deferral backoff, re-armed while the retirement defers"),
     site("cli/src/cli/wait.rs", "pause_unless_stopped", "sleep", 0, Helper, "a pause a stop request cuts short"),

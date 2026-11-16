@@ -3462,6 +3462,7 @@ pub(crate) async fn run_tui(
         }
     });
     let mut said_fault = false;
+    let mut said_unattached = None;
     {
         let ev_tx = ev_tx.clone();
         std::thread::spawn(move || {
@@ -3642,6 +3643,21 @@ pub(crate) async fn run_tui(
                     "{why}. Nothing on screen will change now; quit and run `clank tui` again."
                 ),
             ));
+        }
+        let unattached = watchers.keeper.unattached();
+        let said = unattached.as_ref().map(|(n, _)| *n);
+        if said != said_unattached && detail.is_none() {
+            if let Some((_, why)) = &unattached {
+                detail = Some(Overlay::error(
+                    "no monitor could be attached".to_string(),
+                    format!(
+                        "{why}. Agents waiting on this repo are not woken until one is. \
+                         clank tries again when something that could end this changes; \
+                         press m in the log to try again now."
+                    ),
+                ));
+            }
+            said_unattached = said;
         }
         reconcile_wait_process(
             &mut mode,
@@ -5440,6 +5456,9 @@ pub(crate) async fn run_tui(
                                 if let Some(n) = remote.toggle(&snapshot) {
                                     detail = Some(Overlay::notice(n));
                                 }
+                            }
+                            k if retries_monitor(k, watchers.keeper.unattached().is_some()) => {
+                                watchers.keeper.retry()
                             }
                             Key::Up => match log_up_crossing(&log, &snapshot, cols as usize) {
                                 Some(panel) => mode = panel,
@@ -9018,7 +9037,6 @@ pub(crate) mod tests {
     /// until a rebuild succeeds, then served.
     #[test]
     fn a_handoff_forces_exactly_one_rebuild_past_an_unchanged_signature() {
-        use crate::cli::monitor::Attempt;
         use crate::cli::monitor::keeper::{FreshRebuild, Live, Port};
         use crate::cli::status::{ProcessHealth, input_signature_with};
         let dir = tempfile::tempdir().unwrap();
@@ -9050,11 +9068,17 @@ pub(crate) mod tests {
 
         let (wake, woken) = mpsc::channel();
         let mut keeper = Live::new(
-            || Attempt::Unproven("unused".into()),
+            || {
+                Err(crate::cli::monitor::outage::Unserved::Unstartable(
+                    "unused".into(),
+                ))
+            },
             |_| Ok(()),
+            crate::cli::monitor::outage::scripted::Scripted::default(),
             None,
             wake,
             fresh,
+            Default::default(),
             std::sync::Arc::new(crate::cli::monitor::Hangup::default()),
         );
         keeper.handoff();

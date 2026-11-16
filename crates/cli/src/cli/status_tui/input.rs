@@ -650,6 +650,12 @@ pub(super) fn rebind_draft_sel(
         .unwrap_or_else(|| sel.min(drafts.len().saturating_sub(1)))
 }
 
+/// Whether `key` in the log asks the keeper to attempt a monitor: `m`, and
+/// only while none could be attached. Nothing else does.
+pub(super) fn retries_monitor(key: Key, unattached: bool) -> bool {
+    unattached && key == Key::Char(b'm')
+}
+
 pub(super) fn list_nav(sel: usize, len: usize, key: Key) -> ListNav {
     match key {
         Key::Quit => ListNav::Quit,
@@ -2756,6 +2762,28 @@ pub(super) fn move_selection(sel: usize, len: usize, down: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// Only `m`, and only while no monitor could be attached, asks the
+    /// keeper for an attempt: a refresh, a move or any other key is not
+    /// a reason to start one.
+    #[test]
+    fn only_m_while_unattached_asks_for_a_monitor() {
+        assert!(retries_monitor(Key::Char(b'm'), true));
+        assert!(!retries_monitor(Key::Char(b'm'), false));
+        for key in [
+            Key::Space,
+            Key::Enter,
+            Key::Up,
+            Key::Escape,
+            Key::Focus,
+            Key::Char(b'r'),
+            Key::Char(b'b'),
+            Key::Char(b'a'),
+            Key::Char(b'M'),
+        ] {
+            assert!(!retries_monitor(key, true), "{key:?}");
+        }
+    }
+
     #[test]
     fn every_displayed_event_key_activates_the_action_it_names() {
         // Driven from the action list itself, not a hand-written key

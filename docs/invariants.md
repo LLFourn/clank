@@ -202,20 +202,33 @@ whether its assertions protect the invariant. Reviewers check that.
   - recovery's `RETRY_LOOK`, which stands for three different waits (the
     gate, which only `Driver::due` asks; the record showing the failed
     turn; a turn it cannot watch) behind one `next_at`.
-  - clients retrying a missing monitor past their outage budget (a parked
-    wait, a turn child, the TUI's keeper), whose failures include ones with
-    no event.
   A held event-log sidecar or ingest lease wakes the monitor on its release,
   and a remote's browser streams wake on a sessions-store write or their
-  expiry.
+  expiry. A client with no monitor (a parked wait, a turn child, the TUI's
+  keeper) attempts again only when its failure's events move: the repo's
+  lease or repair permit releasing, a monitor publishing, an install, a
+  config edit. Its outage has one report deadline, which those events and
+  the attempts they cause do not move; a failure none of them ends (a
+  start that failed for want of resources) is reported then and not
+  attempted again until one moves. A watch that cannot be armed or stops
+  ends the wait at once.
 - Tests: `crates/cli/tests/it/timed_wait_boundary.rs::every_timed_wait_is_classified`,
   `crates/cli/tests/it/timed_wait_boundary.rs::invariant_status_matches_the_inventory`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_held_sidecar_wakes_the_loop_only_on_its_release`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_release_before_the_waiter_is_armed_still_wakes_the_loop`,
   `crates/web-cloudflare/src/host.rs::an_unchanged_store_is_not_read_again_while_the_session_lasts`,
-  `crates/web-cloudflare/src/host.rs::a_revocation_before_the_watch_is_armed_is_not_lost`
-- Plans: failed-work-waits-for-a-cause, a-missing-monitor-is-heard-not-polled,
-  recovery-looks-when-something-moves
+  `crates/web-cloudflare/src/host.rs::a_revocation_before_the_watch_is_armed_is_not_lost`,
+  `crates/cli/src/cli/monitor_outage.rs::a_monitor_published_before_its_watch_is_armed_is_found`,
+  `crates/cli/src/cli/monitor_outage.rs::a_held_leases_release_leads_to_an_attach`,
+  `crates/cli/src/cli/monitor_outage.rs::a_lease_held_forever_is_reported_at_its_deadline_with_no_attempt_between`,
+  `crates/cli/src/cli/monitor_outage.rs::a_reported_outage_waits_on_its_events_alone`,
+  `crates/cli/src/cli/monitor_outage.rs::a_watch_refused_or_stopped_ends_the_wait`,
+  `crates/cli/src/cli/monitor_outage.rs::the_kernel_hears_a_held_lease_released`,
+  `crates/cli/src/cli/monitor_keeper.rs::an_unattached_keeper_reports_once_at_its_deadline_and_attempts_nothing_more`,
+  `crates/cli/src/cli/monitor_keeper.rs::a_watch_refused_or_stopped_is_shown_and_ends_the_attempts`,
+  `crates/cli/src/cli/wait.rs::a_bound_wait_fails_once_for_an_outage_and_then_waits_on_its_events`,
+  `crates/cli/src/cli/turn_child_tests.rs::a_stale_child_waits_quietly_and_tells_its_agent_nothing`
+- Plans: failed-work-waits-for-a-cause, recovery-looks-when-something-moves
 
 ## I11. `clank open` works when no zellij session exists.
 

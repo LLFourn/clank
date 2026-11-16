@@ -667,8 +667,10 @@ itself or they exist for one-off upgrades. They still work:
 - `monitor start` runs the per-repo watcher that every wait and TUI shares.
   A parked wait starts one when none is running, and an open `clank tui`
   keeps one up: when its monitor retires or exits, the TUI starts the
-  successor, retrying with a backoff while another client, a held lease or
-  a newer monitor stands in the way. `clank status --watch` only subscribes
+  successor. While another client, a held lease, a newer monitor or a
+  broken config stands in the way it tries again only when that could have
+  changed, says once that no monitor could be attached, and `m` in the log
+  tries again at once. `clank status --watch` only subscribes
   and never starts one. `monitor upgrade` replaces monitors from
   builds that predate self-retirement; run it once after upgrading from one.
 
