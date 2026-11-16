@@ -74,10 +74,11 @@ whether its assertions protect the invariant. Reviewers check that.
 - Scope: a hook uses its stdin, the binding it routes by, and the evidence the
   hook audit allows (the agent's transcript, process identity and upgrade
   state). It never reads monitor-owned policy or configuration.
-- Tests: `crates/cli/tests/it/hook_is_a_messenger.rs::hook_modules_touch_no_decision_state`,
-  `crates/cli/tests/it/hook_is_a_messenger.rs::shared_hook_identity_paths_cannot_parse_monitor_policy`
-- Today: the gate is a substring list that a sibling function can evade.
-- Plans: hooks-read-only-what-they-are-given
+- Tests: `crates/cli/tests/it/hook_reach.rs::nothing_a_hook_reaches_reads_policy_or_decision_state`,
+  `crates/cli/tests/it/hook_reach.rs::every_root_reader_and_exception_names_a_function`,
+  `crates/cli/tests/it/hook_is_a_messenger.rs::hook_modules_touch_no_decision_state`,
+  `crates/cli/tests/it/hook_is_a_messenger.rs::shared_hook_identity_paths_cannot_parse_monitor_policy`,
+  `crates/cli/src/agent_store/identity.rs::the_binding_reader_and_the_roster_parser_agree_on_every_tool`
 
 ## I5. Attendance is only what an agent declares.
 
