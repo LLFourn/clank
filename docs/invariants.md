@@ -117,12 +117,16 @@ whether its assertions protect the invariant. Reviewers check that.
 ## I8. Any change to a monitor wire message bumps the protocol version.
 
 - Why: a peer on the old protocol drops what it does not know, silently.
-- Status: target
-- Today: violated. 5410fb62 (tagged v0.2.0) added `Control::Questions`
-  without bumping protocol 23, so development builds 1ef4886b..9d130109
-  speak 23 without it and drop it silently. v0.2.0 itself carries it. The monitor
-  still declares 23, so it takes those builds for peers.
-- Plans: wire-changes-bump-the-protocol
+- Status: holds
+- Scope: drift is detected by the test: every message the monitor and its
+  clients exchange, and every type nested in them, has a hand-written sample
+  the compiler keeps complete, and the samples' JSON is pinned to `PROTO` in
+  `PINS`. The bump is enforced by review of `PINS`: editing the last pair's
+  hash in place, without a bump, passes the test, so reviewers check that
+  `PINS` only ever grows.
+- Tests: `crates/cli/src/cli/monitor_wire_golden_tests.rs::the_wire_shape_is_pinned_to_the_protocol`,
+  `crates/cli/src/cli/monitor_wire_golden_tests.rs::every_variant_has_a_sample`,
+  `crates/cli/src/cli/monitor_wire_golden_tests.rs::pins_are_a_history`
 
 ## I9. The monitor's serve loop never blocks on a lock an agent process can hold.
 
