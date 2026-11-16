@@ -232,6 +232,10 @@ pub struct Facts<'a> {
     /// An unanswered block is pending for this agent.
     pub blocked: bool,
     pub owed: &'a [OwedItem],
+    /// What is owed could not be read for this step, so `owed` is only a
+    /// stand-in: no change to it ends a repeat episode, breaks the one in
+    /// flight or drops a receipt.
+    pub owed_unknown: bool,
     pub liveness: &'a dyn Liveness,
     /// A person's signed command, verified just now, waits for this agent
     /// to sit idle and only a park stands in its way.
@@ -1384,7 +1388,7 @@ impl SessionState {
 
     /// Evidence for work no longer owed can quiet nothing.
     fn prune_received(&mut self, facts: &Facts<'_>) {
-        if !self.bound(facts) {
+        if !self.bound(facts) || facts.owed_unknown {
             return;
         }
         let owed = owed_identities(facts.owed);
@@ -1631,7 +1635,7 @@ impl SessionState {
     /// evaluated, so a result arriving late is judged by the work owed when
     /// it arrives.
     fn forget_stale_repeat(&mut self, facts: &Facts<'_>) {
-        if !self.bound(facts) {
+        if !self.bound(facts) || facts.owed_unknown {
             return;
         }
         let owed = owed_identities(&self.deliverable(facts));
@@ -2041,7 +2045,11 @@ impl SessionState {
             }
         }
         let owed = owed_identities(facts.owed);
-        for identity in p.identities.into_iter().filter(|i| owed.contains(i)) {
+        for identity in p
+            .identities
+            .into_iter()
+            .filter(|i| facts.owed_unknown || owed.contains(i))
+        {
             if let Err(at) = self.received.binary_search(&identity) {
                 self.received.insert(at, identity);
             }

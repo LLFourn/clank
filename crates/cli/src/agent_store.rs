@@ -1783,6 +1783,9 @@ mod tests {
         assert_eq!(told(repo, &l), None);
     }
 
+    /// Once dropped, the lock is freed when the last copy of its fd closes:
+    /// a spawn on another test's thread may hold one until its exec, so
+    /// that is waited for rather than tried at an unknown moment.
     #[test]
     fn a_held_lock_is_not_taken_and_a_free_one_is() {
         let dir = tempfile::tempdir().unwrap();
@@ -1790,7 +1793,9 @@ mod tests {
         let held = try_exclusive_lock(&path).unwrap().expect("free");
         assert!(try_exclusive_lock(&path).unwrap().is_none(), "contended");
         drop(held);
-        assert!(try_exclusive_lock(&path).unwrap().is_some(), "free again");
+        crate::cli::github::log::tests::within("the dropped lock", move || {
+            exclusive_lock(&path).expect("freed by the drop")
+        });
     }
 
     #[test]

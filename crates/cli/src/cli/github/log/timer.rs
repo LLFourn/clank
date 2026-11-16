@@ -328,7 +328,27 @@ impl EventLog {
         if !recover || !self.is_recurring_key() {
             return self.read_rows();
         }
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let held = Sidecar::acquire(&self.lock_path, true)?;
+        self.read_timer_backlog_held(&held, recover)
+    }
+
+    /// Whether [`Self::read_timer_backlog`] with `recover` writes, and so
+    /// needs the sidecar exclusive.
+    pub(crate) fn timer_backlog_writes(&self, recover: bool) -> bool {
+        recover && self.is_recurring_key()
+    }
+
+    /// [`Self::read_timer_backlog`] under the operation's held sidecar,
+    /// exclusive when [`Self::timer_backlog_writes`].
+    pub(crate) fn read_timer_backlog_held(
+        &mut self,
+        held: &Sidecar,
+        recover: bool,
+    ) -> std::io::Result<Option<ReadRows>> {
+        if !self.timer_backlog_writes(recover) {
+            return self.read_rows_held(held);
+        }
+        self.holds(held, true);
         let lines = self.recurring_lines()?;
         if !lines.is_empty() {
             self.validate_recurring_inspection(&lines)?;
@@ -375,17 +395,48 @@ impl EventLog {
 
     /// The slot this recurring timer next falls due at, passed or not,
     /// or `None` while an occurrence awaits its ack. Arming reads this;
-    /// only [`Self::accept_recurring_with_interrupt`] appends.
-    pub(crate) fn recurring_next_due(&self, r: &Recurrence) -> std::io::Result<Option<u64>> {
+    /// only [`Self::accept_recurring_held`] appends.
+    pub(crate) fn recurring_next_due(
+        &self,
+        r: &Recurrence,
+        locking: Locking,
+    ) -> std::io::Result<Tried<Option<u64>>> {
         self.validate_recurring_key(r)?;
-        let _lock = SidecarLock::acquire(&self.lock_path, false)?;
+        let Some(held) = self.sidecar(false, locking)? else {
+            return Ok(Tried::Contended);
+        };
+        self.holds(&held, false);
         let state = fold(&self.recurring_lines()?, r)?;
         if state.pending.is_some() {
-            return Ok(None);
+            return Ok(Tried::Ran(None));
         }
         r.next_due(state.covered)
-            .map(Some)
+            .map(|due| Tried::Ran(Some(due)))
             .map_err(std::io::Error::other)
+    }
+
+    /// What acceptance of `r` holds for its whole operation: its ingest
+    /// lease, then its sidecar exclusive, taken as `locking` says. A busy
+    /// lease is an error, as it always was; only the sidecar contends.
+    pub(crate) fn recurring_writer(
+        &self,
+        r: &Recurrence,
+        locking: Locking,
+    ) -> std::io::Result<Tried<(IngestLease, Sidecar)>> {
+        self.validate_recurring_key(r)?;
+        let dir = self
+            .log_path
+            .parent()
+            .ok_or_else(|| invalid("recurring WAL has no parent"))?;
+        let Some(lease) = IngestLease::try_acquire(dir, &r.source_key())? else {
+            return Err(invalid(
+                "recurring ingest lease busy; retry on next owner wake",
+            ));
+        };
+        Ok(match self.sidecar(true, locking)? {
+            Some(held) => Tried::Ran((lease, held)),
+            None => Tried::Contended,
+        })
     }
 
     /// Revalidate and append under the ack/compaction write lock. A complete
@@ -400,6 +451,7 @@ impl EventLog {
         self.accept_recurring_with_interrupt(r, content, wall, Interrupt::default())
     }
 
+    #[cfg(test)]
     pub(crate) fn accept_recurring_with_interrupt(
         &mut self,
         r: &Recurrence,
@@ -407,17 +459,24 @@ impl EventLog {
         wall: u64,
         interrupt: Interrupt,
     ) -> std::io::Result<RecurringTransition> {
-        self.validate_recurring_key(r)?;
-        let dir = self
-            .log_path
-            .parent()
-            .ok_or_else(|| invalid("recurring WAL has no parent"))?;
-        let Some(_lease) = IngestLease::try_acquire(dir, &r.source_key())? else {
-            return Err(invalid(
-                "recurring ingest lease busy; retry on next owner wake",
-            ));
+        let Tried::Ran((_lease, held)) = self.recurring_writer(r, Locking::Wait)? else {
+            unreachable!("a blocking take never contends");
         };
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        self.accept_recurring_held(&held, r, content, wall, interrupt)
+    }
+
+    /// Accept `r`'s due slots under [`Self::recurring_writer`]'s held
+    /// sidecar.
+    pub(crate) fn accept_recurring_held(
+        &mut self,
+        held: &Sidecar,
+        r: &Recurrence,
+        content: &str,
+        wall: u64,
+        interrupt: Interrupt,
+    ) -> std::io::Result<RecurringTransition> {
+        self.validate_recurring_key(r)?;
+        self.holds(held, true);
         let lines = self.recurring_lines()?;
         let state = fold(&lines, r)?;
         self.lines = lines.len();
@@ -511,7 +570,7 @@ impl EventLog {
         ident: &str,
         wall: u64,
     ) -> std::io::Result<()> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         self.append_recurring_ack_unlocked(seq, ident, wall)
     }
 

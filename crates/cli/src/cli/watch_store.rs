@@ -563,6 +563,17 @@ pub(crate) fn rows(
     repo: &Path,
     author: &AgentLabel,
 ) -> anyhow::Result<Vec<super::events::Sourced>> {
+    rows_with(repo, author, &super::github::log::Sidecars::waiting())
+}
+
+/// [`rows`], each log read as `sidecars` takes its lock. A watch whose
+/// sidecar is held contributes no rows and is noted unavailable.
+fn rows_with(
+    repo: &Path,
+    author: &AgentLabel,
+    sidecars: &super::github::log::Sidecars,
+) -> anyhow::Result<Vec<super::events::Sourced>> {
+    use super::github::log::Tried;
     let config = read(repo)?;
     let mut rows = vec![];
     for (id, watch) in assigned(&config, author) {
@@ -571,17 +582,19 @@ pub(crate) fn rows(
         if !dir.join(format!("{key}.jsonl")).is_file() {
             continue;
         }
+        let source = selector_key(id, &key);
         let read = (|| {
             let mut log = super::github::log::EventLog::open(&dir, &key)?;
             if matches!(watch.source, WaitEventSource::Timer(_)) {
-                log.read_timer_backlog(false)
+                sidecars.timer_backlog(&mut log, false, &source)
             } else {
-                log.read_rows()
+                sidecars.read_rows(&log, &source)
             }
         })();
         let read = match read {
-            Ok(Some(read)) => read,
-            Ok(None) => {
+            Ok(Tried::Contended) => continue,
+            Ok(Tried::Ran(Some(read))) => read,
+            Ok(Tried::Ran(None)) => {
                 eprintln!("watch {id} ({key}) has corrupt custody; skipping, repair required");
                 continue;
             }
@@ -591,7 +604,7 @@ pub(crate) fn rows(
             }
         };
         rows.extend(read.rows.into_iter().map(|row| super::events::Sourced {
-            source: selector_key(id, &key),
+            source: source.clone(),
             row,
         }));
     }
@@ -602,6 +615,7 @@ pub(crate) fn owed(
     repo: &Path,
     author: &AgentLabel,
     shown: &mut std::collections::HashSet<(String, u64, String)>,
+    sidecars: &super::github::log::Sidecars,
 ) -> Vec<clank_core::wait::WaitItem> {
     let config = match read(repo) {
         Ok(c) => c,
@@ -610,7 +624,7 @@ pub(crate) fn owed(
             return vec![];
         }
     };
-    let rows = match rows(repo, author) {
+    let rows = match rows_with(repo, author, sidecars) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("watch inbox: {e:#}");
@@ -776,7 +790,15 @@ mod routing_tests {
                 .is_empty()
         );
         cli_ack(repo.path(), "alpha", &selector).await.unwrap();
-        assert!(owed(repo.path(), &label("beta"), &mut Default::default()).is_empty());
+        assert!(
+            owed(
+                repo.path(),
+                &label("beta"),
+                &mut Default::default(),
+                &super::super::github::log::Sidecars::waiting()
+            )
+            .is_empty()
+        );
         assert!(log.read_rows().unwrap().unwrap().rows[0].acked);
 
         // An old plain selector works for both the original agent and the new
@@ -827,7 +849,15 @@ mod routing_tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(owed(repo.path(), &label("beta"), &mut Default::default()).is_empty());
+        assert!(
+            owed(
+                repo.path(),
+                &label("beta"),
+                &mut Default::default(),
+                &super::super::github::log::Sidecars::waiting()
+            )
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -865,7 +895,13 @@ mod routing_tests {
             )
             .unwrap();
         assert_eq!(
-            owed(repo.path(), &label("alpha"), &mut Default::default()).len(),
+            owed(
+                repo.path(),
+                &label("alpha"),
+                &mut Default::default(),
+                &super::super::github::log::Sidecars::waiting()
+            )
+            .len(),
             1
         );
         assert_eq!(
@@ -952,8 +988,21 @@ mod routing_tests {
                 &item("in-flight"),
             )
             .unwrap();
-        assert!(owed(repo.path(), &label("alpha"), &mut Default::default()).is_empty());
-        let owed = owed(repo.path(), &label("beta"), &mut Default::default());
+        assert!(
+            owed(
+                repo.path(),
+                &label("alpha"),
+                &mut Default::default(),
+                &super::super::github::log::Sidecars::waiting()
+            )
+            .is_empty()
+        );
+        let owed = owed(
+            repo.path(),
+            &label("beta"),
+            &mut Default::default(),
+            &super::super::github::log::Sidecars::waiting(),
+        );
         assert_eq!(owed.len(), 2);
         assert_eq!(
             rows(repo.path(), &label("beta"))
@@ -1058,7 +1107,13 @@ mod routing_tests {
         assert_eq!(new.len(), 2);
         assert_eq!(new.iter().filter(|r| r.row.acked).count(), 1);
         assert_eq!(
-            owed(repo.path(), &label("beta"), &mut Default::default()).len(),
+            owed(
+                repo.path(),
+                &label("beta"),
+                &mut Default::default(),
+                &super::super::github::log::Sidecars::waiting()
+            )
+            .len(),
             1
         );
         let (dir, key) = log_location(&inbox(repo.path(), "beta"), &new[0].source).unwrap();
@@ -1114,7 +1169,12 @@ mod routing_tests {
         assert!(loaded.feed_ids.contains(&"baseline".to_owned()));
         assert!(loaded.feed_ids.contains(&"pending".to_owned()));
         assert_eq!(loaded.unhandled.len(), 1);
-        let pending = owed(repo.path(), &label("beta"), &mut Default::default());
+        let pending = owed(
+            repo.path(),
+            &label("beta"),
+            &mut Default::default(),
+            &super::super::github::log::Sidecars::waiting(),
+        );
         assert!(
             matches!(&pending[0], WaitItem::GithubEvent { instructions: Some(prompt), .. } if prompt == "triage only")
         );
@@ -1148,12 +1208,26 @@ mod routing_tests {
         ));
         let before = rows(repo.path(), &label("alpha")).unwrap();
         roster(repo.path(), None);
-        assert!(owed(repo.path(), &label("alpha"), &mut Default::default()).is_empty());
+        assert!(
+            owed(
+                repo.path(),
+                &label("alpha"),
+                &mut Default::default(),
+                &super::super::github::log::Sidecars::waiting()
+            )
+            .is_empty()
+        );
         roster(repo.path(), Some("beta"));
         let after = rows(repo.path(), &label("beta")).unwrap();
         assert_eq!(after[0].row.ident, before[0].row.ident);
         assert_eq!(
-            owed(repo.path(), &label("beta"), &mut Default::default()).len(),
+            owed(
+                repo.path(),
+                &label("beta"),
+                &mut Default::default(),
+                &super::super::github::log::Sidecars::waiting()
+            )
+            .len(),
             1
         );
         let mut log = EventLog::open(&inbox(repo.path(), "beta"), &after[0].source).unwrap();
@@ -1170,6 +1244,14 @@ mod routing_tests {
         restarted.arm();
         restarted.due();
         assert!(rx.try_recv().is_err());
-        assert!(owed(repo.path(), &label("beta"), &mut Default::default()).is_empty());
+        assert!(
+            owed(
+                repo.path(),
+                &label("beta"),
+                &mut Default::default(),
+                &super::super::github::log::Sidecars::waiting()
+            )
+            .is_empty()
+        );
     }
 }

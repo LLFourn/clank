@@ -231,7 +231,7 @@ impl EventLog {
         Self::parse(&text).map_err(|_| invalid("event WAL is corrupt; refusing transaction"))
     }
     pub(crate) fn reply_operations(&self) -> std::io::Result<Vec<ReplyOperationState>> {
-        let _lock = SidecarLock::acquire(&self.lock_path, false)?;
+        let _lock = Sidecar::acquire(&self.lock_path, false)?;
         operations(&self.operation_lines()?)
     }
     /// Read-only lookup before membership validation: an accepted delivery
@@ -240,7 +240,7 @@ impl EventLog {
         &self,
         operation: &ReplyOperation,
     ) -> std::io::Result<Option<MessageReceipt>> {
-        let _lock = SidecarLock::acquire(&self.lock_path, false)?;
+        let _lock = Sidecar::acquire(&self.lock_path, false)?;
         let saved = receipts(&self.message_lines()?)?.remove(&operation.delivery_id());
         if let Some((receipt, _)) = saved {
             if receipt.digest != digest(&operation.item()) {
@@ -256,7 +256,7 @@ impl EventLog {
         &mut self,
         operation: &ReplyOperation,
     ) -> std::io::Result<ReplyOperationState> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         let lines = self.operation_lines()?;
         let states = operations(&lines)?;
         if let Some(state) = states.iter().find(|s| s.operation.id == operation.id) {
@@ -338,7 +338,7 @@ impl EventLog {
         &mut self,
         operation: &ReplyOperation,
     ) -> std::io::Result<MessageReceipt> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         let lines = self.message_lines()?;
         let id = operation.delivery_id();
         let item = operation.item();
@@ -387,7 +387,7 @@ impl EventLog {
         state: &ReplyOperationState,
         receipt: &Acceptance,
     ) -> std::io::Result<()> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         let current = operations(&self.operation_lines()?)?
             .into_iter()
             .find(|s| s.operation.id == state.operation.id)
@@ -424,7 +424,7 @@ impl EventLog {
         &mut self,
         receipt: &MessageReceipt,
     ) -> std::io::Result<()> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         if let Some((saved, released)) = receipts(&self.message_lines()?)?.get(&receipt.id) {
             if saved != receipt {
                 return Err(invalid("message receipt changed; refusing release"));

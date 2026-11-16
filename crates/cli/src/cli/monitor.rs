@@ -3254,6 +3254,9 @@ struct Client {
     /// through the loop's channels.
     report: Option<Box<Reporting>>,
     admitted: Admitted,
+    /// Its last serve met a log another process held, so what it was told
+    /// lacks that log: the contention retry serves it again.
+    unavailable: bool,
 }
 
 /// When a connection was admitted, and the build its client said it runs.
@@ -3645,6 +3648,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         asks: mut uc_asks,
         done: mut uc_done,
     } = uc_wakes;
+    let mut contention = ContentionRetry::default();
     let ended = loop {
         if tenure.standing_down(std::time::Instant::now()) {
             tenure
@@ -3706,9 +3710,14 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             let wait = at.saturating_sub(crate::cli::recovery::unix_now());
             tokio::time::Instant::now() + Duration::from_secs(wait)
         });
+        contention.look(
+            unavailable_somewhere(&hosted, &clients, &recovery),
+            crate::cli::timer_source::clock::now(),
+        );
         let timer_retry = hosted
             .values_mut()
             .filter_map(|host| host.timers.as_mut().and_then(|timers| timers.retry_due()))
+            .chain(contention.due())
             .min();
         // Once: an agent with no waiter is said to have none only after
         // the monitor has served long enough for its waits to arrive.
@@ -3800,11 +3809,51 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         match wake {
             Wake::LeaseChanged | Wake::Collected | Wake::Installed | Wake::Settled => {}
             Wake::TimerRetry => {
+                let now = crate::cli::timer_source::clock::now();
                 if owner {
                     for host in hosted.values_mut() {
-                        if let Some(timers) = &mut host.timers {
+                        if let Some(timers) = &mut host.timers
+                            && timers.retry_due().is_some_and(|at| at <= now)
+                        {
                             timers.retry_failed();
                         }
+                    }
+                }
+                let retry = contention.is_due(now);
+                if retry {
+                    contention.ran();
+                }
+                if owner && retry {
+                    leaving.extend(retry_contended(
+                        &repo,
+                        &mut clients,
+                        folded_state.as_ref(),
+                        &mut pending,
+                        &mut timer_backlogs,
+                        &mut hosted,
+                        &mut turns,
+                    ));
+                    if let Some(state) = &folded_state {
+                        let acts = recovery.reconcile(
+                            recovery_facts(
+                                &repo,
+                                state,
+                                &hosted,
+                                &mut timer_backlogs,
+                                &pending,
+                                &mut turns,
+                            ),
+                            crate::cli::recovery::unix_now(),
+                        );
+                        act_on_recovery(
+                            &repo,
+                            &clients,
+                            acts,
+                            &recovery_answers,
+                            &asks,
+                            &records,
+                            &mut owned,
+                        );
                     }
                 }
             }
@@ -4508,6 +4557,119 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     ended
 }
 
+/// The first pause before contended loop operations run again, and its
+/// cap.
+const CONTENTION_FIRST_RETRY: Duration = Duration::from_millis(250);
+const CONTENTION_RETRY_CAP: Duration = Duration::from_secs(5);
+
+/// The loop's one deadline for operations that found an event log's
+/// sidecar held (I9). A bounded retry, not a poll (no-polls-but-github):
+/// it is armed only while such an operation has yet to run again unheld,
+/// a pause from [`CONTENTION_FIRST_RETRY`] doubling to
+/// [`CONTENTION_RETRY_CAP`] with each retry while that lasts, and is
+/// disarmed, starting over, once it does not.
+#[derive(Debug)]
+struct ContentionRetry {
+    at: Option<tokio::time::Instant>,
+    pause: Duration,
+}
+
+impl Default for ContentionRetry {
+    fn default() -> Self {
+        Self {
+            at: None,
+            pause: CONTENTION_FIRST_RETRY,
+        }
+    }
+}
+
+impl ContentionRetry {
+    /// Arm for `unsettled` contention, keeping a deadline already armed;
+    /// with none, the episode is over.
+    fn look(&mut self, unsettled: bool, now: tokio::time::Instant) {
+        if unsettled {
+            self.at.get_or_insert(now + self.pause);
+        } else {
+            self.at = None;
+            self.pause = CONTENTION_FIRST_RETRY;
+        }
+    }
+
+    fn due(&self) -> Option<tokio::time::Instant> {
+        self.at
+    }
+
+    fn is_due(&self, now: tokio::time::Instant) -> bool {
+        self.at.is_some_and(|at| at <= now)
+    }
+
+    /// The retry has come: it backs off, and the next look arms it again
+    /// while what it retried is still unsettled.
+    fn ran(&mut self) {
+        self.at = None;
+        self.pause = (self.pause * 2).min(CONTENTION_RETRY_CAP);
+    }
+}
+
+/// Whether some loop operation met a log another process held and has
+/// yet to run again unheld: a hosted timer's step, a client's last serve,
+/// or recovery's last fold.
+fn unavailable_somewhere(
+    hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
+    clients: &[Client],
+    recovery: &crate::cli::recovery::Driver,
+) -> bool {
+    hosted.values().any(|host| {
+        host.timers
+            .as_ref()
+            .is_some_and(crate::cli::timer_source::TimerSet::awaiting_retry)
+    }) || clients.iter().any(|c| c.unavailable)
+        || recovery.awaits_a_complete_fold()
+}
+
+/// [`ContentionRetry`] has come: re-run each hosted timer's contended
+/// arm or acceptance, and serve again every waiting client and held
+/// report, whose reads went without a held log's items.
+#[allow(clippy::too_many_arguments)]
+fn retry_contended(
+    repo: &std::path::Path,
+    clients: &mut Vec<Client>,
+    state: Option<&crate::repo_state::RepoState>,
+    pending: &mut Vec<(SourceOwner, WaitItem)>,
+    timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
+    hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>,
+    turns: &mut crate::cli::turn_custody::Turns,
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
+    for host in hosted.values_mut() {
+        if let Some(timers) = &mut host.timers {
+            timers.retry_contended();
+        }
+    }
+    let mut leaving = Vec::new();
+    if let Some(state) = state {
+        leaving.extend(serve_to_cached(
+            repo,
+            clients,
+            state,
+            None,
+            pending,
+            timer_backlogs,
+            hosted,
+        ));
+    }
+    leaving.extend(serve_reports(
+        repo,
+        clients,
+        state,
+        None,
+        pending,
+        timer_backlogs,
+        hosted,
+        turns,
+    ));
+    leaving
+}
+
 /// What woke the monitor's loop, received before anything is done
 /// about it.
 enum Wake {
@@ -4533,7 +4695,7 @@ enum Wake {
     /// The repo changed, or a failed fold is due again; `false` once the
     /// watcher is gone.
     Changed(bool),
-    /// A failed timer's retry is due.
+    /// A failed timer's retry is due, or the contention retry.
     TimerRetry,
     /// A registered run's process exited.
     RunEnded(AgentLabel),
@@ -4685,6 +4847,10 @@ fn user_command_look(
 /// the session bound now. It is derived whether or not a deliverer is
 /// registered: a wait that is there and has not been handed the work is
 /// not a delivery.
+///
+/// An agent one of whose logs is held by another process is unknown for
+/// the pass: its ledger is neither folded nor stored, so nothing it is
+/// owed is discharged, and recovery decides nothing for it.
 fn recovery_facts(
     repo: &std::path::Path,
     state: &crate::repo_state::RepoState,
@@ -4692,7 +4858,7 @@ fn recovery_facts(
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
     pending: &[(SourceOwner, WaitItem)],
     turns: &mut crate::cli::turn_custody::Turns,
-) -> Vec<crate::cli::recovery::Facts> {
+) -> crate::cli::recovery::Observed {
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -4702,10 +4868,11 @@ fn recovery_facts(
         Ok(config) => config.recovery,
         Err(error) => {
             tracing::warn!(repo = %repo.display(), error = %format!("{error:#}"), "recovery: config unreadable; skipping");
-            return Vec::new();
+            return Default::default();
         }
     };
     let mut facts = Vec::new();
+    let mut unknown = std::collections::BTreeSet::new();
     let mut bound = std::collections::BTreeSet::new();
     for author in roster_authors(repo) {
         let Ok(cfg) = crate::agent_store::load_agent_config(repo, &author) else {
@@ -4724,6 +4891,7 @@ fn recovery_facts(
             crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref()),
             Ok(clank_core::AutoMode::On)
         );
+        let sidecars = crate::cli::github::log::Sidecars::never_waiting();
         let (admitted, status) = admitted_items(
             repo,
             state,
@@ -4733,8 +4901,15 @@ fn recovery_facts(
             pending,
             &reviews,
             head.as_ref(),
+            &sidecars,
         );
         let owed = crate::cli::wait::presented(admitted.clone());
+        let ended = crate::cli::block::ended(repo);
+        let admissions = admissions(repo, &author, status.as_ref(), admitted, &ended, &sidecars);
+        if sidecars.contended() {
+            unknown.insert(author);
+            continue;
+        }
         let cwd = std::env::current_dir().ok();
         let g =
             crate::cli::turn_custody::Gathered::of(repo, &author, Some((&owed, cwd.as_deref())));
@@ -4750,10 +4925,9 @@ fn recovery_facts(
             delivered: crate::cli::presentation::delivered_to(&dir, session.id.as_str()),
             in_flight: turns.in_flight(&author),
         };
-        let ended = crate::cli::block::ended(repo);
         let ledger = crate::cli::ledger::fold_stored(
             &dir,
-            &admissions(repo, &author, status.as_ref(), admitted, &ended),
+            &admissions,
             &evidence,
             &ended,
             crate::cli::recovery::unix_now(),
@@ -4779,7 +4953,7 @@ fn recovery_facts(
         });
     }
     turns.retire_unbound(&bound);
-    facts
+    crate::cli::recovery::Observed { facts, unknown }
 }
 
 /// Each item's stable identity, as a delivery names it: never its
@@ -4793,7 +4967,9 @@ fn identities(owed: &[WaitItem]) -> Vec<String> {
 
 /// Everything `author` is owed: the repo's work, its sources' unshown rows
 /// and what `pending` holds for it from a source no log keeps, all through
-/// the one block-aware selection a waiting client is served by.
+/// the one block-aware selection a waiting client is served by. `None`
+/// when one of `author`'s logs is held by another process: what it is owed
+/// is then unknown, never the partial list the free logs give.
 #[allow(clippy::too_many_arguments)]
 fn owed_items(
     repo: &std::path::Path,
@@ -4804,25 +4980,26 @@ fn owed_items(
     pending: &[(SourceOwner, WaitItem)],
     reviews: &crate::fs_plan_state_lookup::FsPlanStateLookup,
     head: Option<&clank_core::wait::HeadCommit>,
-) -> Vec<WaitItem> {
-    crate::cli::wait::presented(
-        admitted_items(
-            repo,
-            state,
-            author,
-            hosted,
-            timer_backlogs,
-            pending,
-            reviews,
-            head,
-        )
-        .0,
-    )
+) -> Option<Vec<WaitItem>> {
+    let sidecars = crate::cli::github::log::Sidecars::never_waiting();
+    let (admitted, _) = admitted_items(
+        repo,
+        state,
+        author,
+        hosted,
+        timer_backlogs,
+        pending,
+        reviews,
+        head,
+        &sidecars,
+    );
+    (!sidecars.contended()).then(|| crate::cli::wait::presented(admitted))
 }
 
 /// [`owed_items`] before it is flattened into a wake: each item with what
 /// the pending blocks make of it, and the work status that routed the
-/// review items among them.
+/// review items among them. No log is waited for: one whose sidecar
+/// `sidecars` finds held is unavailable, and none of its items are here.
 #[allow(clippy::too_many_arguments)]
 fn admitted_items(
     repo: &std::path::Path,
@@ -4833,6 +5010,7 @@ fn admitted_items(
     pending: &[(SourceOwner, WaitItem)],
     reviews: &crate::fs_plan_state_lookup::FsPlanStateLookup,
     head: Option<&clank_core::wait::HeadCommit>,
+    sidecars: &crate::cli::github::log::Sidecars,
 ) -> (
     Vec<crate::cli::wait::Admitted>,
     Option<clank_core::wait::WorkStatus>,
@@ -4851,7 +5029,7 @@ fn admitted_items(
     };
     let mut shown = Default::default();
     let mut external =
-        crate::cli::event_source::owed_from_sources(repo, author, sources, &mut shown);
+        crate::cli::event_source::owed_from_sources(repo, author, sources, &mut shown, sidecars);
     external.extend(
         timer_backlogs
             .entry(author.clone())
@@ -4863,7 +5041,7 @@ fn admitted_items(
                     Default::default(),
                 )
             })
-            .owed(&mut shown),
+            .owed(&mut shown, sidecars),
     );
     external.extend(
         pending
@@ -4871,8 +5049,15 @@ fn admitted_items(
             .filter(|(whose, _)| whose.recipient(repo).as_ref() == Some(author))
             .map(|(_, item)| item.clone()),
     );
-    let admitted =
-        crate::cli::wait::admitted_for(repo, author, &inputs, &status, &state.fold, &mut external);
+    let admitted = crate::cli::wait::admitted_for(
+        repo,
+        author,
+        &inputs,
+        &status,
+        &state.fold,
+        &mut external,
+        sidecars,
+    );
     (admitted, Some(status))
 }
 
@@ -4880,12 +5065,15 @@ fn admitted_items(
 /// and when its own durable record says it arrived. An event is dated by
 /// its log row, a timer by when it fell due, and review work by the stage
 /// boundary that handed it to `author`'s tier. Anything else is undated.
+/// A log whose sidecar `sidecars` finds held dates nothing and is noted
+/// there, which leaves the whole pass unknown to the ledger.
 fn admissions(
     repo: &std::path::Path,
     author: &AgentLabel,
     status: Option<&clank_core::wait::WorkStatus>,
     admitted: Vec<crate::cli::wait::Admitted>,
     ended: &crate::cli::ledger::Ended,
+    sidecars: &crate::cli::github::log::Sidecars,
 ) -> Vec<crate::cli::ledger::Admission> {
     use crate::cli::teams_config::RosterRole;
     use clank_core::wait::HandoverTier;
@@ -4900,12 +5088,12 @@ fn admissions(
                 if !crate::cli::watch_store::log_exists(&events_dir, &key.source) {
                     return Vec::new();
                 }
-                crate::cli::github::log::EventLog::open(&events_dir, &key.source)
-                    .and_then(|log| log.read_rows())
-                    .ok()
-                    .flatten()
-                    .map(|read| read.rows)
-                    .unwrap_or_default()
+                match crate::cli::github::log::EventLog::open(&events_dir, &key.source)
+                    .and_then(|log| sidecars.read_rows(&log, &key.source))
+                {
+                    Ok(crate::cli::github::log::Tried::Ran(Some(read))) => read.rows,
+                    _ => Vec::new(),
+                }
             })
             .iter()
             .find(|row| row.seq == key.seq && row.ident == key.ident)
@@ -4993,7 +5181,8 @@ type RecoveryAnswer = (
 
 /// [`recovery_gate`] for an attempt falling due, against the work the
 /// latest fold says is owed. Recovery reconciles only after a fold, so with
-/// none yet there is nothing it may act on.
+/// none yet there is nothing it may act on, nor while what is owed is
+/// unknown.
 #[allow(clippy::too_many_arguments)]
 fn due_gate(
     repo: &std::path::Path,
@@ -5009,7 +5198,9 @@ fn due_gate(
     let Some(state) = state else {
         return crate::cli::recovery::Gate::Hold;
     };
-    let owed = owed_now(repo, state, author, hosted, timer_backlogs, pending);
+    let Some(owed) = owed_now(repo, state, author, hosted, timer_backlogs, pending) else {
+        return crate::cli::recovery::Gate::Hold;
+    };
     recovery_gate(repo, clients, turns, author, session, &owed)
 }
 
@@ -5176,7 +5367,7 @@ fn may_send_now(
 
 /// The deadline's gate asked again at the last look, against the work
 /// derived from the repo as folded for this send, and that work. `None`
-/// when the send carries no fold.
+/// when the send carries no fold; a hold when what is owed is unknown.
 fn last_look(
     repo: &std::path::Path,
     clients: &[Client],
@@ -5197,7 +5388,7 @@ fn last_look(
         Default::default(),
     )
     .inspection();
-    let owed = owed_items(
+    let Some(owed) = owed_items(
         repo,
         state,
         &a.author,
@@ -5206,7 +5397,9 @@ fn last_look(
         pending,
         &reviews,
         head.as_ref(),
-    );
+    ) else {
+        return Some((crate::cli::recovery::Gate::Hold, Vec::new()));
+    };
     let gate = recovery_gate(repo, clients, turns, &a.author, &a.attempt.session, &owed);
     Some((gate, owed))
 }
@@ -6530,7 +6723,9 @@ fn reconcile_timers(
     );
     // Constructors neither ingest nor spawn: a set that cannot be built
     // leaves the running one untouched.
-    match crate::cli::timer_source::TimerSet::new(&wanted, events_dir, None, sink) {
+    match crate::cli::timer_source::TimerSet::new(&wanted, events_dir, None, sink)
+        .map(crate::cli::timer_source::TimerSet::on_the_loop)
+    {
         Ok(mut timers) => {
             if let Some(previous) = host.timers.take() {
                 timers.keep_unchanged(previous);
@@ -7219,6 +7414,7 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
         },
         report,
         farewell: Some(farewell),
+        unavailable: false,
     }))
 }
 
@@ -7695,6 +7891,7 @@ fn claim_late_arrivals(
                     shown: Default::default(),
                     conn: 0,
                     admitted: Default::default(),
+                    unavailable: false,
                     report: None,
                     farewell: None,
                 };
@@ -7882,6 +8079,7 @@ fn serve_to_cached(
             keep.push(client);
             continue;
         }
+        let mut unavailable = false;
         let note = match &client.who {
             // No projection is derived for an observer, which is the
             // point: it asked to know the fold moved, and deriving
@@ -7921,11 +8119,13 @@ fn serve_to_cached(
                         &current
                     }
                 };
+                let sidecars = crate::cli::github::log::Sidecars::never_waiting();
                 let mut external = crate::cli::event_source::owed_from_sources(
                     repo,
                     author,
                     sources,
                     &mut client.shown,
+                    &sidecars,
                 );
                 external.extend(
                     timer_backlogs
@@ -7938,7 +8138,7 @@ fn serve_to_cached(
                                 Default::default(),
                             )
                         })
-                        .owed(&mut client.shown),
+                        .owed(&mut client.shown, &sidecars),
                 );
                 // An emission no log holds exists nowhere else, so it
                 // is merged into THIS presentation rather than sent
@@ -7962,7 +8162,9 @@ fn serve_to_cached(
                     &status,
                     &state.fold,
                     &mut external,
+                    &sidecars,
                 );
+                unavailable = sidecars.contended();
                 if items.is_empty() {
                     Note::Beat
                 } else {
@@ -7987,6 +8189,7 @@ fn serve_to_cached(
         // only for an agent and only when something is owed. Repeating
         // those conditions here would be two more branches saying what
         // the construction already says, and neither could be driven.
+        client.unavailable = unavailable;
         let woke = matches!(&note, Note::Items { .. });
         let author = match &client.who {
             Served::Agent { author, .. } => Some(author.clone()),
@@ -8027,7 +8230,7 @@ fn serve_to_cached(
 }
 
 /// What `author` is owed now, from `state`, with what is held for it from
-/// a source no log keeps.
+/// a source no log keeps: `None` while one of its logs is held elsewhere.
 #[allow(clippy::too_many_arguments)]
 fn owed_now(
     repo: &std::path::Path,
@@ -8036,7 +8239,7 @@ fn owed_now(
     hosted: &std::collections::BTreeMap<SourceOwner, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
     pending: &[(SourceOwner, WaitItem)],
-) -> Vec<WaitItem> {
+) -> Option<Vec<WaitItem>> {
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
     owed_items(
@@ -8051,7 +8254,9 @@ fn owed_now(
     )
 }
 
-/// `author`'s facts now: owing what `state` says, when there is a state.
+/// `author`'s facts now: owing what `state` says, when there is a state and
+/// none of `author`'s logs is held elsewhere; otherwise owing what is not
+/// known.
 #[allow(clippy::too_many_arguments)]
 fn gather(
     repo: &std::path::Path,
@@ -8061,7 +8266,8 @@ fn gather(
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
     pending: &[(SourceOwner, WaitItem)],
 ) -> crate::cli::turn_custody::Gathered {
-    let owed = state.map(|state| owed_now(repo, state, author, hosted, timer_backlogs, pending));
+    let owed =
+        state.and_then(|state| owed_now(repo, state, author, hosted, timer_backlogs, pending));
     let cwd = std::env::current_dir().ok();
     crate::cli::turn_custody::Gathered::of(
         repo,
@@ -8246,6 +8452,7 @@ fn serve_reports(
         let session = reporting.report.session().as_str();
         let g = gather(repo, state, &author, hosted, timer_backlogs, pending)
             .waiting(waiters.iter().any(|(a, s)| a == &author && s == session));
+        client.unavailable = state.is_some() && !g.owed_known();
         let first = !reporting.stepped;
         let Some(frame) = turns.answer(&author, client.conn, &reporting.report, first, &g) else {
             keep.push(client);
@@ -8615,6 +8822,79 @@ mod recovery_tests {
     use super::*;
     use crate::cli::recovery::{Act, Answer, AttemptRef, Gate, Transport};
 
+    /// Each kind of operation contention left unsettled keeps the retry
+    /// armed: a hosted timer's step, a client's serve, recovery's fold.
+    #[tokio::test]
+    async fn every_unsettled_operation_keeps_the_contention_retry_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = std::collections::BTreeMap::new();
+        let driver =
+            || crate::cli::recovery::Driver::new(dir.path().to_path_buf(), "/nonexistent".into());
+        assert!(!unavailable_somewhere(&none, &[], &driver()));
+
+        let source = clank_core::agent_config::TimerSource {
+            interrupt: false,
+            interrupt_message: None,
+            name: "once".into(),
+            repeat_every: None,
+            due_at: "1970-01-01T00:00:01Z".into(),
+            content: None,
+        };
+        let key = source.source_key(None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut timers = crate::cli::timer_source::TimerSet::new(
+            &[(
+                clank_core::agent_config::WaitEventSource::Timer(source),
+                crate::cli::event_source::SourceOrigin::Config,
+            )],
+            dir.path(),
+            None,
+            tx.into(),
+        )
+        .unwrap()
+        .on_the_loop();
+        let held = crate::cli::github::log::tests::hold(&[(dir.path(), &key)]);
+        timers.due();
+        held.release();
+        let hosting = std::collections::BTreeMap::from([(
+            SourceOwner::Agent(AgentLabel::parse("claude").unwrap()),
+            Hosted {
+                timers: Some(timers),
+                spec: Vec::new(),
+                tasks: Default::default(),
+            },
+        )]);
+        assert!(
+            unavailable_somewhere(&hosting, &[], &driver()),
+            "a timer's step"
+        );
+
+        let (mut served, _queued) = client(
+            Served::Agent {
+                author: AgentLabel::parse("claude").unwrap(),
+            },
+            "session",
+        );
+        served.unavailable = true;
+        assert!(
+            unavailable_somewhere(&none, &[served], &driver()),
+            "a client's serve"
+        );
+
+        let mut recovery = driver();
+        recovery.reconcile(
+            crate::cli::recovery::Observed {
+                facts: Vec::new(),
+                unknown: [AgentLabel::parse("claude").unwrap()].into(),
+            },
+            0,
+        );
+        assert!(
+            unavailable_somewhere(&none, &[], &recovery),
+            "recovery's fold"
+        );
+    }
+
     fn client(who: Served, session: &str) -> (Client, tokio::sync::mpsc::Receiver<String>) {
         let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         (
@@ -8629,6 +8909,7 @@ mod recovery_tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             },
@@ -9556,6 +9837,7 @@ mod recovery_tests {
                 &[],
                 &mut turns.borrow_mut(),
             )
+            .facts
         };
 
         let alone = facts();
@@ -9633,6 +9915,7 @@ mod recovery_tests {
                 ),
                 crate::git_io::head_commit_at(repo.path(), &state).as_ref(),
             )
+            .expect("no log is held")
         };
         let owed = owed_now();
         assert!(
@@ -9769,7 +10052,8 @@ mod recovery_tests {
             &mut Default::default(),
             &[],
             &mut turns.borrow_mut(),
-        );
+        )
+        .facts;
         assert!(
             handled[0].ledger.owed().is_empty(),
             "handled work owes nothing: {handled:?}"
@@ -9970,6 +10254,7 @@ mod recovery_tests {
                 &[],
                 &mut self.turns,
             )
+            .facts
             .into_iter()
             .find(|f| f.author == self.artist)
             .unwrap();
@@ -10277,6 +10562,7 @@ mod recovery_tests {
                 &[],
                 &mut crate::cli::turn_custody::Turns::new(repo.path().to_path_buf()),
             )
+            .facts
             .into_iter()
             .find(|f| f.author == lead)
             .unwrap();
@@ -10459,6 +10745,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -10528,6 +10815,7 @@ mod tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             }
@@ -10587,6 +10875,7 @@ mod tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             }
@@ -10763,6 +11052,7 @@ mod tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             }))
@@ -10879,6 +11169,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -11014,6 +11305,7 @@ mod tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             }))
@@ -14814,6 +15106,7 @@ mod tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             };
@@ -14938,6 +15231,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         };
@@ -15239,6 +15533,7 @@ mod tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             });
@@ -15318,6 +15613,41 @@ mod tests {
     /// monitor: a heartbeat restored as an arm fails here, and an idle
     /// repo with no deadline therefore wakes nothing — no fold, no
     /// serve, no probe, no note to any client.
+    /// Before it computes its retry deadline the loop looks at whether any
+    /// operation is unsettled by contention, and sleeps until the
+    /// contention retry among its timer retries; on that wake the retry
+    /// backs off and then, as owner, runs [`retry_contended`] and
+    /// recovery. Read from the source, since no test may run a monitor.
+    #[test]
+    fn the_loop_looks_arms_and_runs_the_contention_retry() {
+        let src = include_str!("monitor.rs");
+        let body = &src[src.find("    let ended = loop {").expect("the loop")..];
+        let looked = body
+            .find("contention.look(\n            unavailable_somewhere(&hosted, &clients, &recovery),")
+            .expect("the loop looks");
+        let deadline = body
+            .find("let timer_retry = hosted")
+            .expect("the retry deadline");
+        assert!(looked < deadline, "looked before the deadline is computed");
+        let computed = &body[deadline..deadline + body[deadline..].find(";").unwrap()];
+        assert!(computed.contains(".chain(contention.due())"), "{computed}");
+        let arm = &body[body
+            .find("            Wake::TimerRetry => {")
+            .expect("the arm")..];
+        let arm = &arm[..arm.find("            Wake::RunEnded(").expect("its end")];
+        let backs_off = arm
+            .find("let retry = contention.is_due(now);\n                if retry {\n                    contention.ran();")
+            .expect("the retry backs off");
+        let owner = arm
+            .find("if owner && retry {")
+            .expect("only an owner retries");
+        let ran = arm
+            .find("leaving.extend(retry_contended(")
+            .expect("the retry runs");
+        let facts = arm.find("recovery_facts(").expect("recovery looks again");
+        assert!(backs_off < owner && owner < ran && ran < facts, "{arm}");
+    }
+
     #[test]
     fn the_loop_waits_only_on_events_and_its_own_deadlines() {
         let src = include_str!("monitor.rs");
@@ -16389,7 +16719,8 @@ mod tests {
             watch_store::owed(
                 repo.path(),
                 &AgentLabel::parse("claude").unwrap(),
-                &mut Default::default()
+                &mut Default::default(),
+                &crate::cli::github::log::Sidecars::waiting(),
             )
             .is_empty()
         );
@@ -16397,7 +16728,8 @@ mod tests {
             watch_store::owed(
                 repo.path(),
                 &AgentLabel::parse("codex").unwrap(),
-                &mut Default::default()
+                &mut Default::default(),
+                &crate::cli::github::log::Sidecars::waiting(),
             )
             .len(),
             1
@@ -16676,6 +17008,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -16711,6 +17044,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         };
@@ -16802,6 +17136,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -16868,6 +17203,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -16950,6 +17286,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -17007,6 +17344,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -17085,6 +17423,7 @@ mod tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             },
@@ -17142,6 +17481,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -17199,6 +17539,7 @@ mod tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             },
@@ -17285,6 +17626,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -17375,6 +17717,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         };
@@ -17432,6 +17775,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -17457,6 +17801,7 @@ mod tests {
                     shown: Default::default(),
                     conn: 0,
                     admitted: Default::default(),
+                    unavailable: false,
                     report: None,
                     farewell: None,
                 },
@@ -17500,6 +17845,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         };
@@ -17514,6 +17860,7 @@ mod tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: None,
             },
@@ -17567,6 +17914,7 @@ mod tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: None,
         }];
@@ -18781,6 +19129,7 @@ mod superseding_tests {
                 shown: Default::default(),
                 conn: 0,
                 admitted: Default::default(),
+                unavailable: false,
                 report: None,
                 farewell: Some(farewell),
             },
@@ -18893,6 +19242,7 @@ mod superseding_tests {
             shown: Default::default(),
             conn: 0,
             admitted: Default::default(),
+            unavailable: false,
             report: None,
             farewell: Some(farewell),
         };
@@ -18983,6 +19333,7 @@ mod user_command_tests {
             shown: Default::default(),
             conn: 7,
             admitted: Default::default(),
+            unavailable: false,
             report: Some(Box::new(Reporting {
                 report: crate::cli::turn_wire::Report::TurnEnd {
                     stop: clank_core::turn_policy::TurnEndReport {

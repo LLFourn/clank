@@ -38,8 +38,8 @@ pub(crate) struct Gathered {
     role: Result<Role, String>,
     asking: Option<String>,
     blocked: bool,
-    /// `None` before the monitor has folded the repo, when what is owed
-    /// is not known.
+    /// `None` before the monitor has folded the repo, or while one of the
+    /// agent's logs is held by another process: what is owed is not known.
     owed: Option<Vec<(OwedItem, WaitItem)>>,
     /// The monitor holds a live registration of this agent's session's
     /// background `clank wait`. Never true without a monitor.
@@ -94,6 +94,11 @@ impl Gathered {
                 .and_then(|c| c.outage_notified)
                 .map(|n| n.session),
         }
+    }
+
+    /// Whether what the agent is owed is known.
+    pub(crate) fn owed_known(&self) -> bool {
+        self.owed.is_some()
     }
 
     /// The same agent, with the monitor's word on whether its session's
@@ -261,6 +266,7 @@ fn facts<'a>(
         asking: g.asking.is_some(),
         blocked: g.blocked,
         owed,
+        owed_unknown: g.owed.is_none(),
         liveness: live,
         user_command: false,
     }

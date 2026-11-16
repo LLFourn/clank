@@ -37,9 +37,18 @@ pub fn take(file: &File) -> io::Result<bool> {
 /// deadline and must not block in between. A Busy here may be a spawn's
 /// passing copy, so it is never final on its own.
 pub fn take_now(file: &File) -> io::Result<bool> {
+    take_now_as(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+}
+
+/// [`take_now`] for `file`'s shared lock: `Ok(false)` when someone holds
+/// it exclusively.
+pub fn take_shared_now(file: &File) -> io::Result<bool> {
+    take_now_as(file, rustix::fs::FlockOperation::NonBlockingLockShared)
+}
+
+fn take_now_as(file: &File, op: rustix::fs::FlockOperation) -> io::Result<bool> {
     loop {
-        let Err(e) = rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        else {
+        let Err(e) = rustix::fs::flock(file, op) else {
             return Ok(true);
         };
         let e = io::Error::from(e);

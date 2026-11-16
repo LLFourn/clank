@@ -526,9 +526,12 @@ async fn items_with_context(
                 &inputs,
                 &initial_status,
                 &initial_state.fold,
+                &crate::cli::github::log::Sidecars::waiting(),
             );
-            owed.events
-                .extend(timer_backlog.owed(&mut Default::default()));
+            owed.events.extend(timer_backlog.owed(
+                &mut Default::default(),
+                &crate::cli::github::log::Sidecars::waiting(),
+            ));
             if peek {
                 // The hook's SessionStart actually emits this catch-up.
                 // Peek inspects custody without starting producers or receipts.
@@ -538,6 +541,7 @@ async fn items_with_context(
                         &author,
                         &sources.events,
                         &mut Default::default(),
+                        &crate::cli::github::log::Sidecars::waiting(),
                     ));
             }
             owed
@@ -702,13 +706,24 @@ async fn items_with_context(
             if had_timers {
                 timer_backlog.invalidate();
             }
-            external.extend(timer_backlog.owed(&mut Default::default()));
+            external.extend(timer_backlog.owed(
+                &mut Default::default(),
+                &crate::cli::github::log::Sidecars::waiting(),
+            ));
             // Nothing is lost by draining into the decision. It
             // returns empty only when `events` is empty, and these
             // items ARE events — which matters because a source
             // running memory-only (`events_dir: None`) has no WAL to
             // re-read them from.
-            let items = owed_for(&repo, &author, &inputs, &status, &state.fold, &mut external);
+            let items = owed_for(
+                &repo,
+                &author,
+                &inputs,
+                &status,
+                &state.fold,
+                &mut external,
+                &crate::cli::github::log::Sidecars::waiting(),
+            );
             if !items.is_empty() {
                 binding.ensure_current(&repo, &author)?;
                 return Ok(items);
@@ -1222,6 +1237,7 @@ pub(crate) fn owed_for(
     status: &clank_core::wait::WorkStatus,
     fold: &clank_core::repo_state::RepoState,
     external: &mut Vec<WaitItem>,
+    sidecars: &crate::cli::github::log::Sidecars,
 ) -> Vec<WaitItem> {
     // Deciding BEFORE the merge left the channel route outside the
     // decision: a blocked park returned a source item with no `Blocked`
@@ -1231,7 +1247,9 @@ pub(crate) fn owed_for(
     // door for the same reason — a source event that woke an agent
     // straight off the channel would arrive without the block context
     // the local path gives it (codex on ca2ea69).
-    presented(admitted_for(repo, author, inputs, status, fold, external))
+    presented(admitted_for(
+        repo, author, inputs, status, fold, external, sidecars,
+    ))
 }
 
 /// [`owed_for`] before it is flattened into a wake: every item `author`
@@ -1243,9 +1261,13 @@ pub(crate) fn admitted_for(
     status: &clank_core::wait::WorkStatus,
     fold: &clank_core::repo_state::RepoState,
     external: &mut Vec<WaitItem>,
+    sidecars: &crate::cli::github::log::Sidecars,
 ) -> Vec<Admitted> {
     admit(check_blocks(repo, author), || {
-        beat_owed(items_for(repo, author, inputs, status, fold), external)
+        beat_owed(
+            items_for(repo, author, inputs, status, fold, sidecars),
+            external,
+        )
     })
 }
 
@@ -2573,6 +2595,7 @@ fn items_for(
     inputs: &WaitInputs,
     status: &clank_core::wait::WorkStatus,
     fold: &clank_core::repo_state::RepoState,
+    sidecars: &crate::cli::github::log::Sidecars,
 ) -> Owed {
     let mut review = status.work_for(author, inputs.role);
     if inputs.role == Role::Master && review.is_empty() && fold.active_plan.is_none() {
@@ -2582,7 +2605,7 @@ fn items_for(
         });
         review.extend(queue_promote_outcome(&queue));
     }
-    let events = message_items(repo, author);
+    let events = message_items(repo, author, sidecars);
     Owed { review, events }
 }
 
@@ -2704,8 +2727,12 @@ fn admit(br: BlockResult, owed: impl FnOnce() -> Owed) -> Vec<Admitted> {
 /// Read from the agent's message LOG, not from a directory of files:
 /// a message is an event like any other, so it is re-presented until it
 /// is acked rather than until a file is deleted.
-fn message_items(repo: &Path, author: &AgentLabel) -> Vec<WaitItem> {
-    crate::inbox::pending(repo, author)
+fn message_items(
+    repo: &Path,
+    author: &AgentLabel,
+    sidecars: &crate::cli::github::log::Sidecars,
+) -> Vec<WaitItem> {
+    crate::inbox::pending_with(repo, author, sidecars)
 }
 
 /// The master-with-nothing-active outcome: a `PromoteFromQueue` for

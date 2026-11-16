@@ -47,7 +47,7 @@ impl EventLog {
     /// Claim exactly this logical row under the shared exclusive writer lock.
     /// The caller must obtain true before making any external side effect.
     pub(crate) fn claim_interrupt(&mut self, seq: u64, ident: &str) -> std::io::Result<bool> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         let row = self.reply_target(seq, ident)?;
         if !row.interrupt || row.acked || row.interrupt_attempt.is_some() {
             // A prior complete append may have failed to sync. It still blocks
@@ -71,7 +71,7 @@ impl EventLog {
         ident: &str,
         outcome: InterruptOutcome,
     ) -> std::io::Result<()> {
-        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let _lock = Sidecar::acquire(&self.lock_path, true)?;
         let row = self.reply_target(seq, ident)?;
         let attempt = row
             .interrupt_attempt

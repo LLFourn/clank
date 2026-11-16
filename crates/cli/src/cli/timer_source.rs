@@ -5,7 +5,7 @@ pub(crate) mod clock;
 pub(crate) mod recurrence;
 
 use super::event_source::{Durability, EmissionSink, SourceOrigin};
-use super::github::log::{EventLog, IngestLease, Transport};
+use super::github::log::{EventLog, IngestLease, Locking, Transport, Tried};
 use super::source_ids::{Known, Seen};
 use clank_core::{
     agent_config::{TimerSource, WaitEventSource},
@@ -143,6 +143,13 @@ struct Entry {
     recurrence: Option<recurrence::Recurrence>,
 }
 
+/// The steps of a timer that take its sidecar, in the order they run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Stage {
+    Arm,
+    Accept,
+}
+
 /// The first pause before failed entries are retried, and its cap.
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const RETRY_CAP: Duration = Duration::from_secs(60);
@@ -157,6 +164,13 @@ pub(crate) struct TimerSet {
     retry_at: Option<Instant>,
     retry_pause: Duration,
     pending: BTreeMap<String, Entry>,
+    /// Entries whose arming or acceptance found the sidecar held, awaiting
+    /// [`TimerSet::retry_contended`]: unarmed, never accepted or dropped.
+    contended: Vec<Entry>,
+    /// Each timer whose arm or acceptance met a held sidecar, by the
+    /// furthest stage that did, until that stage has run again unheld.
+    retrying: BTreeMap<String, Stage>,
+    locking: Locking,
     dir: PathBuf,
     sink: EmissionSink,
     invocation_keys: BTreeSet<String>,
@@ -230,6 +244,9 @@ impl TimerSet {
             retry_at: None,
             retry_pause: FIRST_RETRY,
             pending: BTreeMap::new(),
+            contended: Vec::new(),
+            retrying: BTreeMap::new(),
+            locking: Locking::Wait,
             dir: dir.to_owned(),
             sink,
             invocation_keys,
@@ -238,6 +255,33 @@ impl TimerSet {
 
     pub(crate) fn invocation_keys(&self) -> &BTreeSet<String> {
         &self.invocation_keys
+    }
+
+    /// This set as the monitor's loop hosts it: an arm or acceptance whose
+    /// sidecar is held is left for [`Self::retry_contended`] (I9).
+    pub(crate) fn on_the_loop(mut self) -> Self {
+        self.locking = Locking::Try;
+        self
+    }
+
+    /// Whether some arm or acceptance that met a held sidecar has yet to
+    /// run again unheld. Re-arming is not that: a due entry's acceptance
+    /// is still to come, and may meet the lock again.
+    pub(crate) fn awaiting_retry(&self) -> bool {
+        !self.retrying.is_empty()
+    }
+
+    /// Re-arm every entry left by contention. One already due is accepted
+    /// by the next [`Self::due`], so acceptance keeps its one path.
+    pub(crate) fn retry_contended(&mut self) {
+        let wall = wall_now();
+        let now = clock::now();
+        for entry in std::mem::take(&mut self.contended) {
+            match &entry.recurrence {
+                Some(_) => self.arm_recurring(entry, wall, now, None),
+                None => self.arm_one_shot(entry, wall, now),
+            }
+        }
     }
 
     /// Take over from `previous` each timer this set defines the same
@@ -274,9 +318,29 @@ impl TimerSet {
                 pending.push((key, entry));
             }
         }
+        let mut contended = Vec::new();
+        for entry in previous.contended {
+            if unchanged(&entry) {
+                contended.push(entry);
+            }
+        }
+        let carried: BTreeSet<&String> = kept
+            .iter()
+            .map(|(_, e)| &e.key)
+            .chain(recovery.iter().map(|e| &e.key))
+            .chain(pending.iter().map(|(k, _)| k))
+            .chain(contended.iter().map(|e| &e.key))
+            .collect();
+        let retrying: Vec<_> = previous
+            .retrying
+            .into_iter()
+            .filter(|(key, _)| carried.contains(key))
+            .collect();
         self.entries.extend(kept);
         self.recovery.extend(recovery);
         self.pending.extend(pending);
+        self.contended.extend(contended);
+        self.retrying.extend(retrying);
     }
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.entries.first_key_value().map(|(key, _)| key.0)
@@ -343,6 +407,13 @@ impl TimerSet {
                 refresh.push((entry, None));
             } else {
                 self.recovery.push(entry);
+            }
+        }
+        for entry in std::mem::take(&mut self.contended) {
+            if entry.recurrence.is_some() {
+                refresh.push((entry, None));
+            } else {
+                self.contended.push(entry);
             }
         }
         for (entry, deadline) in refresh {
@@ -424,18 +495,32 @@ impl TimerSet {
     /// have passed, or hold it pending its ack. Writes nothing.
     fn arm_recurring(&mut self, entry: Entry, wall: u64, now: Instant, previous: Option<Instant>) {
         let r = entry.recurrence.as_ref().expect("a recurring entry");
-        let next = EventLog::open(&self.dir, &entry.key).and_then(|log| log.recurring_next_due(r));
-        self.settle(entry, wall, now, previous, next, false);
+        let next = EventLog::open(&self.dir, &entry.key)
+            .and_then(|log| log.recurring_next_due(r, self.locking));
+        self.settle_tried(entry, wall, now, previous, next, false);
     }
 
     fn try_entry(&mut self, entry: Entry, wall: u64, now: Instant) {
         let result = match &entry.recurrence {
-            None => {
-                accept(&self.dir, &entry.key, &entry.source, entry.due, &self.sink).map(|_| None)
-            }
+            None => accept(
+                &self.dir,
+                &entry.key,
+                &entry.source,
+                entry.due,
+                &self.sink,
+                self.locking,
+            )
+            .map(|tried| match tried {
+                Tried::Ran(()) => Tried::Ran(None),
+                Tried::Contended => Tried::Contended,
+            }),
             Some(r) => (|| {
                 let mut log = EventLog::open(&self.dir, &entry.key)?;
-                let transition = log.accept_recurring_with_interrupt(
+                let Tried::Ran((_lease, held)) = log.recurring_writer(r, self.locking)? else {
+                    return Ok(Tried::Contended);
+                };
+                let transition = log.accept_recurring_held(
+                    &held,
                     r,
                     entry.source.content.as_deref().unwrap_or_default(),
                     wall,
@@ -466,11 +551,48 @@ impl TimerSet {
                         None
                     }
                 };
-                log.maybe_compact()?;
-                Ok(next)
+                log.maybe_compact_held(&held)?;
+                Ok(Tried::Ran(next))
             })(),
         };
-        self.settle(entry, wall, now, None, result, true);
+        self.settle_tried(entry, wall, now, None, result, true);
+    }
+
+    /// [`Self::settle`] an answer, or leave a contended entry for
+    /// [`Self::retry_contended`].
+    fn settle_tried(
+        &mut self,
+        entry: Entry,
+        wall: u64,
+        now: Instant,
+        previous: Option<Instant>,
+        result: std::io::Result<Tried<Option<u64>>>,
+        accepted: bool,
+    ) {
+        let stage = if accepted { Stage::Accept } else { Stage::Arm };
+        match result {
+            Ok(Tried::Contended) => {
+                let furthest = self.retrying.entry(entry.key.clone()).or_insert(stage);
+                *furthest = (*furthest).max(stage);
+                self.contended.push(entry);
+            }
+            Ok(Tried::Ran(next)) => {
+                // An arm that leaves the entry with no deadline leads to no
+                // acceptance, so an acceptance it awaited is not coming.
+                if self
+                    .retrying
+                    .get(&entry.key)
+                    .is_some_and(|furthest| *furthest <= stage || next.is_none())
+                {
+                    self.retrying.remove(&entry.key);
+                }
+                self.settle(entry, wall, now, previous, Ok(next), accepted)
+            }
+            Err(error) => {
+                self.retrying.remove(&entry.key);
+                self.settle(entry, wall, now, previous, Err(error), accepted)
+            }
+        }
     }
 
     /// File `entry` by its WAL's answer: `Some` slot to arm for; `None`,
@@ -538,30 +660,36 @@ pub(crate) async fn deadline(at: Option<Instant>) {
     }
 }
 
+/// Accept a one-off's occurrence: one exclusive sidecar, taken as
+/// `locking` says, covers its inspection, append and compaction.
 fn accept(
     dir: &Path,
     key: &str,
     source: &TimerSource,
     due: u64,
     sink: &EmissionSink,
-) -> std::io::Result<()> {
+    locking: Locking,
+) -> std::io::Result<Tried<()>> {
     let Some(_lease) = IngestLease::try_acquire(dir, key)? else {
         return Err(std::io::Error::other(
             "ingest lease busy; retry on next owner wake",
         ));
     };
     let mut log = EventLog::open(dir, key)?;
-    let ids = log.retained_timer_ids()?;
+    let Some(held) = log.sidecar(true, locking)? else {
+        return Ok(Tried::Contended);
+    };
+    let ids = log.retained_timer_ids_held(&held)?;
     // Strict inspection precedes load: timer corruption is preserved rather
     // than quarantined and reset as a replayable command source would be.
-    log.load();
+    log.load_held(&held);
     let mut seen = Seen::at(dir, key);
     seen.checkpoint(ids)?;
     let id = format!("timer/{due}");
     match seen.known(&id) {
         Known::Yes => {
-            log.maybe_compact()?;
-            return Ok(());
+            log.maybe_compact_held(&held)?;
+            return Ok(Tried::Ran(()));
         }
         Known::Damaged(why) => {
             return Err(std::io::Error::other(format!(
@@ -579,7 +707,8 @@ fn accept(
         content: source.content.clone().unwrap_or_default(),
         selector: None,
     };
-    let seq = log.append_interruptible_inbox(
+    let seq = log.append_interruptible_inbox_held(
+        &held,
         Transport::Timer,
         Some(&id),
         None,
@@ -600,8 +729,8 @@ fn accept(
     // A failed index write or closed sink cannot retract accepted WAL custody.
     let _ = sink.send((item, Durability::Logged));
     checkpoint?;
-    log.maybe_compact()?;
-    Ok(())
+    log.maybe_compact_held(&held)?;
+    Ok(Tried::Ran(()))
 }
 
 /// Disposable pending-log inventory. Discovery occurs on initial admission or
@@ -636,7 +765,13 @@ impl Backlog {
         self
     }
 
-    pub(crate) fn owed(&mut self, shown: &mut HashSet<(String, u64, String)>) -> Vec<WaitItem> {
+    /// The unacked timer rows not yet in `shown`. A log whose sidecar
+    /// `sidecars` finds held stays pending and contributes nothing.
+    pub(crate) fn owed(
+        &mut self,
+        shown: &mut HashSet<(String, u64, String)>,
+        sidecars: &super::github::log::Sidecars,
+    ) -> Vec<WaitItem> {
         if self.pending.is_none() {
             let mut keys = self.invocation_keys.clone();
             match std::fs::read_dir(&self.dir) {
@@ -681,16 +816,17 @@ impl Backlog {
             let Ok(mut log) = EventLog::open(&self.dir, key) else {
                 return true;
             };
-            let read = match log.read_timer_backlog(self.recover) {
-                Ok(Some(read)) => {
+            let read = match sidecars.timer_backlog(&mut log, self.recover, key) {
+                Ok(Tried::Contended) => return true,
+                Ok(Tried::Ran(Some(read))) => {
                     self.failures.remove(key);
                     read
                 }
                 result => {
                     let failure = match result {
-                        Ok(None) => "corrupt timer custody; repair required".to_owned(),
+                        Ok(Tried::Ran(None)) => "corrupt timer custody; repair required".to_owned(),
                         Err(error) => error.to_string(),
-                        Ok(Some(_)) => unreachable!(),
+                        Ok(Tried::Ran(Some(_)) | Tried::Contended) => unreachable!(),
                     };
                     if self.failures.get(key) != Some(&failure) {
                         eprintln!("wait: timer `{key}`: {failure}");
@@ -928,7 +1064,15 @@ mod tests {
         assert!(successor_rx.try_recv().is_err());
         assert_eq!(rows(dir.path(), &key).len(), 1);
         let mut removed = Backlog::new(dir.path().to_owned(), BTreeSet::new());
-        assert_eq!(removed.owed(&mut HashSet::new()).len(), 1);
+        assert_eq!(
+            removed
+                .owed(
+                    &mut HashSet::new(),
+                    &crate::cli::github::log::Sidecars::waiting()
+                )
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -947,7 +1091,15 @@ mod tests {
         assert_eq!(original.pop(), Some(b'\n'));
         std::fs::write(&path, &original).unwrap();
         let mut inspection = Backlog::new(dir.path().to_owned(), BTreeSet::new()).inspection();
-        assert_eq!(inspection.owed(&mut HashSet::new()).len(), 1);
+        assert_eq!(
+            inspection
+                .owed(
+                    &mut HashSet::new(),
+                    &crate::cli::github::log::Sidecars::waiting()
+                )
+                .len(),
+            1
+        );
         assert_eq!(
             std::fs::read(&path).unwrap(),
             original,
@@ -955,18 +1107,34 @@ mod tests {
         );
         let mut recovering = Backlog::new(dir.path().to_owned(), BTreeSet::new());
         let mut shown = HashSet::new();
-        assert_eq!(recovering.owed(&mut shown).len(), 1);
+        assert_eq!(
+            recovering
+                .owed(&mut shown, &crate::cli::github::log::Sidecars::waiting())
+                .len(),
+            1
+        );
         assert!(std::fs::read(&path).unwrap().ends_with(b"\n"));
         std::fs::write(&path, "poison\n").unwrap();
         for _ in 0..20 {
-            assert!(recovering.owed(&mut shown).is_empty());
+            assert!(
+                recovering
+                    .owed(&mut shown, &crate::cli::github::log::Sidecars::waiting())
+                    .is_empty()
+            );
         }
         assert!(
             recovering.failures.is_empty(),
             "healthy cache does not reread WAL on beats"
         );
         recovering.invalidate();
-        assert!(recovering.owed(&mut HashSet::new()).is_empty());
+        assert!(
+            recovering
+                .owed(
+                    &mut HashSet::new(),
+                    &crate::cli::github::log::Sidecars::waiting()
+                )
+                .is_empty()
+        );
         assert_eq!(recovering.failures.len(), 1);
     }
 
@@ -1468,14 +1636,18 @@ mod tests {
         let src = source("backlog", 1);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         for scope in [None, Some("one"), Some("two")] {
-            accept(
-                dir.path(),
-                &src.source_key(scope),
-                &src,
-                1,
-                &tx.clone().into(),
-            )
-            .unwrap();
+            assert!(matches!(
+                accept(
+                    dir.path(),
+                    &src.source_key(scope),
+                    &src,
+                    1,
+                    &tx.clone().into(),
+                    Locking::Wait,
+                )
+                .unwrap(),
+                Tried::Ran(())
+            ));
             rx.recv().await.unwrap();
         }
         let mut backlog = Backlog::new(
@@ -1483,7 +1655,7 @@ mod tests {
             BTreeSet::from([src.source_key(Some("one"))]),
         );
         let mut shown = HashSet::new();
-        let got = backlog.owed(&mut shown);
+        let got = backlog.owed(&mut shown, &crate::cli::github::log::Sidecars::waiting());
         assert_eq!(got.len(), 2);
         assert!(got.iter().all(|item| {
             item.event_view()
@@ -1499,7 +1671,9 @@ mod tests {
                     .contains("-one@")
         }));
         assert!(
-            backlog.owed(&mut shown).is_empty(),
+            backlog
+                .owed(&mut shown, &crate::cli::github::log::Sidecars::waiting())
+                .is_empty(),
             "same client does not get two presentations"
         );
         let key = src.source_key(None);
@@ -1509,8 +1683,251 @@ mod tests {
             .append_ack_ident(row.seq, &row.ident)
             .unwrap();
         let mut restarted = Backlog::new(dir.path().to_owned(), BTreeSet::new());
-        assert!(restarted.owed(&mut HashSet::new()).is_empty());
+        assert!(
+            restarted
+                .owed(
+                    &mut HashSet::new(),
+                    &crate::cli::github::log::Sidecars::waiting()
+                )
+                .is_empty()
+        );
         assert_eq!(restarted.pending.as_ref().unwrap().len(), 0);
+    }
+
+    use crate::cli::github::log::Sidecars;
+    use crate::cli::github::log::tests::{counted, hold, within};
+
+    /// `dir`'s one-off WAL for `src`, holding `n` accepted and acked
+    /// occurrences: past [`super::super::github::log::COMPACT_AT`] lines,
+    /// so its next acceptance compacts.
+    fn compactable(dir: &Path, src: &TimerSource, n: u64) -> String {
+        let key = src.source_key(None);
+        let mut log = EventLog::open(dir, &key).unwrap();
+        for due in 1..=n {
+            let id = format!("timer/{due}");
+            let item = WaitItem::TimerEvent {
+                presentation: None,
+                name: src.name.clone(),
+                recurrence: None,
+                id: id.clone(),
+                due_at: due,
+                content: "old".into(),
+                selector: None,
+            };
+            let seq = log
+                .append_inbox(Transport::Timer, Some(&id), None, Some(due), &item)
+                .unwrap();
+            log.append_ack(seq).unwrap();
+        }
+        key
+    }
+
+    fn lines(dir: &Path, key: &str) -> usize {
+        std::fs::read_to_string(dir.join(format!("{key}.jsonl")))
+            .map_or(0, |text| text.lines().count())
+    }
+
+    /// With each timer's sidecar held by another process, the loop's
+    /// timers wait for none of it: a recurring timer's arming and a due
+    /// acceptance of it and of a one-off stay pending, never failed,
+    /// emitted or dropped, and the one-off's compaction is skipped. Once
+    /// released, the contention retry arms each, the next deadline
+    /// accepts each exactly once, and the one-off's log compacts.
+    #[tokio::test]
+    async fn held_sidecars_leave_timers_pending_until_the_contention_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let recurring = recurring_source("deploy");
+        let r = recurrence::Recurrence::parse(&recurring, None).unwrap();
+        let unarmed = recurring_source("later");
+        let later = recurrence::Recurrence::parse(&unarmed, None).unwrap();
+        let once = source("history", 5000);
+        let once_key = compactable(dir.path(), &once, 2100);
+        let before = lines(dir.path(), &once_key);
+        let (timers, mut rx) = set(dir.path(), vec![recurring, once, unarmed.clone()]);
+        let mut timers = timers.on_the_loop();
+        let now = Instant::now();
+        let deploy = r.source_key();
+        let later_key = later.source_key();
+        timers.entries.retain(|_, entry| entry.key != later_key);
+        timers.refresh_at(100, now);
+        assert!(timers.next_deadline().is_some(), "armed while free");
+        let held = hold(&[
+            (dir.path(), &deploy),
+            (dir.path(), &once_key),
+            (dir.path(), &later_key),
+        ]);
+        let unarmed_entry = Entry {
+            source: unarmed.clone(),
+            key: later_key.clone(),
+            due: 100,
+            failure: None,
+            recurrence: Some(later),
+        };
+        let mut timers = within("the loop's timers", move || {
+            timers.due_at(5000, now);
+            timers.arm_recurring(unarmed_entry, 100, now, None);
+            timers
+        });
+        assert!(rx.try_recv().is_err(), "nothing contended is emitted");
+        assert_eq!(timers.contended.len(), 3, "all three pending");
+        assert!(timers.recovery.is_empty(), "contention is not a failure");
+        assert!(timers.pending.is_empty());
+        assert_eq!(timers.next_deadline(), None);
+        assert_eq!(timers.retry_due(), None, "no failure retry is armed");
+        assert_eq!(lines(dir.path(), &deploy), 0, "nothing accepted");
+        assert_eq!(lines(dir.path(), &once_key), before, "compaction skipped");
+        held.release();
+
+        timers.retry_contended();
+        assert!(timers.contended.is_empty());
+        let now = clock::now();
+        timers.due_at(5000, now);
+        let mut emitted = Vec::new();
+        while let Ok((item, _)) = rx.try_recv() {
+            emitted.push(item);
+        }
+        assert_eq!(emitted.len(), 3, "each accepted once: {emitted:#?}");
+        let names: BTreeSet<_> = emitted
+            .iter()
+            .map(|item| match item {
+                WaitItem::TimerEvent { name, .. } => name.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["deploy", "history", "later"].map(String::from).into()
+        );
+        assert_eq!(rows(dir.path(), &deploy).len(), 1);
+        assert_eq!(rows(dir.path(), &later_key).len(), 1);
+        assert!(lines(dir.path(), &once_key) < before, "it compacts");
+        timers.retry_contended();
+        timers.due_at(5000, now);
+        assert!(rx.try_recv().is_err(), "and never again");
+    }
+
+    /// A recovering backlog read of a held recurring log publishes
+    /// nothing from it, keeps it pending, and leaves its unsynced tail
+    /// untouched; once released, the same backlog publishes it.
+    #[tokio::test]
+    async fn a_held_recovering_backlog_publishes_nothing_from_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = recurring_source("cached");
+        let r = recurrence::Recurrence::parse(&source, None).unwrap();
+        let key = r.source_key();
+        let (mut timers, mut rx) = set(dir.path(), vec![source]);
+        let now = Instant::now();
+        timers.refresh_at(120, now);
+        timers.due_at(120, now);
+        rx.try_recv().unwrap();
+        let path = dir.path().join(format!("{key}.jsonl"));
+        let mut torn = std::fs::read(&path).unwrap();
+        assert_eq!(torn.pop(), Some(b'\n'));
+        std::fs::write(&path, &torn).unwrap();
+        let held = hold(&[(dir.path(), &key)]);
+        let reading = dir.path().to_owned();
+        let (backlog, owed, unavailable) = within("a recovering backlog", move || {
+            let mut backlog = Backlog::new(reading, BTreeSet::new());
+            let sidecars = Sidecars::never_waiting();
+            let owed = backlog.owed(&mut HashSet::new(), &sidecars);
+            (backlog, owed, sidecars.unavailable())
+        });
+        assert!(owed.is_empty(), "nothing from the held source: {owed:?}");
+        assert_eq!(unavailable, [key.clone()].into());
+        assert_eq!(std::fs::read(&path).unwrap(), torn, "no sync while held");
+        held.release();
+        let mut backlog = backlog;
+        let mut shown = HashSet::new();
+        assert_eq!(
+            backlog.owed(&mut shown, &Sidecars::never_waiting()).len(),
+            1,
+            "still pending, so published once free"
+        );
+        assert!(std::fs::read(&path).unwrap().ends_with(b"\n"));
+    }
+
+    /// Every loop timer operation takes its sidecar exactly once: a
+    /// recurring arm, a recurring acceptance with its compaction, a
+    /// one-off's inspection, append and compaction, and a recovering
+    /// backlog read.
+    #[tokio::test]
+    async fn each_loop_timer_operation_takes_its_sidecar_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let recurring = recurring_source("deploy");
+        let r = recurrence::Recurrence::parse(&recurring, None).unwrap();
+        let key = r.source_key();
+        let once = source("history", 5000);
+        let once_key = compactable(dir.path(), &once, 2100);
+        let before = lines(dir.path(), &once_key);
+        let (timers, mut rx) = set(dir.path(), vec![recurring.clone(), once]);
+        let mut timers = timers.on_the_loop();
+        let now = Instant::now();
+        let mut log = EventLog::open(dir.path(), &key).unwrap();
+        let super::super::github::log::RecurringTransition::Accepted { seq, .. } =
+            log.accept_recurring(&r, "first", 100).unwrap()
+        else {
+            panic!("not accepted")
+        };
+        let row = rows(dir.path(), &key).remove(0);
+        log.ack_recurring_at(seq, &row.ident, 105).unwrap();
+        log.append_presentations(
+            &[clank_core::wait::EventPresentation {
+                source: key.clone(),
+                seq,
+                ident: row.ident.clone(),
+            }],
+            101,
+            || true,
+        )
+        .unwrap();
+        let path = dir.path().join(format!("{key}.jsonl"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let presented = text.lines().last().unwrap().to_owned();
+        let mut padded = text.clone();
+        for _ in 0..super::super::github::log::COMPACT_AT {
+            padded.push_str(&presented);
+            padded.push('\n');
+        }
+        std::fs::write(&path, padded).unwrap();
+        let recurring_before = lines(dir.path(), &key);
+
+        let (timers_out, armed) = within("a recurring arm", move || {
+            counted(move || {
+                timers.refresh_at(110, now);
+                timers
+            })
+        });
+        timers = timers_out;
+        assert_eq!(armed, 1, "the arm");
+        let (timers_out, accepted) = within("the acceptances", move || {
+            counted(move || {
+                timers.due_at(5000, now);
+                timers
+            })
+        });
+        let _timers = timers_out;
+        assert_eq!(accepted, 2, "one per acceptance, compaction included");
+        let mut emitted = 0;
+        while rx.try_recv().is_ok() {
+            emitted += 1;
+        }
+        assert_eq!(emitted, 2);
+        assert!(
+            lines(dir.path(), &key) < recurring_before,
+            "recurring compacted"
+        );
+        assert!(lines(dir.path(), &once_key) < before, "one-off compacted");
+
+        let backlog_dir = dir.path().to_owned();
+        let (owed, read) = within("a recovering backlog", move || {
+            counted(move || {
+                Backlog::new(backlog_dir, BTreeSet::new())
+                    .owed(&mut HashSet::new(), &Sidecars::never_waiting())
+                    .len()
+            })
+        });
+        assert_eq!(owed, 2, "both accepted rows are owed");
+        assert_eq!(read, 2, "one per log read");
     }
 
     #[tokio::test]
@@ -1525,6 +1942,14 @@ mod tests {
         drop(rx);
         timers.due();
         let mut backlog = Backlog::new(dir.path().to_owned(), BTreeSet::new());
-        assert_eq!(backlog.owed(&mut HashSet::new()).len(), 1);
+        assert_eq!(
+            backlog
+                .owed(
+                    &mut HashSet::new(),
+                    &crate::cli::github::log::Sidecars::waiting()
+                )
+                .len(),
+            1
+        );
     }
 }

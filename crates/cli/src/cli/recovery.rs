@@ -1637,6 +1637,24 @@ pub(crate) fn answered(mut e: Episode, n: u32, answer: Answer, ctx: &Ctx) -> Epi
     e
 }
 
+/// What one fold told recovery: the facts of each bound agent it could
+/// read, and the bound agents it could not, whose standing stays as the
+/// last fold left it, deciding nothing.
+#[derive(Debug, Default)]
+pub(crate) struct Observed {
+    pub(crate) facts: Vec<Facts>,
+    pub(crate) unknown: std::collections::BTreeSet<clank_core::ids::AgentLabel>,
+}
+
+impl From<Vec<Facts>> for Observed {
+    fn from(facts: Vec<Facts>) -> Self {
+        Observed {
+            facts,
+            unknown: Default::default(),
+        }
+    }
+}
+
 /// What the monitor knows about one roster agent at a fold.
 #[derive(Debug, Clone)]
 pub(crate) struct Facts {
@@ -1850,6 +1868,9 @@ pub(crate) struct Driver {
     /// The monitor's connection table as last told. `None` until it is:
     /// then nothing is known of anyone's reachability.
     waiters: Option<Waiters>,
+    /// The bound agents the last fold could not read: nothing has been
+    /// decided for them since.
+    unknown: std::collections::BTreeSet<clank_core::ids::AgentLabel>,
 }
 
 /// What an attempt's history record needs, as it was when dispatched, and
@@ -1955,6 +1976,7 @@ impl Driver {
             agents: Default::default(),
             installed: Default::default(),
             lost: Default::default(),
+            unknown: Default::default(),
             cwd,
             home,
             pending: Default::default(),
@@ -2161,10 +2183,21 @@ impl Driver {
         self.agents.values().filter_map(|w| w.working_look).min()
     }
 
+    /// Whether the latest fold left some bound agent unknown.
+    pub(crate) fn awaits_a_complete_fold(&self) -> bool {
+        !self.unknown.is_empty()
+    }
+
     /// Bring every agent in line with the latest fold.
-    pub(crate) fn reconcile(&mut self, facts: Vec<Facts>, now: u64) -> Vec<Act> {
+    pub(crate) fn reconcile(&mut self, observed: impl Into<Observed>, now: u64) -> Vec<Act> {
+        let Observed { facts, unknown } = observed.into();
         let mut acts = Vec::new();
-        let present: Vec<_> = facts.iter().map(|f| f.author.clone()).collect();
+        let present: Vec<_> = facts
+            .iter()
+            .map(|f| f.author.clone())
+            .chain(unknown.iter().cloned())
+            .collect();
+        self.unknown = unknown;
         let gone: Vec<_> = self
             .agents
             .keys()
