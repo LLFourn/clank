@@ -3854,7 +3854,8 @@ pub(crate) async fn run_tui(
             remote.panes_changed();
             panes_told = presence.clone();
         }
-        mode = settle_detail_cursor(mode, &snapshot.agents, &presence, &mut detail_shown);
+        let session_found = reconcile_worker.session_found();
+        mode = settle_detail_cursor(mode, &snapshot.agents, session_found, &mut detail_shown);
         crate::cli::status_tui::input::settle_seen_session(
             mode,
             &snapshot.agents,
@@ -3935,6 +3936,7 @@ pub(crate) async fn run_tui(
             // A non-blocking drain: the worker reports after each
             // batch, the loop never waits on zellij to paint.
             reach: reconcile_worker.reach(),
+            session_found,
             remote: shown,
             remote_detail: remote_detail.as_deref(),
             remote_page,
@@ -4708,7 +4710,7 @@ pub(crate) async fn run_tui(
                                 .map(|a| {
                                     detail_actions(
                                         a.role,
-                                        reconcile_worker.presence_of(&a.label),
+                                        reconcile_worker.session_found(),
                                         a.session.is_some(),
                                     )
                                 })
@@ -9664,6 +9666,7 @@ pub(crate) mod tests {
             picker: &[],
             log_cursor: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            session_found: false,
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -11262,7 +11265,7 @@ pub(crate) mod tests {
     #[test]
     fn a_batched_enter_then_u_opens_a_confirm_that_knows_its_session() {
         use crate::cli::status_tui::input::{
-            ClearTarget, DetailNav, Presence, agent_detail_nav, detail_actions, open_clear_confirm,
+            ClearTarget, DetailNav, agent_detail_nav, detail_actions, open_clear_confirm,
         };
         let repo = detail_repo();
         bind(repo.path(), "codex", "session-a");
@@ -11270,7 +11273,7 @@ pub(crate) mod tests {
         s.agents[1].session = Some(bound(clank_core::vocab::Tool::Codex, "session-a"));
 
         // Enter on codex's panel row opened its page; nothing settled.
-        let actions = detail_actions(s.agents[1].role, Presence::Unknown, true);
+        let actions = detail_actions(s.agents[1].role, false, true);
         let nav = agent_detail_nav(0, &actions, Key::Char(b'u'));
         assert_eq!(nav, DetailNav::Activate(DetailAction::ClearSession));
         let (mode, target) = open_clear_confirm(&s.agents[1]).expect("codex is bound");

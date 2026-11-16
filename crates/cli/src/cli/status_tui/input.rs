@@ -235,11 +235,11 @@ pub(super) enum DetailAction {
 /// The detail-page actions for `role`, in display order. Master gets a
 /// reduced set (no review checkboxes / promote / remove): the UI hide is
 /// primary, and the cores refuse anyway (defense in depth). Clearing the
-/// session is there only while one is `bound`; Reopen only for an agent
-/// with no live pane.
+/// session is there only while one is `bound`; Reopen whenever the
+/// workspace session has been found, independently of pane presence.
 pub(super) fn detail_actions(
     role: crate::cli::teams_config::RosterRole,
-    presence: Presence,
+    session_found: bool,
     bound: bool,
 ) -> Vec<DetailAction> {
     use crate::cli::teams_config::RosterRole;
@@ -260,7 +260,7 @@ pub(super) fn detail_actions(
     if bound {
         actions.push(ClearSession);
     }
-    if presence == Presence::Missing {
+    if session_found {
         actions.push(Reopen);
     }
     if reviewer {
@@ -1943,7 +1943,7 @@ pub(super) fn rebind_event_sel(before: &[EventAction], sel: usize, after: &[Even
 }
 
 /// Carry the detail-page cursor across a change in its action list —
-/// the reopen row appearing or leaving as presence changes — by the
+/// the reopen row appearing or leaving as session discovery changes — by the
 /// ACTION under it, not its index. Clamping the index alone repurposes
 /// the key: a reviewer page with reopen selected at 6 whose pane comes
 /// back has `remove` at 6 (codex on e310988). A vanished action falls
@@ -1961,7 +1961,7 @@ pub(super) fn rebind_detail_sel(
     }
 }
 
-/// Before a frame paints an agent's page: presence may have changed
+/// Before a frame paints an agent's page: session discovery may have changed
 /// the action list since the last painted one, so carry the cursor
 /// across by its action and record what THIS frame will show. Off the
 /// page nothing is shown. Pure, so the frame sequence a worker wake
@@ -1975,7 +1975,7 @@ pub(super) fn rebind_detail_sel(
 pub(super) fn settle_detail_cursor(
     mode: Mode,
     agents: &[crate::cli::status::AgentAutoRow],
-    presence: &Option<std::collections::BTreeSet<String>>,
+    session_found: bool,
     shown: &mut Option<Vec<DetailAction>>,
 ) -> Mode {
     let Mode::AgentDetail { idx, sel } = mode else {
@@ -1986,11 +1986,7 @@ pub(super) fn settle_detail_cursor(
         *shown = None;
         return mode;
     };
-    let now = detail_actions(
-        agent.role,
-        presence_in(presence, &agent.label),
-        agent.session.is_some(),
-    );
+    let now = detail_actions(agent.role, session_found, agent.session.is_some());
     let sel = match shown {
         Some(last) if *last != now => rebind_detail_sel(last, sel, &now),
         Some(_) => sel,
@@ -2377,6 +2373,8 @@ pub(super) struct PanelView<'a> {
     pub(super) lift: usize,
     /// Whether zellij answers, as the reconcile worker last saw it.
     pub(super) reach: crate::cli::status_tui::zellij::ZellijReach,
+    /// A session was found even if its pane listing failed.
+    pub(super) session_found: bool,
     /// The remote switch, drawn beside the zellij glyph and as a row
     /// under the agents; `remote_detail` is what the row says beside
     /// its state — the URL when on, the reason when failed.
@@ -2422,6 +2420,7 @@ impl<'a> PanelView<'a> {
             log_cursor: 0,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            session_found: false,
             remote: Default::default(),
             remote_detail: None,
             remote_page: None,
@@ -3908,11 +3907,11 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         for role in [RosterRole::Master, RosterRole::Commit] {
             assert!(
-                detail_actions(role, Presence::Live, true).contains(&DetailAction::ClearSession),
+                detail_actions(role, false, true).contains(&DetailAction::ClearSession),
                 "{role:?}, bound"
             );
             assert!(
-                !detail_actions(role, Presence::Live, false).contains(&DetailAction::ClearSession),
+                !detail_actions(role, false, false).contains(&DetailAction::ClearSession),
                 "{role:?}, unbound"
             );
         }
@@ -3999,7 +3998,7 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         use DetailAction::*;
         assert_eq!(
-            detail_actions(RosterRole::Master, Presence::Live, false),
+            detail_actions(RosterRole::Master, false, false),
             vec![ToggleAuto, Info, Swap, Back]
         );
         let reviewer = vec![
@@ -4013,54 +4012,37 @@ mod tests {
             Remove,
             Back,
         ];
-        assert_eq!(
-            detail_actions(RosterRole::Commit, Presence::Live, false),
-            reviewer
-        );
-        assert_eq!(
-            detail_actions(RosterRole::Gate, Presence::Live, false),
-            reviewer
-        );
+        assert_eq!(detail_actions(RosterRole::Commit, false, false), reviewer);
+        assert_eq!(detail_actions(RosterRole::Gate, false, false), reviewer);
     }
 
-    /// Reopen is offered to EVERY role when the pane is missing —
-    /// master included, a closed master pane is the one the
-    /// reconciler stages — and to none when it is live or when nothing
-    /// is known (not in zellij: nothing to reopen into)
-    /// (the-tui-knows-whether-a-pane-is-open).
+    /// Losing the session must not move a selected recovery action onto Remove.
     #[test]
-    fn the_detail_cursor_follows_its_action_when_reopen_comes_and_goes() {
+    fn the_detail_cursor_follows_its_action_when_the_session_is_lost() {
         use crate::cli::teams_config::RosterRole;
         use DetailAction::*;
-        let missing = detail_actions(RosterRole::Commit, Presence::Missing, false);
-        let live = detail_actions(RosterRole::Commit, Presence::Live, false);
-        // Reopen selected, the pane comes back: the row is gone, and
-        // the cursor must NOT land on remove, which now sits at that
-        // index. It lands on Back.
-        let on_reopen = missing.iter().position(|a| *a == Reopen).unwrap();
+        let found = detail_actions(RosterRole::Commit, true, false);
+        let unavailable = detail_actions(RosterRole::Commit, false, false);
+        let on_reopen = found.iter().position(|a| *a == Reopen).unwrap();
+        assert_eq!(unavailable[on_reopen], Remove);
         assert_eq!(
-            live[on_reopen], Remove,
-            "the index alone would select remove"
+            unavailable[rebind_detail_sel(&found, on_reopen, &unavailable)],
+            Back
         );
-        let rebound = rebind_detail_sel(&missing, on_reopen, &live);
-        assert_eq!(live[rebound], Back);
-        // Remove selected on the live list, the pane goes missing: the
-        // cursor stays on remove, one row down.
-        let on_remove = live.iter().position(|a| *a == Remove).unwrap();
+        let on_remove = unavailable.iter().position(|a| *a == Remove).unwrap();
         assert_eq!(
-            missing[rebind_detail_sel(&live, on_remove, &missing)],
+            found[rebind_detail_sel(&unavailable, on_remove, &found)],
             Remove
         );
-        // A cursor past the end of the old list lands on Back.
-        assert_eq!(live[rebind_detail_sel(&missing, 99, &live)], Back);
+        assert_eq!(
+            unavailable[rebind_detail_sel(&found, 99, &unavailable)],
+            Back
+        );
     }
 
     #[test]
     fn a_worker_wake_rebinds_the_cursor_before_the_frame_paints() {
-        // The sequence a hand-close then a reopen produces with no key
-        // pressed: the frame that first shows the pane live must carry
-        // a cursor that was on reopen to Back, not paint it on remove
-        // (codex on 44e937e).
+        // Worker updates leave Reopen selected while the session stays found.
         use crate::cli::teams_config::RosterRole;
         use DetailAction::*;
         let agents = vec![crate::cli::status::AgentAutoRow {
@@ -4084,11 +4066,10 @@ mod tests {
         // first row. Nothing was painted before, so the requested
         // cursor stands — rebinding from nothing sent it to Back
         // (codex on 18b70d3).
-        let missing_set = Some(std::collections::BTreeSet::new());
         let mode = settle_detail_cursor(
             Mode::AgentDetail { idx: 0, sel: 0 },
             &agents,
-            &missing_set,
+            true,
             &mut shown,
         );
         assert_eq!(
@@ -4104,37 +4085,39 @@ mod tests {
         };
         // The operator moves onto reopen (a key), then a worker wake
         // reports the pane live — no key between that and the paint.
-        let live_set = Some(["codex".to_string()].into_iter().collect());
         let painted = settle_detail_cursor(
             Mode::AgentDetail {
                 idx,
                 sel: on_reopen,
             },
             &agents,
-            &live_set,
+            true,
             &mut shown,
         );
         let Mode::AgentDetail { sel, .. } = painted else {
             panic!()
         };
         let list = shown.clone().expect("painted");
-        assert!(!list.contains(&Reopen), "the frame shows the live list");
-        assert_eq!(list[sel], Back, "not remove, which now holds that index");
+        assert!(list.contains(&Reopen));
+        assert_eq!(
+            list[sel], Reopen,
+            "presence changes must not move the action"
+        );
         // Leaving the page forgets the list; coming back is a first
         // entry again.
-        settle_detail_cursor(Mode::AgentPanel { sel: 0 }, &agents, &live_set, &mut shown);
+        settle_detail_cursor(Mode::AgentPanel { sel: 0 }, &agents, true, &mut shown);
         assert!(shown.is_none());
         let back_in = settle_detail_cursor(
             Mode::AgentDetail { idx: 0, sel: 0 },
             &agents,
-            &live_set,
+            true,
             &mut shown,
         );
         assert_eq!(back_in, Mode::AgentDetail { idx: 0, sel: 0 });
     }
 
     #[test]
-    fn reopen_is_offered_exactly_when_the_pane_is_missing() {
+    fn reopen_is_offered_to_every_role_when_the_session_is_found() {
         use crate::cli::teams_config::RosterRole;
         for role in [
             RosterRole::Master,
@@ -4142,8 +4125,9 @@ mod tests {
             RosterRole::Plan,
             RosterRole::Final,
             RosterRole::Gate,
+            RosterRole::Standby,
         ] {
-            let missing = detail_actions(role, Presence::Missing, false);
+            let missing = detail_actions(role, true, false);
             assert!(missing.contains(&DetailAction::Reopen), "{role:?}");
             assert_eq!(
                 missing.last(),
@@ -4158,12 +4142,10 @@ mod tests {
                     "{role:?}: reopen before the destructive row"
                 );
             }
-            for presence in [Presence::Live, Presence::Unknown] {
-                assert!(
-                    !detail_actions(role, presence, false).contains(&DetailAction::Reopen),
-                    "{role:?} {presence:?}"
-                );
-            }
+            assert!(
+                !detail_actions(role, false, false).contains(&DetailAction::Reopen),
+                "{role:?}"
+            );
         }
     }
 
@@ -4180,13 +4162,11 @@ mod tests {
             RosterRole::Gate,
         ] {
             assert!(
-                detail_actions(tier, Presence::Live, false).contains(&DetailAction::Swap),
+                detail_actions(tier, false, false).contains(&DetailAction::Swap),
                 "{tier:?} must be swappable"
             );
         }
-        assert!(
-            detail_actions(RosterRole::Master, Presence::Live, false).contains(&DetailAction::Swap)
-        );
+        assert!(detail_actions(RosterRole::Master, false, false).contains(&DetailAction::Swap));
     }
 
     /// Adding a reviewer asks WHO, then WHAT they review — and the

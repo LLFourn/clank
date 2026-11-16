@@ -652,6 +652,8 @@ pub(super) trait PaneIo {
     fn unreached(&self) -> Option<String> {
         None
     }
+    /// Whether the last discovery found a session, independently of its listing.
+    fn session_found(&self) -> bool;
     fn tab_of(&mut self, _snap: &Self::Snap, _caller: &str) -> Option<u32> {
         None
     }
@@ -711,6 +713,7 @@ struct ZellijPaneIo<'a> {
     caller: Option<String>,
     /// The last snapshot's reason for not asking, if it did not.
     unreached: Option<String>,
+    session_found: bool,
 }
 
 impl ZellijPaneIo<'_> {
@@ -722,10 +725,15 @@ impl ZellijPaneIo<'_> {
 }
 
 impl PaneIo for ZellijPaneIo<'_> {
+    fn session_found(&self) -> bool {
+        self.session_found
+    }
     type Snap = Scoped;
     fn snapshot(&mut self, candidates: &Labels) -> Option<Self::Snap> {
         use crate::cli::open_zellij::Unlisted;
-        let listed = own_endpoint()
+        let endpoint = own_endpoint();
+        self.session_found = endpoint.is_ok();
+        let listed = endpoint
             .map_err(Unlisted::Unnamed)
             .and_then(|ep| crate::cli::open_zellij::list_agent_panes(&ep));
         self.unreached = match &listed {
@@ -1305,6 +1313,9 @@ impl<I: PaneIo> Observed<'_, I> {
 }
 
 impl<I: PaneIo> PaneIo for Observed<'_, I> {
+    fn session_found(&self) -> bool {
+        self.inner.session_found()
+    }
     type Snap = I::Snap;
     fn snapshot(&mut self, candidates: &Labels) -> Option<Self::Snap> {
         let s = self.inner.snapshot(candidates);
@@ -1397,6 +1408,8 @@ pub(super) struct WorkerBatch {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Report {
     Reach(ZellijReach),
+    /// Session discovery is independent of pane-listing success.
+    SessionFound(bool),
     /// This repo's labels with a live pane; `None` when the listing
     /// did not answer — unknown, which is not absent.
     Presence(Option<std::collections::BTreeSet<String>>),
@@ -1549,6 +1562,7 @@ impl WorkerState {
             self.tab.reconcile(|caller| io.tab_of(snap, caller), tabs);
         }
         if listed {
+            reports.push(Report::SessionFound(io.session_found()));
             reports.push(Report::Presence(
                 listing.as_ref().map(|snap| io.live_labels(snap)),
             ));
@@ -1586,6 +1600,7 @@ pub(super) struct ReconcileWorker {
     /// Last observed; `NotInSession` is fixed for the process's life,
     /// since `$ZELLIJ` does not change under a running TUI.
     reach: ZellijReach,
+    session_found: bool,
     /// The last presence report; `None` until one arrives or when the
     /// last listing did not answer.
     presence: Option<std::collections::BTreeSet<String>>,
@@ -1611,6 +1626,7 @@ impl ReconcileWorker {
                 join: None,
                 report_rx: None,
                 reach: ZellijReach::NotInSession,
+                session_found: false,
                 presence: None,
                 lost: Default::default(),
                 answered: Vec::new(),
@@ -1628,6 +1644,7 @@ impl ReconcileWorker {
                 repo: &repo,
                 caller,
                 unreached: None,
+                session_found: false,
             };
             let seen = std::cell::Cell::new(None);
             let mut io = Observed {
@@ -1676,6 +1693,7 @@ impl ReconcileWorker {
             join: None,
             report_rx: Some(report_rx),
             reach: ZellijReach::Unknown,
+            session_found: false,
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
@@ -1689,6 +1707,7 @@ impl ReconcileWorker {
             while let Ok(r) = rx.try_recv() {
                 match r {
                     Report::Reach(reach) => self.reach = reach,
+                    Report::SessionFound(found) => self.session_found = found,
                     Report::Presence(live) => self.presence = live,
                     Report::Lost(lost) => self.lost = lost,
                     Report::Reopened(label, outcome) => self.answered.push((label, outcome)),
@@ -1696,6 +1715,12 @@ impl ReconcileWorker {
                 }
             }
         }
+    }
+
+    /// Session discovery reported by the worker, without doing I/O here.
+    pub(super) fn session_found(&mut self) -> bool {
+        self.drain();
+        self.session_found
     }
 
     /// Whether `label` has a live pane, as of the last presence report.
@@ -1984,6 +2009,7 @@ mod tests {
             join: None,
             report_rx: None,
             reach: ZellijReach::NotInSession,
+            session_found: false,
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
@@ -2003,6 +2029,7 @@ mod tests {
             join: None,
             report_rx: Some(rx),
             reach: ZellijReach::Connected,
+            session_found: true,
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
@@ -2327,6 +2354,7 @@ mod tests {
         reowns: Vec<(Labels, Labels)>,
         /// Why a failed snapshot was never asked, if it was not.
         unreached: Option<String>,
+        session_found: bool,
     }
 
     /// The repo every fake composes for. Composition needs a path
@@ -2365,6 +2393,7 @@ mod tests {
                 record: Ok(Some(Labels::new())),
                 reowns: Vec::new(),
                 unreached: None,
+                session_found: true,
             }
         }
 
@@ -2375,6 +2404,9 @@ mod tests {
     }
 
     impl PaneIo for FakeIo {
+        fn session_found(&self) -> bool {
+            self.session_found
+        }
         type Snap = Vec<(String, bool)>;
         fn unreached(&self) -> Option<String> {
             self.unreached.clone()
@@ -3603,7 +3635,10 @@ mod tests {
             |_, _| {},
         );
         assert_eq!(io.snapshots_taken, 1);
-        assert!(matches!(reports.as_slice(), [Report::Presence(Some(_))]));
+        assert!(matches!(
+            reports.as_slice(),
+            [Report::SessionFound(true), Report::Presence(Some(_))]
+        ));
     }
 
     #[test]
@@ -3711,12 +3746,8 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_close_shows_as_missing_and_offers_reopen_with_nothing_else_moving() {
-        // Two probes, no roster or refresh between them, the live set
-        // shrinks: the mark goes ▶ → ? and the page GAINS its reopen
-        // row. Then the pane is back: ? → ▶ and the row is gone. Both
-        // directions, so this cannot pass with the row hidden
-        // throughout (codex on 580150a).
+    fn presence_changes_do_not_hide_reopen_for_a_found_session() {
+        // Presence updates change the mark but leave recovery available.
         use super::super::input::{DetailAction, detail_actions};
         use super::super::render::auto_mark;
         use crate::cli::teams_config::RosterRole;
@@ -3735,7 +3766,7 @@ mod tests {
         assert_eq!(w.presence_of("r1"), Presence::Live);
         assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "▶");
         assert!(
-            !detail_actions(RosterRole::Commit, w.presence_of("r1"), false)
+            detail_actions(RosterRole::Commit, w.session_found(), false)
                 .contains(&DetailAction::Reopen)
         );
 
@@ -3747,7 +3778,7 @@ mod tests {
         assert_eq!(w.presence_of("r1"), Presence::Missing);
         assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "?");
         assert!(
-            detail_actions(RosterRole::Commit, w.presence_of("r1"), false)
+            detail_actions(RosterRole::Commit, w.session_found(), false)
                 .contains(&DetailAction::Reopen)
         );
 
@@ -3759,7 +3790,31 @@ mod tests {
         assert_eq!(w.presence_of("r1"), Presence::Live);
         assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "▶");
         assert!(
-            !detail_actions(RosterRole::Commit, w.presence_of("r1"), false)
+            detail_actions(RosterRole::Commit, w.session_found(), false)
+                .contains(&DetailAction::Reopen)
+        );
+        // A failed listing leaves presence unknown, but the session is still found.
+        let mut io = FakeIo::new(vec![None]);
+        io.unreached = Some("session index could not be read".into());
+        for r in state.handle(probe(), &mut io, |_, _| {}) {
+            report_tx.send(r).unwrap();
+        }
+        assert_eq!(w.presence_of("r1"), Presence::Unknown);
+        assert!(
+            detail_actions(RosterRole::Commit, w.session_found(), false)
+                .contains(&DetailAction::Reopen)
+        );
+        assert_eq!(
+            io.snapshots_taken, 1,
+            "availability requires no extra probe"
+        );
+        io.session_found = false;
+        io.snaps.push_back(None);
+        for r in state.handle(probe(), &mut io, |_, _| {}) {
+            report_tx.send(r).unwrap();
+        }
+        assert!(
+            !detail_actions(RosterRole::Commit, w.session_found(), false)
                 .contains(&DetailAction::Reopen)
         );
     }
@@ -3827,6 +3882,7 @@ mod tests {
             join: None,
             report_rx: None,
             reach: ZellijReach::NotInSession,
+            session_found: false,
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
@@ -4181,6 +4237,9 @@ mod tests {
     }
 
     impl PaneIo for ListingIo {
+        fn session_found(&self) -> bool {
+            true
+        }
         type Snap = Scoped;
         fn snapshot(&mut self, candidates: &Labels) -> Option<Self::Snap> {
             let panes =
