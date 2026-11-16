@@ -309,7 +309,10 @@ pub(super) fn owes(snap: &StatusSnapshot, label: &str) -> Owes {
         .github_events
         .iter()
         .flat_map(|e| &e.members)
-        .filter(|m| m.key.agent == label && !m.acked)
+        .filter(|m| {
+            matches!(&m.key.agent, crate::cli::watch_store::Producer::Agent(a) if a.as_str() == label)
+                && !m.acked
+        })
         .count();
     Owes { work, events }
 }

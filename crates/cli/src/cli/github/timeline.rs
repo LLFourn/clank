@@ -27,10 +27,19 @@ use clank_core::wait::WaitItem;
 /// ack must never read as the copy disappearing — codex fc7bf6c).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub(crate) struct MemberKey {
-    pub(crate) agent: String,
+    /// Shown, never read back: the timeline's JSON is a view.
+    #[serde(serialize_with = "display")]
+    pub(crate) agent: crate::cli::watch_store::Producer,
     pub(crate) source: String,
     pub(crate) seq: u64,
     pub(crate) ident: String,
+}
+
+fn display<S: serde::Serializer>(
+    producer: &crate::cli::watch_store::Producer,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.collect_str(producer)
 }
 
 /// One copy: its key plus MUTABLE state. Deliberately NOT Eq/Ord as
@@ -528,7 +537,7 @@ struct Copy {
     outgoing: Option<OutgoingReply>,
     replies: Vec<BackendReply>,
     reply_history_pruned: bool,
-    agent: String,
+    agent: crate::cli::watch_store::Producer,
     source: String,
     seq: u64,
     ident: String,
@@ -544,7 +553,7 @@ struct Copy {
 }
 
 impl Copy {
-    fn provenance(&self) -> (u64, &str, &str, u64, &str) {
+    fn provenance(&self) -> (u64, &crate::cli::watch_store::Producer, &str, u64, &str) {
         (
             self.display_at,
             &self.agent,
@@ -581,7 +590,7 @@ fn reply_provenance(
 /// answer, as the history of that copy. One whose provenance disagrees
 /// is not shown, and said so.
 fn backend_replies(
-    label: &str,
+    producer: &crate::cli::watch_store::Producer,
     stem: &str,
     rows: &[crate::cli::github::log::EventRow],
     local_repo: &Path,
@@ -594,9 +603,9 @@ fn backend_replies(
             if !matches!(op.route, ReplyRoute::Command(_)) {
                 continue;
             }
-            if !reply_provenance(op, local_repo, label, stem) {
+            if !reply_provenance(op, local_repo, &producer.to_string(), stem) {
                 notices.insert(format!(
-                    "{label}/{stem}: a reply's provenance disagrees — skipped"
+                    "{producer}/{stem}: a reply's provenance disagrees — skipped"
                 ));
                 continue;
             }
@@ -605,7 +614,7 @@ fn backend_replies(
                 .or_default()
                 .push(BackendReply {
                     original: MemberKey {
-                        agent: label.to_string(),
+                        agent: producer.clone(),
                         source: stem.to_string(),
                         seq: row.seq,
                         ident: row.ident.clone(),
@@ -628,7 +637,8 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
     let mut copies: Vec<Copy> = Vec::new();
     let mut notices: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let agents_root = crate::agent_store::agents_root(repo);
-    let watches = crate::cli::watch_store::read(repo).unwrap_or_default();
+    let config = crate::cli::watch_store::read(repo).unwrap_or_default();
+    let watches = crate::cli::watch_store::Watches(&config);
     let mut nudges: Vec<Nudge> = Vec::new();
     let mut directories = Vec::new();
     if let Ok(agents) = std::fs::read_dir(&agents_root) {
@@ -642,21 +652,25 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                         record,
                     }),
             );
-            directories.push((label, agent.path().join("events"), None));
+            if let Ok(agent) = clank_core::ids::AgentLabel::parse(&label) {
+                let producer = crate::cli::watch_store::Producer::Agent(agent);
+                directories.push((producer.directory(repo), producer, None));
+            }
         }
     }
-    for (id, watch) in &watches.event_watches {
-        directories.push((
-            crate::cli::watch_store::Owner::Watch(*id).to_string(),
-            watch.directory(repo, *id),
-            Some(watch.key()),
-        ));
+    for (id, watch) in &config.event_watches {
+        if let Some(producer) = watches.producer(*id) {
+            directories.push((producer.directory(repo), producer, Some(watch)));
+        }
     }
-    for (label, events_dir, only_key) in directories {
-        let mut glyphs = command_glyphs(repo, &label);
-        if let Ok(crate::cli::watch_store::Owner::Watch(id)) =
-            crate::cli::watch_store::Owner::parse(&label)
-            && let Some(watch) = watches.event_watches.get(&id)
+    for (events_dir, producer, watch) in directories {
+        let label = producer.to_string();
+        let only_key = watch.map(crate::cli::watch_store::Watch::key);
+        let mut glyphs = match &producer {
+            crate::cli::watch_store::Producer::Agent(agent) => command_glyphs(repo, agent),
+            crate::cli::watch_store::Producer::Watch { .. } => HashMap::new(),
+        };
+        if let Some(watch) = watch
             && let clank_core::agent_config::WaitEventSource::Command(c) = &watch.source
             && let Some(glyph) = &c.glyph
         {
@@ -676,7 +690,12 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
             if only_key.as_ref().is_some_and(|key| key != stem) {
                 continue;
             }
-            if only_key.is_none() && crate::cli::watch_store::claimed_key(&events_dir, stem) {
+            if let crate::cli::watch_store::Producer::Agent(agent) = &producer
+                && matches!(
+                    watches.log_owner(agent, stem),
+                    crate::cli::watch_store::Producer::Watch { .. }
+                )
+            {
                 continue;
             }
             let Ok(log) = EventLog::open(&events_dir, stem) else {
@@ -711,7 +730,7 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                         })
                         .collect();
                     let mut replies_of =
-                        backend_replies(&label, stem, &read.rows, &local_repo, &mut notices);
+                        backend_replies(&producer, stem, &read.rows, &local_repo, &mut notices);
                     copies.extend(read.rows.into_iter().filter_map(|r| {
                         let replies = replies_of
                             .remove(&(r.seq, r.ident.clone()))
@@ -767,7 +786,7 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                             outgoing: None,
                             replies,
                             reply_history_pruned: r.reply_history_pruned,
-                            agent: label.clone(),
+                            agent: producer.clone(),
                             source: stem.to_string(),
                             seq: r.seq,
                             ident: r.ident,
@@ -865,7 +884,7 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                                 from_repo: op.repo,
                                 destination,
                                 original: MemberKey {
-                                    agent: label.clone(),
+                                    agent: producer.clone(),
                                     source: stem.into(),
                                     seq: op.original_seq,
                                     ident: op.original_ident,
@@ -873,7 +892,7 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                                 original_handle: op.original_handle,
                                 acknowledge: op.acknowledge,
                             }),
-                            agent: label.clone(),
+                            agent: producer.clone(),
                             source: stem.into(),
                             seq: state.seq,
                             ident: id,
@@ -942,11 +961,8 @@ fn delivery_alias(repo: &Path, recipient: &str, id: &str) -> (String, String) {
 /// Read current presentation config independently of any wait. Unsupported
 /// icons quietly use the default badge; they cannot remove an event or
 /// generate repeated warnings as the timeline refreshes.
-fn command_glyphs(repo: &Path, label: &str) -> HashMap<String, String> {
-    let Ok(author) = clank_core::ids::AgentLabel::parse(label) else {
-        return HashMap::new();
-    };
-    let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, &author) else {
+fn command_glyphs(repo: &Path, author: &clank_core::ids::AgentLabel) -> HashMap<String, String> {
+    let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, author) else {
         return HashMap::new();
     };
     cfg.wait_events
@@ -1028,8 +1044,10 @@ fn merge(copies: Vec<Copy>, local_repo: &Path) -> Vec<MergedEvent> {
                 .copied()
                 .filter(|&i| copies[i].outgoing.is_none())
                 .collect();
-            let mut seen_by: Vec<String> =
-                inbound.iter().map(|&i| copies[i].agent.clone()).collect();
+            let mut seen_by: Vec<String> = inbound
+                .iter()
+                .map(|&i| copies[i].agent.to_string())
+                .collect();
             seen_by.sort();
             seen_by.dedup();
             let mut member_refs: Vec<MemberRef> = inbound
@@ -1828,7 +1846,7 @@ pub(crate) mod tests {
             .events
             .iter()
             .flat_map(|e| &e.members)
-            .filter(|m| m.key.agent == "gamma")
+            .filter(|m| m.key.agent.as_str() == "gamma")
             .map(|m| &m.key)
             .collect();
         assert_eq!(gamma_keys.len(), 2, "both damaged-seq copies surface");
@@ -2262,9 +2280,14 @@ pub(crate) mod tests {
                 ("sent", "reply sent", true),
             ]
         );
-        assert!(event.replies.iter().all(|r| r.original.agent == "worker"
-            && r.original.source == "command-questions-0000"
-            && r.original.seq == seq));
+        assert!(
+            event
+                .replies
+                .iter()
+                .all(|r| r.original.agent.as_str() == "worker"
+                    && r.original.source == "command-questions-0000"
+                    && r.original.seq == seq)
+        );
         assert_eq!(
             crate::cli::log::reply_mark(event).as_deref(),
             Some("↩3 (2 pending)")
@@ -2553,7 +2576,7 @@ pub(crate) mod tests {
         assert!(reply.unhandled);
         assert_eq!(reply.seen_by, vec!["coordinator"]);
         assert_eq!(reply.members.len(), 1);
-        assert_eq!(reply.members[0].key.agent, "coordinator");
+        assert_eq!(reply.members[0].key.agent.as_str(), "coordinator");
         assert_eq!(reply.outgoing[0].delivery_id, op.delivery_id());
         assert_eq!(reply.page_keys().len(), 2);
         let key = &reply.members[0].key;

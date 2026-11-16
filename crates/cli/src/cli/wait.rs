@@ -1302,8 +1302,9 @@ pub(crate) fn resolve_wait_event_sources(
         .into_iter()
         .map(|s| (s, SourceOrigin::Config))
         .collect();
-    let watches = crate::cli::watch_store::read(repo)?;
-    sources.retain(|(source, _)| !crate::cli::watch_store::transferred(&watches, author, source));
+    let config = crate::cli::watch_store::read(repo)?;
+    let watches = crate::cli::watch_store::Watches(&config);
+    sources.retain(|(source, _)| watches.hosts_legacy(author, source));
     for raw in cli_items {
         let item = parse_wait_event_source(raw).map_err(|e| e.context("invalid --event"))?;
         sources.push((item, SourceOrigin::Cli));

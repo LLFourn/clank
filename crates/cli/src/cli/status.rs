@@ -1591,7 +1591,7 @@ fn sources_fingerprint(repo: &Path) -> u64 {
     format!("{:?}", crate::cli::source_status::live(repo)).hash(&mut h);
     for source in crate::cli::source_status::configured(repo).unwrap_or_default() {
         if let Some(state) = &source.timer {
-            (source.agent.as_str(), &source.key, format!("{state:?}")).hash(&mut h);
+            (&source.agent, &source.key, format!("{state:?}")).hash(&mut h);
         }
     }
     h.finish()

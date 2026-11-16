@@ -88,7 +88,7 @@ fn events_context(
             && let Some(prompt) = &g.prompt
         {
             prompts.insert(
-                crate::cli::watch_store::selector_key(id, &watch.key()),
+                crate::cli::watch_store::watch_text(id, Some(&watch.key())),
                 prompt.clone(),
             );
         }
@@ -163,25 +163,25 @@ pub(crate) struct Sourced {
 /// log is reported and skipped — inspection must not block on it (the
 /// ingest side owns quarantine).
 pub(crate) fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
-    if let Some(rows) = crate::cli::watch_store::timeline_rows(dir)? {
-        return Ok(rows);
-    }
-    let context = crate::cli::watch_store::repo_of_events(dir).and_then(|repo| {
-        let author = AgentLabel::parse(dir.parent()?.file_name()?.to_str()?).ok()?;
-        Some((repo, author))
-    });
-    let mut out = match &context {
-        Some((repo, author)) => crate::cli::watch_store::rows(repo, author)?,
-        None => Vec::new(),
+    let context = match crate::cli::watch_store::inbox_owner(dir) {
+        Some((repo, author)) => Some((
+            crate::cli::watch_store::rows(&repo, &author)?,
+            crate::cli::watch_store::read(&repo)?,
+            author,
+        )),
+        None => None,
     };
-    let excluded: std::collections::BTreeSet<String> = match &context {
-        Some((repo, author)) => crate::cli::watch_store::read(repo)?
-            .event_watches
-            .values()
-            .filter(|w| w.legacy_agent.as_ref() == Some(author))
-            .map(|w| w.key())
-            .collect(),
-        None => Default::default(),
+    let (mut out, excluded) = match context {
+        Some((rows, config, author)) => (
+            rows,
+            Some(move |stem: &str| {
+                matches!(
+                    crate::cli::watch_store::Watches(&config).log_owner(&author, stem),
+                    crate::cli::watch_store::Producer::Watch { .. }
+                )
+            }),
+        ),
+        None => (Vec::new(), None),
     };
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -196,7 +196,7 @@ pub(crate) fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
         let Some(stem) = name.strip_suffix(".jsonl") else {
             continue; // state/lock/corrupt/tmp sidecars
         };
-        if excluded.contains(stem) {
+        if excluded.as_ref().is_some_and(|excluded| excluded(stem)) {
             continue;
         }
         let log = EventLog::open(dir, stem)?;
@@ -242,11 +242,12 @@ fn select(dir: &Path, ids: &[String]) -> anyhow::Result<(Vec<Sourced>, Vec<Strin
         };
         let source = durable_source(dir, source)?;
         if !rows.iter().any(|row| row.source == source) {
+            let (at, key) = crate::cli::watch_store::locate(dir, &source)?;
             anyhow::ensure!(
-                crate::cli::watch_store::log_exists(dir, &source),
+                at.join(format!("{key}.jsonl")).is_file(),
                 "no event {selector}"
             );
-            let read = EventLog::open(dir, &source)?
+            let read = EventLog::open(&at, &key)?
                 .read_rows()?
                 .ok_or_else(|| anyhow::anyhow!("{source} has corrupt custody; repair required"))?;
             rows.extend(read.rows.into_iter().map(|row| Sourced {
@@ -264,30 +265,25 @@ fn durable_source(dir: &Path, source: &str) -> anyhow::Result<String> {
         !source.is_empty() && source != "." && source != ".." && !source.contains(['/', '\\']),
         "invalid event source"
     );
-    if source.starts_with("watch:") {
+    use crate::cli::watch_store::{Producer, WatchStorage, Watches, watch_text};
+    if crate::cli::watch_store::parse_watch_text(source).is_some() {
         // Validates the registered ID and backend key, including removed watches.
-        crate::cli::watch_store::log_location(dir, source)?;
+        crate::cli::watch_store::locate(dir, source)?;
         return Ok(source.to_owned());
     }
-    let Some(repo) = crate::cli::watch_store::repo_of_events(dir) else {
+    let Some((repo, author)) = crate::cli::watch_store::inbox_owner(dir) else {
         return Ok(source.to_owned());
     };
     let config = crate::cli::watch_store::read(&repo)?;
-    let author = dir
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str());
-    let candidates: Vec<_> = config
+    if let Producer::Watch { id, .. } = Watches(&config).log_owner(&author, source) {
+        return Ok(watch_text(id, Some(source)));
+    }
+    let candidates: Vec<u64> = config
         .event_watches
         .iter()
-        .filter(|(_, w)| w.legacy_agent.is_some() && w.key() == source)
+        .filter(|(_, w)| matches!(w.storage(), WatchStorage::Agent(_)) && w.key() == source)
+        .map(|(id, _)| *id)
         .collect();
-    if let Some((id, _)) = candidates
-        .iter()
-        .find(|(_, w)| w.legacy_agent.as_ref().map(|a| a.as_str()) == author)
-    {
-        return Ok(crate::cli::watch_store::selector_key(**id, source));
-    }
     // An unrelated local source keeps its own address, even if another agent
     // transferred a same-named legacy watch.
     if dir.join(format!("{source}.jsonl")).is_file() || candidates.is_empty() {
@@ -295,12 +291,14 @@ fn durable_source(dir: &Path, source: &str) -> anyhow::Result<String> {
     }
     anyhow::ensure!(
         candidates.len() == 1,
-        "ambiguous legacy source {source}; use a watch:<id>:{source} selector"
+        "ambiguous legacy source {source}; name one of {}",
+        candidates
+            .iter()
+            .map(|id| watch_text(*id, Some(source)))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
-    Ok(crate::cli::watch_store::selector_key(
-        *candidates[0].0,
-        source,
-    ))
+    Ok(watch_text(candidates[0], Some(source)))
 }
 
 /// How an event is ADDRESSED: `[source@]seq[#N]`.
@@ -844,9 +842,10 @@ fn resolve_ack_target(
         return Ok(None);
     }
     ensure_plain_ack_allowed(dir, rows, s)?;
+    let (dir, source) = crate::cli::watch_store::locate(dir, source)?;
     Ok(Some(AckTarget {
-        dir: dir.to_path_buf(),
-        source: source.to_string(),
+        dir,
+        source,
         seq,
         ident: ident.to_string(),
     }))
@@ -883,20 +882,18 @@ pub(crate) fn ack_members(
     members: &[crate::cli::github::timeline::MemberKey],
 ) -> anyhow::Result<usize> {
     let mut by_agent: std::collections::BTreeMap<
-        &str,
+        &crate::cli::watch_store::Producer,
         Vec<&crate::cli::github::timeline::MemberKey>,
     > = Default::default();
     for m in members {
-        by_agent.entry(m.agent.as_str()).or_default().push(m);
+        by_agent.entry(&m.agent).or_default().push(m);
     }
     use anyhow::Context as _;
     // Phase 1: read + resolve everything.
     let mut targets: Vec<AckTarget> = Vec::new();
     for (agent, keys) in by_agent {
-        let dir = crate::agent_store::agents_root(repo)
-            .join(agent)
-            .join("events");
-        let rows = read_all(&dir)
+        let dir = agent.directory(repo);
+        let rows = crate::cli::watch_store::producer_rows(repo, agent)
             .with_context(|| format!("reading `{agent}`'s event WALs for the ack fanout"))?;
         for k in keys {
             if let Some(t) = resolve_ack_target(&dir, &rows, &k.source, k.seq, &k.ident)? {

@@ -9,10 +9,15 @@ All notable changes to clank are recorded here. The format follows
 
 ### Breaking
 
-- The monitor protocol is 24. v0.2.0 and the development builds before it
-  speak 23, so they and this release do not serve each other: a newer client
-  replaces an older monitor, and an older client is declined. Restart agents
-  still running an older binary after upgrading.
+- The monitor protocol is 25. v0.2.0 and the development builds before it
+  speak 23 or 24, so they and this release do not serve each other: a newer
+  client replaces an older monitor, and an older client is declined. Restart
+  agents still running an older binary after upgrading. Protocol 25 names the
+  producer of a source restart, and of each source in the published sources
+  account, as a tagged value rather than its display name: an agent labelled
+  `watch:1` and repository watch 1 are no longer confused. A sources account
+  written by an older monitor reads as unreadable until that monitor is
+  replaced.
 - Blocks left in the per-agent layout (`.clank/agents/<label>/blocks`,
   `unblocks` and `blocks.lock`) are no longer migrated or read. Ask any that
   are still pending again; the old directories and `.clank/block-migration.json`

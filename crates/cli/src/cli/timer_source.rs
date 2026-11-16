@@ -795,7 +795,7 @@ impl Backlog {
         }
         let mut items = Vec::new();
         self.pending.as_mut().expect("initialized").retain(|key| {
-            if crate::cli::watch_store::claimed_key(&self.dir, key) {
+            if crate::cli::watch_store::transferred_away(&self.dir, key) {
                 return false;
             }
             if let Some(rows) = self.recurring.get(key) {

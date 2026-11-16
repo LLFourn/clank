@@ -189,16 +189,17 @@ pub(crate) fn record(
         if !current() {
             break;
         }
+        let Ok((at, physical_key)) = super::watch_store::locate(&dir, source) else {
+            continue;
+        };
         // Removed custody is never recreated by a late presentation.
-        if !super::watch_store::log_exists(&dir, source) {
+        if !at.join(format!("{physical_key}.jsonl")).is_file() {
             continue;
         }
-        if let Ok((_, physical_key)) = super::watch_store::log_location(&dir, source) {
-            for key in &mut keys {
-                key.source = physical_key.clone();
-            }
+        for key in &mut keys {
+            key.source = physical_key.clone();
         }
-        let result = super::github::log::EventLog::open(&dir, source).and_then(|log| {
+        let result = super::github::log::EventLog::open(&at, &physical_key).and_then(|log| {
             log.under(permit)
                 .append_presentations(&keys, super::github::log::now_epoch(), &current)
         });

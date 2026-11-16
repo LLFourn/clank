@@ -361,7 +361,7 @@ mod tests {
 
         // Acking is. Same core as every other event.
         let key = crate::cli::github::timeline::MemberKey {
-            agent: to.as_str().to_string(),
+            agent: crate::cli::watch_store::Producer::Agent(to.clone()),
             source: MESSAGES_SOURCE.to_string(),
             seq: 1,
             // `logical_ident` prefixes an action key with `k:`.
@@ -498,7 +498,7 @@ mod tests {
         crate::cli::events::ack_members(
             repo.path(),
             &[crate::cli::github::timeline::MemberKey {
-                agent: to.as_str().to_string(),
+                agent: crate::cli::watch_store::Producer::Agent(to.clone()),
                 source: MESSAGES_SOURCE.to_string(),
                 seq: first.seq,
                 ident: first.ident.clone(),
@@ -580,7 +580,7 @@ mod tests {
                         .into_iter()
                         .filter(|r| !r.acked)
                         .map(|r| crate::cli::github::timeline::MemberKey {
-                            agent: to.as_str().to_string(),
+                            agent: crate::cli::watch_store::Producer::Agent(to.clone()),
                             source: MESSAGES_SOURCE.to_string(),
                             seq: r.seq,
                             ident: r.ident,
@@ -695,7 +695,7 @@ mod tests {
         crate::cli::events::ack_members(
             repo.path(),
             &[crate::cli::github::timeline::MemberKey {
-                agent: to.as_str().to_string(),
+                agent: crate::cli::watch_store::Producer::Agent(to.clone()),
                 source: MESSAGES_SOURCE.to_string(),
                 seq: last.seq,
                 ident: last.ident,
@@ -784,7 +784,7 @@ mod tests {
         );
 
         let key = crate::cli::github::timeline::MemberKey {
-            agent: to.as_str().to_string(),
+            agent: crate::cli::watch_store::Producer::Agent(to.clone()),
             source: MESSAGES_SOURCE.to_string(),
             seq: 1,
             ident: format!("k:{}", action_key(&to, &handle)),

@@ -11,7 +11,7 @@ use crate::cli::github::timeline::{Backend, MergedEvent};
 /// each have a source of the same name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredSource {
-    pub(crate) agent: String,
+    pub(crate) agent: crate::cli::watch_store::Producer,
     pub(crate) target: Option<crate::cli::watch_store::Target>,
     pub(crate) recipient: Option<AgentLabel>,
     pub(crate) key: String,
@@ -25,6 +25,9 @@ pub(crate) struct ConfiguredSource {
     pub(crate) polling: Option<String>,
     /// A timer's state, from its durable evidence; set by [`configured`].
     pub(crate) timer: Option<crate::cli::timer_source::TimerState>,
+    /// The producer that hosts this source's stream in its place, while
+    /// both would deliver it to one recipient.
+    pub(crate) suppressed_by: Option<crate::cli::watch_store::Producer>,
 }
 
 impl ConfiguredSource {
@@ -57,7 +60,7 @@ impl ConfiguredSource {
             _ => (None, None),
         };
         Self {
-            agent: agent.to_string(),
+            agent: crate::cli::watch_store::Producer::Agent(agent.clone()),
             target: None,
             recipient: Some(agent.clone()),
             key,
@@ -68,13 +71,16 @@ impl ConfiguredSource {
             subscription,
             polling,
             timer: None,
+            suppressed_by: None,
         }
     }
 
     /// Whether `event` came from this source: one of its copies is in this
     /// source's log, or it is a reply sent from an event that was.
     pub(crate) fn produced(&self, event: &MergedEvent) -> bool {
-        let ours = |agent: &str, source: &str| agent == self.agent.as_str() && source == self.key;
+        let ours = |agent: &crate::cli::watch_store::Producer, source: &str| {
+            *agent == self.agent && source == self.key
+        };
         event
             .members
             .iter()
@@ -120,26 +126,37 @@ pub(crate) fn configured(repo: &std::path::Path) -> anyhow::Result<Vec<Configure
                 .collect::<Vec<_>>()
         })
         .collect();
-    let watches = crate::cli::watch_store::read(repo)?;
-    sources.retain(|source| {
-        !watches.event_watches.values().any(|watch| {
-            watch
-                .legacy_agent
-                .as_ref()
-                .is_some_and(|a| a.as_str() == source.agent)
-                && watch.key() == source.key
-        })
-    });
-    for (id, watch) in &watches.event_watches {
-        if watch.removed {
-            continue;
+    use crate::cli::watch_store::{Legacy, Producer, Watches};
+    let config = crate::cli::watch_store::read(repo)?;
+    let watches = Watches(&config);
+    sources.retain_mut(|source| {
+        let Producer::Agent(agent) = &source.agent else {
+            return true;
+        };
+        match watches.legacy(agent, &source.key) {
+            Legacy::Hosted => true,
+            Legacy::Transferred(_) => false,
+            Legacy::Displaced(id) => {
+                source.suppressed_by = watches.producer(id);
+                true
+            }
         }
-        let recipient = watch.target.recipient(&watches);
-        let label = recipient
-            .clone()
-            .unwrap_or_else(|| AgentLabel::parse("unassigned").unwrap());
-        let mut source = ConfiguredSource::of(&label, &watch.source);
-        source.agent = crate::cli::watch_store::Owner::Watch(*id).to_string();
+    });
+    for (id, watch) in &config.event_watches {
+        let Some(producer) = watches.producer(*id).filter(|_| !watch.removed) else {
+            continue;
+        };
+        let recipient = watch.target.recipient(&config);
+        let mut source = ConfiguredSource::of(
+            recipient
+                .as_ref()
+                .unwrap_or(&AgentLabel::parse("unassigned").unwrap()),
+            &watch.source,
+        );
+        source.agent = producer.clone();
+        source.suppressed_by = watches
+            .displaced_by(*id)
+            .and_then(|id| watches.producer(id));
         source.target = Some(watch.target.clone());
         source.recipient = recipient.clone();
         source.name = format!(
@@ -152,7 +169,7 @@ pub(crate) fn configured(repo: &std::path::Path) -> anyhow::Result<Vec<Configure
                 .unwrap_or("awaiting recipient")
         );
         if let WaitEventSource::Timer(t) = &watch.source {
-            let state = crate::cli::timer_source::inspect(&watch.directory(repo, *id), t);
+            let state = crate::cli::timer_source::inspect(&producer.directory(repo), t);
             if state == crate::cli::timer_source::TimerState::Fired {
                 continue;
             }
@@ -160,9 +177,7 @@ pub(crate) fn configured(repo: &std::path::Path) -> anyhow::Result<Vec<Configure
         }
         sources.push(source);
     }
-    sources.sort_by(|a, b| {
-        (&a.name, a.agent.as_str(), &a.key).cmp(&(&b.name, b.agent.as_str(), &b.key))
-    });
+    sources.sort_by(|a, b| (&a.name, &a.agent, &a.key).cmp(&(&b.name, &b.agent, &b.key)));
     Ok(sources)
 }
 
@@ -178,7 +193,7 @@ pub(crate) fn fingerprint(config: &WaitEventSource) -> String {
 /// and its producer's lifecycle when it has one.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Hosted {
-    pub(crate) agent: String,
+    pub(crate) agent: crate::cli::watch_store::Producer,
     pub(crate) key: String,
     pub(crate) accepted: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,7 +211,7 @@ impl<'de> serde::Deserialize<'de> for Hosted {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
         struct Raw {
-            agent: String,
+            agent: crate::cli::watch_store::Producer,
             key: String,
             accepted: String,
             #[serde(default)]
@@ -289,7 +304,8 @@ pub(crate) fn live(repo: &std::path::Path) -> Live {
 }
 
 /// Verified producers of followed sources, by (agent, key).
-pub(crate) type Producers = std::collections::BTreeMap<(String, String), i32>;
+pub(crate) type Producers =
+    std::collections::BTreeMap<(crate::cli::watch_store::Producer, String), i32>;
 
 fn live_in(namespace: &std::path::Path, repo: &std::path::Path) -> Live {
     // The account proves itself by its writer's birth; the descriptor is
@@ -323,17 +339,13 @@ fn live_in(namespace: &std::path::Path, repo: &std::path::Path) -> Live {
 /// Another host holds a followed source's lease, so its producer is
 /// whatever that source's own record proves, in its author's events.
 fn followed_producers(repo: &std::path::Path, account: &Account) -> Producers {
-    let events = |agent: &str| {
-        crate::agent_store::agents_root(repo)
-            .join(agent)
-            .join("events")
-    };
     account
         .sources
         .iter()
         .filter(|h| h.lifecycle == Some(crate::cli::event_source::Lifecycle::Following))
         .filter_map(|h| {
-            let pgid = crate::cli::command_source::verified_producer(&events(&h.agent), &h.key)?;
+            let pgid =
+                crate::cli::command_source::verified_producer(&h.agent.directory(repo), &h.key)?;
             Some(((h.agent.clone(), h.key.clone()), pgid))
         })
         .collect()
@@ -345,7 +357,7 @@ impl Live {
     pub(crate) fn producer(&self, source: &ConfiguredSource) -> Option<i32> {
         match self {
             Live::Monitor(_, producers) => producers
-                .get(&(source.agent.to_string(), source.key.clone()))
+                .get(&(source.agent.clone(), source.key.clone()))
                 .copied(),
             Live::Unavailable | Live::Unreadable => None,
         }
@@ -357,7 +369,7 @@ impl Live {
             Live::Monitor(p, _) => p
                 .sources
                 .iter()
-                .find(|h| h.agent == source.agent.as_str() && h.key == source.key),
+                .find(|h| h.agent == source.agent && h.key == source.key),
             Live::Unavailable | Live::Unreadable => None,
         }
     }
@@ -397,9 +409,10 @@ pub(crate) fn status_lines(
     sources
         .iter()
         .map(|source| {
-            let state = match &source.timer {
-                Some(_) => timer_text(source, now),
-                None => state_text(source, live, now),
+            let state = match (&source.suppressed_by, &source.timer) {
+                (Some(by), _) => format!("suppressed: {by} hosts this stream"),
+                (None, Some(_)) => timer_text(source, now),
+                (None, None) => state_text(source, live, now),
             };
             let state = match paint && source_health(source, live.of(source), now).failing() {
                 true => format!("\x1b[{FAILING_SGR}m{state}\x1b[0m"),
@@ -619,6 +632,73 @@ pub(crate) fn events_of(source: &ConfiguredSource, events: &[MergedEvent]) -> Ve
 }
 
 #[cfg(test)]
+mod producer_identity_tests {
+    use super::*;
+
+    /// Agent `watch:1` and watch 1 display alike and configure identical
+    /// definitions; each reads its own hosted entry.
+    #[test]
+    fn a_watch_reads_its_own_status_not_the_agent_that_displays_like_it() {
+        let label = AgentLabel::parse("watch:1").unwrap();
+        let source: WaitEventSource = serde_json::from_value(
+            serde_json::json!({"kind":"command", "name":"build", "command":["producer"]}),
+        )
+        .unwrap();
+        let agent = ConfiguredSource::of(&label, &source);
+        let mut watch = agent.clone();
+        watch.agent = crate::cli::watch_store::Producer::repo_watch(1);
+        assert_eq!(agent.agent.to_string(), watch.agent.to_string());
+        let entry = |source: &ConfiguredSource, lifecycle| Hosted {
+            agent: source.agent.clone(),
+            key: source.key.clone(),
+            accepted: fingerprint(&source.config),
+            lifecycle: Some(lifecycle),
+            foreign: None,
+        };
+        let account = Account {
+            monitor: 1,
+            birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
+            sources: vec![
+                entry(&agent, crate::cli::event_source::Lifecycle::Following),
+                entry(
+                    &watch,
+                    crate::cli::event_source::Lifecycle::Settling {
+                        why: "the watch's own".into(),
+                    },
+                ),
+            ],
+        };
+        let read: Account = serde_json::from_slice(&serde_json::to_vec(&account).unwrap()).unwrap();
+        let live = Live::Monitor(read, Default::default());
+        assert_eq!(
+            live.of(&watch).unwrap().lifecycle,
+            Some(crate::cli::event_source::Lifecycle::Settling {
+                why: "the watch's own".into()
+            })
+        );
+        assert_eq!(
+            live.of(&agent).unwrap().lifecycle,
+            Some(crate::cli::event_source::Lifecycle::Following)
+        );
+    }
+
+    /// A protocol-24 monitor named a producer by display text, which
+    /// cannot say which one it meant: its account is another build's.
+    #[test]
+    fn an_account_naming_producers_by_display_text_is_not_read() {
+        let old = serde_json::json!({
+            "monitor": 1,
+            "birth": crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
+            "sources": [{"agent": "watch:1", "key": "k", "accepted": "f"}],
+        });
+        assert!(serde_json::from_value::<Account>(old.clone()).is_err());
+        let mut tagged = old;
+        tagged["sources"][0]["agent"] = serde_json::json!({"agent": "watch:1"});
+        assert!(serde_json::from_value::<Account>(tagged).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::github::log::Transport;
@@ -656,7 +736,7 @@ mod tests {
                 .map(|original| OutgoingReply {
                     operation_id: "op".into(),
                     delivery_id: "op".into(),
-                    from: original.agent.clone(),
+                    from: original.agent.to_string(),
                     from_repo: "/r".into(),
                     destination: None,
                     original,
@@ -827,7 +907,7 @@ mod tests {
         std::fs::write(
             path_in(&namespace, repo.path()),
             format!(
-                r#"{{"monitor":{ours},"birth":{birth},"sources":[{{"agent":"claude","key":"github-LLFourn-clank-3718fe74","accepted":"75796871d350697a14ea6d6492d77ab28003df5870d0f2b80bf6eb44daa8ffb9","lifecycle":{{"state":"degraded","why":"another forwarder holds the webhook slot for LLFourn/clank (another clank monitor, another machine, or a `gh webhook forward` of your own); stop it to free the slot","polling":false}}}}]}}"#
+                r#"{{"monitor":{ours},"birth":{birth},"sources":[{{"agent":{{"agent":"claude"}},"key":"github-LLFourn-clank-3718fe74","accepted":"75796871d350697a14ea6d6492d77ab28003df5870d0f2b80bf6eb44daa8ffb9","lifecycle":{{"state":"degraded","why":"another forwarder holds the webhook slot for LLFourn/clank (another clank monitor, another machine, or a `gh webhook forward` of your own); stop it to free the slot","polling":false}}}}]}}"#
             ),
         )
         .unwrap();
@@ -907,7 +987,7 @@ mod tests {
 
     fn hosted(source: &ConfiguredSource, lifecycle: crate::cli::event_source::Lifecycle) -> Hosted {
         Hosted {
-            agent: source.agent.to_string(),
+            agent: source.agent.clone(),
             key: source.key.clone(),
             accepted: fingerprint(&source.config),
             lifecycle: Some(lifecycle),
@@ -1202,7 +1282,7 @@ mod tests {
         let found = followed_producers(repo.path(), &account);
         assert_eq!(
             found.into_iter().collect::<Vec<_>>(),
-            [(("alpha".to_string(), "live".to_string()), pgid)],
+            [(("alpha".into(), "live".to_string()), pgid)],
             "alpha's absent record is not beta's"
         );
         child.kill().unwrap();

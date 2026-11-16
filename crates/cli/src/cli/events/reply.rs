@@ -43,8 +43,7 @@ pub(super) async fn ack_with_reply(
         anyhow::bail!("this event's backend does not support --reply");
     };
     let replying_author = crate::cli::watch_store::inbox_author(repo, dir)?;
-    let (physical_dir, physical_key) =
-        crate::cli::watch_store::log_location(dir, &selected.source)?;
+    let (physical_dir, physical_key) = crate::cli::watch_store::locate(dir, &selected.source)?;
     let selected = Sourced {
         source: physical_key,
         row: selected.row.clone(),
@@ -163,8 +162,8 @@ pub(super) fn backend_lease(
     source: &str,
     route: &clank_core::wait::CommandReplyRoute,
 ) -> anyhow::Result<(IngestLease, PathBuf)> {
-    let alias_dir = crate::agent_store::agents_root(repo).join("inbox/events");
-    let (_, canonical_source) = crate::cli::watch_store::log_location(&alias_dir, source)?;
+    let canonical_source = crate::cli::watch_store::watch_stream(repo, source)?
+        .map_or_else(|| source.to_owned(), |(_, key)| key);
     let source = canonical_source.as_str();
     let owner_identity = serde_json::to_vec(&("clank-reply-owner-v1", repo, source, Some(route)))?;
     let owner_key = blake3::hash(&owner_identity).to_hex().to_string();
@@ -199,9 +198,13 @@ fn copies_of(
             }
         }
     }
-    for (id, watch) in crate::cli::watch_store::read(repo)?.event_watches {
-        if watch.key() == source {
-            directories.insert(watch.directory(repo, id));
+    let config = crate::cli::watch_store::read(repo)?;
+    let watches = crate::cli::watch_store::Watches(&config);
+    for (id, watch) in &config.event_watches {
+        if watch.key() == source
+            && let Some(producer) = watches.producer(*id)
+        {
+            directories.insert(producer.directory(repo));
         }
     }
     for dir in directories {

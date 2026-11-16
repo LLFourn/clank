@@ -62,7 +62,7 @@ type Report = Arc<dyn Fn(&str, Lifecycle) + Send + Sync>;
 
 /// What a reporting sink tells its host: whose source, its storage key,
 /// the instance of the task that reported, and the state.
-pub(crate) type LifecycleReport = (crate::cli::watch_store::Owner, String, u64, Lifecycle);
+pub(crate) type LifecycleReport = (crate::cli::watch_store::Producer, String, u64, Lifecycle);
 
 /// Success means the delivery owner's queue already holds the emission.
 /// Metadata transformations run within the send, with no private buffer or task.
@@ -81,14 +81,14 @@ pub(crate) struct EmissionSink {
 impl EmissionSink {
     #[cfg(test)]
     pub(crate) fn for_owner(
-        tx: UnboundedSender<(crate::cli::watch_store::Owner, Emission)>,
-        owner: crate::cli::watch_store::Owner,
+        tx: UnboundedSender<(crate::cli::watch_store::Stream, Emission)>,
+        owner: crate::cli::watch_store::Stream,
     ) -> Self {
         Self::routed(tx, move |_| owner.clone())
     }
     pub(crate) fn routed(
-        tx: UnboundedSender<(crate::cli::watch_store::Owner, Emission)>,
-        owner: impl Fn(&WaitItem) -> crate::cli::watch_store::Owner + Send + Sync + 'static,
+        tx: UnboundedSender<(crate::cli::watch_store::Stream, Emission)>,
+        owner: impl Fn(&WaitItem) -> crate::cli::watch_store::Stream + Send + Sync + 'static,
     ) -> Self {
         Self {
             send: Arc::new(move |emission| {
@@ -118,7 +118,7 @@ impl EmissionSink {
     pub(crate) fn reporting(
         mut self,
         tx: UnboundedSender<LifecycleReport>,
-        author: impl Into<crate::cli::watch_store::Owner>,
+        author: impl Into<crate::cli::watch_store::Producer>,
         instance: u64,
     ) -> Self {
         let author = author.into();
@@ -265,7 +265,13 @@ pub(crate) fn owed_from_sources(
     if !events_dir.is_dir() {
         return owed;
     }
-    for (source, origin) in sources {
+    // A displaced declaration ingests nothing new, but what its log already
+    // holds is still the agent's to handle.
+    let displaced: Vec<_> = crate::cli::watch_store::displaced_declarations(repo, author)
+        .into_iter()
+        .map(|source| (source, crate::cli::event_source::SourceOrigin::Config))
+        .collect();
+    for (source, origin) in sources.iter().chain(&displaced) {
         // Invocation WALs use a separate resolved key and must never borrow
         // the configured source's backlog just because their names match.
         if *origin != crate::cli::event_source::SourceOrigin::Config {
@@ -279,7 +285,7 @@ pub(crate) fn owed_from_sources(
                 g.prompt.clone(),
             ),
         };
-        if crate::cli::watch_store::claimed_key(&events_dir, &key) {
+        if crate::cli::watch_store::transferred_away(&events_dir, &key) {
             continue;
         }
         if !events_dir.join(format!("{key}.jsonl")).is_file() {
