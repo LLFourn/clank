@@ -42,7 +42,7 @@ pub(crate) fn tool(repo: &Path, label: &AgentLabel) -> anyhow::Result<Tool> {
     anyhow::ensure!(entry.get("role").is_some(), "legacy roster entry");
     serde_json::from_value(
         entry
-            .get("tool")
+            .get(crate::cli::teams_config::ROSTER_TOOL_FIELD)
             .context("roster entry has no tool")?
             .clone(),
     )
@@ -128,6 +128,88 @@ mod boundary_tests {
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         for key in ["auto_mode", "wait_events", "outage_notified"] {
             assert_eq!(after[key], policy[key]);
+        }
+    }
+
+    /// The rosters the two readers are compared over: the format fixture,
+    /// and one entry for each tool in each role, with and without launch
+    /// policy.
+    fn rosters() -> Vec<String> {
+        use crate::cli::teams_config::RosterRole;
+        let tools = [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode];
+        let roles = [
+            RosterRole::Master,
+            RosterRole::Commit,
+            RosterRole::Plan,
+            RosterRole::Final,
+            RosterRole::Gate,
+            RosterRole::Standby,
+        ];
+        let mut agents = serde_json::Map::new();
+        for (i, tool) in tools.iter().enumerate() {
+            for (j, role) in roles.iter().enumerate() {
+                let mut entry = serde_json::json!({ "tool": tool, "role": role });
+                if j % 2 == 1 {
+                    entry["launch"] = serde_json::json!({ "args": ["--profile", "x"] });
+                    entry["initial_prompt"] = "go".into();
+                }
+                agents.insert(format!("agent{i}x{j}"), entry);
+            }
+        }
+        vec![
+            include_str!("../../tests/fixtures/formats/repo-config.json").to_string(),
+            serde_json::json!({ "agents": agents }).to_string(),
+        ]
+    }
+
+    #[test]
+    fn the_binding_reader_and_the_roster_parser_agree_on_every_tool() {
+        use crate::cli::teams_config::{ROSTER_TOOL_FIELD, RosterAgent, RosterRole};
+        let entry = RosterAgent {
+            tool: Tool::Grok,
+            launch: None,
+            initial_prompt: None,
+            role: RosterRole::Master,
+        };
+        assert_eq!(
+            serde_json::to_value(&entry).unwrap()[ROSTER_TOOL_FIELD],
+            serde_json::json!(Tool::Grok),
+            "the roster parser keeps the tool in the shared field"
+        );
+        for roster in rosters() {
+            let repo = tempfile::tempdir().unwrap();
+            let path = repo_config::path(repo.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &roster).unwrap();
+            let parsed = repo_config::read(repo.path())
+                .expect("the roster parser reads the fixture")
+                .expect("the fixture is a roster");
+            assert!(!parsed.agents.is_empty());
+            for (label, agent) in &parsed.agents {
+                assert_eq!(
+                    tool(repo.path(), label).unwrap(),
+                    agent.tool,
+                    "{label} in {roster}"
+                );
+            }
+            let absent = AgentLabel::parse("nobody").unwrap();
+            assert!(tool(repo.path(), &absent).is_err());
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo_config::path(repo.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/formats/repo-config-legacy.json"),
+        )
+        .unwrap();
+        assert!(repo_config::read(repo.path()).is_err());
+        for label in ["claude", "codex"] {
+            let label = AgentLabel::parse(label).unwrap();
+            assert!(
+                tool(repo.path(), &label).is_err(),
+                "neither reader takes a tool from a legacy roster"
+            );
         }
     }
 

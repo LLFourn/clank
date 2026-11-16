@@ -32,6 +32,7 @@ mod grok_launch_acceptance;
 mod grok_transport;
 mod harness_support;
 mod hook_is_a_messenger;
+mod hook_reach;
 mod html_integration;
 mod identity_env_boundary;
 mod inbox_wakes;

@@ -15,6 +15,8 @@ use std::process::Command;
 #[path = "../../support/git.rs"]
 pub mod git_fixture;
 
+pub mod call_graph;
+
 /// The runtime shared with test-built CLI children. The test runner owns and
 /// removes the override; a plain Cargo invocation retains the CLI default.
 pub fn runtime_dir() -> PathBuf {

@@ -192,6 +192,11 @@ impl RosterRole {
     }
 }
 
+/// The field of a roster entry that names its tool. [`RosterAgent`] and
+/// the binding-only reader `agent_store::identity::tool` both read the
+/// tool from this field.
+pub(crate) const ROSTER_TOOL_FIELD: &str = "tool";
+
 /// One roster entry: an agent's DEFINITION plus its ROLE. This is
 /// the value type of a [`Roster`]. The `role` field is what
 /// distinguishes a roster entry from a bare [`AgentDescription`]

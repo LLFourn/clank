@@ -74,7 +74,13 @@ pub(crate) fn binding_in(agent_dir: &Path) -> anyhow::Result<Option<Session>> {
     struct Binding {
         session: Option<Session>,
     }
-    Ok(load_json::<Binding>(&config_in(agent_dir))?.and_then(|c| c.session))
+    let path = config_in(agent_dir);
+    let Some(doc) = versioned::read(&path, AGENT_CONFIG_VERSION)? else {
+        return Ok(None);
+    };
+    let binding: Binding = serde_json::from_value(serde_json::Value::Object(doc))
+        .map_err(|e| Refusal::malformed(&path, e))?;
+    Ok(binding.session)
 }
 
 /// Whether the current binding still assigns this label to this tool and session.

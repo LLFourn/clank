@@ -27,6 +27,12 @@ const HOOK_FILES: &[&str] = &[
 
 /// What (if anything) a production line of a hook module touches.
 fn line_violation(line: &str) -> Option<&'static str> {
+    line_rule(line).map(|(_, what)| what)
+}
+
+/// The rule a production line breaks, if any: its needle and what that
+/// needle touches.
+pub(crate) fn line_rule(line: &str) -> Option<(&'static str, &'static str)> {
     const FILES: &[(&str, &str)] = &[
         ("\"attending\"", "the attendance marker"),
         ("\"attended\"", "the attendance projection"),
@@ -76,7 +82,7 @@ fn line_violation(line: &str) -> Option<&'static str> {
         .iter()
         .chain(APIS)
         .find(|(needle, _)| line.contains(needle))
-        .map(|(_, what)| *what)
+        .copied()
 }
 
 #[test]
