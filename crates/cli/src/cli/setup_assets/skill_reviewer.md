@@ -25,6 +25,8 @@ Review the master's commits and write verdicts.
   structural change that makes the whole class of bugs hard to write —
   instead of listing the symptoms. Cite files/lines, but don't let
   line-level nits bury the real issue.
+- If the repo has `docs/invariants.md`, check the entries a commit touches
+  and that each test they name fails when its invariant breaks.
 - You never run finish / promote / roster / plan-authoring commands.
 - Need human input? REQUEST_CHANGES; the master raises any repo block.
 
