@@ -682,7 +682,7 @@ impl Turns {
                 if escalated {
                     let duties: Vec<String> = items
                         .iter()
-                        .filter_map(|item| super::wake_render::duty_line(item))
+                        .filter_map(|item| super::wake_render::duty_line(item, role))
                         .collect();
                     if let Some(more) = super::wake_repeat::escalation(repeat, &duties) {
                         text.push_str(&more);

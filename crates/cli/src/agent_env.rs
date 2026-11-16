@@ -360,27 +360,55 @@ pub fn resolve_identity_from_env(repo: &Path) -> anyhow::Result<AgentLabel> {
 }
 
 pub(crate) fn resolve_identity_in(repo: &Path, env: &dyn Ambient) -> anyhow::Result<AgentLabel> {
+    match identify_in(repo, env)? {
+        Identity::Agent(label) => Ok(label),
+        Identity::Absent => Err(no_session()),
+    }
+}
+
+fn no_session() -> anyhow::Error {
+    anyhow::anyhow!(
+        "no session detected — pass --author <label>, set CLANK_AGENT, \
+         or run inside claude/codex/grok/opencode"
+    )
+}
+
+/// Who a command is running as, where a person at a shell is an
+/// acceptable answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Identity {
+    /// No harness session variable and no `CLANK_AGENT`: no agent is
+    /// running this command.
+    Absent,
+    Agent(AgentLabel),
+}
+
+/// [`resolve_identity_in`], telling a caller with no identity at all
+/// from one whose identity fails to resolve. Every resolver failure is
+/// an error, never [`Identity::Absent`]: an agent whose session
+/// variable is malformed, ambiguous or unbound is still an agent.
+pub(crate) fn identify_in(repo: &Path, env: &dyn Ambient) -> anyhow::Result<Identity> {
     let detected = detect_session_in(env)?;
     let caller = match &detected {
         Some((tool, id)) => Caller::Session { tool: *tool, id },
-        None => Caller::Outside {
-            named: explicit_label_in(env)?,
+        None => match explicit_label_in(env)? {
+            None => return Ok(Identity::Absent),
+            named => Caller::Outside { named },
         },
     };
     let agent_configs = load_all_agent_configs_lossy(repo)?;
-    resolve_agent_identity(&caller, &agent_configs).map_err(|e| match e {
-        ResolveError::NoSession => anyhow::anyhow!(
-            "no session detected — pass --author <label>, set CLANK_AGENT, \
-             or run inside claude/codex/grok/opencode"
-        ),
-        ResolveError::NoAgentForSession { session_id, tool } => anyhow::anyhow!(
-            "no agent is bound to {tool} session {sid} in this repo — run \
+    resolve_agent_identity(&caller, &agent_configs)
+        .map(Identity::Agent)
+        .map_err(|e| match e {
+            ResolveError::NoSession => no_session(),
+            ResolveError::NoAgentForSession { session_id, tool } => anyhow::anyhow!(
+                "no agent is bound to {tool} session {sid} in this repo — run \
              `clank as <label>` first (inside this session) or `clank init` \
              to bootstrap",
-            tool = tool.as_str(),
-            sid = session_id.as_str(),
-        ),
-    })
+                tool = tool.as_str(),
+                sid = session_id.as_str(),
+            ),
+        })
 }
 
 /// A hook's identity: the agent bound to the session its stdin names.

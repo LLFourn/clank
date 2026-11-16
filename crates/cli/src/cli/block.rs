@@ -8,7 +8,7 @@ use clank_core::wait::AnswerRef;
 
 pub async fn run(args: BlockArgs) -> anyhow::Result<()> {
     match args.command {
-        BlockCmd::Ask(a) => run_create(a).await,
+        BlockCmd::Ask(a) => create(a, &crate::agent_env::Process),
         BlockCmd::Answer(a) => run_unblock(a).await,
         BlockCmd::List(a) => list(a.repo.as_deref()),
     }
@@ -47,10 +47,61 @@ pub(crate) fn master(repo: &Path) -> anyhow::Result<clank_core::AgentLabel> {
 /// The user's `blocked` hook may page someone and wait on the answer.
 const BLOCK_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
+/// Who may raise a block (I7): a person running no agent, or the
+/// repository's unique master. Any other agent is refused with what it
+/// does instead, and so is a caller whose identity fails to resolve.
+/// `Ok(None)` is the person.
+fn admit(
+    repo: &Path,
+    caller: anyhow::Result<crate::agent_env::Identity>,
+) -> anyhow::Result<Option<clank_core::AgentLabel>> {
+    use crate::agent_env::Identity;
+    use clank_core::vocab::Role;
+    let label = match caller {
+        Ok(Identity::Absent) => return Ok(None),
+        Ok(Identity::Agent(label)) => label,
+        Err(e) => anyhow::bail!(
+            "refusing to raise a block: who is asking did not resolve, and only the master \
+             may ask: {e:#}"
+        ),
+    };
+    let cfg = crate::agent_store::repo_config::read(repo)?.unwrap_or_default();
+    if super::watch_store::Target::Master.recipient(&cfg).as_ref() == Some(&label) {
+        return Ok(Some(label));
+    }
+    match cfg.agents.get(&label).map(|a| a.role.resolved()) {
+        Some(Role::Reviewer) => anyhow::bail!(
+            "refusing to raise a block: only the master raises blocks, and `{label}` is a \
+             reviewer. Write REQUEST_CHANGES saying what the person must decide; the master \
+             raises the block. A `clank send --master` may add to the verdict, never replace it."
+        ),
+        Some(Role::Master) => anyhow::bail!(
+            "refusing to raise a block: the repository has no unique master, and only the \
+             master raises blocks"
+        ),
+        Some(Role::Standby) | None => anyhow::bail!(
+            "refusing to raise a block: only the master raises blocks. Tell the master what \
+             the person must decide: `clank send --master -m \"<question>\"`."
+        ),
+    }
+}
+
+/// Raise `name` as `caller`, once [`admit`] allows it.
+fn raise(
+    repo: &Path,
+    caller: anyhow::Result<crate::agent_env::Identity>,
+    name: &str,
+    question: &str,
+    kind: &Kind,
+) -> anyhow::Result<(Option<clank_core::AgentLabel>, PathBuf)> {
+    let author = admit(repo, caller)?;
+    let path = ask_with(repo, author.as_ref(), name, question, kind)?;
+    Ok((author, path))
+}
+
+fn create(args: BlockCreateArgs, env: &dyn crate::agent_env::Ambient) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
-    let author = crate::agent_env::resolve_identity_from_env(&repo).ok();
-    eprintln!("BLOCK: this pauses the repository review cycle until the question is answered");
+    let caller = crate::agent_env::identify_in(&repo, env);
     let kind = if args.permission {
         let suggestion = match (args.suggest, args.suggest_file) {
             (Some(text), _) => Some(text),
@@ -67,7 +118,8 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
     } else {
         Kind::Plain
     };
-    let path = ask_with(&repo, author.as_ref(), &args.name, &args.message, &kind)?;
+    let (author, path) = raise(&repo, caller, &args.name, &args.message, &kind)?;
+    eprintln!("BLOCK: this pauses the repository review cycle until the question is answered");
 
     let config = crate::cli::config::load(&repo).map_err(|e| {
         anyhow::anyhow!("the block is raised, but its `hooks.blocked` command was not run: {e:#}")
