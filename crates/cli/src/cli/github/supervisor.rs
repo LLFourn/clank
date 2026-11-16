@@ -163,7 +163,7 @@ async fn source_supervisor<F, R, C>(
     loop {
         let taken = match handed.take() {
             Some(waited) => waited.map(Some),
-            None => crate::cli::github::log::IngestLease::try_acquire(&dir, &key),
+            None => crate::cli::github::log::IngestLease::try_acquire_now(&dir, &key),
         };
         let lease = match taken {
             Ok(l) => l,
@@ -367,6 +367,58 @@ mod tests {
     use crate::cli::github::feed::{GhResponse, tests::classify_event_flat};
     use crate::cli::github::log::tests::wal_tempdir;
     use crate::cli::github::session::tests::FixedLogin;
+
+    /// A source whose lease is held elsewhere never parks a runtime thread
+    /// on the holder: it follows, and the release alone hands it the lease.
+    #[tokio::test]
+    async fn a_held_lease_parks_no_runtime_thread_and_its_release_hands_it_over() {
+        use crate::cli::github::log::tests::{hold_leases, lease_waited};
+        let dir = wal_tempdir();
+        let s = src(&[GithubEventKind::IssueOpened], true);
+        let key = source_key(&s);
+        let held = hold_leases(&[(&dir, &key)]);
+        let (polled_tx, mut polled) = tokio::sync::mpsc::unbounded_channel();
+        struct Polled(tokio::sync::mpsc::UnboundedSender<()>);
+        impl EventFetcher for Polled {
+            async fn fetch(&self, _p: u32, _e: Option<String>) -> anyhow::Result<GhResponse> {
+                let _ = self.0.send(());
+                Ok(ok(vec![], None, None))
+            }
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
+        let d = dir.clone();
+        let k = key.clone();
+        let run = tokio::spawn(async move {
+            source_supervisor(
+                &s,
+                FeedSide {
+                    fetcher: &Polled(polled_tx),
+                    login: &FixedLogin("me"),
+                },
+                &NoCi,
+                &tx,
+                Some(d),
+                k,
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), polled.recv())
+                .await
+                .is_err(),
+            "a follower polls nothing"
+        );
+        assert!(!lease_waited(&dir, &key), "the take waited on its holder");
+        held.release();
+        tokio::time::timeout(std::time::Duration::from_secs(30), polled.recv())
+            .await
+            .expect("the release hands the lease over and polling begins")
+            .expect("open");
+        assert!(!lease_waited(&dir, &key));
+        run.abort();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn non_holder_tails_without_transports_and_takes_over() {
