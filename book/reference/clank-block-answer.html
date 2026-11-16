@@ -36,7 +36,7 @@
   </dd>
   <dt id="option-nudge"><code>--nudge</code></dt>
   <dd>
-<p>Type the answer into the agent&#39;s terminal as your own message, the way <code>clank nudge</code> does, and record it only once it was submitted. The only way to answer a permission block. If the outcome is unknown the block stays unresolved, and nothing is resent</p>
+<p>Type the answer into the master&#39;s terminal as your own message, the way <code>clank nudge</code> does. Once it is submitted the block is delivered and deleted. If the outcome is unknown the block stays unresolved, and nothing is resent</p>
   </dd>
   <dt id="option-resend"><code>--resend</code></dt>
   <dd>
@@ -44,7 +44,7 @@
   </dd>
   <dt id="option-delivered"><code>--delivered</code></dt>
   <dd>
-<p>Settle an outstanding nudge whose text you saw arrive: record it as the answer, typing nothing</p>
+<p>Say the master has the answer, typing nothing: an outstanding nudge&#39;s text arrived, or you typed it into its terminal yourself. Deletes the block. A permission block you answered by typing is completed only this way</p>
   </dd>
   <dt id="option-override_permission_classifier"><code>--override-permission-classifier</code></dt>
   <dd>

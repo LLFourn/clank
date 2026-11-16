@@ -19,7 +19,7 @@ use super::wait::Standing;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Since {
     /// Unix seconds, from the item's own durable record, or from the
-    /// answer or receipt file of the block that last withheld it.
+    /// answer file of the block that last withheld it.
     At(u64),
     /// No record dates it. `held` is when this ledger first held it: a
     /// bound on how recently it could have become owed, never its age.
@@ -58,8 +58,9 @@ pub(crate) enum Obligation {
     Discharged,
 }
 
-/// When each block that no longer withholds anything from the agent
-/// stopped doing so, by its key: [`crate::cli::block::ended`].
+/// When each answered block was answered, by its key:
+/// [`crate::cli::block::ended`]. The master's answered blocks still
+/// withhold its work until a wake delivers and deletes them.
 pub(crate) type Ended = BTreeMap<String, u64>;
 
 /// Whether an owed item reached the session bound now. A receipt from any
@@ -178,8 +179,8 @@ impl Ledger {
 /// that ended after it arrived, since that block withheld it until then.
 ///
 /// Where the boundary cannot be dated (an arrival no record gives, a
-/// block cleaned away before its end was read) the item is owed since an
-/// unknown moment, never since `now`.
+/// block delivered and deleted before its end was read) the item is owed
+/// since an unknown moment, never since `now`.
 pub(crate) fn obligation(
     before: Option<&Obligation>,
     admitted: Option<&Admission>,

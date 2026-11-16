@@ -53,7 +53,7 @@ pub(super) enum Standing {
     /// The name was asked again, even with the same text: a different
     /// question, which this page never saw.
     Replaced,
-    /// Withdrawn, or answered and already received.
+    /// Withdrawn, or answered and already delivered.
     Gone,
 }
 
@@ -289,7 +289,7 @@ pub(super) fn answer_in_store(
     };
     // The answer is a keypress in the person's own TUI.
     crate::cli::block::resolve(repo, &ask.name, Some(ask.shown()), By::Person, how)?
-        .into_answer(&ask.name)
+        .settled(&ask.name)
         .map(|_| ())
 }
 
@@ -472,7 +472,7 @@ mod tests {
             let mut store = |a: &Ask, t: &str| answer_in_store(repo, a, t, &mut never);
             press(&mut slot, &s, &typed("yes"), &mut store);
             crate::cli::block::answer_block(repo, "scope", "earlier decision", None).unwrap();
-            crate::cli::block::test_receive(repo, "scope");
+            crate::cli::block::test_complete(repo, "scope");
             crate::cli::block::ask(repo, &codex, "scope", "Ship it?").unwrap();
             if refreshed {
                 s.blocks = crate::cli::block::scan_blocks(repo);
@@ -662,7 +662,7 @@ mod tests {
         assert_eq!(typed, ["yes, push it"]);
         assert!(
             crate::cli::block::scan_blocks(repo).is_empty(),
-            "answered and received"
+            "answered, delivered and deleted"
         );
     }
 

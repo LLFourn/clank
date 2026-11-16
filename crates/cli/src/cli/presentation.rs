@@ -13,6 +13,8 @@ use std::{
 #[derive(Debug, Default)]
 pub(crate) struct Carried {
     pub(crate) events: Vec<EventPresentation>,
+    /// The exact answers it carried, held only for as long as the
+    /// delivery is: the blocks a successful emit deletes.
     pub(crate) answers: Vec<AnswerRef>,
     /// The stable identity of every item it presented, event or not.
     pub(crate) identities: Vec<String>,
@@ -114,9 +116,10 @@ fn receive_with(
 }
 
 /// The one record of a wake that reached the model in `session` of
-/// `tool`: its items are delivered to that session if it still holds the
-/// label, its events presented and its answers received, each only while
-/// `current` holds.
+/// `tool`: the blocks its answers answered are deleted, whoever holds the
+/// label now, and its items are delivered to that session if it still
+/// holds the label and its events presented, each only while `current`
+/// holds.
 pub(crate) fn record_delivered(
     repo: &Path,
     author: &AgentLabel,
@@ -126,6 +129,15 @@ pub(crate) fn record_delivered(
     current: impl Fn() -> bool,
     permit: &crate::upgrade::Permit,
 ) {
+    for answer in &carried.answers {
+        if let Err(e) = super::block::complete(repo, answer, permit) {
+            eprintln!(
+                "clank: wake delivered; could not delete the block `{}` it answered, so it is \
+                 offered again: {e:#}",
+                answer.name
+            );
+        }
+    }
     let received = match carried.identities.is_empty() {
         true => Ok(true),
         false => crate::agent_store::hold_binding(repo, author)
@@ -147,22 +159,6 @@ pub(crate) fn record_delivered(
         );
     }
     record(repo, author, &carried.events, &current, permit);
-    for answer in &carried.answers {
-        let Ok(session) = clank_core::SessionId::parse(session) else {
-            continue;
-        };
-        let delivered = super::block::Destination {
-            agent: author.clone(),
-            tool,
-            session,
-        };
-        if let Err(e) = super::block::receive(repo, answer, &delivered, &current, permit) {
-            eprintln!(
-                "clank: wake delivered; could not receive answer to `{}`, so it stays owed: {e:#}",
-                answer.name
-            );
-        }
-    }
 }
 
 pub(crate) fn record(

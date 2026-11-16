@@ -4744,11 +4744,12 @@ fn recovery_facts(
             delivered: crate::cli::presentation::delivered_to(&dir, session.id.as_str()),
             in_flight: turns.in_flight(&author),
         };
+        let ended = crate::cli::block::ended(repo);
         let ledger = crate::cli::ledger::fold_stored(
             &dir,
-            &admissions(repo, &author, status.as_ref(), admitted),
+            &admissions(repo, &author, status.as_ref(), admitted, &ended),
             &evidence,
-            &crate::cli::block::ended(repo, &author),
+            &ended,
             crate::cli::recovery::unix_now(),
         );
         facts.push(crate::cli::recovery::Facts {
@@ -4878,6 +4879,7 @@ fn admissions(
     author: &AgentLabel,
     status: Option<&clank_core::wait::WorkStatus>,
     admitted: Vec<crate::cli::wait::Admitted>,
+    ended: &crate::cli::ledger::Ended,
 ) -> Vec<crate::cli::ledger::Admission> {
     use crate::cli::teams_config::RosterRole;
     use clank_core::wait::HandoverTier;
@@ -4944,6 +4946,9 @@ fn admissions(
                 .or(match &a.item {
                     WaitItem::TimerEvent { due_at, .. } => Some(*due_at),
                     WaitItem::CommandEvent { at, .. } => *at,
+                    WaitItem::Unblocked { carries, .. } => {
+                        ended.get(&crate::cli::block::key(&carries.name)).copied()
+                    }
                     _ => None,
                 })
                 .or_else(|| handed(&a.item));
@@ -10210,13 +10215,12 @@ mod recovery_tests {
     }
 
     /// A block answered while no monitor ran, and a monitor that starts
-    /// forty minutes later. The master's promotion was withheld when the
-    /// last monitor looked and is owed now: it is owed from the block's
-    /// answer, as the answer's own file dates it, so the forty minutes are
-    /// already spent and the nudge comes at forty-five, not a whole window
-    /// after the restart.
+    /// forty minutes later. The master's promotion stays withheld behind
+    /// the answer, which is owed from the moment its own file dates, so
+    /// the forty minutes are already spent and the nudge comes at
+    /// forty-five, not a whole window after the restart.
     #[tokio::test]
-    async fn work_released_while_no_monitor_ran_is_owed_from_the_blocks_answer() {
+    async fn an_answer_written_while_no_monitor_ran_is_owed_from_its_file() {
         use crate::cli::ledger::Since;
         crate::cli::recovery::tests::enable(clank_core::Tool::Codex, Some(Transport::Typed));
         let repo = tempfile::tempdir().unwrap();
@@ -10273,22 +10277,16 @@ mod recovery_tests {
             crate::cli::block::answer_block(repo.path(), "takes", "the third", None).unwrap();
         let answered = crate::cli::recovery::unix_now() - 40 * 60;
         written_at(&answer, answered);
-        // The master receives the repo decision before review work is released.
-        crate::cli::block::test_receive(repo.path(), "takes");
-        written_at(
-            &repo.path().join(".clank/unblocks/takes.received"),
-            answered,
-        );
         let restart = answered + 40 * 60;
 
         let released = facts().await;
         let owed = released.ledger.owed();
-        let [promotion] = owed.as_slice() else {
+        let [decision] = owed.as_slice() else {
             panic!("{owed:?}");
         };
-        assert_eq!(promotion.entry.what, "promotion of next-plan");
+        assert_eq!(decision.entry.what, "answer to takes");
         assert_eq!(
-            promotion.owed_since,
+            decision.owed_since,
             Since::At(answered),
             "from the answer, not from this fold"
         );

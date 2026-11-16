@@ -13,6 +13,16 @@ All notable changes to clank are recorded here. The format follows
   `unblocks` and `blocks.lock`) are no longer migrated or read. Ask any that
   are still pending again; the old directories and `.clank/block-migration.json`
   can be deleted. `clank block migrate` is removed.
+- A block's answer is delivered best effort and then deleted, not kept.
+  Once the wake carrying it is emitted, the question, answer, creator and
+  attempt files are removed, and no later session or master is shown it
+  again; nothing records which session received it. A submitted
+  `block answer --nudge`, or `block answer --delivered`, deletes it the same
+  way. `clank block list` no longer shows delivered decisions, and
+  `clank block clean` is removed. Asking a name whose question still exists,
+  pending or answered and undelivered, is refused. Answers already recorded
+  are delivered once more after upgrading, and `.received` files are no
+  longer read and can be deleted.
 
 ## [0.2.0]
 

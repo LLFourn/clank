@@ -1405,7 +1405,7 @@ fn an_answered_block_never_holds_finish() {
     block_on(clank::cli::finish::run(args)).expect("answered blocks hold nothing");
     assert!(repo.join(".clank/finished/foo.md").exists());
     assert!(
-        !repo.join(".clank/unblocks/answered.received").exists(),
-        "finish went ahead without a receipt"
+        repo.join(".clank/unblocks/answered.md").exists(),
+        "finish went ahead without the answer being delivered"
     );
 }

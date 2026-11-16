@@ -817,7 +817,7 @@ mod tests {
         crate::cli::block::ask(repo.path(), &claude, "why", "Which option?").unwrap();
         let first = shown();
         crate::cli::block::answer_block(repo.path(), "why", "previous decision", None).unwrap();
-        crate::cli::block::test_receive(repo.path(), "why");
+        crate::cli::block::test_complete(repo.path(), "why");
         crate::cli::block::ask(repo.path(), &claude, "why", "Which option?").unwrap();
         let second = shown();
         assert_eq!(first.1, second.1, "the same question text");

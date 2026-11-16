@@ -68,63 +68,35 @@ async fn cli_addresses_repository_questions_without_an_agent_or_binding() {
     assert_eq!(owed_answers(repo.path(), &label("bob")).len(), 1);
 }
 
+/// An answer follows whoever is master until a wake delivers it, and is
+/// then deleted: a later master, or the same master rebound to a new
+/// session, is shown nothing again.
 #[test]
-fn handover_fences_old_receipts_and_keeps_decisions_until_repo_cleanup() {
+fn an_answer_follows_the_master_and_a_rebind_replays_nothing() {
     let repo = tempfile::tempdir().unwrap();
     let repo = repo.path();
     set_master(repo, Some("alice"));
     ask_with(repo, Some(&label("alice")), "q", "Proceed?", &Kind::Plain).unwrap();
     answer_block(repo, "q", "yes", None).unwrap();
     let first = owed_answers(repo, &label("alice")).remove(0).carries;
-    let old = destination(repo).unwrap();
     set_master(repo, None);
     assert!(owed_answers(repo, &label("alice")).is_empty());
-    assert_eq!(clean(repo).unwrap(), 0);
-    set_master(repo, Some("bob"));
-    assert_eq!(
-        receive(
-            repo,
-            &first,
-            &old,
-            || true,
-            &crate::upgrade::process().settling()
-        )
-        .unwrap(),
-        Receipt::Unauthorized
-    );
-    let new = destination(repo).unwrap();
-    let owed = owed_answers(repo, &label("bob")).remove(0);
-    assert_eq!(
-        receive(
-            repo,
-            &owed.carries,
-            &new,
-            || true,
-            &crate::upgrade::process().settling()
-        )
-        .unwrap(),
-        Receipt::Retired
-    );
-    assert!(owed_answers(repo, &label("bob")).is_empty());
     assert!(Pair::read(&root(repo), "q").unwrap().answer.is_some());
-    set_master(repo, Some("carol"));
-    assert_eq!(owed_answers(repo, &label("carol")).len(), 1);
-    assert_eq!(
-        clean(repo).unwrap(),
-        0,
-        "successor has not seen the decision"
-    );
-    let owed = owed_answers(repo, &label("carol")).remove(0);
-    receive(
+    set_master(repo, Some("bob"));
+    let owed = owed_answers(repo, &label("bob")).remove(0);
+    assert_eq!(owed.carries, first, "the same answer, to the new master");
+    assert!(complete(repo, &owed.carries, &crate::upgrade::process().settling()).unwrap());
+    assert!(Pair::read(&root(repo), "q").is_none());
+    crate::agent_store::bind_session_to_agent(
         repo,
-        &owed.carries,
-        &destination(repo).unwrap(),
-        || true,
-        &crate::upgrade::process().settling(),
+        &label("bob"),
+        Tool::Codex,
+        &clank_core::SessionId::parse("replacement").unwrap(),
     )
     .unwrap();
-    assert!(clean(repo).unwrap() > 0);
-    assert!(Pair::read(&root(repo), "q").is_none());
+    assert!(owed_answers(repo, &label("bob")).is_empty());
+    set_master(repo, Some("carol"));
+    assert!(owed_answers(repo, &label("carol")).is_empty());
 }
 
 #[test]
@@ -140,14 +112,7 @@ fn names_are_repo_unique_and_old_occurrences_cannot_answer_a_reused_name() {
     assert_eq!(attempts.into_iter().filter(|v| *v).count(), 1);
     answer_block(repo, "q", "yes", None).unwrap();
     let old = owed_answers(repo, &label("alice")).remove(0).carries;
-    receive(
-        repo,
-        &old,
-        &destination(repo).unwrap(),
-        || true,
-        &crate::upgrade::process().settling(),
-    )
-    .unwrap();
+    assert!(complete(repo, &old, &crate::upgrade::process().settling()).unwrap());
     ask_with(repo, None, "q", "again", &Kind::Plain).unwrap();
     assert!(
         answer_block(
@@ -161,22 +126,14 @@ fn names_are_repo_unique_and_old_occurrences_cannot_answer_a_reused_name() {
         )
         .is_err()
     );
-    assert_eq!(
-        receive(
-            repo,
-            &old,
-            &destination(repo).unwrap(),
-            || true,
-            &crate::upgrade::process().settling()
-        )
-        .unwrap(),
-        Receipt::Stale
-    );
+    assert!(!complete(repo, &old, &crate::upgrade::process().settling()).unwrap());
     assert!(scan_blocks(repo)[0].answer.is_none());
 }
 
+/// A nudge is typed to the master of its claim, and its submission
+/// completes the block even if the master changed while it was typed.
 #[test]
-fn a_permission_attempt_is_evidence_for_one_session_not_block_ownership() {
+fn a_submitted_nudge_completes_across_a_handover() {
     let repo = tempfile::tempdir().unwrap();
     let repo = repo.path();
     set_master(repo, Some("alice"));
@@ -205,36 +162,36 @@ fn a_permission_attempt_is_evidence_for_one_session_not_block_ownership() {
             }
         )
         .unwrap(),
-        Resolved::Unknown(_)
+        Resolved::Delivered
     ));
-    assert!(resolve(repo, "publish", None, By::Person, How::Delivered).is_err());
-    assert_eq!(clean(repo).unwrap(), 0);
-    let mut submitted = |_: &str| Outcome::Submitted;
-    resolve(
-        repo,
-        "publish",
-        None,
-        By::Person,
-        How::Nudge {
-            text: "push it",
-            resend: true,
-            via: &mut submitted,
-        },
-    )
-    .unwrap();
-    assert!(owed_answers(repo, &label("bob")).is_empty());
+    assert!(Pair::read(&root(repo), "publish").is_none());
+    assert_eq!(
+        crate::cli::nudge_log::read(&agents_root(repo).join("alice")).len(),
+        1,
+        "typed to the master that claimed it"
+    );
+}
+
+/// A permission block's recorded answer, which only an older clank could
+/// write, reaches a wake as a prior decision, never as an approval.
+#[test]
+fn a_permission_blocks_owed_answer_is_no_approval() {
+    let repo = tempfile::tempdir().unwrap();
+    let repo = repo.path();
     set_master(repo, Some("carol"));
+    let f = files(&root(repo), "publish");
+    let occurrence = "0123456789abcdef0123456789abcdef";
+    write(
+        &f.question,
+        stamp_question(occurrence, &Kind::Permission { suggestion: None }, "Push?").unwrap(),
+    );
+    write(&f.answer, stamp(occurrence, None, "push it"));
     let owed = owed_answers(repo, &label("carol")).remove(0);
-    assert!(owed.answer.contains("not permission approval"));
-    // Rebinding also invalidates old delivery evidence even without a role change.
-    crate::agent_store::bind_session_to_agent(
-        repo,
-        &label("carol"),
-        Tool::Codex,
-        &clank_core::SessionId::parse("replacement").unwrap(),
-    )
-    .unwrap();
-    assert_eq!(owed_answers(repo, &label("carol")).len(), 1);
+    assert!(
+        owed.answer.contains("not permission approval"),
+        "{}",
+        owed.answer
+    );
 }
 
 /// The per-agent layout is gone, not migrated: its files, an orphan answer
@@ -261,63 +218,4 @@ fn per_agent_block_files_are_ignored_and_left_alone() {
         "an answer with no question"
     );
     assert!(old.join("blocks/old.md").exists());
-}
-
-#[test]
-fn damaged_receipts_preserve_custody() {
-    for damage in ["malformed", "unreadable", "dangling"] {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path();
-        set_master(repo, Some("master"));
-        let dir = root(repo);
-        let f = files(&dir, "q");
-        let occurrence = "0123456789abcdef0123456789abcdef";
-        write(&f.question, stamp(occurrence, None, "Which?"));
-        write(&f.answer, stamp(occurrence, None, "B"));
-        // A delivery may have captured this answer before its receipt was damaged.
-        let carries = Pair::read(&dir, "q").unwrap().carries("q").unwrap();
-        match damage {
-            "malformed" => write(&f.marker, b"{torn receipt"),
-            "unreadable" => std::fs::create_dir(&f.marker).unwrap(),
-            "dangling" => std::os::unix::fs::symlink("missing-receipt", &f.marker).unwrap(),
-            _ => unreachable!(),
-        }
-        let blocks = scan_blocks(repo);
-        assert_eq!(blocks.len(), 1, "{damage}");
-        assert!(blocks[0].pending());
-        assert!(blocks[0].unreadable.is_some());
-        assert!(owed_answers(repo, &label("master")).is_empty());
-        assert!(ended(repo, &label("master")).is_empty());
-        let received = receive(
-            repo,
-            &carries,
-            &destination(repo).unwrap(),
-            || true,
-            &crate::upgrade::process().settling(),
-        );
-        assert!(matches!(received, Ok(Receipt::Stale) | Err(_)), "{damage}");
-        assert!(ask_with(repo, None, "q", "replacement", &Kind::Plain).is_err());
-        assert!(matches!(clean(repo), Ok(0) | Err(_)));
-        let marker = f.marker;
-        match damage {
-            "malformed" => {
-                assert_eq!(std::fs::read(&marker).unwrap(), b"{torn receipt");
-                std::fs::remove_file(&marker).unwrap();
-            }
-            "unreadable" => std::fs::remove_dir(&marker).unwrap(),
-            "dangling" => {
-                assert!(
-                    std::fs::symlink_metadata(&marker)
-                        .unwrap()
-                        .file_type()
-                        .is_symlink()
-                );
-                std::fs::remove_file(&marker).unwrap();
-            }
-            _ => unreachable!(),
-        }
-        // Only explicit repair makes the absent-receipt case deliverable again.
-        assert_eq!(owed_answers(repo, &label("master")).len(), 1);
-        assert!(!scan_blocks(repo)[0].pending());
-    }
 }

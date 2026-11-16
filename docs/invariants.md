@@ -57,12 +57,11 @@ whether its assertions protect the invariant. Reviewers check that.
 - Today: GitHub, command, timer and message events are re-presented until
   `clank events ack`, which is intended. Separately,
   `presentation::Receipts` (`delivered.json`) records which items reached
-  which session, the monitor reads it (`delivered_to`), and a block answer is
-  recorded as received per session.
+  which session, and the monitor reads it (`delivered_to`).
 - Terms: a transport attempt is a try to put an item in front of the model;
   a presentation is the model being shown it; an acknowledgement is the agent
   saying it is handled. Only inbox events have acknowledgements.
-- Plans: block-answers-are-best-effort, one-state-file-per-agent
+- Plans: one-state-file-per-agent
 
 ## I4. A hook acts only on what it is given.
 

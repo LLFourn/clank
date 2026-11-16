@@ -1879,7 +1879,7 @@ mod tests {
 
         assert!(
             duties(&[serde_json::json!({"kind":"unblocked","name":"q","answer":"yes"})]).is_empty(),
-            "an answer is received by its delivery and owes no duty"
+            "an answer is completed by its delivery and owes no duty"
         );
         let blocked = one(
             serde_json::json!({"kind":"blocked","agent":"claude","name":"q",
