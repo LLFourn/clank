@@ -30,6 +30,7 @@ mod gh_spawn_boundary;
 mod git_boundary;
 mod grok_launch_acceptance;
 mod grok_transport;
+mod harness_adapter_boundary;
 mod harness_support;
 mod hook_is_a_messenger;
 mod hook_reach;

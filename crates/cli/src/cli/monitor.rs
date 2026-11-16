@@ -6951,11 +6951,9 @@ fn automatic_grok_client(repo: &std::path::Path, client: &Client) -> bool {
     let Served::Agent { author } = &client.who else {
         return false;
     };
-    if !client
-        .holder
-        .as_ref()
-        .is_some_and(|h| h.tool == clank_core::Tool::Grok)
-    {
+    if !client.holder.as_ref().is_some_and(|h| {
+        clank_core::harness::of(h.tool).behaviour.stop == clank_core::harness::Stop::Handoff
+    }) {
         return false;
     }
     let Ok(cfg) = crate::agent_store::load_agent_config(repo, author) else {

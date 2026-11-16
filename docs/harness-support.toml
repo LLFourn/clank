@@ -14,8 +14,26 @@
 #                        "unavailable" when none exists, which blocks a claim.
 #   acceptance           one entry per required test and version: test,
 #                        version, date, outcome.
+#   behaviour            one entry per field of the harness adapter's
+#                        `Behaviour` (crates/core/src/harness.rs): what the
+#                        harness DOES, which a recorded payload cannot prove.
+#                        capability, value (as the adapter declares it),
+#                        status, version, evidence, uncertain, and for an
+#                        observed status its conditions. Status is one of
+#                          observed  a reproducible experiment; `conditions`
+#                                    says how it was run (a parked Stop versus
+#                                    an active turn, notably)
+#                          source    the tool's versioned source, file and line
+#                          policy    clank's chosen compatibility behaviour,
+#                                    not a claim about the tool
+#                          unknown   none of the above; never stated as fact
+#                        `version` is the harness version the evidence rests
+#                        on, or "unknown" / "n/a". Nothing is observed
+#                        without a recorded experiment.
 # A version is "tested" when its latest walk passed and the latest entry for
 # every required test passed. No walk has been run yet: every list is empty.
+# Hook payloads recorded from real runs live under
+# crates/core/tests/fixtures/<tool>/, each manifest naming the version.
 
 [[harness]]
 name = "Claude Code"
@@ -30,7 +48,49 @@ acceptance = []
 version = "2.1.223"
 readme = "2.1.223 or later for the async loop; older versions get the legacy loop"
 file = "crates/cli/src/cli/setup.rs"
-line = 1708
+line = 1713
+
+[[harness.behaviour]]
+capability = "stop"
+value = "async_rewake"
+status = "observed"
+version = "2.1.223"
+conditions = "Headless `claude -p` in a scratch clank repo with the async Stop entry (asyncRewake, statusMessage, timeout 86400): a turn completes, the hook parks without blocking the turn, its exit 2 puts stderr before the model, which acted on it, and the wake turn's own Stop exit 0 ends the cycle (.clank/finished/claude-asyncrewake-work-loop.md, M0 and M2 findings, 2026-08-08)."
+evidence = "Live runs on 2.1.223 recorded in claude-asyncrewake-work-loop; setup writes the async entry only from 2.1.223 (crates/cli/src/cli/setup.rs, claude_asyncrewake_capable)."
+uncertain = "An interactive TUI park was not probed (docs assert it is non-blocking). Below 2.1.223 setup installs the legacy entry, whose Stop holds the turn; the adapter does not model that fallback. Later versions were not re-run."
+
+[[harness.behaviour]]
+capability = "deadline"
+value = "harness_ends"
+status = "policy"
+version = "n/a"
+evidence = "clank sets no deadline of its own on a Claude Stop: the hook holds its wait until Claude Code ends it, under the ceiling setup writes (HOOK_TIMEOUT_SECS). A deadline handed over by an older build re-arms with a heartbeat."
+uncertain = "Nothing about Claude Code: this is clank's choice."
+
+[[harness.behaviour]]
+capability = "lists_background_tasks"
+value = "true"
+status = "observed"
+version = "unknown"
+conditions = "A recording hook on Stop and SubagentStop while a subagent ran, finished, and parked on a background `sleep 240` (attendance-survives-a-subagent-waiting, 2026-11-11; earlier Stops in the-stop-hook-is-a-messenger, by 2026-10-21). The payloads are crates/core/tests/fixtures/claude/."
+evidence = "The recorded Stop and SubagentStop payloads each carry `background_tasks`, listing running subagents, shells and monitors, and `[]` when nothing runs."
+uncertain = "No recording names its Claude Code version. Claude's changelog dates the field to 2.1.145; that was not re-checked."
+
+[[harness.behaviour]]
+capability = "reports_background_completion"
+value = "true"
+status = "unknown"
+version = "unknown"
+evidence = "A spike before stop-hook-yield-on-background-work (.clank/finished, 2026-06-30) found Claude Code waking a session when its `run_in_background` task ended, and Claude's hooks documentation describes `background_tasks` as telling a paused session from a finished one. The spike kept no conditions or version."
+uncertain = "Whether Claude Code continues an agent parked under the async Stop when a background run ends has not been recorded on any version. clank relies on it and sends no run-ended notice on Claude."
+
+[[harness.behaviour]]
+capability = "session_start_reaches_model"
+value = "true"
+status = "unknown"
+version = "unknown"
+evidence = "Claude's hooks documentation describes SessionStart's `additionalContext` output, and clank has surfaced pending work there since claude-asyncrewake-work-loop."
+uncertain = "No recorded experiment shows the model receiving it. clank commits receipts for what it surfaces there, so a context Claude dropped would be wrongly counted as delivered."
 
 [[harness]]
 name = "Codex"
@@ -43,6 +103,49 @@ acceptance = []
 [harness.source_floor]
 version = "none"
 readme = "no version check"
+
+[[harness.behaviour]]
+capability = "stop"
+value = "blocking"
+status = "observed"
+version = "0.167.2"
+conditions = "The installed_codex_tui_background_probe cases with the hook parked and with no hook, native and wrapped, exits 0 and 7, twice each (docs/codex-tui-background.md, 2026-11-13): the agent made no model request until the parked Stop hook was released, and releasing it did."
+evidence = "docs/codex-tui-background.md, and the Stop producer at rust-v0.167.2 codex-rs/hooks/src/events/stop.rs."
+uncertain = "Other versions were not run. The two-second observation window is bounded, not a liveness proof."
+
+[[harness.behaviour]]
+capability = "deadline"
+value = "harness_ends"
+status = "policy"
+version = "n/a"
+evidence = "clank sets no deadline of its own on a Codex Stop: the hook holds its wait until Codex ends it, under the ceiling setup writes (HOOK_TIMEOUT_SECS)."
+uncertain = "Nothing about Codex: this is clank's choice."
+
+[[harness.behaviour]]
+capability = "lists_background_tasks"
+value = "false"
+status = "observed"
+version = "0.167.2"
+conditions = "A Stop captured with a live background command (docs/codex-tui-background.md, answer table, 2026-11-13)."
+evidence = "The captured Stop carries session_id, turn_id, cwd, transcript_path, hook_event_name, model, permission_mode, stop_hook_active and last_assistant_message, and no task listing; the versioned Stop schema agrees."
+uncertain = "The 0.167.2 capture was not committed; the recorded fixture (crates/core/tests/fixtures/codex/stop_hello.json) has no version."
+
+[[harness.behaviour]]
+capability = "reports_background_completion"
+value = "false"
+status = "observed"
+version = "0.167.2"
+conditions = "installed_codex_tui_background_probe: a native or wrapped background command exiting 0 or 7, with the agent's Stop hook parked and with no hook, twice each (docs/codex-tui-background.md, 2026-11-13)."
+evidence = "In every case no agent model request followed the command's exit within two seconds until the Stop hook was released."
+uncertain = "Two seconds is a bounded observation. No known-good version exists to call this a regression; other versions were not run."
+
+[[harness.behaviour]]
+capability = "session_start_reaches_model"
+value = "false"
+status = "policy"
+version = "0.153"
+evidence = "clank commits no receipt for what a Codex SessionStart surfaces. Codex 0.153's embedded schema declares the same `additionalContext` output as Claude's (a-session-binds-itself-at-start)."
+uncertain = "Whether Codex puts that context before the model has not been recorded."
 
 [[harness]]
 name = "Grok"
@@ -59,6 +162,46 @@ readme = "1.x, at least 1.0.46, advertising the native Stop decision gate"
 file = "crates/cli/src/cli/grok_setup.rs"
 line = 102
 
+[[harness.behaviour]]
+capability = "stop"
+value = "handoff"
+status = "policy"
+version = "1.0.46"
+evidence = "Grok's Stop is a decision gate (hook documentation at grok-build 2bdd1d6, Grok 1.0.46, docs/grok-integration.md). clank chose never to park it: it blocks once with the request to run a background `clank wait`."
+uncertain = "A live provider check of immediate and delayed terminal completion has not been run (docs/grok-integration.md)."
+
+[[harness.behaviour]]
+capability = "deadline"
+value = "never_parks"
+status = "policy"
+version = "n/a"
+evidence = "Follows from the handoff: a Grok Stop holds no in-hook wait, so it has no deadline to meet."
+uncertain = "Nothing about Grok: this is clank's choice."
+
+[[harness.behaviour]]
+capability = "lists_background_tasks"
+value = "true"
+status = "source"
+version = "1.0.46"
+evidence = "grok-build 2bdd1d6, crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md: the Stop payload's in-flight `backgroundTasks`."
+uncertain = "No Grok payload has been recorded."
+
+[[harness.behaviour]]
+capability = "reports_background_completion"
+value = "true"
+status = "source"
+version = "1.0.46"
+evidence = "grok-build 2bdd1d6, crates/codegen/xai-grok-pager/docs/user-guide/20-background-tasks.md: Grok owns a background task and its completion notification."
+uncertain = "Neither the ACP advertisement nor a version proves an authenticated model consumes the notification, and notifications must be enabled in the session (docs/grok-integration.md). Not observed."
+
+[[harness.behaviour]]
+capability = "session_start_reaches_model"
+value = "false"
+status = "policy"
+version = "n/a"
+evidence = "clank's Grok SessionStart binds or releases and surfaces nothing."
+uncertain = "Nothing about Grok: clank does not use it."
+
 [[harness]]
 name = "OpenCode"
 required_acceptance = "unavailable"
@@ -69,4 +212,44 @@ acceptance = []
 version = "2"
 readme = "2.x"
 file = "crates/cli/src/cli/setup.rs"
-line = 404
+line = 409
+
+[[harness.behaviour]]
+capability = "stop"
+value = "plugin_poll"
+status = "policy"
+version = "n/a"
+evidence = "clank's own plugin (crates/cli/src/cli/setup_assets/opencode_plugin.js) runs the Stop hook as a long-poll on a session's idle."
+uncertain = "How OpenCode schedules a plugin's idle handler that runs this long has not been recorded."
+
+[[harness.behaviour]]
+capability = "deadline"
+value = "renews_poll"
+status = "policy"
+version = "n/a"
+evidence = "The hook's report names a deadline POLL_MARGIN_SECS under the ceiling setup writes, at which it answers the plugin's renewal wire and the plugin polls again without a model turn."
+uncertain = "Nothing about OpenCode: this is clank's plugin's choice."
+
+[[harness.behaviour]]
+capability = "lists_background_tasks"
+value = "false"
+status = "policy"
+version = "n/a"
+evidence = "clank's plugin sends no task listing in its Stop."
+uncertain = "Whether OpenCode exposes one a plugin could send has not been looked at."
+
+[[harness.behaviour]]
+capability = "reports_background_completion"
+value = "false"
+status = "policy"
+version = "n/a"
+evidence = "clank tells an OpenCode agent when a `clank run` ends, as on Codex: telling a harness that would also have told costs at most one extra turn (codex-wakes-when-its-declared-work-ends)."
+uncertain = "Whether OpenCode continues an idle session when a background process exits is unknown; no experiment has been run."
+
+[[harness.behaviour]]
+capability = "session_start_reaches_model"
+value = "false"
+status = "policy"
+version = "n/a"
+evidence = "clank's plugin installs no SessionStart; clank commits no receipt for one."
+uncertain = "Nothing about OpenCode: clank does not use it."

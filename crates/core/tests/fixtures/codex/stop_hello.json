@@ -1,0 +1,1 @@
+{"session_id": "019e5385-ed97-7603-8561-dd9024328ff9", "turn_id": "019e5386-1684-7250-a7fc-1823f4b8c1be", "transcript_path": "/Users/llfourn/.codex/sessions/rollout.jsonl", "cwd": "/private/tmp/clank-hook-experiment/codex", "hook_event_name": "Stop", "model": "gpt-5.5", "permission_mode": "default", "stop_hook_active": false, "last_assistant_message": "Hello. How can I help?"}

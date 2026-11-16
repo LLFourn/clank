@@ -16,7 +16,8 @@ It is not yet a complete passive observer of arbitrary Code Mode cells.
 **What clank does with this:** nothing native. That server is a new socket,
 which clank's remote gate forbids, and observing undeclared commands would be
 background-work detection, which clank does not do. On Codex, clank itself
-tells the agent when a `clank run` ends (`Tool::reports_background_completion`).
+tells the agent when a `clank run` ends
+(`clank_core::harness::Behaviour::reports_background_completion`).
 Native background commands never wake a parked Codex agent.
 
 ## Answer table

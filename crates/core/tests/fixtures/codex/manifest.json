@@ -1,0 +1,13 @@
+{
+  "tool": "codex",
+  "note": "One Stop payload recorded from a real Codex run. No SessionStart payload has been recorded: the adapter's test for it uses a synthetic payload in the shape Codex 0.153's embedded schema declares, labelled as such.",
+  "recorded": [
+    {
+      "file": "stop_hello.json",
+      "hook": "Stop",
+      "version": "unknown",
+      "date": "2026-05-23",
+      "provenance": "Pasted into crates/core/src/hook_io.rs as \"Captured codex stdin\" in 5241b58a (2026-05-23) and moved here unchanged; its transcript_path reads as shortened. Neither the commit nor the code names the Codex version."
+    }
+  ]
+}

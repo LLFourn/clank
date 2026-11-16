@@ -79,22 +79,21 @@ use super::turn_wire::{Frame, NO_DEADLINE, Report, TurnResult, WireVerdict};
 use super::{StopHookArgs, resolve_cwd_repo, resolve_repo};
 use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
 use crate::lifecycle::AgentLabel;
+use clank_core::harness::{self, Protocol, Stream};
 use clank_core::turn_policy::{
     ChildReport, ChildSeen, Ms, PresentationId, TaskSnapshot, TurnEndReport, TurnPlace,
 };
-use clank_core::{
-    CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
-    SilentReason, Tool,
-};
+use clank_core::{HOOK_OK_EXIT, HookInput, HookOutcome, SilentReason, Tool};
 
 pub(crate) async fn run(args: StopHookArgs, host: &mut impl Host) -> anyhow::Result<()> {
-    // Grok imports Claude hook files too. Suppress only Clank's imported
-    // adapter; the native adapter below owns this lifecycle. Other user hooks
-    // are unaffected. Never park Grok inside the Claude hook protocol.
-    if std::env::var_os("GROK_HOOK_EVENT").is_some() && Tool::from(args.tool) != Tool::Grok {
+    let protocol = harness::of(args.tool.into()).protocol;
+    // Suppress only clank's own imported hook; other user hooks are
+    // unaffected. Never park Grok inside the Claude hook protocol.
+    if std::env::var_os(harness::grok::HOOK_EVENT_VAR).is_some() && protocol != Protocol::GrokNative
+    {
         return Ok(());
     }
-    if Tool::from(args.tool) == Tool::Grok {
+    if protocol == Protocol::GrokNative {
         return super::grok_hook::hook(args).await;
     }
     if args.observe.is_some() || args.recovery_helper || args.recovery_reply.is_some() {
@@ -172,7 +171,7 @@ impl Arrived {
         hook_started: Ms,
     ) -> Result<Self, String> {
         Ok(Arrived {
-            input: parse_input(&raw)?,
+            input: harness::parse_stop(&raw)?,
             raw,
             resumed: None,
             deadline: stop_deadline(tool, started),
@@ -190,7 +189,7 @@ impl Arrived {
             ))
         });
         Ok(Arrived {
-            input: parse_input(&handoff.input)?,
+            input: harness::parse_stop(&handoff.input)?,
             raw: handoff.input,
             deadline,
             resumed: Some(handoff.report),
@@ -205,10 +204,6 @@ enum Evidence {
     Read(TurnPlace, Vec<super::question_state::Observation>),
     /// The report the replaced build made of it.
     Carried(Report),
-}
-
-fn parse_input(raw: &str) -> Result<HookInput, String> {
-    serde_json::from_str(raw).map_err(|e| format!("hook: parsing stdin JSON: {e}"))
 }
 
 /// This process: its stdio, `clank wait --turn-end` children, its exit.
@@ -451,7 +446,7 @@ fn subagent_report(
     raw: &str,
     hook_started: Ms,
 ) -> Result<Option<(HookInput, ChildReport)>, String> {
-    let input = parse_input(raw)?;
+    let input = harness::parse_stop(raw)?;
     let Some(child) = input.agent_id.clone() else {
         return Ok(None);
     };
@@ -538,20 +533,6 @@ async fn subagent(
     frame.diagnostic()
 }
 
-/// The SessionStart payload both tools send: claude documents it, codex
-/// 0.153 carries the same fields.
-#[derive(serde::Deserialize)]
-struct SessionStartInput {
-    session_id: String,
-    cwd: String,
-    /// `startup` / `resume` / `clear` / `compact`, for the diagnostic line.
-    #[serde(default)]
-    source: Option<String>,
-    /// Claude sends the session's own transcript file; codex does not.
-    #[serde(default)]
-    transcript_path: Option<String>,
-}
-
 /// Who this session is, and — when it is unbound and clank launched it —
 /// the binding that says so.
 ///
@@ -563,14 +544,15 @@ struct SessionStartInput {
 fn session_started(
     repo: &Path,
     tool: Tool,
-    input: &SessionStartInput,
+    input: &harness::SessionStart,
     launched_as: Option<&AgentLabel>,
 ) -> Option<(AgentLabel, Tool)> {
     use crate::agent_env::Start;
     let sid = clank_core::ids::SessionId::parse(&input.session_id).ok()?;
     let label = match crate::agent_env::session_start(repo, tool, &sid, launched_as) {
         Ok(Start::Bound(label)) => {
-            if tool == Tool::Claude
+            // Only a binding with a recorded transcript is armed to check in.
+            if harness::of(tool).start_sends_transcript
                 && let Err(e) = crate::agent_store::resume_checked_in(repo, &label, &sid)
             {
                 eprintln!("clank: cannot record that this resume checked in: {e:#}");
@@ -626,7 +608,7 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     if std::io::stdin().read_to_string(&mut raw).is_err() {
         return Ok(());
     }
-    let Ok(input) = serde_json::from_str::<SessionStartInput>(&raw) else {
+    let Ok(input) = harness::parse_session_start(&raw) else {
         return Ok(());
     };
     let Ok(repo) = session_start_repo(args.repo.as_deref(), &input.cwd) else {
@@ -757,8 +739,7 @@ async fn emit_session_start(
         return;
     };
     let emitted = binding.current().then(|| {
-        let payload = session_start_payload(text);
-        serde_json::to_writer(&mut *stdout, &payload)?;
+        stdout.write_all(session_start_answer(text).as_bytes())?;
         stdout.write_all(b"\n")?;
         stdout.flush()
     });
@@ -766,17 +747,11 @@ async fn emit_session_start(
     Box::new(wait).answer(result).await;
 }
 
-/// The SessionStart hook-output wire: pending work rides
-/// `additionalContext`.
-fn session_start_payload(items_text: &str) -> serde_json::Value {
-    serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": format!(
-                "Pending clank work found at session start.\n{items_text}"
-            ),
-        }
-    })
+/// What a SessionStart answers when work is pending at the start.
+fn session_start_answer(items_text: &str) -> String {
+    harness::session_start_answer(&format!(
+        "Pending clank work found at session start.\n{items_text}"
+    ))
 }
 
 use super::hook_owner::Lifetime;
@@ -803,12 +778,7 @@ fn wait_argv(repo: &Path, label: &AgentLabel, session: &str) -> Vec<String> {
 }
 
 fn wait_command(exe: &Path, repo: &Path, label: &AgentLabel, session: &str, tool: Tool) -> Spec {
-    let key = match tool {
-        Tool::Claude => "CLAUDE_CODE_SESSION_ID",
-        Tool::Codex => "CODEX_THREAD_ID",
-        Tool::OpenCode => "OPENCODE_SESSION_ID",
-        Tool::Grok => "GROK_AGENT",
-    };
+    let key = harness::of(tool).session_env;
     Spec::new(exe)
         .args(wait_argv(repo, label, session))
         // Piped stdin IS the ownership channel, and the report's way in.
@@ -1034,13 +1004,11 @@ const POLL_MARGIN_SECS: u64 = 300;
 const VERDICT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// When a Stop of `tool` whose hook started at `started` can no longer
-/// hold its wait. Only OpenCode's has a deadline, at which its plugin
-/// renews the long-poll; a Claude or Codex Stop holds its wait until its
-/// harness ends the hook.
+/// hold its wait: `None` where its harness ends the hook.
 fn stop_deadline(tool: Tool, started: std::time::Instant) -> Option<std::time::Instant> {
-    match tool {
-        Tool::OpenCode => Some(poll_deadline(started)),
-        Tool::Claude | Tool::Codex | Tool::Grok => None,
+    match harness::of(tool).behaviour.deadline {
+        harness::Deadline::RenewsPoll => Some(poll_deadline(started)),
+        harness::Deadline::HarnessEnds | harness::Deadline::NeverParks => None,
     }
 }
 
@@ -1161,7 +1129,7 @@ fn read_stdin() -> Result<String, String> {
 }
 
 pub(crate) fn read_hook_stdin() -> Result<HookInput, String> {
-    parse_input(&read_stdin()?)
+    harness::parse_stop(&read_stdin()?)
 }
 
 /// The repo a SessionStart binds in: `--repo` exactly, else the worktree
@@ -1190,54 +1158,24 @@ pub(crate) fn resolve_hook_repo(
     })
 }
 
-/// Writes and flushes the established wire. `presented` is true only for
-/// a continuation that reached the agent's channel; diagnostics and plugin
-/// control present nothing.
+/// Writes and flushes `answer`: whether a presentation reached the agent.
 fn emit_wire(
-    outcome: &HookOutcome,
-    tool: Tool,
+    answer: &harness::Answer,
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
-) -> std::io::Result<(i32, bool)> {
+) -> std::io::Result<bool> {
     use std::io::Write;
-    let (stream, text, code, presented): (&mut dyn Write, std::borrow::Cow<'_, str>, i32, bool) =
-        match (outcome, tool) {
-            (HookOutcome::RenewWait, Tool::OpenCode) => {
-                (stdout, OPENCODE_RENEW_WAIT_WIRE.into(), HOOK_OK_EXIT, false)
-            }
-            (HookOutcome::RenewWait, _) => (
-                stderr,
-                "hook: renew-wait action reached an unsupported adapter".into(),
-                HOOK_OK_EXIT,
-                false,
-            ),
-            (HookOutcome::Continue { reason }, Tool::Claude) => (
-                stderr,
-                reason.as_str().into(),
-                CLAUDE_CONTINUATION_EXIT,
-                true,
-            ),
-            (HookOutcome::Continue { reason }, Tool::Codex) => (
-                stdout,
-                serde_json::to_string(&CodexBlockDecision::from_reason(reason))?.into(),
-                HOOK_OK_EXIT,
-                true,
-            ),
-            (HookOutcome::Continue { reason }, Tool::OpenCode) => {
-                (stdout, reason.as_str().into(), HOOK_OK_EXIT, true)
-            }
-            (HookOutcome::Continue { reason }, Tool::Grok) => {
-                (stderr, reason.as_str().into(), HOOK_OK_EXIT, false)
-            }
-            (HookOutcome::Silent { .. }, _) => return Ok((HOOK_OK_EXIT, false)),
-            (HookOutcome::Diagnostic { message }, _) => {
-                (stderr, message.as_str().into(), HOOK_OK_EXIT, false)
-            }
-        };
+    let Some((stream, text)) = &answer.write else {
+        return Ok(false);
+    };
+    let stream: &mut dyn Write = match stream {
+        Stream::Stdout => stdout,
+        Stream::Stderr => stderr,
+    };
     stream.write_all(text.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    Ok((code, presented))
+    Ok(answer.presented)
 }
 
 /// Frame a Stop's outcome, answer its presentation, and give the exit code.
@@ -1261,18 +1199,15 @@ async fn emit_turn(
             why: SilentReason::StaleBinding,
         };
     }
-    let emission = emit_wire(&outcome, tool, stdout, stderr);
-    let fallback = match (&outcome, tool) {
-        (HookOutcome::Continue { .. }, Tool::Claude) => CLAUDE_CONTINUATION_EXIT,
-        _ => HOOK_OK_EXIT,
-    };
+    let answer = harness::of(tool).answer(&outcome);
+    let emission = emit_wire(&answer, stdout, stderr);
     let result = presentation.map(|id| match &emission {
-        Ok((_, true)) => TurnResult::Delivered { presentation: id },
-        Ok((_, false)) if stale => TurnResult::EmitFailed {
+        Ok(true) => TurnResult::Delivered { presentation: id },
+        Ok(false) if stale => TurnResult::EmitFailed {
             presentation: id,
             why: "the session no longer holds the label".into(),
         },
-        Ok((_, false)) => TurnResult::EmitFailed {
+        Ok(false) => TurnResult::EmitFailed {
             presentation: id,
             why: "nothing reached the agent".into(),
         },
@@ -1284,15 +1219,8 @@ async fn emit_turn(
     if let Some(wait) = wait {
         wait.answer(result).await;
     }
-    match emission {
-        Ok((code, _)) => code,
-        Err(_) => fallback,
-    }
+    answer.exit
 }
-
-/// Plugin-only control wire. It is intercepted before OpenCode's
-/// non-empty stdout is treated as a model prompt.
-const OPENCODE_RENEW_WAIT_WIRE: &str = r#"{"clank":"renew_wait"}"#;
 
 #[cfg(test)]
 #[path = "stop_hook_tests.rs"]

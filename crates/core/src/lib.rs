@@ -40,6 +40,8 @@
 //! - [`hook_io`] — typed Stop-hook stdin (`HookInput`) and the
 //!   adapter's decision (`HookOutcome`); plus the codex
 //!   `{decision:"block",reason:...}` wire shape.
+//! - [`harness`] — one adapter per harness: its hook payloads parsed,
+//!   its behaviour as data with provenance, clank's answers on its wire.
 //! - [`turn_policy`] — the turn-end state machine: what each Stop,
 //!   attendance request, check-in, delivery result and recovery question
 //!   means for one agent's session. Inert until the monitor calls it.
@@ -55,6 +57,7 @@ pub mod api;
 pub mod checkpoint;
 pub mod feedback_body;
 pub mod feedback_view;
+pub mod harness;
 pub mod hook_io;
 pub mod identity;
 pub mod ids;

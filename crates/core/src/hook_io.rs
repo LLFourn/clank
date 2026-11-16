@@ -14,19 +14,9 @@
 //! adapter actually uses; unknown fields are silently ignored
 //! (`#[serde(default)]` + a deny-list of zero extras).
 //!
-//! [`HookOutcome`] is what the stop-hook adapter decides; the
-//! per-tool wire form is the CLI's job to render — see the
-//! `claude_*` / `codex_*` helpers and the [`CodexBlockDecision`]
-//! struct (which serializes to codex's `{"decision":"block",
-//! "reason":"..."}` stdout shape).
-//!
-//! Per-tool exit-code contract (from the plan):
-//!
-//! | Outcome             | Claude                  | Codex                                          |
-//! | ---                 | ---                     | ---                                            |
-//! | `Continue { reason }` | exit 2, stderr=reason | exit 0, stdout=`{decision:"block",reason:...}` |
-//! | `Silent`            | exit 0, no output       | exit 0, no output                              |
-//! | `Diagnostic { msg }` | exit 0, stderr=msg     | exit 0, stderr=msg                             |
+//! [`HookOutcome`] is what the stop-hook adapter decides; each harness's
+//! wire form for it, output and exit code, is its [`crate::harness`]
+//! adapter's.
 
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +63,7 @@ pub struct HookInput {
 /// One entry of a harness's Stop-time task listing: Claude's
 /// `background_tasks`, Grok's `backgroundTasks`.
 ///
-/// Observed shapes (`crates/core/tests/fixtures/stop_hook/`): a subagent is
+/// Observed shapes (`crates/core/tests/fixtures/claude/`): a subagent is
 /// `{id, type: "subagent", status, description, agent_type}` with its name
 /// in `description`; a finished task leaves the list rather than turning
 /// `completed`. Every field is optional, and `raw` keeps the whole entry as
@@ -119,9 +109,8 @@ impl From<serde_json::Value> for BackgroundTask {
 }
 
 /// What the stop-hook adapter decides to emit after evaluating
-/// agent config + work state. CLI maps to per-tool wire output
-/// (see [`claude_continuation_exit_code`],
-/// [`codex_continuation_stdout`]).
+/// agent config + work state; [`crate::harness::Adapter::answer`] puts it
+/// on a harness's wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOutcome {
     /// Resume the agent with `reason` as a continuation prompt.
@@ -243,107 +232,6 @@ mod tests {
         assert!(!parsed.stop_hook_active);
         assert!(parsed.transcript_path.is_none());
         assert!(parsed.last_assistant_message.is_none());
-    }
-
-    fn fixture(name: &str) -> HookInput {
-        let path = format!(
-            "{}/tests/fixtures/stop_hook/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
-    }
-
-    /// Claude's captured Stops: a running subagent is listed by its id and
-    /// name, a finished one leaves an empty list, and a payload without the
-    /// field (codex) is no listing at all rather than an empty one.
-    #[test]
-    fn a_claude_stop_carries_its_listing_and_an_omitted_one_is_none() {
-        let running = fixture("stop_subagent_running.json");
-        let tasks = running.background_tasks.expect("a listing");
-        let [task] = tasks.as_slice() else {
-            panic!("{tasks:?}")
-        };
-        assert_eq!(task.id.as_deref(), Some("a25eee2eef81caf3e"));
-        assert_eq!(task.kind.as_deref(), Some("subagent"));
-        assert_eq!(task.description.as_deref(), Some("capture-probe sleeper"));
-        assert!(task.live());
-        assert_eq!(task.raw["agent_type"], "general-purpose", "kept whole");
-
-        assert_eq!(
-            fixture("stop_subagent_finished.json").background_tasks,
-            Some(vec![])
-        );
-        let bare: HookInput = serde_json::from_str(
-            r#"{"session_id":"session-one","cwd":"/r","stop_hook_active":false}"#,
-        )
-        .unwrap();
-        assert_eq!(bare.background_tasks, None);
-    }
-
-    /// Claude's captured `SubagentStop`s name their subagent, and still
-    /// list it as running in the stop that reports it; the agent's own
-    /// Stop names none. No `SubagentStart` was captured: the last payload
-    /// is the documented shape (the common fields plus `agent_id` and
-    /// `agent_type`), not a recording.
-    #[test]
-    fn a_subagents_hooks_name_it_and_the_agents_do_not() {
-        let parks = fixture("subagent_stop_a_parks.json");
-        assert_eq!(parks.agent_id.as_deref(), Some("a2185a1add00531a0"));
-        let listed: Vec<_> = parks
-            .background_tasks
-            .iter()
-            .flatten()
-            .map(|t| {
-                (
-                    t.id.as_deref().unwrap(),
-                    t.kind.as_deref().unwrap(),
-                    t.live(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            listed,
-            [
-                ("sxc82ytp5", "monitor", true),
-                ("a2185a1add00531a0", "subagent", true),
-                ("aeedcce3823eb5bd2", "subagent", true),
-                ("bl2req1k0", "shell", true),
-            ]
-        );
-        assert_eq!(fixture("stop_a_parked_b_running.json").agent_id, None);
-
-        let started: HookInput = serde_json::from_str(
-            r#"{"session_id":"00000000-0000-0000-0000-000000000000",
-                "transcript_path":"/REDACTED/transcript.jsonl","cwd":"/REDACTED/repo",
-                "hook_event_name":"SubagentStart","agent_id":"a2185a1add00531a0",
-                "agent_type":"general-purpose"}"#,
-        )
-        .unwrap();
-        assert_eq!(started.agent_id.as_deref(), Some("a2185a1add00531a0"));
-        assert_eq!(started.background_tasks, None, "a start lists nothing");
-    }
-
-    #[test]
-    fn hook_input_deserializes_full_codex_payload_ignoring_extras() {
-        // Captured codex stdin. Extras: `turn_id`, `model`,
-        // `permission_mode`, `hook_event_name`.
-        let raw = r#"{
-            "session_id": "019e5385-ed97-7603-8561-dd9024328ff9",
-            "turn_id": "019e5386-1684-7250-a7fc-1823f4b8c1be",
-            "transcript_path": "/Users/llfourn/.codex/sessions/rollout.jsonl",
-            "cwd": "/private/tmp/clank-hook-experiment/codex",
-            "hook_event_name": "Stop",
-            "model": "gpt-5.5",
-            "permission_mode": "default",
-            "stop_hook_active": false,
-            "last_assistant_message": "Hello. How can I help?"
-        }"#;
-        let parsed: HookInput = serde_json::from_str(raw).unwrap();
-        assert_eq!(
-            parsed.session_id,
-            sid("019e5385-ed97-7603-8561-dd9024328ff9")
-        );
-        assert!(!parsed.stop_hook_active);
     }
 
     #[test]

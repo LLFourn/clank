@@ -2425,11 +2425,11 @@ async fn the_loop_gives_up_a_presentation_its_carrier_never_answered_for() {
     );
 }
 
-/// A payload recorded under `core/tests/fixtures/stop_hook/`, as Claude
+/// A payload recorded under `core/tests/fixtures/claude/`, as Claude
 /// would send it for [`SESSION`] working in `root`.
 fn recorded_payload(fixture: &str, root: &std::path::Path) -> serde_json::Value {
     let path = format!(
-        "{}/../core/tests/fixtures/stop_hook/{fixture}",
+        "{}/../core/tests/fixtures/claude/{fixture}",
         env!("CARGO_MANIFEST_DIR")
     );
     let mut payload: serde_json::Value =

@@ -5,17 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct Hook {
-    pub cwd: String,
-    pub session_id: String,
-    pub prompt_id: String,
-    pub hook_event_name: String,
-    pub tool_name: String,
-    pub tool_input: Value,
-    pub tool_use_id: Option<String>,
-    pub tool_response: Option<Value>,
-}
+pub(crate) use clank_core::harness::claude::QuestionHook as Hook;
+use clank_core::harness::claude::{Question, parse_question_hook};
 #[derive(Deserialize, Serialize)]
 pub(crate) struct Frame {
     pub(crate) proto: u32,
@@ -30,33 +21,28 @@ pub(crate) struct HookReply {
 /// Convert native evidence to a control message. No question state is read or
 /// written here, including when no browser broker is running.
 ///
-/// Only an `AskUserQuestion` PreToolUse, PostToolUse or PostToolUseFailure
-/// with a `tool_use_id` is evidence; anything else is `None` before the repo
-/// or the binding is looked up, so it can fail no routing.
+/// Only what the adapter reads as a question asked or returned is
+/// evidence; anything else is `None` before the repo or the binding is
+/// looked up, so it can fail no routing.
 pub(crate) fn evidence(
     hook: &Hook,
 ) -> Result<Option<(std::path::PathBuf, super::monitor::Control)>> {
     use super::question_state::{Key, Observation, input_hash};
-    if hook.tool_name != "AskUserQuestion" {
+    let Some(question) = hook.question() else {
         return Ok(None);
-    }
-    let (asked, id) = match (hook.hook_event_name.as_str(), &hook.tool_use_id) {
-        ("PreToolUse", Some(id)) => (true, id),
-        ("PostToolUse" | "PostToolUseFailure", Some(id)) => (false, id),
-        _ => return Ok(None),
     };
-    let key = Key {
+    let key = |tool_use: &str| Key {
         session: hook.session_id.clone(),
         prompt: hook.prompt_id.clone(),
-        tool_use: id.clone(),
+        tool_use: tool_use.to_string(),
     };
-    let observation = match asked {
-        true => Observation::Asked {
-            key,
-            header: header_of(&hook.tool_input),
+    let observation = match question {
+        Question::Asked { tool_use, header } => Observation::Asked {
+            key: key(tool_use),
+            header,
             input: input_hash(&hook.tool_input),
         },
-        false => Observation::Result { key },
+        Question::Returned { tool_use } => Observation::Result { key: key(tool_use) },
     };
     let repo = super::resolve_cwd_repo(Path::new(&hook.cwd))?;
     let session = clank_core::SessionId::parse(&hook.session_id)?;
@@ -69,22 +55,6 @@ pub(crate) fn evidence(
             observation,
         },
     )))
-}
-
-/// One line saying what is asked: the first question's header, or else its
-/// first line.
-fn header_of(input: &Value) -> String {
-    let first = input.pointer("/questions/0");
-    let pick = |key: &str| {
-        first
-            .and_then(|q| q.get(key))
-            .and_then(|v| v.as_str())
-            .map(|s| s.lines().next().unwrap_or_default().trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-    pick("header")
-        .or_else(|| pick("question"))
-        .unwrap_or_else(|| "a question".into())
 }
 
 /// One observation on its way to the monitor: what `question-hook
@@ -195,7 +165,7 @@ async fn deliver(
 /// Claude's own prompt. Evidence is handed to `child` first and never
 /// waited for; a diagnostic about it goes to `err`.
 async fn answer(input: &str, child: &impl HandOff, err: &mut impl std::io::Write) -> Value {
-    if let Ok(hook) = serde_json::from_str::<Hook>(input) {
+    if let Ok(hook) = parse_question_hook(input) {
         match evidence(&hook) {
             Ok(Some((repo, request))) => {
                 if let Err(e) = child.hand_off(&Delivery { repo, request }) {
@@ -215,7 +185,7 @@ async fn answer(input: &str, child: &impl HandOff, err: &mut impl std::io::Write
 async fn broker(input: &str) -> Result<Value> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let hook: Hook = serde_json::from_str(input)?;
+    let hook = parse_question_hook(input)?;
     let repo = crate::cli::resolve_cwd_repo(Path::new(&hook.cwd))?;
     let path = crate::cli::monitor::runtime_path(&repo, "claude-questions.sock");
     let meta = std::fs::symlink_metadata(&path)?;
@@ -223,7 +193,7 @@ async fn broker(input: &str) -> Result<Value> {
         meta.file_type().is_socket() && meta.uid() == rustix::process::geteuid().as_raw(),
         "untrusted question socket"
     );
-    let parked = hook.hook_event_name == "PermissionRequest";
+    let parked = hook.waits_for_a_decision();
     let frame = Frame {
         proto: 1,
         input: hook,

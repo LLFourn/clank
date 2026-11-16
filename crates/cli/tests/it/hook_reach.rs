@@ -180,12 +180,6 @@ struct Unfollowable {
 
 const UNFOLLOWABLE: &[Unfollowable] = &[
     Unfollowable {
-        at: "crate::cli::grok_hook::blocking",
-        form: "json!",
-        subject: "json!",
-        why: "builds Grok's block decision from the reason it is given",
-    },
-    Unfollowable {
         at: "crate::cli::question_hook::answer",
         form: "json!",
         subject: "json!",
@@ -202,12 +196,6 @@ const UNFOLLOWABLE: &[Unfollowable] = &[
         form: "json!",
         subject: "json!",
         why: "frames what the monitor heard",
-    },
-    Unfollowable {
-        at: "crate::cli::stop_hook::session_start_payload",
-        form: "json!",
-        subject: "json!",
-        why: "frames the monitor's items as SessionStart context",
     },
     Unfollowable {
         at: "crate::cli::monitor::connect_within",

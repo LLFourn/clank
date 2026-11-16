@@ -667,16 +667,6 @@ pub enum DeadlineVerdict {
     Failed(String),
 }
 
-pub fn deadline_verdict(tool: Tool) -> DeadlineVerdict {
-    match tool {
-        Tool::Claude | Tool::Codex => DeadlineVerdict::ReArm,
-        Tool::OpenCode => DeadlineVerdict::RenewWait,
-        Tool::Grok => DeadlineVerdict::Failed(
-            "hook: Grok native handoffs do not use the in-hook wait route".into(),
-        ),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttendRequest {
     /// A `clank run` registering the process it is about to become.
@@ -1345,7 +1335,10 @@ impl SessionState {
         }
         let mut gone = gone.into_iter();
         self.retain_entries(|_| !gone.next().unwrap_or(false));
-        if !tool.reports_background_completion() {
+        if !crate::harness::of(tool)
+            .behaviour
+            .reports_background_completion
+        {
             self.feedback
                 .extend(ended.into_iter().map(|desc| Notice::RunEnded { desc }));
         }
@@ -1659,8 +1652,8 @@ impl SessionState {
         if let Some(gated) = drive_gate(facts) {
             return gated;
         }
-        if report.tool == Tool::Grok {
-            return grok_verdict();
+        if let Some(why) = crate::harness::of(report.tool).no_in_hook_wait() {
+            return Verdict::Failed(why);
         }
         let verdict = release_for_user_command(
             self.deliver_or_park(facts, Some(&report.place), Carrier::Stop),
@@ -1775,8 +1768,8 @@ impl SessionState {
         if let Some(gated) = drive_gate(facts) {
             return gated;
         }
-        if report.tool == Tool::Grok {
-            return grok_verdict();
+        if let Some(why) = crate::harness::of(report.tool).no_in_hook_wait() {
+            return Verdict::Failed(why);
         }
         let verdict = release_for_user_command(
             self.deliver_or_park(facts, Some(&report.place), carrier),
@@ -2307,10 +2300,6 @@ fn release_for_user_command(verdict: Verdict, facts: &Facts<'_>) -> Verdict {
         Verdict::Park if facts.user_command => Verdict::Silent(SilentWhy::UserCommand),
         other => other,
     }
-}
-
-fn grok_verdict() -> Verdict {
-    Verdict::Failed("hook: Grok native handoffs do not use the in-hook wait route".into())
 }
 
 fn owed_identities(owed: &[OwedItem]) -> Vec<String> {

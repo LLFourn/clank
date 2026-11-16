@@ -1,0 +1,5 @@
+{
+  "tool": "opencode",
+  "note": "No payload has been recorded. OpenCode's Stop is written by clank's own plugin (crates/cli/src/cli/setup_assets/opencode_plugin.js), so the adapter's tests use synthetic payloads in the plugin's shape, labelled as such.",
+  "recorded": []
+}

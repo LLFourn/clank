@@ -11,39 +11,26 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use clank_core::harness::grok::{self, Event as Input, Kind};
 use clank_core::turn_policy::TaskSnapshot;
-use clank_core::{AgentLabel, BackgroundTask, SessionId, Tool};
-use serde::Deserialize;
+use clank_core::{AgentLabel, Tool};
 
 use super::turn_wire::{Frame, Report, WireVerdict};
 use crate::agent_env::{Ambient, Process};
 use crate::agent_store::binding_matches;
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Input {
-    hook_event_name: String,
-    session_id: SessionId,
-    cwd: PathBuf,
-    reason: Option<String>,
-    subagent_type: Option<String>,
-    #[serde(default)]
-    stop_hook_active: bool,
-    #[serde(default)]
-    background_tasks: Option<Vec<BackgroundTask>>,
-}
-
 /// Route one native event: bind or release on the session's ends, and for
 /// a bound Stop that ended a turn, the label it reports for.
 fn route(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<AgentLabel>> {
-    if input.subagent_type.is_some() {
+    let kind = input.kind();
+    if kind == Kind::Subagent {
         return Ok(None);
     }
     ensure!(
         super::resolve_cwd_repo(&input.cwd)? == repo,
         "native Grok cwd does not match the Clank repository"
     );
-    if input.hook_event_name == "session_start" {
+    if kind == Kind::SessionStart {
         let launched_as = crate::agent_env::explicit_label_in(env)?;
         if let crate::agent_env::Start::Bootstrap(label) = crate::agent_env::session_start(
             repo,
@@ -58,14 +45,14 @@ fn route(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<AgentLa
     let Some(label) = crate::agent_env::bound_agent(repo, Tool::Grok, &input.session_id)? else {
         return Ok(None);
     };
-    if input.hook_event_name == "session_end" {
-        crate::agent_store::release_binding(repo, &label, &input.session_id)?;
-        return Ok(None);
+    match kind {
+        Kind::SessionEnd => {
+            crate::agent_store::release_binding(repo, &label, &input.session_id)?;
+            Ok(None)
+        }
+        Kind::TurnEnd => Ok(Some(label)),
+        Kind::Subagent | Kind::SessionStart | Kind::Other => Ok(None),
     }
-    if input.hook_event_name != "stop" || input.reason.as_deref() != Some("end_turn") {
-        return Ok(None);
-    }
-    Ok(Some(label))
 }
 
 /// The repo a hook acts for: `--repo` exactly, else the worktree holding
@@ -115,8 +102,7 @@ pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
             bytes.len() <= 1024 * 1024,
             "native Grok hook input exceeds 1 MiB"
         );
-        let input: Input =
-            serde_json::from_slice(&bytes).context("unsupported native Grok hook payload")?;
+        let input = grok::parse(&bytes).context("unsupported native Grok hook payload")?;
         let repo = hook_repo(args.repo.as_deref(), &input.cwd)?;
         if !repo.join(".clank").is_dir() {
             return Ok(None);
@@ -209,10 +195,10 @@ fn still_bound(repo: &Path, label: &AgentLabel, session: &str, frame: Frame) -> 
 pub(super) fn wire(frame: &Frame) -> (Option<String>, Option<String>) {
     match &frame.verdict {
         WireVerdict::Notify | WireVerdict::Deliver { .. } => (
-            Some(blocking(frame.rendered.as_deref().unwrap_or_default())),
+            Some(grok::block(frame.rendered.as_deref().unwrap_or_default())),
             None,
         ),
-        WireVerdict::Unanswered { .. } => (Some(blocking(super::wake_render::ARM_WAIT)), None),
+        WireVerdict::Unanswered { .. } => (Some(grok::block(super::wake_render::ARM_WAIT)), None),
         WireVerdict::Silent { .. } => (None, None),
         WireVerdict::Diagnostic { message } => (
             None,
@@ -228,15 +214,6 @@ pub(super) fn wire(frame: &Frame) -> (Option<String>, Option<String>) {
             )),
         ),
     }
-}
-
-/// A Stop blocked with `reason`, which continues the turn with it.
-fn blocking(reason: &str) -> String {
-    serde_json::json!({
-        "decision": "block",
-        "reason": reason,
-    })
-    .to_string()
 }
 
 #[cfg(test)]
