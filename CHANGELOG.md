@@ -7,6 +7,13 @@ All notable changes to clank are recorded here. The format follows
 
 ## [Unreleased]
 
+### Breaking
+
+- Blocks left in the per-agent layout (`.clank/agents/<label>/blocks`,
+  `unblocks` and `blocks.lock`) are no longer migrated or read. Ask any that
+  are still pending again; the old directories and `.clank/block-migration.json`
+  can be deleted. `clank block migrate` is removed.
+
 ## [0.2.0]
 
 The first published release of clank. The previous `0.1.0` version identified

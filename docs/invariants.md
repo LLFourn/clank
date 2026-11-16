@@ -41,12 +41,14 @@ whether its assertions protect the invariant. Reviewers check that.
   `crates/cli/src/cli/monitor_turn_tests.rs::a_codex_run_ending_wakes_its_parked_agent`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_codex_run_ending_is_never_told_to_a_rebound_session`
 
-## I2. Reading durable state has no side effects.
+## I2. Reading blocks never changes them.
 
 - Why: a read that writes can wedge every reader on one bad file.
-- Status: target
-- Today: `block::lock()` runs the legacy block migration on every read.
-- Plans: blocks-have-no-migration
+- Status: holds
+- Scope: a block read takes the repository's block lock and nothing else; it
+  never migrates, repairs or rewrites block files. Other stores are not yet
+  audited for reads with side effects.
+- Tests: `crates/cli/src/cli/block/repo_tests.rs::per_agent_block_files_are_ignored_and_left_alone`
 
 ## I3. Inbox events are at-least-once until acked; everything else is best effort.
 

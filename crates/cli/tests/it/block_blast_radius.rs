@@ -80,11 +80,8 @@ fn idle_env() -> TestEnv {
 
 /// A question for a human, as `clank block` leaves one.
 fn block(repo: &Path, agent: &str, name: &str, question: &str) {
-    write(
-        repo,
-        &format!(".clank/agents/{agent}/blocks/{name}.md"),
-        question,
-    );
+    write(repo, &format!(".clank/blocks/{name}.md"), question);
+    write(repo, &format!(".clank/blocks/{name}.creator"), agent);
 }
 
 fn send(repo: &Path, to: &str, body: &str) {
@@ -202,7 +199,7 @@ async fn an_answered_block_leads_with_the_answer() {
     block(repo, "master", "q", "should I?");
     // The answer file, where the scanner looks for it: a `<name>.md`
     // under `unblocks/` beside the `blocks/` entry it answers.
-    write(repo, ".clank/agents/master/unblocks/q.md", "yes");
+    write(repo, ".clank/unblocks/q.md", "yes");
 
     let items = peek(repo, "master").await;
 
@@ -270,7 +267,7 @@ async fn inspecting_an_answer_receives_nothing() {
     let env = idle_env();
     let repo = env.repo();
     block(repo, "master", "legacy", "should I?");
-    write(repo, ".clank/agents/master/unblocks/legacy.md", "yes");
+    write(repo, ".clank/unblocks/legacy.md", "yes");
     clank::cli::block::run(clank::cli::BlockArgs {
         command: clank::cli::BlockCmd::Ask(clank::cli::BlockCreateArgs {
             name: "current".into(),
@@ -297,7 +294,7 @@ async fn inspecting_an_answer_receives_nothing() {
     let snapshot = || {
         let mut files: Vec<(std::path::PathBuf, Vec<u8>)> = ["blocks", "unblocks"]
             .iter()
-            .flat_map(|d| std::fs::read_dir(repo.join(".clank/agents/master").join(d)).unwrap())
+            .flat_map(|d| std::fs::read_dir(repo.join(".clank").join(d)).unwrap())
             .flatten()
             .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
             .collect();

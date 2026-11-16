@@ -1,7 +1,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use super::{BlockArgs, BlockCmd, BlockCreateArgs, BlockMigrateArgs, UnblockArgs, resolve_repo};
+use super::{BlockArgs, BlockCmd, BlockCreateArgs, UnblockArgs, resolve_repo};
 use crate::agent_store::agents_root;
 use crate::cli::nudge_log::Outcome;
 use clank_core::wait::AnswerRef;
@@ -11,12 +11,9 @@ pub async fn run(args: BlockArgs) -> anyhow::Result<()> {
         BlockCmd::Ask(a) => run_create(a).await,
         BlockCmd::Answer(a) => run_unblock(a).await,
         BlockCmd::Clean(a) => run_clean(a).await,
-        BlockCmd::Migrate(a) => run_migrate(a).await,
         BlockCmd::List(a) => list(a.repo.as_deref()),
     }
 }
-
-mod migration;
 
 fn root(repo: &Path) -> PathBuf {
     repo.join(".clank")
@@ -25,12 +22,6 @@ fn root(repo: &Path) -> PathBuf {
 fn hold_roster(repo: &Path) -> anyhow::Result<std::fs::File> {
     std::fs::create_dir_all(root(repo))?;
     crate::agent_store::exclusive_lock(&root(repo).join("config.lock"))
-}
-
-async fn run_migrate(args: BlockMigrateArgs) -> anyhow::Result<()> {
-    let repo = resolve_repo(args.repo.as_deref())?;
-    let _lock = raw_lock(&repo)?;
-    migration::run(&repo, args.dry)
 }
 
 /// No identity is needed to inspect repository decisions, including received
@@ -655,15 +646,9 @@ fn question_names(agent_dir: &Path) -> Vec<String> {
 
 /// Serializes every read-compare-write of repository blocks: ask, answer,
 /// clean and receive.
-fn raw_lock(repo: &Path) -> anyhow::Result<std::fs::File> {
+pub(crate) fn lock(repo: &Path) -> anyhow::Result<std::fs::File> {
     std::fs::create_dir_all(root(repo))?;
     crate::agent_store::exclusive_lock(&root(repo).join("blocks.lock"))
-}
-
-pub(crate) fn lock(repo: &Path) -> anyhow::Result<std::fs::File> {
-    let guard = raw_lock(repo)?;
-    migration::run(repo, false)?;
-    Ok(guard)
 }
 
 fn publish(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -725,6 +710,15 @@ pub(crate) fn test_master(repo: &Path, fallback: &clank_core::AgentLabel) {
         )
         .unwrap();
     }
+}
+
+/// `creator`'s question `name`, written as the repository stores it.
+#[cfg(test)]
+pub(crate) fn asked(repo: &Path, creator: &str, name: &str, question: &str) {
+    let f = files(&root(repo), name);
+    std::fs::create_dir_all(root(repo).join("blocks")).unwrap();
+    std::fs::write(&f.question, question).unwrap();
+    std::fs::write(&f.creator, creator).unwrap();
 }
 
 /// Ask `question` as a new plain occurrence of `name`.
@@ -1404,8 +1398,8 @@ impl Stored<Attempt> {
 }
 
 /// Every block not yet received, pending or answered, and every one
-/// whose state cannot be read. Migrates legacy custody first; otherwise it
-/// neither receives answers nor removes questions.
+/// whose state cannot be read. It neither receives answers nor removes
+/// questions.
 pub fn scan_blocks(repo: &Path) -> Vec<BlockEntry> {
     // Inspecting an ordinary Git repo must not initialize Clank storage.
     if !root(repo).exists() {
@@ -1532,8 +1526,7 @@ pub(crate) struct OwedAnswer {
     pub(crate) carries: AnswerRef,
 }
 
-/// Decisions owed to the current master, by name. Legacy custody is migrated
-/// first. Delivery to a different session never proves this one received it;
+/// Decisions owed to the current master, by name. Delivery to a different session never proves this one received it;
 /// unreadable disposition stays unresolved rather than being delivered again.
 pub(crate) fn owed_answers(repo: &Path, agent: &clank_core::AgentLabel) -> Vec<OwedAnswer> {
     if master(repo).ok().as_ref() != Some(agent) {
@@ -1567,8 +1560,10 @@ mod tests {
     #[test]
     fn scan_finds_repo_block() {
         let dir = tempfile::tempdir().unwrap();
-        write(
-            &dir.path().join(".clank/agents/alice/blocks/fix-api.md"),
+        asked(
+            dir.path(),
+            "alice",
+            "fix-api",
             "What should the return type be?",
         );
         let blocks = scan_blocks(dir.path());
@@ -1580,28 +1575,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_migrates_legacy_plan_scoped_questions_without_losing_them() {
-        // Even an old plan-scoped question survives the ownership migration.
-        let dir = tempfile::tempdir().unwrap();
-        write(
-            &dir.path()
-                .join(".clank/agents/bob/blocks/auth/need-creds.md"),
-            "Which OAuth provider?",
-        );
-        let blocks = scan_blocks(dir.path());
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].name, "need-creds");
-    }
-
-    #[test]
     fn scan_includes_answer_when_unblock_exists() {
         let dir = tempfile::tempdir().unwrap();
+        asked(dir.path(), "alice", "fix-api", "What type?");
         write(
-            &dir.path().join(".clank/agents/alice/blocks/fix-api.md"),
-            "What type?",
-        );
-        write(
-            &dir.path().join(".clank/agents/alice/unblocks/fix-api.md"),
+            &dir.path().join(".clank/unblocks/fix-api.md"),
             "Use Result<T>",
         );
         let blocks = scan_blocks(dir.path());
@@ -1613,10 +1591,7 @@ mod tests {
     fn answer_requires_current_question_and_records_once() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        write(
-            &repo.join(".clank/agents/alice/blocks/why.md"),
-            "Which option?",
-        );
+        asked(repo, "alice", "why", "Which option?");
         assert!(answer_block(repo, "why", " ", None).is_err());
         assert!(answer_block(repo, "../why", "yes", None).is_err());
         assert!(answer_block(repo, "missing", "yes", None).is_err());
@@ -1700,10 +1675,7 @@ mod tests {
             ("claude", "first", "question one"),
             ("codex", "second", "question two"),
         ] {
-            write(
-                &root.join(format!(".clank/agents/{agent}/blocks/{name}.md")),
-                q,
-            );
+            asked(root, agent, name, q);
         }
 
         run_unblock(crate::cli::UnblockArgs {
@@ -1726,7 +1698,7 @@ mod tests {
         assert_eq!(open.len(), 1, "the other agent's question stays open");
         assert_eq!(open[0].creator, "codex");
         assert!(
-            !root.join(".clank/agents/codex/unblocks/second.md").exists(),
+            !root.join(".clank/unblocks/second.md").exists(),
             "no canned answer written under the untouched question"
         );
     }
@@ -3341,7 +3313,7 @@ mod tests {
     #[test]
     fn scan_returns_sorted_by_repository_name() {
         let dir = tempfile::tempdir().unwrap();
-        write(&dir.path().join(".clank/agents/bob/blocks/z.md"), "q");
+        asked(dir.path(), "bob", "z", "q");
         write(&dir.path().join(".clank/blocks/b.md"), "q");
         write(&dir.path().join(".clank/blocks/a.md"), "q");
         let blocks = scan_blocks(dir.path());

@@ -9599,9 +9599,7 @@ mod recovery_tests {
 
         // A count that still describes the agent survives folds, a standing
         // block included; a change of session or of block clears it.
-        let dir = crate::agent_store::agents_root(repo.path()).join("codex");
-        std::fs::create_dir_all(dir.join("blocks")).unwrap();
-        std::fs::write(dir.join("blocks/mic.md"), "Which microphone?").unwrap();
+        crate::cli::block::asked(repo.path(), "codex", "mic", "Which microphone?");
         let owed_now = || {
             owed_items(
                 repo.path(),
@@ -9870,17 +9868,12 @@ mod recovery_tests {
 
         // Every repository block holds an otherwise idle agent; unrelated
         // work still wakes it regardless of who asked the question.
-        let blocks = |who: &str| {
-            let dir = crate::agent_store::agents_root(repo.path())
-                .join(who)
-                .join("blocks");
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
-        };
-        std::fs::write(blocks("claude").join("stork.md"), "Which take?").unwrap();
+        let ask =
+            |who: &str, name: &str, q: &str| crate::cli::block::asked(repo.path(), who, name, q);
+        ask("claude", "stork", "Which take?");
         assert!(crate::cli::wait::blocked(repo.path(), &codex));
         assert_eq!(gate(&[]), Gate::Hold, "the repository waits for the human");
-        std::fs::write(blocks("codex").join("mine.md"), "Which way?").unwrap();
+        ask("codex", "mine", "Which way?");
         assert_eq!(gate(&[]), Gate::Hold, "its own block");
     }
 
@@ -9916,9 +9909,7 @@ mod recovery_tests {
                 &clank_core::ids::SessionId::parse("session-one").unwrap(),
             )
             .unwrap();
-            let blocks = crate::agent_store::agents_root(repo.path()).join("claude/blocks");
-            std::fs::create_dir_all(&blocks).unwrap();
-            std::fs::write(blocks.join("stork-retakes.md"), "Which takes?").unwrap();
+            crate::cli::block::asked(repo.path(), "claude", "stork-retakes", "Which takes?");
             let record = repo.path().join("rollout.jsonl");
             append(&record, &STARTED.replace("\"T\"", "\"t1\""));
             let turns = crate::cli::turn_custody::Turns::new(repo.path().to_path_buf());
@@ -16753,15 +16744,14 @@ mod tests {
         let repo = repo_with_roster();
         with_source(repo.path(), "codex", "deploys");
         let codex = AgentLabel::parse("codex").unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo.path()).join("codex");
-        std::fs::create_dir_all(agent_dir.join("blocks")).unwrap();
-        std::fs::write(
-            agent_dir.join("blocks/why-is-this-here.md"),
+        crate::cli::block::asked(
+            repo.path(),
+            "codex",
+            "why-is-this-here",
             "# why is this here\n\nasking the human\n",
-        )
-        .unwrap();
+        );
 
-        let events = agent_dir.join("events");
+        let events = crate::agent_store::agents_root(repo.path()).join("codex/events");
         let key = match &hostable(repo.path(), &codex).unwrap()[0].0 {
             clank_core::agent_config::WaitEventSource::Command(c) => c.source_key(),
             other => panic!("the fixture declares a command source, got {other:?}"),

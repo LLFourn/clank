@@ -865,9 +865,7 @@ const FOLLOWED_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_message_owed_behind_anothers_block_is_delivered_by_the_monitor_replacing_two_lost() {
     let (repo, author, _timer) = timer_repo();
-    let blocks = repo.path().join(".clank/agents/codex/blocks");
-    std::fs::create_dir_all(&blocks).unwrap();
-    std::fs::write(blocks.join("which-way.md"), "which way?").unwrap();
+    crate::cli::block::asked(repo.path(), "codex", "which-way", "which way?");
     assert!(
         crate::cli::wait::blocked(repo.path(), &author),
         "the block is what a fold of the child's own would have parked on"

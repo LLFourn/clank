@@ -79,7 +79,6 @@ const DECLARED: &[&str] = &[
     "blocks",
     "unblocks",
     "blocks.lock",
-    "block-migration.json",
     "stash",
     "shelved",
     "cache",

@@ -7195,9 +7195,7 @@ mod tests {
     fn pending_block_suppresses_and_surfaces_itself() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        let blocks = repo.join(".clank/agents/claude/blocks");
-        std::fs::create_dir_all(&blocks).unwrap();
-        std::fs::write(blocks.join("q.md"), "why?").unwrap();
+        crate::cli::block::asked(repo, "claude", "q", "why?");
 
         let br = check_blocks(repo, &AgentLabel::parse("claude").unwrap());
 
@@ -7220,10 +7218,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         crate::cli::block::test_master(repo, &AgentLabel::parse("claude").unwrap());
-        let agent = repo.join(".clank/agents/claude");
-        std::fs::create_dir_all(agent.join("blocks")).unwrap();
-        std::fs::create_dir_all(agent.join("unblocks")).unwrap();
-        std::fs::write(agent.join("blocks/q.md"), "why?").unwrap();
+        crate::cli::block::asked(repo, "claude", "q", "why?");
         let before = check_blocks(repo, &AgentLabel::parse("claude").unwrap());
         assert!(matches!(
             before.items.as_slice(),

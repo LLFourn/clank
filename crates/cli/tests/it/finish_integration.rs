@@ -135,11 +135,7 @@ fn finish_force_still_refuses_an_open_block() {
     let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
     commit(repo, "[foo] intro");
-    write(
-        repo,
-        ".clank/agents/codex/blocks/which-api.md",
-        "Which API shape?\n",
-    );
+    write(repo, ".clank/blocks/which-api.md", "Which API shape?\n");
 
     let mut args = finish_args(repo, "foo", None);
     args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
@@ -159,11 +155,7 @@ fn finish_refuses_an_open_block_on_a_master_only_repo() {
     let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
     commit(repo, "[foo] intro");
-    write(
-        repo,
-        ".clank/agents/claude/blocks/which-api.md",
-        "Which API shape?\n",
-    );
+    write(repo, ".clank/blocks/which-api.md", "Which API shape?\n");
 
     let mut args = finish_args(repo, "foo", None);
     args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
@@ -195,11 +187,7 @@ fn finish_refuses_an_open_block_even_when_the_gate_is_finished() {
         &format!(".clank/agents/codex/feedback/{}.md", &intro[..7]),
         "FINISHED ship it\n",
     );
-    write(
-        repo,
-        ".clank/agents/codex/blocks/which-api.md",
-        "Which API shape?\n",
-    );
+    write(repo, ".clank/blocks/which-api.md", "Which API shape?\n");
 
     let mut args = finish_args(repo, "foo", None);
     args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
@@ -1417,9 +1405,7 @@ fn an_answered_block_never_holds_finish() {
     block_on(clank::cli::finish::run(args)).expect("answered blocks hold nothing");
     assert!(repo.join(".clank/finished/foo.md").exists());
     assert!(
-        !repo
-            .join(".clank/agents/claude/unblocks/answered.received")
-            .exists(),
+        !repo.join(".clank/unblocks/answered.received").exists(),
         "finish went ahead without a receipt"
     );
 }

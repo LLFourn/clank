@@ -758,9 +758,7 @@ mod tests {
     #[tokio::test]
     async fn block_answers_require_the_current_question_and_are_single_use() {
         let repo = git_repo();
-        let question = repo.path().join(".clank/agents/claude/blocks/why.md");
-        std::fs::create_dir_all(question.parent().unwrap()).unwrap();
-        std::fs::write(&question, "Which option?").unwrap();
+        crate::cli::block::asked(repo.path(), "claude", "why", "Which option?");
         let backend = backend(repo.path(), None);
         let answer = |question: &str, answer: &str| BrowserRequest::BlockAnswer {
             name: "why".into(),

@@ -146,12 +146,12 @@ async fn for_stopped_fires_on_a_new_block_and_ignores_preexisting() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "seed"]);
     // An already-pending block is baseline, not an event.
-    write(repo, ".clank/agents/claude/blocks/pre.md", "old question\n");
+    write(repo, ".clank/blocks/pre.md", "old question\n");
 
     assert_ignores_preexisting(repo, WaitFor::Stopped, "pre-existing block is baseline").await;
 
     fires_after(repo, WaitFor::Stopped, |repo| {
-        write(repo, ".clank/agents/claude/blocks/new-q.md", "which way?\n");
+        write(repo, ".clank/blocks/new-q.md", "which way?\n");
     })
     .await;
 }
