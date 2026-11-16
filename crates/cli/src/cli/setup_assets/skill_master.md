@@ -26,6 +26,9 @@ review gate.
   Use `clank block` ONLY when reviews are contentious, the plan is
   drifting from user intent, or the work seems unwise.
 - You never WRITE verdicts. You read feedback and act on the gate state.
+- **Name the invariants a plan touches**, when the repo keeps a
+  `docs/invariants.md` registry. A plan names each one it touches, and the
+  commit that changes an entry's status updates the entry.
 
 ### Commit tagging
 

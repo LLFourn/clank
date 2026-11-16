@@ -36,6 +36,7 @@ mod html_integration;
 mod identity_env_boundary;
 mod inbox_wakes;
 mod install_script;
+mod invariants_registry;
 mod no_json_literal_config_writes;
 mod no_ngrok;
 mod no_orphan_doc_comments;

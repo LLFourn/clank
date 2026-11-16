@@ -2857,14 +2857,17 @@ mod tests {
         // and how its tool starts a run without blocking
         // (all-background-work-is-attended), and by the 21B it costs to
         // say what ends a declaration on each tool
-        // (declared-work-ends-by-the-harness-listing).
-        const CEILING: usize = 6_175;
+        // (declared-work-ends-by-the-harness-listing), and by the 139B
+        // that sends reviewers to the invariant registry
+        // (invariants-are-written-down).
+        const CEILING: usize = 6_325;
         let len = compose_skill(Role::Reviewer, Tool::Codex).len();
         assert!(
             len <= CEILING,
             "codex reviewer skill is {len}B, over the {CEILING}B ceiling (5,667B \
              before compression, 5,300B until the inbox, 5,600B until standby, 5,700B \
-             until marking background work, 6,150B until per-tool declaration ends) — \
+             until marking background work, 6,150B until per-tool declaration ends, \
+             6,175B until the invariant registry) — \
              re-read in full every reviewing turn, so growth here is paid again \
              on every wake"
         );
