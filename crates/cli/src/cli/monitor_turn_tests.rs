@@ -2786,3 +2786,166 @@ async fn the_subagent_hooks_hold_a_parked_agents_work_and_release_it_with_no_sto
         let _ = writer.await;
     }
 }
+
+const OTHER_SESSION: &str = "session-other";
+
+/// [`owed_repo`] with a second agent, `other`, bound to [`OTHER_SESSION`],
+/// and `claude` told of an outage.
+async fn two_agents_claude_told() -> (TempRepo, [AgentLabel; 2], crate::repo_state::RepoState) {
+    let (repo, claude, timer) = timer_repo();
+    log_timer_event(repo.path(), &timer);
+    let other = AgentLabel::parse("other").unwrap();
+    crate::cli::agent::add_repo_roster_agent(
+        repo.path(),
+        &other,
+        crate::cli::teams_config::AgentDescription {
+            tool: clank_core::Tool::Claude,
+            launch: None,
+            initial_prompt: None,
+        },
+        crate::cli::teams_config::RosterRole::Commit,
+    )
+    .unwrap();
+    crate::agent_store::bind_session_to_agent(
+        repo.path(),
+        &other,
+        clank_core::Tool::Claude,
+        &clank_core::SessionId::parse(OTHER_SESSION).unwrap(),
+    )
+    .unwrap();
+    crate::agent_store::update_agent_config(repo.path(), &claude, |config| {
+        config.outage_notified = Some(clank_core::agent_config::OutageNotified {
+            session: clank_core::SessionId::parse(SESSION).unwrap(),
+            at: "2026-11-16T00:00:00Z".into(),
+        });
+    })
+    .unwrap();
+    let state = folded(repo.path()).await.unwrap();
+    (repo, [claude, other], state)
+}
+
+fn told(repo: &std::path::Path, author: &AgentLabel) -> bool {
+    crate::agent_store::load_agent_config(repo, author)
+        .unwrap()
+        .is_some_and(|cfg| cfg.outage_notified.is_some())
+}
+
+/// Serve each agent's first Stop over a real writer, then retire, on a
+/// thread of its own; what each agent's end of its socket read comes back.
+/// `None` when that took longer than any serve can, which is the monitor
+/// waiting on a lock.
+fn served_then_retired(
+    repo: &std::path::Path,
+    state: crate::repo_state::RepoState,
+    authors: &[AgentLabel; 2],
+) -> Option<(Shutdown, Vec<String>)> {
+    let (repo, authors) = (repo.to_path_buf(), authors.clone());
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let mut clients = Vec::new();
+                let mut theirs = Vec::new();
+                for (conn, (author, session)) in
+                    authors.iter().zip([SESSION, OTHER_SESSION]).enumerate()
+                {
+                    let (ours, their) = tokio::net::UnixStream::pair().unwrap();
+                    let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+                    let mut report = stop_report();
+                    if let Report::TurnEnd { stop, .. } = &mut report {
+                        stop.session = clank_core::SessionId::parse(session).unwrap();
+                    }
+                    clients.push(Client {
+                        who: Served::Agent {
+                            author: author.clone(),
+                        },
+                        holder: None,
+                        out,
+                        writer: Some(tokio::spawn(write_to(ours, queued, author.to_string()))),
+                        farewell: None,
+                        shown: Default::default(),
+                        conn: conn as u64 + 1,
+                        admitted: Default::default(),
+                        report: Some(Box::new(Reporting {
+                            report,
+                            stepped: false,
+                            reader: None,
+                        })),
+                    });
+                    theirs.push(their);
+                }
+                let mut turns = Turns::new(repo.clone());
+                let leaving = serve(&repo, &mut clients, &state, &mut turns);
+                let shutdown = retire(
+                    clients,
+                    leaving,
+                    Vec::new(),
+                    Duration::from_secs(10),
+                    Duration::from_millis(500),
+                    0,
+                )
+                .await;
+                let mut read = Vec::new();
+                for mut their in theirs {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = String::new();
+                    their.read_to_string(&mut buf).await.unwrap();
+                    read.push(buf);
+                }
+                (shutdown, read)
+            });
+        let _ = done.send(outcome);
+    });
+    finished.recv_timeout(Duration::from_secs(60)).ok()
+}
+
+/// An agent's process holding its binding lock for the whole serve stalls
+/// nothing: both agents' reports are served and the monitor retires while
+/// the lock is still held, and the outage notice the lock guards stands.
+#[test]
+fn a_held_binding_lock_stalls_no_serve_and_leaves_the_notice() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (repo, authors, state) = runtime.block_on(two_agents_claude_told());
+    let lock = crate::agent_store::agents_root(repo.path()).join("claude/binding.lock");
+    let (held_tx, held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _lock = crate::agent_store::exclusive_lock(&lock).unwrap();
+        held_tx.send(()).unwrap();
+        let _ = released.recv();
+    });
+    held.recv().unwrap();
+
+    let (shutdown, read) = served_then_retired(repo.path(), state, &authors)
+        .expect("the monitor waited on the agent's binding lock");
+    assert!(
+        matches!(
+            shutdown,
+            Shutdown::ReadyToRelease(Retired { drained: 2, .. })
+        ),
+        "{shutdown:?}"
+    );
+    for (author, read) in authors.iter().zip(&read) {
+        assert!(
+            read.contains(r#""t":"verdict""#),
+            "{author} was served: {read:?}"
+        );
+    }
+    assert!(told(repo.path(), &authors[0]), "nothing was cleared");
+
+    release.send(()).unwrap();
+    holder.join().unwrap();
+}
+
+/// With the binding lock free, the first serve ends the outage.
+#[test]
+fn a_free_binding_lock_lets_the_serve_clear_the_notice() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (repo, authors, state) = runtime.block_on(two_agents_claude_told());
+    assert!(told(repo.path(), &authors[0]));
+    served_then_retired(repo.path(), state, &authors).expect("served");
+    assert!(!told(repo.path(), &authors[0]));
+}

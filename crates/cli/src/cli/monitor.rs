@@ -8255,8 +8255,15 @@ fn serve_reports(
         // verdict refused by the delivery queue has not served this session.
         let session = reporting.report.session().clone();
         let clear_outage = || {
-            if first && let Err(e) = crate::agent_store::outage_served(repo, &author, &session) {
-                tracing::debug!(%e, "could not clear the served outage");
+            if !first {
+                return;
+            }
+            match crate::agent_store::outage_served(repo, &author, &session) {
+                Ok(crate::agent_store::OutageServed::Contended) => {
+                    tracing::debug!("the binding lock is held; the outage notice stands")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(%e, "could not clear the served outage"),
             }
         };
         reporting.stepped = true;

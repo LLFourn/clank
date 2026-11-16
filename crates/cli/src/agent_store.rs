@@ -547,8 +547,11 @@ pub fn release_binding(
 ///
 /// BLOCKING, unlike the leases elsewhere: a caller here is not
 /// choosing whether to drive, it is performing a short file write it
-/// must not do concurrently. Held for one label only, and never
-/// across another label's, so there is no lock order to get wrong.
+/// must not do concurrently. The monitor's serve loop is the exception:
+/// an agent's process may hold this lock across a side effect, so the
+/// loop only [`try_acquire`](Self::try_acquire)s it. Held for one label
+/// only, and never across another label's, so there is no lock order to
+/// get wrong.
 pub(crate) struct BindingGuard<'a> {
     repo: &'a Path,
     label: &'a AgentLabel,
@@ -564,6 +567,21 @@ impl<'a> BindingGuard<'a> {
             label,
             _lock: exclusive_lock(&dir.join("binding.lock"))?,
         })
+    }
+
+    /// [`acquire`](Self::acquire) without waiting: `None` when another
+    /// holder has the lock.
+    fn try_acquire(repo: &'a Path, label: &'a AgentLabel) -> anyhow::Result<Option<Self>> {
+        let dir = agents_root(repo).join(label.as_str());
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
+        let path = dir.join("binding.lock");
+        let lock =
+            try_exclusive_lock(&path).with_context(|| format!("locking `{}`", path.display()))?;
+        Ok(lock.map(|lock| Self {
+            repo,
+            label,
+            _lock: lock,
+        }))
     }
 }
 
@@ -606,6 +624,17 @@ pub(crate) fn exclusive_lock(path: &Path) -> anyhow::Result<std::fs::File> {
         ));
     }
     Ok(file)
+}
+
+/// [`exclusive_lock`] without waiting: `None` when the lock is held by
+/// another open file, which may be a spawned child's passing copy of
+/// one. Any other failure is an error, never `None`.
+pub(crate) fn try_exclusive_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    Ok(clank_user_config::lease::take_now(&file)?.then_some(file))
 }
 
 /// Record where `session`'s transcript lives — only while that session
@@ -745,8 +774,27 @@ pub(crate) fn announce_outage(
     })
 }
 
+/// What serving a session did to its outage notice.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OutageServed {
+    /// A notice stood for the session, and it is cleared.
+    Cleared,
+    /// No notice stood for the session.
+    NoneStood,
+    /// The label's binding lock was held elsewhere, so nothing was read
+    /// or cleared: a notice standing for the session stays until a later
+    /// serve finds the lock free.
+    Contended,
+}
+
 /// A monitor served `session`, so its outage is over and the next one is
-/// announced again. `true` when a notice stood.
+/// announced again.
+///
+/// Never waits for the binding lock: an agent's process may hold it
+/// across a side effect, and a server that waited would stall serving
+/// for every agent. Clearing is therefore best effort; a serve that
+/// finds the lock held clears nothing ([`OutageServed::Contended`]), and
+/// the notice is cleared only by a later serve whose attempt succeeds.
 ///
 /// The marker is read under the lock, never before it: an announcement
 /// holds the lock while it delivers and records only afterwards, so a
@@ -760,14 +808,16 @@ pub(crate) fn outage_served(
     repo: &Path,
     label: &AgentLabel,
     session: &SessionId,
-) -> anyhow::Result<bool> {
-    let guard = BindingGuard::acquire(repo, label)?;
+) -> anyhow::Result<OutageServed> {
+    let Some(guard) = BindingGuard::try_acquire(repo, label)? else {
+        return Ok(OutageServed::Contended);
+    };
     mutate_locked(&guard, |cfg| {
         if !outage_told(cfg, session) {
-            return false;
+            return OutageServed::NoneStood;
         }
         cfg.outage_notified = None;
-        true
+        OutageServed::Cleared
     })
 }
 
@@ -1600,7 +1650,10 @@ mod tests {
             Announcement::Suppressed
         ));
         assert_eq!(told(repo, &l), None, "not the bound session");
-        assert!(!outage_served(repo, &l, &sid(RESUMED)).unwrap());
+        assert_eq!(
+            outage_served(repo, &l, &sid(RESUMED)).unwrap(),
+            OutageServed::NoneStood
+        );
 
         assert!(matches!(
             announce(repo, &l, RESUMED, now),
@@ -1612,12 +1665,18 @@ mod tests {
         ));
         assert_eq!(told(repo, &l).unwrap().at, now);
 
-        assert!(!outage_served(repo, &l, &sid(SUCCESSOR)).unwrap());
+        assert_eq!(
+            outage_served(repo, &l, &sid(SUCCESSOR)).unwrap(),
+            OutageServed::NoneStood
+        );
         assert!(
             told(repo, &l).is_some(),
             "another session's monitor clears nothing"
         );
-        assert!(outage_served(repo, &l, &sid(RESUMED)).unwrap());
+        assert_eq!(
+            outage_served(repo, &l, &sid(RESUMED)).unwrap(),
+            OutageServed::Cleared
+        );
         assert_eq!(told(repo, &l), None);
         assert!(matches!(
             announce(repo, &l, RESUMED, now),
@@ -1679,42 +1738,65 @@ mod tests {
     }
 
     /// A monitor serving the session while its announcement is still being
-    /// delivered waits for that announcement, and then ends the outage.
+    /// delivered does not wait for it: it clears nothing, the notice the
+    /// announcement records stands, and the next serve ends the outage.
     #[test]
-    fn a_session_served_during_its_announcement_ends_told_of_nothing() {
+    fn a_session_served_during_its_announcement_is_cleared_by_the_next_serve() {
         let dir = tempfile::tempdir().unwrap();
         let (repo, l) = (dir.path(), label("claude"));
         bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
         let (delivering, started) = std::sync::mpsc::channel::<()>();
-        let cleared = std::thread::scope(|scope| {
-            scope.spawn(|| {
+        let (served, finish) = std::sync::mpsc::channel::<()>();
+        let during = std::thread::scope(|scope| {
+            let l = &l;
+            let announcing = scope.spawn(move || {
                 announce_outage(
                     repo,
-                    &l,
+                    l,
                     &sid(RESUMED),
                     at("2026-11-10T00:00:00Z"),
                     &mut || {
                         delivering.send(()).unwrap();
-                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        finish.recv().unwrap();
                         Ok(())
                     },
                 )
-                .unwrap();
+                .unwrap()
             });
             started.recv().unwrap();
-            scope
-                .spawn(|| outage_served(repo, &l, &sid(RESUMED)).unwrap())
-                .join()
-                .unwrap()
+            let (result, serve) = std::sync::mpsc::channel();
+            scope.spawn(move || result.send(outage_served(repo, l, &sid(RESUMED)).unwrap()));
+            let during = serve.recv_timeout(std::time::Duration::from_secs(60));
+            served.send(()).unwrap();
+            assert!(matches!(
+                announcing.join().unwrap(),
+                Announcement::Delivered
+            ));
+            during.expect("the serve waited for the announcement's lock")
         });
-        assert!(cleared, "the recovery saw the announcement it waited for");
+        assert_eq!(during, OutageServed::Contended);
+        assert!(told(repo, &l).is_some(), "the announcement's notice stands");
         assert_eq!(
-            load_agent_config(repo, &l)
-                .unwrap()
-                .unwrap()
-                .outage_notified,
-            None
+            outage_served(repo, &l, &sid(RESUMED)).unwrap(),
+            OutageServed::Cleared
         );
+        assert_eq!(told(repo, &l), None);
+    }
+
+    #[test]
+    fn a_held_lock_is_not_taken_and_a_free_one_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.lock");
+        let held = try_exclusive_lock(&path).unwrap().expect("free");
+        assert!(try_exclusive_lock(&path).unwrap().is_none(), "contended");
+        drop(held);
+        assert!(try_exclusive_lock(&path).unwrap().is_some(), "free again");
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_opened_is_an_error_not_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(try_exclusive_lock(&dir.path().join("missing/held.lock")).is_err());
     }
 
     #[test]

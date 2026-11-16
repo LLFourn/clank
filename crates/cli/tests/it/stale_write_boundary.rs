@@ -67,6 +67,11 @@ const UNGATED: &[(&str, &str, &str)] = &[
     ),
     (
         "agent_store.rs",
+        "try_exclusive_lock",
+        "OWN: opens the label's lock file, which is never written",
+    ),
+    (
+        "agent_store.rs",
         "bind_session_to_agent",
         "OWN: opens the roster lock file; the binding itself is saved through save_json, which asks",
     ),
