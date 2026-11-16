@@ -256,11 +256,6 @@ const UNGATED: &[(&str, &str, &str)] = &[
         "*",
         "ONE-SHOT: git mutations, made by commands; the TUI's plan actions reach them only through queue and plan helpers that ask",
     ),
-    (
-        "inbox.rs",
-        "migrate",
-        "ONE-SHOT: moves a legacy inbox aside once, at the first read",
-    ),
     ("post_rewrite.rs", "*", "ONE-SHOT: the post-rewrite hook"),
     (
         "priority_dir.rs",

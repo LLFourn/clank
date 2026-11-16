@@ -416,8 +416,8 @@ impl EventLog {
     }
 
     /// What acceptance of `r` holds for its whole operation: its ingest
-    /// lease, then its sidecar exclusive, taken as `locking` says. A busy
-    /// lease is an error, as it always was; only the sidecar contends.
+    /// lease ([`IngestLease::for_acceptance`]), then its sidecar exclusive,
+    /// both taken as `locking` says.
     pub(crate) fn recurring_writer(
         &self,
         r: &Recurrence,
@@ -428,10 +428,8 @@ impl EventLog {
             .log_path
             .parent()
             .ok_or_else(|| invalid("recurring WAL has no parent"))?;
-        let Some(lease) = IngestLease::try_acquire(dir, &r.source_key())? else {
-            return Err(invalid(
-                "recurring ingest lease busy; retry on next owner wake",
-            ));
+        let Tried::Ran(lease) = IngestLease::for_acceptance(dir, &r.source_key(), locking)? else {
+            return Ok(Tried::Contended);
         };
         Ok(match self.sidecar(true, locking)? {
             Some(held) => Tried::Ran((lease, held)),

@@ -660,8 +660,9 @@ pub(crate) async fn deadline(at: Option<Instant>) {
     }
 }
 
-/// Accept a one-off's occurrence: one exclusive sidecar, taken as
-/// `locking` says, covers its inspection, append and compaction.
+/// Accept a one-off's occurrence: its ingest lease and one exclusive
+/// sidecar, both taken as `locking` says, cover its inspection, append and
+/// compaction.
 fn accept(
     dir: &Path,
     key: &str,
@@ -670,10 +671,8 @@ fn accept(
     sink: &EmissionSink,
     locking: Locking,
 ) -> std::io::Result<Tried<()>> {
-    let Some(_lease) = IngestLease::try_acquire(dir, key)? else {
-        return Err(std::io::Error::other(
-            "ingest lease busy; retry on next owner wake",
-        ));
+    let Tried::Ran(_lease) = IngestLease::for_acceptance(dir, key, locking)? else {
+        return Ok(Tried::Contended);
     };
     let mut log = EventLog::open(dir, key)?;
     let Some(held) = log.sidecar(true, locking)? else {
@@ -1695,7 +1694,7 @@ mod tests {
     }
 
     use crate::cli::github::log::Sidecars;
-    use crate::cli::github::log::tests::{counted, hold, within};
+    use crate::cli::github::log::tests::{counted, hold, hold_leases, lease_waited, within};
 
     /// `dir`'s one-off WAL for `src`, holding `n` accepted and acked
     /// occurrences: past [`super::super::github::log::COMPACT_AT`] lines,
@@ -1803,6 +1802,62 @@ mod tests {
         assert!(lines(dir.path(), &once_key) < before, "it compacts");
         timers.retry_contended();
         timers.due_at(5000, now);
+        assert!(rx.try_recv().is_err(), "and never again");
+    }
+
+    /// With each due timer's ingest lease held by another process, the
+    /// loop's acceptances wait for none of it: a one-off's and a recurring
+    /// timer's stay pending at acceptance, never failed, emitted or
+    /// dropped, and no take waits on the holder. Once released, the
+    /// contention retry and the next deadline accept each exactly once.
+    #[tokio::test]
+    async fn a_held_ingest_lease_leaves_acceptances_pending_until_the_contention_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let recurring = recurring_source("deploy");
+        let deploy = recurrence::Recurrence::parse(&recurring, None)
+            .unwrap()
+            .source_key();
+        let once = source("history", 5000);
+        let once_key = once.source_key(None);
+        let (timers, mut rx) = set(dir.path(), vec![recurring, once]);
+        let mut timers = timers.on_the_loop();
+        let now = Instant::now();
+        timers.refresh_at(100, now);
+        assert!(timers.next_deadline().is_some(), "armed while free");
+        let held = hold_leases(&[(dir.path(), &deploy), (dir.path(), &once_key)]);
+        let mut timers = within("the loop's acceptances", move || {
+            timers.due_at(5000, now);
+            timers
+        });
+        for key in [&deploy, &once_key] {
+            assert!(
+                !lease_waited(dir.path(), key),
+                "{key}: the loop waited on the lease's holder"
+            );
+            assert_eq!(timers.retrying.get(key), Some(&Stage::Accept), "{key}");
+            assert_eq!(lines(dir.path(), key), 0, "{key}: nothing accepted");
+        }
+        assert!(rx.try_recv().is_err(), "nothing contended is emitted");
+        assert_eq!(timers.contended.len(), 2, "both pending");
+        assert!(timers.recovery.is_empty(), "contention is not a failure");
+        assert_eq!(timers.retry_due(), None, "no failure retry is armed");
+        assert_eq!(timers.next_deadline(), None);
+        held.release();
+
+        timers.retry_contended();
+        timers.due_at(5000, clock::now());
+        let mut names = Vec::new();
+        while let Ok((item, _)) = rx.try_recv() {
+            let WaitItem::TimerEvent { name, .. } = item else {
+                unreachable!()
+            };
+            names.push(name);
+        }
+        names.sort();
+        assert_eq!(names, ["deploy", "history"], "each accepted once");
+        assert!(!timers.awaiting_retry(), "the retry settled them");
+        timers.retry_contended();
+        timers.due_at(5000, clock::now());
         assert!(rx.try_recv().is_err(), "and never again");
     }
 

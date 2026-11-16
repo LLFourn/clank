@@ -3224,6 +3224,202 @@ fn a_held_event_log_stalls_no_serve_and_the_retry_presents_it() {
     );
 }
 
+/// Every file directly in `dir`, with its bytes.
+fn files_in(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let path = e.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+/// A leftover old file inbox, with its `inbox/.lock` and its recipient's
+/// `messages.writer.lock` held by another thread for the whole test, stalls
+/// no serve and is never read: both agents' reports are served without
+/// it and the monitor retires before release, and served again once
+/// released, the old inbox is byte-for-byte as it was.
+#[test]
+fn a_held_legacy_inbox_and_message_writer_lock_stall_no_serve_and_leave_the_old_inbox() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (repo, authors, state) = runtime.block_on(two_agents_claude_told());
+    let claude = crate::agent_store::agents_root(repo.path()).join("claude");
+    let inbox = claude.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::write(
+        inbox.join("500-00000001-legacy.md"),
+        "---\nsent: 2026-09-22T10:15:00Z\n---\nLEGACY-INBOX-PAYLOAD\n",
+    )
+    .unwrap();
+    std::fs::write(inbox.join(".seq"), "1").unwrap();
+    std::fs::write(inbox.join(".lock"), "").unwrap();
+    let before = files_in(&inbox);
+    let locks = [
+        inbox.join(".lock"),
+        claude.join("events").join("messages.writer.lock"),
+    ];
+    let (held_tx, held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _locks = locks.map(|lock| crate::agent_store::exclusive_lock(&lock).unwrap());
+        held_tx.send(()).unwrap();
+        let _ = released.recv();
+    });
+    held.recv().unwrap();
+
+    let (shutdown, read) = served_then_retired(repo.path(), state.clone(), &authors)
+        .expect("the monitor waited on the old inbox's or the message writer's lock");
+    assert!(
+        matches!(
+            shutdown,
+            Shutdown::ReadyToRelease(Retired { drained: 2, .. })
+        ),
+        "{shutdown:?}"
+    );
+    for (author, read) in authors.iter().zip(&read) {
+        assert!(
+            read.contains(r#""t":"verdict""#),
+            "{author} was served: {read:?}"
+        );
+        assert!(!read.contains("LEGACY-INBOX-PAYLOAD"), "{read:?}");
+    }
+    assert_eq!(files_in(&inbox), before, "the old inbox is untouched");
+
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let (_, read) = served_then_retired(repo.path(), state, &authors)
+        .expect("the monitor served once the locks were free");
+    assert!(read.iter().all(|r| !r.contains("LEGACY-INBOX-PAYLOAD")));
+    assert_eq!(files_in(&inbox), before, "still untouched");
+}
+
+/// A process holding each hosted timer's ingest lease for the whole test
+/// makes the loop wait for none of it: a due one-off's and a recurring
+/// timer's acceptance stay pending, no take waits on the holder, and both
+/// agents' reports are served and the monitor retires, all before
+/// release. Once released, the monitor's contention retry and the next
+/// deadline accept each exactly once.
+#[test]
+fn a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once() {
+    use crate::cli::github::log::tests::{hold_leases, lease_waited, within};
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (repo, authors, state) = runtime.block_on(two_agents_claude_told());
+    let events = crate::agent_store::agents_root(repo.path()).join("other/events");
+    let once = clank_core::agent_config::TimerSource {
+        interrupt: false,
+        interrupt_message: None,
+        name: "once".into(),
+        repeat_every: None,
+        due_at: "1970-01-01T00:01:40Z".into(),
+        content: None,
+    };
+    let every = clank_core::agent_config::TimerSource {
+        name: "every".into(),
+        repeat_every: Some("10s".into()),
+        ..once.clone()
+    };
+    let keys = [
+        once.source_key(None),
+        crate::cli::timer_source::recurrence::Recurrence::parse(&every, None)
+            .unwrap()
+            .source_key(),
+    ];
+    let (tx, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+    let timers = crate::cli::timer_source::TimerSet::new(
+        &[once, every].map(|timer| {
+            (
+                clank_core::agent_config::WaitEventSource::Timer(timer),
+                crate::cli::event_source::SourceOrigin::Config,
+            )
+        }),
+        &events,
+        None,
+        tx.into(),
+    )
+    .unwrap()
+    .on_the_loop();
+    let hosted = std::collections::BTreeMap::from([(
+        SourceOwner::Agent(authors[1].clone()),
+        Hosted {
+            timers: Some(timers),
+            spec: Vec::new(),
+            tasks: Default::default(),
+        },
+    )]);
+    let held = hold_leases(&[(&events, &keys[0]), (&events, &keys[1])]);
+
+    let mut hosted = within("the loop's timers", move || {
+        let mut hosted = hosted;
+        for host in hosted.values_mut() {
+            host.timers.as_mut().unwrap().due();
+        }
+        hosted
+    });
+    for key in &keys {
+        assert!(
+            !lease_waited(&events, key),
+            "{key}: the loop waited on the lease's holder"
+        );
+    }
+    assert!(emitted.try_recv().is_err(), "nothing is accepted");
+    let recovery =
+        || crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
+    assert!(
+        unavailable_somewhere(&hosted, &[], &recovery()),
+        "the acceptances await the contention retry"
+    );
+    let (shutdown, read) = served_then_retired(repo.path(), state.clone(), &authors)
+        .expect("the monitor waited on a held ingest lease");
+    assert!(
+        matches!(
+            shutdown,
+            Shutdown::ReadyToRelease(Retired { drained: 2, .. })
+        ),
+        "{shutdown:?}"
+    );
+    assert!(
+        read[1].contains(r#""t":"verdict""#),
+        "the agent owed nothing is served: {read:?}"
+    );
+    held.release();
+
+    let _runtime = runtime.enter();
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let mut retry_and_accept = |hosted: &mut std::collections::BTreeMap<SourceOwner, Hosted>| {
+        let leaving = retry_contended(
+            repo.path(),
+            &mut Vec::new(),
+            Some(&state),
+            &mut Vec::new(),
+            &mut Default::default(),
+            hosted,
+            &mut turns,
+        );
+        assert!(leaving.is_empty());
+        for host in hosted.values_mut() {
+            host.timers.as_mut().unwrap().due();
+        }
+        let mut names = Vec::new();
+        while let Ok((item, _)) = emitted.try_recv() {
+            let WaitItem::TimerEvent { name, .. } = item else {
+                panic!("not a timer event: {item:?}")
+            };
+            names.push(name);
+        }
+        names.sort();
+        names
+    };
+    assert_eq!(
+        retry_and_accept(&mut hosted),
+        ["every", "once"],
+        "each accepted once"
+    );
+    assert!(!unavailable_somewhere(&hosted, &[], &recovery()));
+    assert!(retry_and_accept(&mut hosted).is_empty(), "and never again");
+}
+
 /// A waiting client served while its author's log is held is told no
 /// item from it and left for the contention retry; served again once the
 /// log is free, it is handed the event and settled.

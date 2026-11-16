@@ -74,27 +74,6 @@ pub(crate) enum RecurringTransition {
 /// weight for reconciliation.
 pub(crate) const LOG_IDENTITY_CAP: usize = 1000;
 
-/// Action keys under this prefix are NEVER aged out of the dedup
-/// horizon (`a-message-is-an-event-like-any-other`).
-///
-/// Migration is the one ingest whose source outlives its append: the
-/// old inbox file is deleted only after the event is durable, and a
-/// crash between the two leaves the file to be found again whenever
-/// the next read happens — which nothing schedules. If the horizon has
-/// moved past that message in the meantime, the replay mints a second
-/// copy of something a person wrote.
-///
-/// Every other identity may age out because nothing replays it. This
-/// exemption is bounded by the historical inbox, which is finite and
-/// only ever shrinks: once the last file is migrated there is nothing
-/// left to produce a key under this prefix.
-pub(crate) const MIGRATED_MESSAGE_PREFIX: &str = "migrated-message#";
-
-/// Whether this action key must survive the horizon.
-pub(crate) fn identity_is_pinned(action_key: Option<&str>) -> bool {
-    action_key.is_some_and(|k| k.starts_with(MIGRATED_MESSAGE_PREFIX))
-}
-
 /// Total-line threshold that triggers compaction on ingest appends.
 pub(crate) const COMPACT_AT: usize = 4 * LOG_IDENTITY_CAP;
 
@@ -550,10 +529,11 @@ pub(crate) struct Sidecar {
     exclusive: bool,
 }
 
-/// Sidecars a test has another process hold. A flock taken in this test
-/// process is copied, still held, into any child a parallel test spawns,
-/// until that child's exec (see `proc_run`), so its release cannot be
-/// observed at a known moment and an assertion after it would race.
+/// Sidecars and ingest leases a test has another process hold. A flock
+/// taken in this test process is copied, still held, into any child a
+/// parallel test spawns, until that child's exec (see `proc_run`), so its
+/// release cannot be observed at a known moment and an assertion after it
+/// would race.
 #[cfg(test)]
 mod elsewhere {
     use std::collections::BTreeSet;
@@ -573,6 +553,43 @@ mod elsewhere {
             held.remove(path);
         }
         RELEASED.notify_all();
+    }
+
+    /// Ingest leases held elsewhere that a [`super::Take::Patient`] take
+    /// waited on.
+    static WAITED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+    /// Whether this process may go on to take the lease at `path`, waiting
+    /// on a holder elsewhere as `take` does.
+    pub(super) fn admits_lease(path: &Path, take: super::Take) -> bool {
+        let held = HELD.lock().unwrap();
+        if !held.contains(path) {
+            return true;
+        }
+        match take {
+            super::Take::Now => false,
+            super::Take::Patient => {
+                WAITED.lock().unwrap().insert(path.to_path_buf());
+                let (held, _) = RELEASED
+                    .wait_timeout_while(held, clank_user_config::lease::PATIENCE, |held| {
+                        held.contains(path)
+                    })
+                    .unwrap();
+                !held.contains(path)
+            }
+            super::Take::Blocking => {
+                drop(
+                    RELEASED
+                        .wait_while(held, |held| held.contains(path))
+                        .unwrap(),
+                );
+                true
+            }
+        }
+    }
+
+    pub(super) fn waited(path: &Path) -> bool {
+        WAITED.lock().unwrap().contains(path)
     }
 
     /// Whether this process may go on to flock `path`: under
@@ -758,7 +775,7 @@ impl IngestLease {
         events_dir: &Path,
         source_key: &str,
     ) -> std::io::Result<Option<IngestLease>> {
-        Self::taking(events_dir, source_key, clank_user_config::lease::take)
+        Self::taking(events_dir, source_key, Take::Patient)
     }
 
     /// [`IngestLease::try_acquire`] in one attempt, for a caller that
@@ -767,22 +784,35 @@ impl IngestLease {
         events_dir: &Path,
         source_key: &str,
     ) -> std::io::Result<Option<IngestLease>> {
-        Self::taking(events_dir, source_key, clank_user_config::lease::take_now)
+        Self::taking(events_dir, source_key, Take::Now)
+    }
+
+    /// The lease for an acceptance, taken as `locking` says. Under
+    /// [`Locking::Try`] one attempt, a held lease being
+    /// [`Tried::Contended`] (I9); under [`Locking::Wait`]
+    /// [`Self::try_acquire`]'s patience, a held lease being an error.
+    pub(crate) fn for_acceptance(
+        events_dir: &Path,
+        source_key: &str,
+        locking: Locking,
+    ) -> std::io::Result<Tried<IngestLease>> {
+        match locking {
+            Locking::Try => Ok(match Self::try_acquire_now(events_dir, source_key)? {
+                Some(lease) => Tried::Ran(lease),
+                None => Tried::Contended,
+            }),
+            Locking::Wait => Self::try_acquire(events_dir, source_key)?
+                .map(Tried::Ran)
+                .ok_or_else(|| {
+                    std::io::Error::other("ingest lease busy; retry on next owner wake")
+                }),
+        }
     }
 
     /// Block until the lease is free, then take it: the kernel wakes
     /// this when its holder lets go, by dropping it or by dying.
     pub(crate) fn wait(events_dir: &Path, source_key: &str) -> std::io::Result<IngestLease> {
-        fn blocking(file: &std::fs::File) -> std::io::Result<bool> {
-            loop {
-                match rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive) {
-                    Ok(()) => return Ok(true),
-                    Err(rustix::io::Errno::INTR) => continue,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-        Self::taking(events_dir, source_key, blocking)?
+        Self::taking(events_dir, source_key, Take::Blocking)?
             .ok_or_else(|| std::io::Error::other("a blocking take returned untaken"))
     }
 
@@ -803,21 +833,51 @@ impl IngestLease {
         rx
     }
 
+    fn path(events_dir: &Path, source_key: &str) -> PathBuf {
+        events_dir.join(format!("{source_key}.ingest.lock"))
+    }
+
     fn taking(
         events_dir: &Path,
         source_key: &str,
-        take: fn(&std::fs::File) -> std::io::Result<bool>,
+        take: Take,
     ) -> std::io::Result<Option<IngestLease>> {
         std::fs::create_dir_all(events_dir)?;
-        let path = events_dir.join(format!("{source_key}.ingest.lock"));
+        let path = Self::path(events_dir, source_key);
+        #[cfg(test)]
+        if !elsewhere::admits_lease(&path, take) {
+            return Ok(None);
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
-        Ok(take(&file)?.then_some(IngestLease { _file: file }))
+        let taken = match take {
+            Take::Now => clank_user_config::lease::take_now(&file)?,
+            Take::Patient => clank_user_config::lease::take(&file)?,
+            Take::Blocking => loop {
+                match rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) {
+                    Ok(()) => break true,
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            },
+        };
+        Ok(taken.then_some(IngestLease { _file: file }))
     }
+}
+
+/// How an [`IngestLease`] take waits for a holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Take {
+    /// Not at all.
+    Now,
+    /// For up to [`clank_user_config::lease::PATIENCE`].
+    Patient,
+    /// Until it lets go.
+    Blocking,
 }
 
 /// The moment between a follower's watch on `events_dir` registering and
@@ -1406,20 +1466,7 @@ impl EventLog {
             }
         };
         cap_tail(&mut feed_ids);
-        // The in-memory horizon caps the same way the file does, and
-        // must make the same exemption, or a pinned identity would
-        // survive compaction and still be forgotten by the reader.
-        let pinned: Vec<String> = action_keys
-            .iter()
-            .filter(|k| identity_is_pinned(Some(k)))
-            .cloned()
-            .collect();
         cap_tail(&mut action_keys);
-        for k in pinned {
-            if !action_keys.contains(&k) {
-                action_keys.push(k);
-            }
-        }
         FoldOut {
             unhandled,
             feed_ids,
@@ -2543,7 +2590,7 @@ impl EventLog {
             for (i, (feed_id, action_key, _, _)) in identities.iter().enumerate().rev() {
                 let want_feed = feed_id.is_some() && feed_seen < LOG_IDENTITY_CAP;
                 let want_key = action_key.is_some() && key_seen < LOG_IDENTITY_CAP;
-                if want_feed || want_key || identity_is_pinned(action_key.as_deref()) {
+                if want_feed || want_key {
                     keep[i] = true;
                     if feed_id.is_some() {
                         feed_seen += 1;
@@ -4306,6 +4353,23 @@ pub(crate) mod tests {
             .collect();
         super::elsewhere::hold(&paths);
         Held(paths)
+    }
+
+    /// Hold the ingest lease of each of `sources` (events dir, source
+    /// key) elsewhere.
+    pub(crate) fn hold_leases(sources: &[(&Path, &str)]) -> Held {
+        let paths: Vec<PathBuf> = sources
+            .iter()
+            .map(|(dir, key)| super::IngestLease::path(dir, key))
+            .collect();
+        super::elsewhere::hold(&paths);
+        Held(paths)
+    }
+
+    /// Whether a take of `source`'s ingest lease ever waited on its
+    /// holder elsewhere.
+    pub(crate) fn lease_waited(events_dir: &Path, source_key: &str) -> bool {
+        super::elsewhere::waited(&super::IngestLease::path(events_dir, source_key))
     }
 
     impl Held {

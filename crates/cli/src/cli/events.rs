@@ -67,10 +67,6 @@ fn events_context(
     author: Option<&str>,
 ) -> anyhow::Result<(PathBuf, std::collections::HashMap<String, String>)> {
     let (repo, author) = resolve_author(repo, author)?;
-    // Before the WAL is read, not after: a message still sitting in the
-    // old file inbox belongs in this listing, and the reader is where a
-    // person finds out it exists.
-    let _ = crate::inbox::migrate(&repo, &author);
     let dir = crate::agent_store::agents_root(&repo)
         .join(author.as_str())
         .join("events");

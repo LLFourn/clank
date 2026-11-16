@@ -60,20 +60,6 @@ fn send(repo: &Path, to: &str, body: &str) -> String {
     clank::inbox::deliver(repo, &label(to), None, "2026-09-22T10:15:00Z", body).unwrap()
 }
 
-/// A message dropped into the OLD file inbox, as one sent before this
-/// existed would be. Migration is what brings it into the log.
-fn legacy_file(repo: &Path, to: &str, body: &str) -> std::path::PathBuf {
-    let dir = clank::inbox::inbox_dir(repo, &label(to));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("500-00000001-legacy.md");
-    std::fs::write(
-        &file,
-        format!("---\nsent: 2026-09-22T10:15:00Z\n---\n{body}\n"),
-    )
-    .unwrap();
-    file
-}
-
 /// The selector a message's wake names — what `clank events ack`
 /// takes, and the only handle an agent is given.
 fn selector_of(items: &[WaitItem], subject: &str) -> String {
@@ -191,28 +177,6 @@ async fn a_message_keeps_waking_until_it_is_acked() {
     assert_eq!(subjects(&items), ["rebase please"]);
     assert_eq!(subjects(&peek(repo, "rev").await), ["rebase please"]);
     ack(repo, "rev", &selector_of(&items, "rebase please")).await;
-    assert!(peek(repo, "rev").await.is_empty());
-}
-
-/// A message sent BEFORE this existed still wakes its agent: the first
-/// read migrates it into the log, and from there it behaves like any
-/// other.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_legacy_file_still_wakes_and_is_acked_like_an_event() {
-    let env = idle_env();
-    let repo = env.repo();
-    legacy_file(repo, "rev", "from before");
-
-    let items = peek(repo, "rev").await;
-    assert_eq!(subjects(&items), ["from before"]);
-    assert_eq!(
-        subjects(&peek(repo, "rev").await),
-        ["from before"],
-        "still owed until it is acked",
-    );
-    // Through the SAME command, with the selector its wake named: a
-    // migrated message is not a second kind of thing.
-    ack(repo, "rev", &selector_of(&items, "from before")).await;
     assert!(peek(repo, "rev").await.is_empty());
 }
 

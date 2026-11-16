@@ -17,6 +17,9 @@ All notable changes to clank are recorded here. The format follows
   `unblocks` and `blocks.lock`) are no longer migrated or read. Ask any that
   are still pending again; the old directories and `.clank/block-migration.json`
   can be deleted. `clank block migrate` is removed.
+- Messages left in an old per-agent file inbox (`.clank/agents/<label>/inbox/`)
+  are no longer moved into the event log. Read or delete them before
+  upgrading; the directory can be deleted.
 - A block's answer is delivered best effort and then deleted, not kept.
   Once the wake carrying it is emitted, the question, answer, creator and
   attempt files are removed, and no later session or master is shown it
