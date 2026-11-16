@@ -191,7 +191,6 @@ mod tests {
         assert_eq!(subject, "hello");
         assert_eq!(body, "hello");
         assert_eq!(selector.as_deref(), Some("messages@1"));
-        assert!(!crate::inbox::inbox_dir(&repo, &to).exists());
     }
 
     #[tokio::test]

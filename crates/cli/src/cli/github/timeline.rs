@@ -624,10 +624,6 @@ fn backend_replies(
 /// merge. Corrupt logs are skipped with one stderr notice each —
 /// a viewer degrades, never quarantines (the ingest side owns that).
 pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
-    // Anything still in a file inbox joins the log before it is read,
-    // so a legacy message is in the timeline the first time somebody
-    // LOOKS rather than the next time its recipient waits.
-    crate::inbox::migrate_all(repo);
     let local_repo = dunce::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let mut copies: Vec<Copy> = Vec::new();
     let mut notices: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();

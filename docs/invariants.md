@@ -131,25 +131,33 @@ whether its assertions protect the invariant. Reviewers check that.
 ## I9. The monitor's serve loop never blocks on a lock an agent process can hold.
 
 - Why: one agent holding a lock would stall serving for every agent.
-- Status: target
-- Today: the binding lock is only tried on the loop (an outage notice
-  stands until a serve finds it free), and blocks are read without
-  `.clank/blocks.lock` (only writers take it; a read is checked against
-  its question's generation, and one that cannot settle blocks and owes
-  nothing). Event-log sidecars are only tried on the loop: each loop
-  operation takes its lock once, without waiting, and a held one leaves
-  that source unavailable for the pass (its items absent, the agent
-  unknown to recovery and its ledger) until a bounded contention retry
-  (250 ms doubling to 5 s) finds it free. The one blocking lock serving
-  still takes is the legacy inbox migration's `inbox/.lock` and
-  `messages.writer.lock` (`inbox::pending_with`, via `migrate`). A timer
-  acceptance's ingest lease is taken with its bounded patience (250 ms),
-  never waited for. Corrupt or unreadable logs are skipped as before
+- Status: holds
+- Scope: the sweeps covered the locks serving, folding, recovery and
+  hosted timers take: an agent's binding lock, `.clank/blocks.lock`, event
+  log sidecars, timer ingest leases, and the old file inbox's migration
+  (`inbox/.lock` and `messages.writer.lock`), which is removed. The loop
+  only tries the binding lock (an outage notice stands until a serve finds
+  it free), reads blocks without their lock (a read is checked against its
+  question's generation, and one that cannot settle blocks and owes
+  nothing), and takes each event-log sidecar and each timer acceptance's
+  ingest lease once, without waiting. A held one leaves that source or
+  acceptance unavailable for the pass (its items absent, the agent unknown
+  to recovery and its ledger, the timer pending) until a bounded contention
+  retry (250 ms doubling to 5 s) finds it free. A holder may keep a lock
+  across a side effect, such as signed user-command delivery, because the
+  loop never waits on it. The ingest lease's patience (250 ms) remains only
+  off the loop: in commands, wait clients, and a hosted GitHub source's own
+  task. `messages.writer.lock` only serializes message writers.
+  Corrupt or unreadable logs are skipped as before
   (`event_source::owed_from_sources`), which reads as no events.
-- Tests: `crates/cli/src/cli/monitor_turn_tests.rs::a_held_event_log_stalls_no_serve_and_the_retry_presents_it`,
+- Tests: `crates/cli/src/cli/monitor_turn_tests.rs::a_held_binding_lock_stalls_no_serve_and_leaves_the_notice`,
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_blocks_lock_stalls_no_serve`,
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_event_log_stalls_no_serve_and_the_retry_presents_it`,
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once`,
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_legacy_inbox_and_message_writer_lock_stall_no_serve_and_leave_the_old_inbox`,
   `crates/cli/src/cli/timer_source.rs::held_sidecars_leave_timers_pending_until_the_contention_retry`,
+  `crates/cli/src/cli/timer_source.rs::a_held_ingest_lease_leaves_acceptances_pending_until_the_contention_retry`,
   `crates/cli/src/cli/timer_source.rs::each_loop_timer_operation_takes_its_sidecar_once`
-- Plans: the-serve-loop-survives-a-held-inbox-lock
 
 ## I10. Nothing polls except GitHub.
 
