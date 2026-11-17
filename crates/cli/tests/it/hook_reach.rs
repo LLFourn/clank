@@ -293,18 +293,6 @@ const UNFOLLOWABLE: &[Unfollowable] = &[
         subject: "select!",
         why: "races the hook's pipe against the monitor's notes",
     },
-    Unfollowable {
-        at: "crate::upgrade::Replacing::pass_until",
-        form: "select!",
-        subject: "select!",
-        why: "races the retry pause against a wake",
-    },
-    Unfollowable {
-        at: "crate::upgrade::watch_install",
-        form: "warn!",
-        subject: "warn!",
-        why: "logs why the install could not be watched",
-    },
 ];
 
 /// Calls that open a file.

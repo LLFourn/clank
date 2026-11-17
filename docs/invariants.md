@@ -192,16 +192,10 @@ whether its assertions protect the invariant. Reviewers check that.
   throttles of an event's work are not polls. Every production timed wait is
   classified so in `timed_wait_boundary`; the gate sees forms by name, so
   the classes themselves are the reviewers' check.
-- Today: besides GitHub's, these residual polls remain:
-  - capped-backoff retries of failed work with no bound: a timer occurrence
-    that will not write, the status TUI's and status watch's refresh, a
-    failed self-replacement, a failing command source, a deferred
-    retirement, the web connector's reconnect, a dead pane subscription.
-    Whether each waits for a cause or gives up after a budget and reports
-    is the user's open decision.
-  - recovery's `RETRY_LOOK`, which stands for three different waits (the
-    gate, which only `Driver::due` asks; the record showing the failed
-    turn; a turn it cannot watch) behind one `next_at`.
+- Today: besides GitHub's, one residual poll remains: recovery's
+  `RETRY_LOOK`, which stands for three different waits (the gate, which
+  only `Driver::due` asks; the record showing the failed turn; a turn it
+  cannot watch) behind one `next_at`.
   A held event-log sidecar or ingest lease wakes the monitor on its release,
   and a remote's browser streams wake on a sessions-store write or their
   expiry. A client with no monitor (a parked wait, a turn child, the TUI's
@@ -211,7 +205,28 @@ whether its assertions protect the invariant. Reviewers check that.
   the attempts they cause do not move; a failure none of them ends (a
   start that failed for want of resources) is reported then and not
   attempted again until one moves. A watch that cannot be armed or stops
-  ends the wait at once.
+  ends the wait at once. Other failed work waits for what can end its
+  failure, and is never tried on a clock: a timer occurrence that will not
+  write stays owed until a change at its log, its seen index or their
+  directory leaves them other than the failure found them (its own staging
+  never does), looked at once more as the owner's watch is armed, and one
+  held off by a lock waits for the release; a failed
+  status refresh, in the TUI or a status watch, until a wake moves its
+  inputs from where the failure found them (or `s` in the TUI's log); a
+  failed self-replacement until another build is installed or a watch
+  hears the installation change, and a watch that cannot be had, covers
+  less than the installation's directories, or fails ends that wait,
+  saying so (a monitor and a status watch end; the TUI says so, and `w`
+  watches again, trying the replacement once more); a deferred retirement until a member of its
+  group exits or its producer record changes, every member watched or the
+  source stopped, saying why. Restarts answer an end, with
+  a budget counted per episode: a command source is restarted when its
+  run ends, a pane subscription when it ends, and the web connector when
+  its connection ends, each `FAILURES_BEFORE_SURFACING`, `RESTARTS` or
+  `RECONNECTS` times in a row, and then reported and not tried again
+  until a person asks (`r` on a source's page, a viewer's retry on a
+  stopped pane, which the page shows, the remote switched off and on) or
+  what it runs changes; routine verifications never restart a pane.
 - Tests: `crates/cli/tests/it/timed_wait_boundary.rs::every_timed_wait_is_classified`,
   `crates/cli/tests/it/timed_wait_boundary.rs::invariant_status_matches_the_inventory`,
   `crates/cli/src/cli/monitor_turn_tests.rs::a_held_sidecar_wakes_the_loop_only_on_its_release`,
@@ -227,8 +242,38 @@ whether its assertions protect the invariant. Reviewers check that.
   `crates/cli/src/cli/monitor_keeper.rs::an_unattached_keeper_reports_once_at_its_deadline_and_attempts_nothing_more`,
   `crates/cli/src/cli/monitor_keeper.rs::a_watch_refused_or_stopped_is_shown_and_ends_the_attempts`,
   `crates/cli/src/cli/wait.rs::a_bound_wait_fails_once_for_an_outage_and_then_waits_on_its_events`,
-  `crates/cli/src/cli/turn_child_tests.rs::a_stale_child_waits_quietly_and_tells_its_agent_nothing`
-- Plans: failed-work-waits-for-a-cause, recovery-looks-when-something-moves
+  `crates/cli/src/cli/turn_child_tests.rs::a_stale_child_waits_quietly_and_tells_its_agent_nothing`,
+  `crates/cli/src/cli/timer_source.rs::a_failed_entry_waits_for_its_files_to_change`,
+  `crates/cli/src/cli/timer_source.rs::a_failed_attempts_own_writes_try_nothing_again`,
+  `crates/cli/src/cli/timer_source.rs::a_staging_files_rewrite_is_not_a_change`,
+  `crates/cli/src/repo_watch.rs::a_timer_index_repair_is_heard_and_tries_the_failed_timer`,
+  `crates/cli/src/cli/monitor.rs::a_hosted_timer_that_will_not_write_waits_for_a_timer_log_to_change`,
+  `crates/cli/src/cli/wait.rs::the_own_loop_tries_a_failed_timer_only_on_a_timer_log_change`,
+  `crates/cli/src/cli/status_watch_tests.rs::a_failed_refresh_waits_for_its_inputs_to_move`,
+  `crates/cli/src/cli/status_tui/mod.rs::a_failed_rebuild_is_owed_again_only_for_a_cause`,
+  `crates/cli/src/upgrade.rs::a_failed_replacement_waits_for_the_installation_to_change`,
+  `crates/cli/src/upgrade.rs::until_current_returns_when_its_build_is_back`,
+  `crates/cli/src/upgrade.rs::an_installation_that_cannot_be_heard_ends_the_park`,
+  `crates/cli/src/cli/wait.rs::a_wait_that_cannot_hear_its_installation_is_served_or_says_why`,
+  `crates/cli/src/cli/wait.rs::a_failing_source_is_restarted_on_its_ends_until_its_budget`,
+  `crates/cli/src/cli/wait.rs::a_deferred_retirement_waits_for_a_member_to_exit`,
+  `crates/cli/src/cli/wait.rs::a_failed_retirement_watch_ends_the_wait`,
+  `crates/cli/src/cli/wait.rs::a_group_that_cannot_be_covered_does_not_arm_its_retirement`,
+  `crates/cli/src/cli/command_source.rs::a_retiring_group_is_covered_whole_or_not_at_all`,
+  `crates/cli/src/cli/timer_source.rs::a_repair_before_the_watch_is_armed_is_found_by_the_look_after`,
+  `crates/cli/src/cli/status_tui/mod.rs::a_lost_install_watch_is_shown_once_the_screen_is_free_and_w_arms_it_again`,
+  `crates/cli/src/cli/status_tui/mod.rs::the_loop_reports_a_lost_install_watch_and_w_rearms_it`,
+  `crates/cli/src/cli/status_watch_tests.rs::a_watch_that_cannot_hear_its_installation_ends`,
+  `crates/cli/src/cli/monitor.rs::a_monitor_deaf_to_installs_ends`,
+  `crates/cli/src/upgrade.rs::a_rearmed_watch_tries_a_failed_replacement_once_more`,
+  `crates/web/src/request.rs::a_verify_without_retry_is_routine`,
+  `crates/web/src/service.rs::a_verify_carries_the_pages_retry`,
+  `crates/cli/src/cli/web/mod.rs::a_first_subscription_that_cannot_start_is_reported_and_retried`,
+  `crates/cli/src/cli/wait.rs::a_held_timer_lock_is_heard_released`,
+  `crates/cli/src/cli/wait.rs::a_deferred_retirement_withholds_the_launch_and_keeps_the_record`,
+  `crates/cli/src/cli/web/mod.rs::a_dead_subscription_is_restarted_at_its_end_until_its_budget`,
+  `crates/cli/src/cli/web/bridge_instance.rs::host_crash_reports_disconnection_without_stopping_local_panes`
+- Plans: recovery-looks-when-something-moves
 
 ## I11. `clank open` works when no zellij session exists.
 

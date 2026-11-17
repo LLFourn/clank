@@ -1281,13 +1281,19 @@ fn event_prompts(
 /// watcher to a monitor since then: what changed in that gap may not
 /// have moved the signature this gate compared against, and baselining
 /// it away is the staleness the handoff exists to prevent.
+///
+/// A rebuild that failed is not let through again for the inputs it
+/// failed on: only one that moves them, a handoff, or the person asking
+/// tries it again, so nothing the failed rebuild itself stirs can loop it.
 struct RebuildGate {
     accepted: Option<crate::cli::status::InputSignature>,
     fresh: crate::cli::monitor::keeper::FreshRebuild,
     served: u64,
+    failed: Option<Due>,
 }
 
 /// A rebuild the gate let through, to be accepted once it succeeds.
+#[derive(PartialEq)]
 struct Due {
     sig: Option<crate::cli::status::InputSignature>,
     fresh: u64,
@@ -1302,13 +1308,16 @@ impl RebuildGate {
             accepted,
             fresh,
             served: 0,
+            failed: None,
         }
     }
 
     /// The rebuild owed for inputs at `sig`, if any.
     fn due(&self, sig: Option<crate::cli::status::InputSignature>) -> Option<Due> {
         let fresh = self.fresh.owed();
-        (fresh > self.served || sig != self.accepted).then_some(Due { sig, fresh })
+        let due = Due { sig, fresh };
+        ((fresh > self.served || due.sig != self.accepted) && self.failed.as_ref() != Some(&due))
+            .then_some(due)
     }
 
     /// `due`'s rebuild succeeded: its inputs, and every handoff it saw,
@@ -1316,6 +1325,22 @@ impl RebuildGate {
     fn accept(&mut self, due: Due) {
         self.accepted = due.sig;
         self.served = due.fresh;
+        self.failed = None;
+    }
+
+    /// `due`'s rebuild failed: not owed again until its inputs move.
+    fn failed(&mut self, due: Due) {
+        self.failed = Some(due);
+    }
+
+    /// Whether the last rebuild failed and has not been tried since.
+    fn failing(&self) -> bool {
+        self.failed.is_some()
+    }
+
+    /// The person asked: the failed rebuild is owed again as it stands.
+    fn retry(&mut self) {
+        self.failed = None;
     }
 }
 
@@ -1355,7 +1380,8 @@ fn apply_refresh(
             snapshot.log_rows.insert(
                 0,
                 OnelineRow::Notice(format!(
-                    "{PREFIX}: {e}{streak}; kept the last view, retrying on the next change"
+                    "{PREFIX}: {e}{streak}; kept the last view, trying again when its inputs \
+                     change; press s in the log to try now"
                 )),
             );
             false
@@ -3039,23 +3065,19 @@ fn recv_until(
 }
 
 /// How long the loop may sleep before something on its own clock is
-/// due: the spinner's next frame, a deferred refresh, a failed
-/// rebuild's retry, a failed replacement's, a timer falling due, a clock
-/// on screen changing. `None` when nothing is: the loop then sleeps
-/// until an event.
+/// due: the spinner's next frame, a deferred refresh, a timer falling
+/// due, a clock on screen changing. `None` when nothing is: the loop
+/// then sleeps until an event. A failed rebuild or replacement is not
+/// one: each waits for what can end it.
 fn turn_wait(
     snapshot: &StatusSnapshot,
     spinner_visible: bool,
     deferred: Option<Duration>,
-    rebuild_retry: Option<Duration>,
-    replacement_retry: Option<Duration>,
     now: i64,
 ) -> Option<Duration> {
     [
         spinner_visible.then_some(SPINNER_TICK),
         deferred,
-        rebuild_retry,
-        replacement_retry,
         until_next_due(snapshot, now),
         clocks_change_in(snapshot, now),
     ]
@@ -3236,15 +3258,85 @@ fn deferred_wait(
     refresh_pending.then(|| min_interval.saturating_sub(since_last_rebuild))
 }
 
-/// Backoff before RETRYING a failed rebuild
-/// (tui-transient-refresh-resilience, codex 889c637): 1s, 2s, 4s …
-/// capped at 30s — a lone transient failure recovers in about a
-/// second without needing a filesystem event, while a persistent
-/// one polls gently instead of spinning the rebuild loop hot.
-/// Event-driven recovery is unaffected (a real refresh event still
-/// rebuilds immediately). Pure → unit-tested.
-fn retry_delay(failures: u32) -> Duration {
-    Duration::from_secs(1u64 << failures.saturating_sub(1).min(5)).min(Duration::from_secs(30))
+/// The TUI's watch on its installation, which is what tries a failed
+/// replacement again: when it cannot be armed or fails, that is said once,
+/// and `w` arms it again.
+struct InstallWatch {
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    watch: Result<Option<crate::upgrade::Subscription>, String>,
+    fault: crate::fs_notice::Fault,
+    said: bool,
+}
+
+impl InstallWatch {
+    fn arm(authority: &crate::upgrade::Authority, wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self::armed(authority, std::sync::Arc::new(wake))
+    }
+
+    fn armed(
+        authority: &crate::upgrade::Authority,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let fault = crate::fs_notice::Fault::default();
+        let watch = authority.subscribe(
+            {
+                let wake = wake.clone();
+                move || wake()
+            },
+            {
+                let (wake, fault) = (wake.clone(), fault.clone());
+                move |why| {
+                    crate::fs_notice::record(&fault, why);
+                    wake()
+                }
+            },
+        );
+        InstallWatch {
+            wake,
+            watch,
+            fault,
+            said: false,
+        }
+    }
+
+    /// A fresh watch in place of this one, as the person asked.
+    fn rearm(self, authority: &crate::upgrade::Authority) -> Self {
+        let wake = self.wake.clone();
+        drop(self);
+        Self::armed(authority, wake)
+    }
+
+    fn why(&self) -> Option<String> {
+        match &self.watch {
+            Err(why) => Some(format!("cannot watch the installation: {why}")),
+            Ok(_) => crate::fs_notice::read(&self.fault)
+                .map(|why| format!("the watch on the installation failed: {why}")),
+        }
+    }
+
+    /// Whether installs can no longer be heard.
+    fn lost(&self) -> bool {
+        self.why().is_some()
+    }
+
+    /// Show why installs can no longer be heard, once, when no other
+    /// overlay holds the screen: until then the report stays owed.
+    fn report(&mut self, detail: &mut Option<Overlay>) {
+        if self.said || detail.is_some() {
+            return;
+        }
+        let Some(why) = self.why() else {
+            return;
+        };
+        *detail = Some(Overlay::error(
+            "clank cannot watch its installation".to_string(),
+            format!(
+                "{why}. A newer install is not noticed, so this TUI is not replaced by one; \
+                 press w in the log to watch again."
+            ),
+        ));
+        self.said = true;
+    }
 }
 
 /// A drained burst of loop events collapsed for ONE pass: keystrokes in
@@ -3455,7 +3547,7 @@ pub(crate) async fn run_tui(
         screen = Some(AltScreen::enter());
         failed
     });
-    let _installs = replacing.authority().subscribe({
+    let mut installs = InstallWatch::arm(replacing.authority(), {
         let wake = ev_tx.clone();
         move || {
             let _ = wake.send(Ev::Installed);
@@ -3508,10 +3600,8 @@ pub(crate) async fn run_tui(
         watchers.keeper.fresh(),
     );
     // Consecutive failed refreshes (tui-transient-refresh-resilience);
-    // reset by every successful rebuild. `refresh_retry_at` schedules
-    // the bounded self-retry after a failure.
+    // reset by every successful rebuild.
     let mut refresh_failures: u32 = 0;
-    let mut refresh_retry_at: Option<std::time::Instant> = None;
     let mut snapshot = StatusSnapshot::build_with(
         &repo,
         &basename,
@@ -3644,6 +3734,7 @@ pub(crate) async fn run_tui(
                 ),
             ));
         }
+        installs.report(&mut detail);
         let unattached = watchers.keeper.unattached();
         let said = unattached.as_ref().map(|(n, _)| *n);
         if said != said_unattached && detail.is_none() {
@@ -4037,22 +4128,10 @@ pub(crate) async fn run_tui(
         // screen when a roster exists — tick whenever any agent is active
         // (no window math; the log carries no placeholders).
         let spinner_visible = !in_prog.is_empty() && !snapshot.agents.is_empty();
-        // A scheduled retry that has come due is promoted to a normal
-        // deferred refresh; a pending one caps the sleep so the
-        // deadline actually fires (a plain Timeout wake loops back
-        // here and promotes).
-        if let Some(at) = refresh_retry_at
-            && at <= std::time::Instant::now()
-        {
-            refresh_pending = true;
-            refresh_retry_at = None;
-        }
         let wait = turn_wait(
             &snapshot,
             spinner_visible,
             deferred_wait(refresh_pending, last_rebuild.elapsed(), REBUILD_MIN),
-            refresh_retry_at.map(|at| at.saturating_duration_since(std::time::Instant::now())),
-            replacing.retry_in(),
             crate::age::now(),
         );
 
@@ -5460,6 +5539,16 @@ pub(crate) async fn run_tui(
                             k if retries_monitor(k, watchers.keeper.unattached().is_some()) => {
                                 watchers.keeper.retry()
                             }
+                            k if rewatches_installs(k, installs.lost()) => {
+                                installs = installs.rearm(replacing.authority());
+                                if !installs.lost() {
+                                    replacing.rearmed();
+                                }
+                            }
+                            k if retries_rebuild(k, gate.failing()) => {
+                                gate.retry();
+                                refresh_pending = true;
+                            }
                             Key::Up => match log_up_crossing(&log, &snapshot, cols as usize) {
                                 Some(panel) => mode = panel,
                                 None => log.up(total, &|i| is_rule(&snapshot, head, i)),
@@ -5723,10 +5812,8 @@ pub(crate) async fn run_tui(
                 if refresh_ok {
                     gate.accept(due);
                     exits.track(&repo);
-                    refresh_retry_at = None;
                 } else {
-                    refresh_retry_at =
-                        Some(std::time::Instant::now() + retry_delay(refresh_failures));
+                    gate.failed(due);
                 }
                 reconcile_worker.observe(&snapshot);
                 log.complete = log.next.is_none();
@@ -7206,17 +7293,6 @@ pub(crate) mod tests {
         assert!(page.is_none());
     }
 
-    #[test]
-    fn retry_delay_backs_off_and_caps() {
-        // The scheduling decision (codex 889c637): bounded backoff —
-        // fast first retry, gentle persistent polling, hard cap.
-        assert_eq!(retry_delay(1), Duration::from_secs(1));
-        assert_eq!(retry_delay(2), Duration::from_secs(2));
-        assert_eq!(retry_delay(3), Duration::from_secs(4));
-        assert_eq!(retry_delay(6), Duration::from_secs(30));
-        assert_eq!(retry_delay(100), Duration::from_secs(30));
-    }
-
     /// The reopen answer is one notice row, replacing the last reopen
     /// notice and leaving other notices alone — the refresh notice's
     /// own rule, applied per prefix.
@@ -8248,7 +8324,7 @@ pub(crate) mod tests {
         s.agents.clear();
         s.sources.clear();
         s.drafts.clear();
-        let idle = |s: &StatusSnapshot| turn_wait(s, false, None, None, None, now);
+        let idle = |s: &StatusSnapshot| turn_wait(s, false, None, now);
         assert_eq!(idle(&s), None, "no tick of any kind");
 
         let commit = |age: i64| crate::cli::log::OnelineRow::Commit {
@@ -8284,18 +8360,10 @@ pub(crate) mod tests {
         s.log_rows.clear();
         s.drafts.clear();
         for (owed, why) in [
-            (turn_wait(&s, true, None, None, None, now), "the spinner"),
+            (turn_wait(&s, true, None, now), "the spinner"),
             (
-                turn_wait(&s, false, Some(Duration::from_millis(300)), None, None, now),
+                turn_wait(&s, false, Some(Duration::from_millis(300)), now),
                 "a deferred refresh",
-            ),
-            (
-                turn_wait(&s, false, None, Some(Duration::from_secs(4)), None, now),
-                "a failed rebuild's retry",
-            ),
-            (
-                turn_wait(&s, false, None, None, Some(Duration::from_secs(2)), now),
-                "a failed replacement's retry",
             ),
         ] {
             assert!(owed.is_some(), "{why} is a timer the loop set itself");
@@ -8732,7 +8800,7 @@ pub(crate) mod tests {
             "the loop's first statement, under no condition"
         );
         let subscribed = flat
-            .find("let_installs=replacing.authority().subscribe(")
+            .find("letmutinstalls=InstallWatch::arm(replacing.authority(),")
             .expect("woken by an install");
         let waited = flat
             .find("letwait=turn_wait(")
@@ -8741,10 +8809,6 @@ pub(crate) mod tests {
             .find("matchrecv_until(&ev_rx,wait){")
             .expect("the panel's own receive");
         assert!(subscribed < top && pass < waited && waited < recv);
-        assert!(
-            flat[waited..recv].contains("replacing.retry_in()"),
-            "a failed replacement's retry is one of them"
-        );
     }
 
     #[test]
@@ -9092,6 +9156,185 @@ pub(crate) mod tests {
         let due = gate.due(sig()).unwrap();
         gate.accept(due);
         assert!(gate.due(sig()).is_none(), "exactly once");
+    }
+
+    /// A failed rebuild is not owed again for the inputs it failed on, so
+    /// no wake that leaves them there, the failed rebuild's own included,
+    /// tries it again. Inputs that move, a handoff, or the person asking
+    /// owe it again, and a success ends the failure.
+    #[test]
+    fn a_failed_rebuild_is_owed_again_only_for_a_cause() {
+        use crate::cli::monitor::keeper::FreshRebuild;
+        use crate::cli::status::{ProcessHealth, input_signature_with};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sig = |attendances| {
+            input_signature_with(
+                p,
+                &Default::default(),
+                ProcessHealth {
+                    attendances,
+                    monitor: crate::cli::monitor::Liveness::None,
+                },
+            )
+            .ok()
+        };
+        let fresh = FreshRebuild::default();
+        let mut gate = RebuildGate::new(sig(0), fresh.clone());
+
+        let due = gate.due(sig(1)).expect("its inputs moved");
+        assert!(!gate.failing());
+        gate.failed(due);
+        assert!(gate.failing());
+        for _ in 0..3 {
+            assert!(gate.due(sig(1)).is_none(), "nothing moved since it failed");
+        }
+
+        gate.failed(gate.due(sig(2)).expect("they moved again"));
+        assert!(gate.due(sig(2)).is_none());
+        fresh.owe();
+        gate.failed(gate.due(sig(2)).expect("a handoff"));
+        assert!(gate.due(sig(2)).is_none());
+
+        gate.retry();
+        assert!(!gate.failing());
+        assert!(gate.due(sig(2)).is_some(), "asked for");
+        gate.failed(gate.due(sig(2)).unwrap());
+        let due = gate.due(sig(3)).expect("moved");
+        gate.accept(due);
+        assert!(!gate.failing(), "a success ends it");
+        assert!(gate.due(sig(3)).is_none(), "served");
+    }
+
+    /// The loop tells the gate of each failed rebuild, and `s` is what
+    /// asks for one again. Read, since the loop runs only as a whole TUI.
+    #[test]
+    fn the_loop_tells_the_gate_of_a_failure_and_s_asks_again() {
+        let whole = include_str!("mod.rs");
+        let prod = &whole[..whole
+            .find("\n#[cfg(test)]\npub(crate) mod tests {")
+            .expect("the test module still opens with that attribute")];
+        let flat: String = prod.split_whitespace().collect();
+        assert!(
+            flat.contains(
+                "ifrefresh_ok{gate.accept(due);exits.track(&repo);}else{gate.failed(due);}"
+            ),
+            "a failed rebuild is told to the gate"
+        );
+        assert!(
+            flat.contains(
+                "kifretries_rebuild(k,gate.failing())=>{gate.retry();refresh_pending=true;}"
+            ),
+            "`s` asks for it again"
+        );
+    }
+
+    /// An installation the TUI cannot watch, or whose watch fails, is shown
+    /// once, with how to watch it again, and only when no other overlay
+    /// holds the screen: one arriving under another overlay is shown when
+    /// that closes. `w` arms it again, and watched again it says nothing.
+    #[test]
+    fn a_lost_install_watch_is_shown_once_the_screen_is_free_and_w_arms_it_again() {
+        let shown = |detail: &Option<Overlay>| match detail {
+            Some(Overlay {
+                data: OverlayData::Error { title, message },
+                ..
+            }) if title == "clank cannot watch its installation" => {
+                Some((title.clone(), message.clone()))
+            }
+            _ => None,
+        };
+        let other = |what: &str| Some(Overlay::error(what.to_string(), String::new()));
+        let gone = tempfile::tempdir().unwrap();
+        let unwatchable = crate::upgrade::Authority::watching(
+            crate::build_stamp::Installation::at(gone.path().join("no-such-dir/clank")),
+            crate::build_stamp::running(),
+        );
+        let mut watch = InstallWatch::arm(&unwatchable, || {});
+        assert!(watch.lost());
+        let mut detail = other("something else");
+        watch.report(&mut detail);
+        assert_eq!(shown(&detail), None, "the other overlay stays");
+        detail = None;
+        watch.report(&mut detail);
+        let (title, message) = shown(&detail).expect("shown once the screen is free");
+        assert_eq!(title, "clank cannot watch its installation");
+        assert!(
+            message.contains("cannot watch the installation"),
+            "{message}"
+        );
+        assert!(message.contains("press w"), "{message}");
+        detail = None;
+        watch.report(&mut detail);
+        assert!(detail.is_none(), "shown once");
+
+        let installed = crate::upgrade::tests::Installed::current();
+        let mut watch = watch.rearm(&installed.authority());
+        assert!(!watch.lost(), "watched again");
+        watch.report(&mut detail);
+        assert!(detail.is_none());
+        detail = other("help");
+        crate::fs_notice::record(&watch.fault, "the stream died".into());
+        watch.report(&mut detail);
+        assert_eq!(
+            shown(&detail),
+            None,
+            "a later loss under an overlay waits too"
+        );
+        detail = None;
+        watch.report(&mut detail);
+        assert!(
+            shown(&detail).is_some_and(|(_, message)| message.contains("the stream died")),
+            "the later loss is shown once the screen is free"
+        );
+        let watch = watch.rearm(&installed.authority());
+        assert!(!watch.lost());
+
+        assert!(input::rewatches_installs(Key::Char(b'w'), true));
+        assert!(!input::rewatches_installs(Key::Char(b'w'), false));
+        assert!(!input::rewatches_installs(Key::Char(b's'), true));
+    }
+
+    /// The loop offers the screen to the lost watch's report on every
+    /// pass, and `w` arms a fresh watch and lets a failed replacement be
+    /// tried once more, for what went unheard.
+    #[test]
+    fn the_loop_reports_a_lost_install_watch_and_w_rearms_it() {
+        let whole = include_str!("mod.rs");
+        let prod = &whole[..whole
+            .find("\n#[cfg(test)]\npub(crate) mod tests {")
+            .expect("the test module still opens with that attribute")];
+        let flat: String = prod.split_whitespace().collect();
+        assert!(flat.contains("installs.report(&mutdetail);"));
+        assert!(flat.contains(
+            "kifrewatches_installs(k,installs.lost())=>{installs=installs.rearm(replacing.authority());if!installs.lost(){replacing.rearmed();}}"
+        ));
+    }
+
+    /// Only `s`, and only while the last rebuild failed, asks for one: no
+    /// other key, and no key while nothing failed.
+    #[test]
+    fn only_s_while_a_rebuild_failed_asks_for_one() {
+        assert!(input::retries_rebuild(Key::Char(b's'), true));
+        assert!(!input::retries_rebuild(Key::Char(b's'), false));
+        for key in [
+            Key::Space,
+            Key::Enter,
+            Key::Char(b'r'),
+            Key::Char(b'm'),
+            Key::Char(b'S'),
+        ] {
+            assert!(!input::retries_rebuild(key, true), "{key:?}");
+        }
     }
 
     /// `run_tui` hands the real starter to the keeper. No test may start

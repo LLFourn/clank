@@ -1095,7 +1095,12 @@ async fn await_verdict_under_deadline<W: Run>(
         tokio::select! {
             biased;
             ran = &mut verdict => ran,
-            never = replacing.parked() => match never {},
+            deaf = replacing.parked() => {
+                // Not replaced from here on, which only costs the upgrade:
+                // the verdict it frames is still the one it waits for.
+                tracing::warn!(%deaf, "a parked hook stops looking for the installed clank");
+                verdict.await
+            }
         }
     };
     let ran = under_deadline(parked, deadline).await;

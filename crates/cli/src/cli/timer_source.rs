@@ -140,7 +140,61 @@ struct Entry {
     key: String,
     due: u64,
     failure: Option<String>,
+    /// The files its failure was found among, as they stood after it.
+    failed_among: Option<Evidence>,
     recurrence: Option<recurrence::Recurrence>,
+}
+
+/// What a timer's arm and acceptance read and write: its log, its seen
+/// index and the directory holding them, each by kind, permissions, size
+/// and modification time. A staging file counts by name and kind alone,
+/// so an attempt rewriting the one it left behind changes nothing here.
+#[derive(Debug, PartialEq, Eq)]
+struct Evidence(Vec<(PathBuf, Result<Stat, std::io::ErrorKind>)>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct Stat {
+    dir: bool,
+    mode: u32,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Evidence {
+    fn of(dir: &Path, key: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let stat = |path: &Path, staging: bool| {
+            std::fs::symlink_metadata(path)
+                .map(|meta| Stat {
+                    dir: meta.is_dir(),
+                    mode: meta.permissions().mode(),
+                    len: if meta.is_dir() || staging {
+                        0
+                    } else {
+                        meta.len()
+                    },
+                    modified: (!meta.is_dir() && !staging)
+                        .then(|| meta.modified().ok())
+                        .flatten(),
+                })
+                .map_err(|e| e.kind())
+        };
+        let mut seen = vec![(dir.to_path_buf(), stat(dir, false))];
+        let log = dir.join(format!("{key}.jsonl"));
+        seen.push((log.clone(), stat(&log, false)));
+        let index = dir.join(format!("{key}.seen"));
+        seen.push((index.clone(), stat(&index, false)));
+        if let Ok(entries) = std::fs::read_dir(&index) {
+            let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for path in paths {
+                let staging = path.extension().is_some_and(|ext| ext == "tmp");
+                let stat = stat(&path, staging);
+                seen.push((path, stat));
+            }
+        }
+        Evidence(seen)
+    }
 }
 
 /// The steps of a timer that take its sidecar, in the order they run.
@@ -150,19 +204,18 @@ enum Stage {
     Accept,
 }
 
-/// The first pause before failed entries are retried, and its cap.
-const FIRST_RETRY: Duration = Duration::from_secs(1);
-const RETRY_CAP: Duration = Duration::from_secs(60);
-
 /// Ordered deadlines plus failed entries awaiting a retry. Failed due
-/// entries leave the sleep set, preventing a zero-delay hot loop; their
-/// retry has a deadline of its own ([`TimerSet::retry_due`]) that backs
-/// off while they keep failing.
+/// entries leave the sleep set, preventing a zero-delay hot loop, and are
+/// tried again only once a change at a timer's files
+/// ([`TimerSet::inventory_changed`]) has left their [`Evidence`] other than
+/// the failure found it: no clock retries them, nothing else in the repo
+/// moving does, and nor does a notice of the failed attempt's own writes.
+/// A failed occurrence stays owed meanwhile, neither accepted nor dropped.
+/// A held lock is never a failure: it leaves the entry contended until
+/// its release ([`TimerSet::retry_contended`], I9).
 pub(crate) struct TimerSet {
     entries: BTreeMap<(Instant, String), Entry>,
     recovery: Vec<Entry>,
-    retry_at: Option<Instant>,
-    retry_pause: Duration,
     pending: BTreeMap<String, Entry>,
     /// Entries whose arming or acceptance found the sidecar held, awaiting
     /// [`TimerSet::retry_contended`]: unarmed, never accepted or dropped.
@@ -170,7 +223,6 @@ pub(crate) struct TimerSet {
     /// Each timer whose arm or acceptance met a held sidecar, by the
     /// furthest stage that did, until that stage has run again unheld.
     retrying: BTreeMap<String, Stage>,
-    locking: Locking,
     dir: PathBuf,
     sink: EmissionSink,
     invocation_keys: BTreeSet<String>,
@@ -234,6 +286,7 @@ impl TimerSet {
                     key,
                     due,
                     failure: None,
+                    failed_among: None,
                     recurrence,
                 },
             );
@@ -241,12 +294,9 @@ impl TimerSet {
         Ok(Self {
             entries,
             recovery: Vec::new(),
-            retry_at: None,
-            retry_pause: FIRST_RETRY,
             pending: BTreeMap::new(),
             contended: Vec::new(),
             retrying: BTreeMap::new(),
-            locking: Locking::Wait,
             dir: dir.to_owned(),
             sink,
             invocation_keys,
@@ -255,13 +305,6 @@ impl TimerSet {
 
     pub(crate) fn invocation_keys(&self) -> &BTreeSet<String> {
         &self.invocation_keys
-    }
-
-    /// This set as the monitor's loop hosts it: an arm or acceptance whose
-    /// sidecar is held is left for [`Self::retry_contended`] (I9).
-    pub(crate) fn on_the_loop(mut self) -> Self {
-        self.locking = Locking::Try;
-        self
     }
 
     /// Whether some arm or acceptance that met a held sidecar has yet to
@@ -346,26 +389,6 @@ impl TimerSet {
         self.entries.first_key_value().map(|(key, _)| key.0)
     }
 
-    /// When the failed entries are next retried, while there are any:
-    /// a pause after the failure, doubling up to [`RETRY_CAP`] while they
-    /// go on failing. Nothing healthy is ever retried by the clock.
-    pub(crate) fn retry_due(&mut self) -> Option<Instant> {
-        if self.recovery.is_empty() {
-            self.retry_at = None;
-            return None;
-        }
-        let pause = self.retry_pause;
-        Some(*self.retry_at.get_or_insert_with(|| clock::now() + pause))
-    }
-
-    /// [`Self::retry_due`] has come: retry every failed entry, and back
-    /// off for those that fail again.
-    pub(crate) fn retry_failed(&mut self) {
-        self.retry_entries(true);
-        self.retry_at = None;
-        self.retry_pause = (self.retry_pause * 2).min(RETRY_CAP);
-    }
-
     /// Constructors are passive, so a complete replacement can be validated
     /// before disturbing a running host. Arm once after taking ownership.
     pub(crate) fn arm(&mut self) {
@@ -402,13 +425,7 @@ impl TimerSet {
                 .into_values()
                 .map(|entry| (entry, None)),
         );
-        for entry in std::mem::take(&mut self.recovery) {
-            if entry.recurrence.is_some() {
-                refresh.push((entry, None));
-            } else {
-                self.recovery.push(entry);
-            }
-        }
+        refresh.extend(self.moved(true).into_iter().map(|entry| (entry, None)));
         for entry in std::mem::take(&mut self.contended) {
             if entry.recurrence.is_some() {
                 refresh.push((entry, None));
@@ -431,9 +448,6 @@ impl TimerSet {
             return;
         }
         self.due_at(wall_now(), clock::now());
-        if self.recovery.is_empty() {
-            self.retry_pause = FIRST_RETRY;
-        }
     }
 
     fn due_at(&mut self, wall: u64, now: Instant) {
@@ -457,29 +471,42 @@ impl TimerSet {
         }
     }
 
-    /// Healthy future timers do not read clocks or files on heartbeats.
-    /// Like a refresh, a retry only re-arms what failed.
-    pub(crate) fn retry(&mut self) {
-        self.retry_entries(true);
-    }
-
-    pub(crate) fn retry_one_shots(&mut self) {
-        self.retry_entries(false);
-    }
-
-    fn retry_entries(&mut self, recurring: bool) {
-        if self.recovery.is_empty() {
+    /// A timer's log, its seen index, or a directory holding them changed:
+    /// what can end a failed entry's failure, a repair or another writer's
+    /// acceptance. Recurring entries are armed again from their logs, and
+    /// a failed one-off whose files moved since it failed is re-armed, so
+    /// a due one is accepted on the next [`Self::due`]. Healthy future
+    /// one-offs read no file.
+    pub(crate) fn inventory_changed(&mut self) {
+        self.refresh();
+        let moved = self.moved(false);
+        if moved.is_empty() {
             return;
         }
         let wall = wall_now();
         let now = clock::now();
-        for entry in std::mem::take(&mut self.recovery) {
-            match &entry.recurrence {
-                Some(_) if !recurring => self.recovery.push(entry),
-                Some(_) => self.arm_recurring(entry, wall, now, None),
-                None => self.arm_one_shot(entry, wall, now),
-            }
+        for entry in moved {
+            self.arm_one_shot(entry, wall, now);
         }
+    }
+
+    /// Take out the failed entries, recurring or not as asked, whose files
+    /// are no longer as their failure left them.
+    fn moved(&mut self, recurring: bool) -> Vec<Entry> {
+        let (moved, stay) =
+            std::mem::take(&mut self.recovery)
+                .into_iter()
+                .partition(|entry: &Entry| {
+                    entry.recurrence.is_some() == recurring
+                        && entry.failed_among.as_ref() != Some(&Evidence::of(&self.dir, &entry.key))
+                });
+        self.recovery = stay;
+        moved
+    }
+
+    fn fail(&mut self, mut entry: Entry) {
+        entry.failed_among = Some(Evidence::of(&self.dir, &entry.key));
+        self.recovery.push(entry);
     }
 
     fn arm_one_shot(&mut self, entry: Entry, wall: u64, now: Instant) {
@@ -487,7 +514,7 @@ impl TimerSet {
             Some(deadline) => {
                 self.entries.insert((deadline, entry.key.clone()), entry);
             }
-            None => self.recovery.push(entry),
+            None => self.fail(entry),
         }
     }
 
@@ -496,7 +523,7 @@ impl TimerSet {
     fn arm_recurring(&mut self, entry: Entry, wall: u64, now: Instant, previous: Option<Instant>) {
         let r = entry.recurrence.as_ref().expect("a recurring entry");
         let next = EventLog::open(&self.dir, &entry.key)
-            .and_then(|log| log.recurring_next_due(r, self.locking));
+            .and_then(|log| log.recurring_next_due(r, Locking::Try));
         self.settle_tried(entry, wall, now, previous, next, false);
     }
 
@@ -508,7 +535,7 @@ impl TimerSet {
                 &entry.source,
                 entry.due,
                 &self.sink,
-                self.locking,
+                Locking::Try,
             )
             .map(|tried| match tried {
                 Tried::Ran(()) => Tried::Ran(None),
@@ -516,7 +543,7 @@ impl TimerSet {
             }),
             Some(r) => (|| {
                 let mut log = EventLog::open(&self.dir, &entry.key)?;
-                let Tried::Ran((_lease, held)) = log.recurring_writer(r, self.locking)? else {
+                let Tried::Ran((_lease, held)) = log.recurring_writer(r, Locking::Try)? else {
                     return Ok(Tried::Contended);
                 };
                 let transition = log.accept_recurring_held(
@@ -630,7 +657,7 @@ impl TimerSet {
                         );
                     }
                     entry.failure = Some("recurring deadline outside monotonic range".into());
-                    self.recovery.push(entry);
+                    self.fail(entry);
                 }
             }
             Ok(None) if entry.recurrence.is_some() => {
@@ -646,7 +673,7 @@ impl TimerSet {
                     eprintln!("wait: timer `{}`: {failure}", entry.source.name);
                     entry.failure = Some(failure);
                 }
-                self.recovery.push(entry);
+                self.fail(entry);
             }
         }
     }
@@ -970,10 +997,9 @@ mod tests {
         let path = dir.path().join(format!("{key}.jsonl"));
         let original = std::fs::read(&path).unwrap();
         // A heartbeat would expose this poison if it read the healthy pending
-        // WAL. Neither retry nor due may perform that read or arm a deadline.
+        // WAL. Due may not perform that read or arm a deadline.
         std::fs::write(&path, "poison\n").unwrap();
         for _ in 0..20 {
-            timers.retry();
             timers.due();
         }
         assert!(timers.recovery.is_empty());
@@ -1030,7 +1056,7 @@ mod tests {
         assert_eq!(timers.recovery.len(), 1);
         let failure = timers.recovery[0].failure.clone();
         assert!(failure.is_some());
-        timers.retry();
+        timers.inventory_changed();
         assert_eq!(timers.recovery.len(), 1);
         assert_eq!(timers.recovery[0].failure, failure);
         assert!(timers.next_deadline().is_none());
@@ -1277,10 +1303,10 @@ mod tests {
         assert_eq!(
             looked(&dir, &timer),
             TimerState::Due(100),
-            "acceptance failed"
+            "acceptance was held off"
         );
         drop(held);
-        timers.retry();
+        timers.retry_contended();
         timers.due();
         assert_eq!(looked(&dir, &timer), TimerState::Fired);
 
@@ -1399,7 +1425,7 @@ mod tests {
         let (mut timers, mut rx) = set(dir.path(), vec![source("future", due)]);
         let deadline = timers.next_deadline().unwrap();
         for _ in 0..20 {
-            timers.retry();
+            timers.inventory_changed();
             timers.due();
             assert_eq!(timers.next_deadline(), Some(deadline));
         }
@@ -1457,6 +1483,9 @@ mod tests {
         assert!(after[0].acked);
     }
 
+    /// A held ingest lease is never a failure: the acceptance is left
+    /// contended, with no deadline and nothing a log change tries, until
+    /// the release's retry accepts it once.
     #[tokio::test]
     async fn lease_contention_disables_due_sleep_and_recovers_after_owner_dies() {
         let dir = tempfile::tempdir().unwrap();
@@ -1469,15 +1498,16 @@ mod tests {
             timers.next_deadline().is_none(),
             "no zero-duration retry sleep"
         );
-        assert_eq!(timers.recovery.len(), 1);
+        assert!(timers.recovery.is_empty(), "contention is not a failure");
+        assert!(timers.awaiting_retry());
         assert!(rx.try_recv().is_err());
-        timers.retry();
+        timers.inventory_changed();
         timers.due();
-        assert_eq!(timers.recovery.len(), 1);
+        assert!(rx.try_recv().is_err());
         drop(lease);
-        timers.retry();
+        timers.retry_contended();
         timers.due();
-        assert!(timers.recovery.is_empty());
+        assert!(!timers.awaiting_retry());
         assert!(matches!(
             rx.recv().await.unwrap().0,
             WaitItem::TimerEvent { .. }
@@ -1485,38 +1515,138 @@ mod tests {
         assert_eq!(rows(dir.path(), &key).len(), 1);
     }
 
-    /// A failed entry is retried at a deadline of its own, backing off
-    /// while it goes on failing, and nothing is due once it succeeds:
-    /// no heartbeat stands in for the retry.
+    /// A failed entry has no deadline of its own: nothing the clock or
+    /// the owner's other wakes bring tries it again, nor a change notice
+    /// that leaves its files as the failure found them, and it stays owed,
+    /// neither accepted nor dropped. A repair of those files is what tries
+    /// it, and accepts its occurrence exactly once.
     #[tokio::test]
-    async fn a_failed_entry_is_retried_at_a_backing_off_deadline() {
+    async fn a_failed_entry_waits_for_its_files_to_change() {
         let dir = tempfile::tempdir().unwrap();
-        let src = source("locked", 1);
+        let src = source("blocked", 1);
         let key = src.source_key(None);
-        let lease = IngestLease::try_acquire(dir.path(), &key).unwrap().unwrap();
-        let (mut timers, mut rx) = set(dir.path(), vec![src]);
-        assert_eq!(timers.retry_due(), None, "nothing has failed");
+        let blocker = dir.path().join(format!("{key}.seen"));
+        std::fs::write(&blocker, "not an index").unwrap();
+        let (mut timers, mut rx) = set(dir.path(), vec![src.clone()]);
         timers.due();
-        let first = timers.retry_due().expect("a failure is retried");
-        assert_eq!(
-            timers.retry_due(),
-            Some(first),
-            "one deadline, not a new one per look"
+        assert_eq!(timers.recovery.len(), 1, "it failed");
+        for _ in 0..20 {
+            assert_eq!(timers.next_deadline(), None, "no deadline to retry it at");
+            timers.inventory_changed();
+            timers.due();
+        }
+        assert_eq!(timers.recovery.len(), 1, "tried by nothing but a repair");
+        assert!(rx.try_recv().is_err());
+        assert!(
+            matches!(looked(dir.path(), &src), TimerState::Unknown(_)),
+            "still unaccepted"
         );
-        let now = clock::now();
-        assert!(first > now && first <= now + FIRST_RETRY);
-        timers.retry_failed();
+
+        std::fs::remove_file(&blocker).unwrap();
+        timers.inventory_changed();
         timers.due();
-        let second = timers.retry_due().expect("still failing");
-        assert!(second > clock::now() + FIRST_RETRY, "it backs off");
-        drop(lease);
-        timers.retry_failed();
-        timers.due();
-        assert_eq!(timers.retry_due(), None, "nothing is owed once it succeeds");
+        assert!(timers.recovery.is_empty());
         assert!(matches!(
             rx.recv().await.unwrap().0,
             WaitItem::TimerEvent { .. }
         ));
+        for _ in 0..3 {
+            timers.inventory_changed();
+            timers.due();
+        }
+        assert!(rx.try_recv().is_err(), "accepted once");
+        assert_eq!(rows(dir.path(), &key).len(), 1);
+    }
+
+    /// A one-off that failed before its owner's watch was armed, and was
+    /// repaired before the arming, is accepted by the look the owner takes
+    /// once armed: no change notice ever comes for that repair.
+    #[tokio::test]
+    async fn a_repair_before_the_watch_is_armed_is_found_by_the_look_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source("gap", 1);
+        let key = src.source_key(None);
+        let blocker = dir.path().join(format!("{key}.seen"));
+        std::fs::write(&blocker, "not an index").unwrap();
+        let (mut timers, mut rx) = set(dir.path(), vec![src]);
+        timers.due();
+        assert_eq!(timers.recovery.len(), 1, "it failed");
+        std::fs::remove_file(&blocker).unwrap();
+
+        timers.inventory_changed();
+        timers.due();
+        assert!(matches!(
+            rx.recv().await.unwrap().0,
+            WaitItem::TimerEvent { .. }
+        ));
+    }
+
+    /// A failed attempt's own writes are not a repair: a notice of its
+    /// append tries nothing again however often it comes. Clearing what
+    /// blocked its index entry's staging does.
+    #[tokio::test]
+    async fn a_failed_attempts_own_writes_try_nothing_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source("staged", 1);
+        let key = src.source_key(None);
+        Seen::at(dir.path(), &key).record("timer/1").unwrap();
+        let entry = std::fs::read_dir(dir.path().join(format!("{key}.seen")))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::remove_file(&entry).unwrap();
+        let blocked = entry.with_extension("tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        let (mut timers, mut rx) = set(dir.path(), vec![src]);
+        timers.due();
+        assert!(rx.try_recv().is_ok(), "appended, then the index failed");
+        assert_eq!(rows(dir.path(), &key).len(), 1);
+        assert_eq!(timers.recovery.len(), 1);
+        for _ in 0..5 {
+            timers.inventory_changed();
+            assert_eq!(
+                timers.next_deadline(),
+                None,
+                "nothing moved since it failed"
+            );
+        }
+
+        std::fs::remove_dir(&blocked).unwrap();
+        timers.inventory_changed();
+        timers.due();
+        assert!(timers.recovery.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "the occurrence was already presented"
+        );
+        assert_eq!(rows(dir.path(), &key).len(), 1);
+    }
+
+    /// A staging file counts by its name alone: rewriting the one an
+    /// attempt left behind changes nothing, and its going does.
+    #[test]
+    fn a_staging_files_rewrite_is_not_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("timer-x.seen");
+        std::fs::create_dir(&index).unwrap();
+        let staging = index.join("0123.tmp");
+        std::fs::write(&staging, "a").unwrap();
+        let before = Evidence::of(dir.path(), "timer-x");
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&staging, "a longer rewrite").unwrap();
+        assert_eq!(Evidence::of(dir.path(), "timer-x"), before);
+        std::fs::remove_file(&staging).unwrap();
+        assert_ne!(Evidence::of(dir.path(), "timer-x"), before);
+        std::fs::write(index.join("0123"), "timer/1").unwrap();
+        let entry = Evidence::of(dir.path(), "timer-x");
+        std::fs::write(index.join("0123"), "timer/12").unwrap();
+        assert_ne!(
+            Evidence::of(dir.path(), "timer-x"),
+            entry,
+            "an entry counts"
+        );
     }
 
     #[tokio::test]
@@ -1545,7 +1675,7 @@ mod tests {
         assert_eq!(rows(dir.path(), &key).len(), 1);
         assert_eq!(timers.recovery.len(), 1);
         std::fs::remove_dir(&blocked).unwrap();
-        timers.retry();
+        timers.inventory_changed();
         timers.due();
         assert!(timers.recovery.is_empty());
         assert!(rx.try_recv().is_err());
@@ -1584,7 +1714,7 @@ mod tests {
         assert_eq!(log.retained_timer_ids().unwrap().len(), 2100);
         assert!(rx.try_recv().is_err());
         std::fs::remove_file(dir.path().join(format!("{key}.seen"))).unwrap();
-        timers.retry();
+        timers.inventory_changed();
         timers.due();
         assert!(timers.recovery.is_empty());
         assert!(
@@ -1742,8 +1872,7 @@ mod tests {
         let once = source("history", 5000);
         let once_key = compactable(dir.path(), &once, 2100);
         let before = lines(dir.path(), &once_key);
-        let (timers, mut rx) = set(dir.path(), vec![recurring, once, unarmed.clone()]);
-        let mut timers = timers.on_the_loop();
+        let (mut timers, mut rx) = set(dir.path(), vec![recurring, once, unarmed.clone()]);
         let now = Instant::now();
         let deploy = r.source_key();
         let later_key = later.source_key();
@@ -1760,6 +1889,7 @@ mod tests {
             key: later_key.clone(),
             due: 100,
             failure: None,
+            failed_among: None,
             recurrence: Some(later),
         };
         let mut timers = within("the loop's timers", move || {
@@ -1772,7 +1902,6 @@ mod tests {
         assert!(timers.recovery.is_empty(), "contention is not a failure");
         assert!(timers.pending.is_empty());
         assert_eq!(timers.next_deadline(), None);
-        assert_eq!(timers.retry_due(), None, "no failure retry is armed");
         assert_eq!(lines(dir.path(), &deploy), 0, "nothing accepted");
         assert_eq!(lines(dir.path(), &once_key), before, "compaction skipped");
         held.release();
@@ -1819,8 +1948,7 @@ mod tests {
             .source_key();
         let once = source("history", 5000);
         let once_key = once.source_key(None);
-        let (timers, mut rx) = set(dir.path(), vec![recurring, once]);
-        let mut timers = timers.on_the_loop();
+        let (mut timers, mut rx) = set(dir.path(), vec![recurring, once]);
         let now = Instant::now();
         timers.refresh_at(100, now);
         assert!(timers.next_deadline().is_some(), "armed while free");
@@ -1840,7 +1968,6 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing contended is emitted");
         assert_eq!(timers.contended.len(), 2, "both pending");
         assert!(timers.recovery.is_empty(), "contention is not a failure");
-        assert_eq!(timers.retry_due(), None, "no failure retry is armed");
         assert_eq!(timers.next_deadline(), None);
         held.release();
 
@@ -1914,8 +2041,7 @@ mod tests {
         let once = source("history", 5000);
         let once_key = compactable(dir.path(), &once, 2100);
         let before = lines(dir.path(), &once_key);
-        let (timers, mut rx) = set(dir.path(), vec![recurring.clone(), once]);
-        let mut timers = timers.on_the_loop();
+        let (mut timers, mut rx) = set(dir.path(), vec![recurring.clone(), once]);
         let now = Instant::now();
         let mut log = EventLog::open(dir.path(), &key).unwrap();
         let super::super::github::log::RecurringTransition::Accepted { seq, .. } =

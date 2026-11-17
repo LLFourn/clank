@@ -3343,8 +3343,7 @@ fn a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once() {
         None,
         tx.into(),
     )
-    .unwrap()
-    .on_the_loop();
+    .unwrap();
     let hosted = std::collections::BTreeMap::from([(
         Producer::Agent(authors[1].clone()),
         Hosted {
@@ -3741,8 +3740,7 @@ fn a_held_timer(
         None,
         tx.into(),
     )
-    .unwrap()
-    .on_the_loop();
+    .unwrap();
     let held = crate::cli::github::log::tests::hold(&[(&events, &key)]);
     timers.due();
     assert!(timers.awaiting_retry(), "the acceptance met the lock");

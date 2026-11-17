@@ -1774,6 +1774,7 @@
   // ---- panes (terminal mode) ----
   function onPanes(d) {
     paneHeard = true;
+    stalled = d.stalled ?? null;
     paneOf.clear();
     const seen = new Set();
     for (const meta of d.panes) {
@@ -1810,6 +1811,9 @@
   const freshness = new Map();   // pane id → {revision, ageMs, at, liveRevision, liveUntil}
   const asked = new Map();       // request id → when this page sent it
   let demanding = false, lastAsk = -Infinity;
+  // Why the panes' updates stopped, while the bridge does not restart
+  // them: only the viewer's retry does.
+  let stalled = null;
   function demandedPane() {
     if (live !== true || document.visibilityState !== 'visible') return null;
     if (!shown || workspace || modeFor(shown) !== 'terminal') return null;
@@ -1820,11 +1824,11 @@
     const id = paneOf.get(shown);
     return id && !panes.get(id)?.closed ? id : null;
   }
-  function askVerify(list) {
+  function askVerify(list, retry = false) {
     const id = newId();
     if (list.length) asked.set(id, performance.now());
     fetch(route('/verify'), { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ tab: TAB, id, panes: list }) }).catch(() => {});
+      body: JSON.stringify({ tab: TAB, id, panes: list, retry }) }).catch(() => {});
   }
   function verifyTick(now_ = false) {
     const pane = demandedPane();
@@ -1847,6 +1851,7 @@
   }
   function freshText(id) {
     if (live !== true) return ['disconnected', ''];
+    if (stalled) return [`updates stopped: ${stalled}`, 'stalled'];
     const f = freshness.get(id);
     if (!f) return ['awaiting first frame', ''];
     const now = performance.now();
@@ -1861,6 +1866,13 @@
       const [text, cls] = freshText(id);
       el.textContent = text;
       el.className = `fresh ${cls}`;
+      if (cls === 'stalled') {
+        const again = document.createElement('button');
+        again.type = 'button';
+        again.textContent = 'retry';
+        again.addEventListener('click', () => askVerify([id], true));
+        el.append(' ', again);
+      }
     }
   }
   setInterval(() => verifyTick(), 1000);

@@ -10,6 +10,8 @@ struct Repo {
     attaches: u32,
     probes: u32,
     builds: u32,
+    /// Builds fail while set.
+    broken: bool,
     wake: Option<Wake<Ring>>,
     path_wake: Option<Wake<Ring>>,
     fault: Fault,
@@ -41,6 +43,10 @@ impl World {
 
     fn probes(&self, repo: &str) -> u32 {
         self.repos.lock().unwrap()[Path::new(repo)].probes
+    }
+
+    fn builds(&self, repo: &str) -> u32 {
+        self.repos.lock().unwrap()[Path::new(repo)].builds
     }
 
     fn watching(&self, repo: &str) -> bool {
@@ -186,6 +192,9 @@ impl<S: Shown> Panel for Fake<S> {
         let mut repos = self.world.repos.lock().unwrap();
         let r = repos.entry(repo.to_path_buf()).or_default();
         r.builds += 1;
+        if r.broken {
+            anyhow::bail!("the build broke");
+        }
         Ok((self.shown)(r.version))
     }
 }
@@ -415,7 +424,6 @@ async fn idle_repos_cost_nothing() {
     }
     assert!(Wake::new(h.watch.tx.clone(), Ring::Install).ring());
     h.settle().await;
-    assert_eq!(h.watch.timer(), None);
     assert_eq!([h.world.probes("/w/a"), h.world.probes("/w/b")], [1, 1]);
     assert!(h.out.take().is_empty());
 }
@@ -818,6 +826,52 @@ async fn an_upgrade_carries_the_set_as_it_stands_and_stdin_goes_on() {
     );
 }
 
+/// A watch whose installation cannot be watched does not start, and one
+/// whose watch fails later ends, saying why: neither goes on stale and
+/// deaf to an install.
+#[tokio::test]
+async fn a_watch_that_cannot_hear_its_installation_ends() {
+    let gone = tempfile::tempdir().unwrap();
+    let unwatchable = Authority::watching(
+        crate::build_stamp::Installation::at(gone.path().join("no-such-dir/clank")),
+        crate::build_stamp::running(),
+    );
+    let refused = StatusWatch::new(
+        Fake {
+            world: World::default(),
+            real_paths: false,
+            shown: Snap,
+        },
+        Wire::Many,
+        false,
+        Out::default(),
+        unwatchable,
+        Box::new(|_: Resume<'_>| std::io::Error::other("no exec in a test"))
+            as Box<dyn FnMut(Resume<'_>) -> std::io::Error>,
+        Stdin::Unread,
+    );
+    assert!(
+        refused
+            .err()
+            .is_some_and(|e| e.to_string().contains("cannot watch the installation"))
+    );
+
+    let installed = crate::upgrade::tests::Installed::current();
+    let mut h = harness_of(
+        Wire::Many,
+        Snap,
+        false,
+        installed.authority(),
+        Stdin::Unread,
+    );
+    h.world.exists("/w/a");
+    h.add("/w/a");
+    h.watch.turn().await.unwrap();
+    crate::fs_notice::record(&h.watch.install_fault, "the stream died".into());
+    let ended = h.watch.turn().await.unwrap_err();
+    assert!(ended.to_string().contains("the stream died"), "{ended}");
+}
+
 /// One repo's watch is restarted as it was started, and is looked for
 /// even when nothing in its repo moved.
 #[tokio::test]
@@ -1005,13 +1059,40 @@ async fn stdin_takes_any_script_and_refuses_what_names_nothing() {
     expected_refusals(&errors);
 }
 
-/// The timers a watch sets itself: a failed refresh's retry, 1s doubling
-/// to 30s.
-#[test]
-fn a_failed_refresh_is_retried_on_a_backoff() {
-    assert_eq!(watch_retry(0), None);
-    assert_eq!(watch_retry(1), Some(Duration::from_secs(1)));
-    assert_eq!(watch_retry(9), Some(Duration::from_secs(30)));
+/// A refresh that fails once a repo is shown keeps its line and is not
+/// tried again by any clock, nor on a wake that leaves its inputs where
+/// the failure found them, its own included; a wake that moves them is
+/// what tries it again, and that is not lost however soon it comes.
+#[tokio::test]
+async fn a_failed_refresh_waits_for_its_inputs_to_move() {
+    let mut h = many();
+    h.world.exists("/w/a");
+    h.add("/w/a");
+    h.watch.turn().await.unwrap();
+    assert_eq!(h.out.take(), vec![line("/w/a", 0)]);
+
+    h.world.with("/w/a", |r| r.broken = true);
+    h.world.change("/w/a");
+    h.settle().await;
+    assert_eq!(h.world.builds("/w/a"), 2);
+    for _ in 0..3 {
+        assert!(h.world.wake("/w/a").ring());
+        h.settle().await;
+    }
+    let began = std::time::Instant::now();
+    h.wait_and_turn(Duration::from_millis(1500)).await;
+    assert!(
+        began.elapsed() >= Duration::from_millis(1500),
+        "nothing woke it"
+    );
+    assert_eq!(h.world.builds("/w/a"), 2, "no build until its inputs move");
+    assert!(h.out.take().is_empty(), "the last line is kept");
+
+    h.world.with("/w/a", |r| r.broken = false);
+    h.world.change("/w/a");
+    h.settle().await;
+    assert_eq!(h.world.builds("/w/a"), 3);
+    assert_eq!(h.out.take(), vec![line("/w/a", 2)]);
 }
 
 #[test]

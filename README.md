@@ -514,7 +514,10 @@ retires it; `--json` emits typed records, and the usual range, `-n` and
 `--plan` filters apply (`-n 0` for the whole first-parent history).
 
 Enter selects whatever the cursor is on; every screen shows its own
-keys along the bottom. The `remote` row under the agent list is the
+keys along the bottom. A refresh that fails keeps the last view and says
+why at the top of the log; it is tried again when something it reads
+changes, and `s` in the log tries it again at once. If the TUI cannot watch
+its installation, it says so once, and `w` in the log watches it again. The `remote` row under the agent list is the
 remote: Space there (or `r` from the log view) is the switch. From a
 shell, `clank remote on|off` asks the repo's running `clank tui` to do
 the same, and `clank remote status` shows its state and address; on
@@ -1545,6 +1548,13 @@ process group it owns, and ends that whole group — TERM, a short grace, then
 KILL — when its host stops, including on SIGTERM or SIGINT. If the host was
 SIGKILLed instead, the next host to take the source ends the old group before
 starting its own. A producer need not watch for its parent's death.
+
+A producer that exits is started again at once. One that keeps stopping, three
+runs in a row each shorter than a minute, is reported to its agent and not
+started again until it is restarted from the TUI (`r` on its page) or its
+definition changes. A previous group that cannot be confirmed gone holds off
+the next start until one of its processes exits or its `.producer` record
+changes.
 
 The monitor restarts a source only when its own entry changes: editing,
 adding or removing another source or a timer leaves it running. A source it

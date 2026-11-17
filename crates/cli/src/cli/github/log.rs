@@ -521,7 +521,7 @@ pub(crate) enum Tried<T> {
 }
 
 /// Proof that this process holds a log's sidecar flock, shared or
-/// exclusive, until dropped: the fd's close releases it. Shared = append,
+/// exclusive, until dropped. Shared = append,
 /// exclusive = ack, reply, compaction. A step of a larger operation takes
 /// the operation's guard by reference, so it never acquires again.
 pub(crate) struct Sidecar {
@@ -783,6 +783,22 @@ pub(crate) struct IngestLease {
     _file: std::fs::File,
 }
 
+/// Unlocked rather than only closed: the lock belongs to the open file,
+/// and a child forked meanwhile holds a copy of its descriptor until its
+/// exec, which would keep it locked past the drop.
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self._file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+/// Unlocked rather than only closed, as [`Sidecar`] is.
+impl Drop for IngestLease {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self._file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 impl IngestLease {
     /// `Ok(None)` = CONTENDED (another live process holds the lease —
     /// strictly EWOULDBLOCK); any other failure is a real error the
@@ -929,7 +945,7 @@ pub(crate) fn lock_exclusive(
     Ok(held)
 }
 
-fn held_elsewhere(path: &Path, exclusive: bool) {
+pub(crate) fn held_elsewhere(path: &Path, exclusive: bool) {
     *HELD_ELSEWHERE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

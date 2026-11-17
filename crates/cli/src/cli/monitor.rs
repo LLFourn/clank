@@ -3224,10 +3224,26 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     };
     let lease_lost = tenure.watch.clone();
     let installs = std::sync::Arc::new(tokio::sync::Notify::new());
-    let _installs = authority.subscribe({
-        let installs = installs.clone();
-        move || installs.notify_one()
-    });
+    let installs_lost = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    // A monitor that cannot hear an install would serve on, stale, past
+    // the build that should replace it: it ends instead, saying why.
+    let _installs = authority
+        .subscribe(
+            {
+                let installs = installs.clone();
+                move || installs.notify_one()
+            },
+            {
+                let (installs, lost) = (installs.clone(), installs_lost.clone());
+                move |why| {
+                    lost.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert(why);
+                    installs.notify_one();
+                }
+            },
+        )
+        .map_err(|why| anyhow::anyhow!("cannot watch the installation: {why}"))?;
 
     // The monitor's own fold counter. Private on purpose: it was
     // once published and put on every frame, and no reader ever
@@ -3470,10 +3486,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 || waiter_retry.is_some(),
             "an operation is unsettled by a held lock nobody waits on"
         );
-        let timer_retry = hosted
-            .values_mut()
-            .filter_map(|host| host.timers.as_mut().and_then(|timers| timers.retry_due()))
-            .min();
         // Once: an agent with no waiter is said to have none only after
         // the monitor has served long enough for its waits to arrive.
         let settles = (serving_since.elapsed() < WAITERS_SETTLE)
@@ -3501,7 +3513,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 Wake::Records(events)
             }
             _ = crate::cli::timer_source::clock::sleep_until(timer_deadline) => Wake::TimersDue,
-            _ = crate::cli::timer_source::clock::sleep_until(timer_retry) => Wake::TimerRetry,
             Some(_) = releases.released() => Wake::Released,
             _ = crate::cli::timer_source::deadline(fold_retry.map(|(at, _)| at)) => Wake::Changed(true),
             _ = crate::cli::timer_source::deadline(settles) => Wake::Settled,
@@ -3564,19 +3575,16 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             _ => None,
         };
         match wake {
-            Wake::LeaseChanged | Wake::Collected | Wake::Installed | Wake::Settled => {}
-            Wake::TimerRetry => {
-                let now = crate::cli::timer_source::clock::now();
-                if owner {
-                    for host in hosted.values_mut() {
-                        if let Some(timers) = &mut host.timers
-                            && timers.retry_due().is_some_and(|at| at <= now)
-                        {
-                            timers.retry_failed();
-                        }
-                    }
+            Wake::Installed => {
+                if let Some(why) = installs_lost
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    anyhow::bail!("the watch on the installation failed: {why}");
                 }
             }
+            Wake::LeaseChanged | Wake::Collected | Wake::Settled => {}
             Wake::Released => {
                 if owner {
                     leaving.extend(retry_contended(
@@ -4513,8 +4521,6 @@ enum Wake {
     /// The repo changed, or a failed fold is due again; `false` once the
     /// watcher is gone.
     Changed(bool),
-    /// A failed timer's retry is due.
-    TimerRetry,
     /// A lock a loop operation found held was let go.
     Released,
     /// A registered run's process exited.
@@ -6354,10 +6360,7 @@ fn reconcile_hosting_with(
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let retry_timers = |timers: &mut crate::cli::timer_source::TimerSet| {
         if timers_changed {
-            timers.refresh();
-            timers.retry_one_shots();
-        } else {
-            timers.retry();
+            timers.inventory_changed();
         }
     };
     let mut departing = Vec::new();
@@ -6522,8 +6525,8 @@ fn reconcile_timers(
     if wanted == accepted
         && let Some(running) = &mut host.timers
     {
-        // One retry per existing reconciliation wake. New/replaced
-        // sets already attempted catchup; do not try them twice.
+        // New or replaced sets already attempted catchup; do not try
+        // them twice.
         retry_timers(running);
         return wanted;
     }
@@ -6536,9 +6539,7 @@ fn reconcile_timers(
     );
     // Constructors neither ingest nor spawn: a set that cannot be built
     // leaves the running one untouched.
-    match crate::cli::timer_source::TimerSet::new(&wanted, events_dir, None, sink)
-        .map(crate::cli::timer_source::TimerSet::on_the_loop)
-    {
+    match crate::cli::timer_source::TimerSet::new(&wanted, events_dir, None, sink) {
         Ok(mut timers) => {
             if let Some(previous) = host.timers.take() {
                 timers.keep_unchanged(previous);
@@ -8672,8 +8673,7 @@ mod recovery_tests {
             None,
             tx.into(),
         )
-        .unwrap()
-        .on_the_loop();
+        .unwrap();
         let held = crate::cli::github::log::tests::hold(&[(dir.path(), &key)]);
         timers.due();
         held.release();
@@ -14735,6 +14735,60 @@ mod tests {
         .unwrap();
     }
 
+    /// A hosted timer whose occurrence will not write is tried again by
+    /// no clock and by no repo change but a timer log's: a fold over
+    /// anything else leaves it unarmed and owed, and the change re-arms
+    /// it, so the next deadline wake accepts it.
+    #[tokio::test]
+    async fn a_hosted_timer_that_will_not_write_waits_for_a_timer_log_to_change() {
+        let repo = repo_with_roster();
+        let codex = Producer::Agent(AgentLabel::parse("codex").unwrap());
+        with_timer(repo.path(), "owed", 1);
+        let config = crate::agent_store::load_agent_config(
+            repo.path(),
+            &AgentLabel::parse("codex").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let clank_core::agent_config::WaitEventSource::Timer(source) = &config.wait_events[0]
+        else {
+            unreachable!()
+        };
+        let events_dir = codex.directory(repo.path());
+        let wal = events_dir.join(format!("{}.jsonl", source.source_key(None)));
+        std::fs::create_dir_all(&wal).unwrap();
+        let spawn = stand_in_spawner(Default::default());
+        let (into, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let starts = Starts {
+            into: &into,
+            lifecycle: None,
+            spawn: &spawn,
+        };
+        let mut hosted = std::collections::BTreeMap::new();
+        let reconcile = |hosted: &mut std::collections::BTreeMap<Producer, Hosted>, changed| {
+            assert!(reconcile_hosting_with(repo.path(), hosted, changed, &starts).is_empty());
+        };
+        let due = |hosted: &mut std::collections::BTreeMap<Producer, Hosted>| {
+            let set = hosted.get_mut(&codex).unwrap().timers.as_mut().unwrap();
+            set.due();
+            set.next_deadline()
+        };
+        reconcile(&mut hosted, false);
+        assert_eq!(due(&mut hosted), None, "it failed, and has no deadline");
+        std::fs::remove_dir(&wal).unwrap();
+        for _ in 0..3 {
+            reconcile(&mut hosted, false);
+            assert_eq!(due(&mut hosted), None, "nothing but its log tries it");
+        }
+        assert!(rx.try_recv().is_err(), "still owed, not accepted");
+
+        reconcile(&mut hosted, true);
+        assert_eq!(due(&mut hosted), None, "accepted at once");
+        let (_, emission) = rx.try_recv().expect("its occurrence");
+        assert!(format!("{emission:?}").contains("owed"), "{emission:?}");
+        assert!(rx.try_recv().is_err(), "once");
+    }
+
     #[tokio::test]
     async fn recurring_timer_host_rearms_on_ack_invalidation_and_cancels_on_removal() {
         use crate::cli::github::log::EventLog;
@@ -15495,11 +15549,6 @@ mod tests {
             .find("        let wake = tokio::select! {")
             .expect("the select");
         assert!(armed < select, "armed before the loop sleeps");
-        let deadline = body
-            .find("let timer_retry = hosted")
-            .expect("the retry deadline");
-        let computed = &body[deadline..deadline + body[deadline..].find(";").unwrap()];
-        assert!(!computed.contains("contention"), "{computed}");
         let arms = &body[select..select + body[select..].find("\n        };\n").unwrap()];
         assert!(
             arms.contains("Some(_) = releases.released() => Wake::Released,"),
@@ -15515,6 +15564,21 @@ mod tests {
             .expect("the retry runs");
         let facts = arm.find("recovery_facts(").expect("recovery looks again");
         assert!(owner < ran && ran < facts, "{arm}");
+    }
+
+    /// A monitor that cannot watch its installation does not serve, and one
+    /// whose watch fails ends, saying why: it would otherwise serve on past
+    /// the build installed to replace it. Read, since no test may run one.
+    #[test]
+    fn a_monitor_deaf_to_installs_ends() {
+        let src = include_str!("monitor.rs");
+        let flat: String = src.split_whitespace().collect();
+        assert!(
+            flat.contains(".map_err(|why|anyhow::anyhow!(\"cannotwatchtheinstallation:{why}\"))?;")
+        );
+        assert!(flat.contains(
+            "Wake::Installed=>{ifletSome(why)=installs_lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(){anyhow::bail!(\"thewatchontheinstallationfailed:{why}\");}}"
+        ));
     }
 
     #[test]
@@ -15558,7 +15622,6 @@ mod tests {
             "deadline(recovery_due)",
             "deadline(turns_due)",
             "sleep_until(timer_deadline)",
-            "sleep_until(timer_retry)",
             "deadline(fold_retry",
             "deadline(settles)",
             "deadline(quiesced)",

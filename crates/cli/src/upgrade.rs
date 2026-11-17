@@ -10,8 +10,8 @@
 //! A process that never arms its authority is a one-shot command: it is
 //! always current, and nothing here costs it a system call.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
 
 use crate::build_stamp::{Build, Install, Installation, Stamp};
 
@@ -80,6 +80,8 @@ struct Inner {
     installed: Option<Build>,
     in_flight: usize,
     refused: u64,
+    /// Changes heard at the installation by any subscription's watch.
+    heard: Arc<AtomicU64>,
     subscribers: Vec<(u64, Wake)>,
     next_subscriber: u64,
 }
@@ -138,6 +140,7 @@ impl Authority {
             installed: None,
             in_flight: 0,
             refused: 0,
+            heard: Arc::default(),
             subscribers: Vec::new(),
             next_subscriber: 0,
         })))
@@ -171,30 +174,35 @@ impl Authority {
         self.inner().standing()
     }
 
-    /// Call `wake` whenever where this process stands may have moved: an
-    /// entry of a directory holding the installation changed (an install
-    /// replaces the file, or retargets the link to it), or the last work
-    /// in flight on a stale build finished. `wake` only signals; the
-    /// subscriber looks. Subscribe before looking, so an install landing
-    /// between the two is still heard. Ends when the [`Subscription`] is
-    /// dropped.
-    pub fn subscribe(&self, wake: impl Fn() + Send + Sync + 'static) -> Subscription {
-        let wake: Wake = Arc::new(wake);
-        let installed = self
-            .inner()
-            .watched
-            .as_ref()
-            .map(|(installation, _)| installation.path().to_path_buf());
-        let watch = installed.and_then(|installed| watch_install(&installed, wake.clone()));
-        self.subscribed(wake, watch)
+    /// `wake`, counting each change at the installation as heard.
+    fn hearing(&self, wake: Wake) -> Wake {
+        let heard = self.inner().heard.clone();
+        Arc::new(move || {
+            heard.fetch_add(1, Ordering::AcqRel);
+            wake()
+        })
     }
 
-    /// Call `moved` on each wake [`Self::subscribe`] gives, and `failed`
-    /// when the watch on the installation fails, after which nothing more
-    /// is heard. A watch that cannot be armed is an error rather than a
-    /// subscription that never wakes; `Ok(None)` when no installation is
-    /// watched, so this process is never replaced.
-    pub(crate) fn hear_installs(
+    /// How many changes at the installation this process's watches have
+    /// heard. A failed replacement is tried again only once it moves.
+    pub fn installs_heard(&self) -> u64 {
+        self.inner().heard.load(Ordering::Acquire)
+    }
+
+    /// Call `moved` whenever where this process stands may have moved: an
+    /// entry of a directory holding the installation changed (an install
+    /// replaces the file, or retargets the link to it), the file itself was
+    /// written, or the last work in flight on a stale build finished.
+    /// `moved` only signals; the subscriber looks. Subscribe before
+    /// looking, so an install landing between the two is still heard.
+    ///
+    /// `failed` is told when the watch fails once armed, after which
+    /// nothing more is heard. A watch that cannot be armed, or covers less
+    /// than every directory an install changes, is an error rather than a
+    /// subscription that never wakes. `Ok(None)` when no installation is
+    /// watched, so this process is never replaced. Ends when the
+    /// [`Subscription`] is dropped.
+    pub fn subscribe(
         &self,
         moved: impl Fn() + Send + Sync + 'static,
         failed: impl Fn(String) + Send + Sync + 'static,
@@ -208,7 +216,13 @@ impl Authority {
         else {
             return Ok(None);
         };
-        let (watch, missed) = install_watcher(&installed, wake.clone(), failed)?;
+        if install_dirs(&installed).is_empty() {
+            return Err(format!(
+                "no directory holding {} exists to watch",
+                installed.display()
+            ));
+        }
+        let (watch, missed) = install_watcher(&installed, self.hearing(wake.clone()), failed)?;
         if let Some((dir, e)) = missed.into_iter().next() {
             return Err(format!("{}: {e}", dir.display()));
         }
@@ -310,39 +324,8 @@ impl Drop for Subscription {
 /// Watch an installation: the directories holding its path and the file
 /// it resolves to, for an install that renames over it or retargets a
 /// link, and that file's own writes, for one that writes over it in
-/// place. A replaced file is followed by its directory's listing.
-fn watch_install(
-    installed: &std::path::Path,
-    wake: Wake,
-) -> Option<crate::proc_identity::tree_watch::KernelWatcher> {
-    let shown = installed.to_path_buf();
-    let failed = {
-        let wake = wake.clone();
-        move |why: String| {
-            eprintln!(
-                "clank: the watch on {} failed: {why}; an install is no longer \
-                 noticed until this process restarts",
-                shown.display()
-            );
-            wake()
-        }
-    };
-    match install_watcher(installed, wake, failed) {
-        Ok((watcher, missed)) => {
-            for (dir, e) in missed {
-                tracing::warn!(dir = %dir.display(), "cannot watch for an install: {e}");
-            }
-            Some(watcher)
-        }
-        Err(e) => {
-            tracing::warn!(path = %installed.display(), "cannot watch for an install: {e}");
-            None
-        }
-    }
-}
-
-/// [`watch_install`]'s watcher, with `failed` told of a watch that fails
-/// once armed, and the directories it could not watch.
+/// place. `failed` is told of a watch that fails once armed; the
+/// directories it could not watch are returned.
 fn install_watcher(
     installed: &std::path::Path,
     wake: Wake,
@@ -428,10 +411,6 @@ pub fn arm() {
     }
 }
 
-/// The pause after a failed replacement, doubled up to [`RETRY_CAP`].
-const FIRST_RETRY: Duration = Duration::from_millis(500);
-const RETRY_CAP: Duration = Duration::from_secs(8);
-
 /// What one pass of a [`Mover`] came to. There is no outcome for a
 /// replacement that worked: that process is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -440,12 +419,12 @@ pub enum Pass {
     /// Replaceable once what is in flight is finished.
     Deferred,
     /// The replacement was tried and failed; this process goes on as it
-    /// was and tries again after the pause.
+    /// was until the installation changes.
     Failed {
         why: String,
-        retry_in: Duration,
     },
-    /// A failed replacement's pause is still running.
+    /// A replacement failed and nothing has changed at the installation
+    /// since, so it is not tried again.
     Waiting,
     /// It is stale and stays: replacing it would break what it hosts.
     Held,
@@ -469,18 +448,27 @@ pub enum Hosting {
 }
 
 /// A process that replaces itself with the installed build at its safe
-/// point, and keeps trying when that fails.
+/// point, and tries again when a replacement failed only once the
+/// installation has changed.
 #[derive(Debug)]
 pub struct Mover {
     authority: Authority,
-    retry: Option<(Instant, Duration)>,
+    failed: Option<Failure>,
+}
+
+/// A replacement that failed: the build it was to become, and the
+/// installs heard before it was tried.
+#[derive(Debug)]
+struct Failure {
+    build: Build,
+    heard: u64,
 }
 
 impl Mover {
     pub fn new(authority: Authority) -> Self {
         Mover {
             authority,
-            retry: None,
+            failed: None,
         }
     }
 
@@ -490,17 +478,16 @@ impl Mover {
 
     /// Look at the installation, and at the safe point become the build
     /// installed there through `exec`, which returns only if it failed.
-    /// The installation is read again on every pass, so a retry becomes
-    /// whatever is installed by then.
-    pub fn pass(
-        &mut self,
-        now: Instant,
-        hosting: Hosting,
-        exec: impl FnOnce(&Build) -> std::io::Error,
-    ) -> Pass {
+    /// After a failure nothing is tried until another build is installed
+    /// or a watch hears the installation change, so a pass on any other
+    /// wake costs no attempt.
+    pub fn pass(&mut self, hosting: Hosting, exec: impl FnOnce(&Build) -> std::io::Error) -> Pass {
+        // Read before the look: a change landing between the two is then
+        // counted as after the attempt, and earns one more.
+        let heard = self.authority.installs_heard();
         let installed = match self.authority.look() {
             Standing::Current => {
-                self.retry = None;
+                self.failed = None;
                 return Pass::Current;
             }
             Standing::Quiescing { .. } => return Pass::Deferred,
@@ -509,32 +496,26 @@ impl Mover {
         if hosting == Hosting::Someone {
             return Pass::Held;
         }
-        if self.retry.is_some_and(|(at, _)| now < at) {
+        if self
+            .failed
+            .as_ref()
+            .is_some_and(|failed| failed.build == installed && failed.heard == heard)
+        {
             return Pass::Waiting;
         }
         let why = exec(&installed).to_string();
-        let pause = match self.retry {
-            Some((_, pause)) => (pause * 2).min(RETRY_CAP),
-            None => FIRST_RETRY,
-        };
-        self.retry = Some((now + pause, pause));
-        Pass::Failed {
-            why,
-            retry_in: pause,
-        }
+        self.failed = Some(Failure {
+            build: installed,
+            heard,
+        });
+        Pass::Failed { why }
     }
 
-    /// How long until a failed replacement's pause ends, while one is
-    /// running. Nothing else makes a pass due by the clock.
-    pub fn retry_in(&self, now: Instant) -> Option<Duration> {
-        self.retry.map(|(at, _)| at.saturating_duration_since(now))
+    /// A watch on the installation was armed after a gap in which changes
+    /// went unheard: a failed replacement is tried once more.
+    pub fn rearmed(&mut self) {
+        self.failed = None;
     }
-}
-
-/// The runtime's clock, so a retry's pause and the sleep that waits it
-/// out are measured on the same one.
-fn now() -> Instant {
-    tokio::time::Instant::now().into_std()
 }
 
 /// A [`Mover`] together with the way its process becomes the installed
@@ -542,6 +523,35 @@ fn now() -> Instant {
 pub struct Replacing<E> {
     mover: Mover,
     exec: E,
+    hear: Hear,
+    /// The watch on the installation, kept from the first park until it
+    /// fails, so no change between two parks goes unheard.
+    hearing: Option<Hearing>,
+}
+
+struct Hearing {
+    _watch: Option<Box<dyn Send>>,
+    woken: Arc<tokio::sync::Notify>,
+    deaf: Arc<Mutex<Option<String>>>,
+}
+
+/// How a [`Replacing`] hears its installation: what wakes it, what tells
+/// it the watch failed, and the guard that keeps the watch, `None` for a
+/// process that watches no installation. A seam, so a test can fail it.
+pub(crate) type Hear = fn(
+    &Authority,
+    Box<dyn Fn() + Send + Sync>,
+    Box<dyn Fn(String) + Send + Sync>,
+) -> Result<Option<Box<dyn Send>>, String>;
+
+fn hear_installs(
+    authority: &Authority,
+    moved: Box<dyn Fn() + Send + Sync>,
+    failed: Box<dyn Fn(String) + Send + Sync>,
+) -> Result<Option<Box<dyn Send>>, String> {
+    Ok(authority
+        .subscribe(moved, failed)?
+        .map(|subscription| Box::new(subscription) as Box<dyn Send>))
 }
 
 impl Replacing<fn(&Build) -> std::io::Error> {
@@ -559,24 +569,26 @@ impl<E: FnMut(&Build) -> std::io::Error> Replacing<E> {
         Replacing {
             mover: Mover::new(authority),
             exec,
+            hear: hear_installs,
+            hearing: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hearing_through(mut self, hear: Hear) -> Self {
+        self.hear = hear;
+        self
     }
 
     /// One pass, now. See [`Mover::pass`].
     pub fn pass(&mut self, hosting: Hosting) -> Pass {
-        let pass = self.mover.pass(now(), hosting, &mut self.exec);
-        if let Pass::Failed { why, retry_in } = &pass {
-            // Never to the terminal or a harness: a retried replacement
-            // is nobody's news.
-            tracing::debug!(%why, ?retry_in, "could not become the installed clank");
+        let pass = self.mover.pass(hosting, &mut self.exec);
+        if let Pass::Failed { why } = &pass {
+            // Never to the terminal or a harness: the stale badge already
+            // says this process is not the installed build.
+            tracing::debug!(%why, "could not become the installed clank");
         }
         pass
-    }
-
-    /// How long until a failed replacement's pause ends, while one is
-    /// running.
-    pub fn retry_in(&self) -> Option<Duration> {
-        self.mover.retry_in(now())
     }
 
     pub fn authority(&self) -> &Authority {
@@ -588,41 +600,75 @@ impl<E: FnMut(&Build) -> std::io::Error> Replacing<E> {
         self.mover.authority().standing().stale().is_some()
     }
 
-    /// Pass now, and again on each [`Authority::subscribe`] wake or when
-    /// a failed replacement's pause ends, for as long as this is polled.
-    /// For a process to select against while it is parked: whatever it
-    /// is parked on goes first, so a pass only ever runs with nothing in
-    /// hand.
-    pub async fn parked(&mut self) -> std::convert::Infallible {
-        loop {
-            self.pass_until(|_| false).await;
+    /// Pass now, and again each time the installation may have moved, for
+    /// as long as this is polled. For a process to select against while
+    /// it is parked: whatever it is parked on goes first, so a pass only
+    /// ever runs with nothing in hand. Ends only when the installation
+    /// can no longer be heard, saying why: from then on this process is
+    /// not replaced, and goes on as it is.
+    pub async fn parked(&mut self) -> String {
+        match self.pass_until(|_| false).await {
+            Ok(()) => unreachable!("a pass that is never done"),
+            Err(deaf) => deaf,
         }
     }
 
     /// Pass as [`Self::parked`] does until a pass finds this process
-    /// current, which may be at once.
-    pub async fn until_current(&mut self) {
-        self.pass_until(|pass| *pass == Pass::Current).await;
+    /// current, which may be at once, or why the installation can no
+    /// longer be heard.
+    pub async fn until_current(&mut self) -> Result<(), String> {
+        self.pass_until(|pass| *pass == Pass::Current).await
     }
 
-    async fn pass_until(&mut self, done: impl Fn(&Pass) -> bool) {
-        let woken = Arc::new(tokio::sync::Notify::new());
-        let _subscription = self.authority().subscribe({
-            let woken = woken.clone();
-            move || woken.notify_one()
-        });
+    async fn pass_until(&mut self, done: impl Fn(&Pass) -> bool) -> Result<(), String> {
+        let (woken, deaf) = match &self.hearing {
+            Some(hearing) => (hearing.woken.clone(), hearing.deaf.clone()),
+            None => {
+                let woken = Arc::new(tokio::sync::Notify::new());
+                let deaf = Arc::new(Mutex::new(None::<String>));
+                let watch = (self.hear)(
+                    self.authority(),
+                    Box::new({
+                        let woken = woken.clone();
+                        move || woken.notify_one()
+                    }),
+                    Box::new({
+                        let (woken, deaf) = (woken.clone(), deaf.clone());
+                        move |why| {
+                            deaf.lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .get_or_insert(why);
+                            woken.notify_one();
+                        }
+                    }),
+                )
+                .map_err(|why| format!("cannot watch the installation: {why}"))?;
+                self.hearing = Some(Hearing {
+                    _watch: watch,
+                    woken: woken.clone(),
+                    deaf: deaf.clone(),
+                });
+                self.mover.rearmed();
+                (woken, deaf)
+            }
+        };
         loop {
             if done(&self.pass(Hosting::Nothing)) {
-                return;
+                return Ok(());
             }
-            match self.retry_in() {
-                Some(pause) => tokio::select! {
-                    _ = tokio::time::sleep(pause) => {}
-                    _ = woken.notified() => {}
-                },
-                None => woken.notified().await,
+            woken.notified().await;
+            if let Some(why) = deaf.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                self.hearing = None;
+                return Err(format!("the watch on the installation failed: {why}"));
             }
         }
+    }
+
+    /// A watch on the installation was armed again after one was lost:
+    /// what changed between is unheard, so a failed replacement is tried
+    /// once more.
+    pub fn rearmed(&mut self) {
+        self.mover.rearmed();
     }
 }
 
@@ -651,6 +697,7 @@ pub fn exec_installed_as_started() -> std::io::Error {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::time::Duration;
 
     thread_local! {
         pub(super) static STANDS_IN: std::cell::RefCell<Option<Authority>> =
@@ -743,7 +790,7 @@ pub(crate) mod tests {
         assert_eq!(authority.look(), Standing::Current);
         assert!(authority.permit().is_ok());
         assert_eq!(
-            Mover::new(authority).pass(Instant::now(), Hosting::Nothing, never),
+            Mover::new(authority).pass(Hosting::Nothing, never),
             Pass::Current
         );
     }
@@ -754,12 +801,11 @@ pub(crate) mod tests {
     fn a_replaced_build_with_nothing_in_flight_is_replaced_once() {
         let installed = Installed::current();
         let mut mover = Mover::new(installed.authority());
-        let now = Instant::now();
-        assert_eq!(mover.pass(now, Hosting::Nothing, never), Pass::Current);
+        assert_eq!(mover.pass(Hosting::Nothing, never), Pass::Current);
 
         let other = installed.replace(1);
         let tried = std::cell::RefCell::new(Vec::new());
-        let pass = mover.pass(now, Hosting::Nothing, |build| {
+        let pass = mover.pass(Hosting::Nothing, |build| {
             tried.borrow_mut().push(build.stamp);
             std::io::Error::other("no exec in a test")
         });
@@ -772,7 +818,6 @@ pub(crate) mod tests {
             pass,
             Pass::Failed {
                 why: "no exec in a test".into(),
-                retry_in: FIRST_RETRY
             }
         );
     }
@@ -786,9 +831,8 @@ pub(crate) mod tests {
         let mut mover = Mover::new(authority.clone());
         let presenting = authority.permit().expect("current");
         let other = installed.replace(1);
-        let now = Instant::now();
 
-        assert_eq!(mover.pass(now, Hosting::Nothing, never), Pass::Deferred);
+        assert_eq!(mover.pass(Hosting::Nothing, never), Pass::Deferred);
         assert!(matches!(
             authority.standing(),
             Standing::Quiescing { in_flight: 1, .. }
@@ -800,70 +844,114 @@ pub(crate) mod tests {
 
         drop(presenting);
         let tried = std::cell::Cell::new(0);
-        mover.pass(now, Hosting::Nothing, |_| {
+        mover.pass(Hosting::Nothing, |_| {
             tried.set(tried.get() + 1);
             std::io::Error::other("no exec in a test")
         });
         assert_eq!(tried.get(), 1, "replaced once the result is settled");
     }
 
-    /// A failed replacement leaves the process as it was, backs off, and
-    /// on its next attempt becomes whatever is installed by then.
+    /// A failed replacement leaves the process as it was and is not
+    /// tried again on any pass, however many, until the installation
+    /// changes: another build installed, or a change a watch heard. Then
+    /// it becomes whatever is installed by then.
     #[test]
-    fn a_failed_replacement_is_retried_against_what_is_installed_then() {
+    fn a_failed_replacement_waits_for_the_installation_to_change() {
         let installed = Installed::current();
-        let mut mover = Mover::new(installed.authority());
+        let authority = installed.authority();
+        let mut mover = Mover::new(authority.clone());
         installed.replace(1);
-        let began = Instant::now();
         let fail = |_: &Build| std::io::Error::other("the binary is missing");
 
-        let mut pauses = Vec::new();
-        let mut now = began;
-        for _ in 0..6 {
-            match mover.pass(now, Hosting::Nothing, fail) {
-                Pass::Failed { retry_in, .. } => {
-                    assert_eq!(
-                        mover.pass(
-                            now + retry_in - Duration::from_millis(1),
-                            Hosting::Nothing,
-                            never
-                        ),
-                        Pass::Waiting
-                    );
-                    assert_eq!(mover.retry_in(now), Some(retry_in));
-                    pauses.push(retry_in);
-                    now += retry_in;
-                }
-                other => panic!("{other:?}"),
-            }
-        }
-        assert_eq!(
-            pauses,
-            [500, 1000, 2000, 4000, 8000, 8000].map(Duration::from_millis)
-        );
-
-        // Mid-install the binary is gone: still stale, still retried.
-        installed.remove();
         assert!(matches!(
-            mover.pass(now + RETRY_CAP, Hosting::Nothing, fail),
+            mover.pass(Hosting::Nothing, fail),
             Pass::Failed { .. }
         ));
+        for _ in 0..100 {
+            assert_eq!(mover.pass(Hosting::Nothing, never), Pass::Waiting);
+        }
 
         let third = installed.replace(2);
         let tried = std::cell::RefCell::new(None);
-        mover.pass(now + RETRY_CAP * 3, Hosting::Nothing, |build| {
+        mover.pass(Hosting::Nothing, |build| {
             *tried.borrow_mut() = Some(build.stamp);
             std::io::Error::other("no exec in a test")
         });
         assert_eq!(*tried.borrow(), Some(third), "the build installed since");
+        assert_eq!(mover.pass(Hosting::Nothing, never), Pass::Waiting);
+
+        authority.inner().heard.fetch_add(1, Ordering::AcqRel);
+        let tried = std::cell::Cell::new(0);
+        mover.pass(Hosting::Nothing, |_| {
+            tried.set(tried.get() + 1);
+            std::io::Error::other("no exec in a test")
+        });
+        assert_eq!(tried.get(), 1, "the same build, after a change was heard");
 
         installed.install(crate::build_stamp::running());
         assert_eq!(
-            mover.pass(now + RETRY_CAP * 6, Hosting::Nothing, never),
+            mover.pass(Hosting::Nothing, never),
             Pass::Current,
             "its own build installed again"
         );
-        assert_eq!(mover.retry_in(now), None, "nothing is due by the clock");
+    }
+
+    /// A watch armed again after one was lost may have missed a repair of
+    /// the same build: the failed replacement is tried once more, and
+    /// then waits again.
+    #[test]
+    fn a_rearmed_watch_tries_a_failed_replacement_once_more() {
+        let installed = Installed::current();
+        let mut mover = Mover::new(installed.authority());
+        installed.replace(1);
+        let tries = std::cell::Cell::new(0);
+        let fail = |_: &Build| {
+            tries.set(tries.get() + 1);
+            std::io::Error::other("not executable")
+        };
+        assert!(matches!(
+            mover.pass(Hosting::Nothing, fail),
+            Pass::Failed { .. }
+        ));
+        assert_eq!(mover.pass(Hosting::Nothing, fail), Pass::Waiting);
+        mover.rearmed();
+        assert!(matches!(
+            mover.pass(Hosting::Nothing, fail),
+            Pass::Failed { .. }
+        ));
+        assert_eq!(mover.pass(Hosting::Nothing, fail), Pass::Waiting);
+        assert_eq!(tries.get(), 2);
+    }
+
+    /// What a subscription's watch hears at the installation is counted,
+    /// and the last permit's drop, which moves no installation, is not.
+    #[test]
+    fn only_a_change_at_the_installation_is_heard() {
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let presenting = authority.permit().expect("current");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _subscription = authority
+            .subscribe(
+                move || {
+                    let _ = tx.send(());
+                },
+                |why| panic!("{why}"),
+            )
+            .unwrap();
+        assert_eq!(authority.installs_heard(), 0);
+        installed.replace(1);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the install");
+        std::thread::sleep(Duration::from_millis(200));
+        while rx.try_recv().is_ok() {}
+        let heard = authority.installs_heard();
+        assert!(heard > 0);
+        let _ = authority.look();
+        drop(presenting);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the last permit");
+        assert_eq!(authority.installs_heard(), heard);
     }
 
     /// A process hosting someone is never replaced, and is stale all the
@@ -874,7 +962,7 @@ pub(crate) mod tests {
         let authority = installed.authority();
         let mut mover = Mover::new(authority.clone());
         installed.replace(1);
-        let pass = mover.pass(Instant::now(), Hosting::Someone, never);
+        let pass = mover.pass(Hosting::Someone, never);
         assert_eq!(pass, Pass::Held);
         assert!(pass.stale());
         assert!(authority.permit().is_err());
@@ -1098,10 +1186,7 @@ pub(crate) mod tests {
         installed.replace(1);
         assert!(authority.permit().is_err());
         let settling = authority.settling();
-        assert_eq!(
-            mover.pass(Instant::now(), Hosting::Nothing, never),
-            Pass::Deferred
-        );
+        assert_eq!(mover.pass(Hosting::Nothing, never), Pass::Deferred);
         drop(settling);
         assert!(matches!(authority.standing(), Standing::Replaceable { .. }));
     }
@@ -1113,9 +1198,14 @@ pub(crate) mod tests {
         let installed = Installed::current();
         let authority = installed.authority();
         let (tx, rx) = std::sync::mpsc::channel();
-        let subscription = authority.subscribe(move || {
-            let _ = tx.send(());
-        });
+        let subscription = authority
+            .subscribe(
+                move || {
+                    let _ = tx.send(());
+                },
+                |why| panic!("{why}"),
+            )
+            .unwrap();
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),
             "nothing yet"
@@ -1144,12 +1234,17 @@ pub(crate) mod tests {
         installed.replace(1);
         assert!(matches!(authority.look(), Standing::Quiescing { .. }));
         let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let _subscription = authority.subscribe({
-            let woken = woken.clone();
-            move || {
-                woken.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            }
-        });
+        let _subscription = authority
+            .subscribe(
+                {
+                    let woken = woken.clone();
+                    move || {
+                        woken.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
+                },
+                |why| panic!("{why}"),
+            )
+            .unwrap();
         let before = woken.load(std::sync::atomic::Ordering::Acquire);
         drop(presenting);
         assert!(woken.load(std::sync::atomic::Ordering::Acquire) > before);
@@ -1241,14 +1336,25 @@ pub(crate) mod tests {
     }
 
     /// A stale process waiting to become current again returns as soon
-    /// as its own build is installed back.
+    /// as its own build is installed back, and a replacement that failed
+    /// meanwhile is not tried again while nothing at the installation
+    /// changes.
     #[tokio::test]
     async fn until_current_returns_when_its_build_is_back() {
         let installed = Installed::current();
         installed.replace(1);
-        let mut replacing = Replacing::new(installed.authority(), |_: &Build| {
-            std::io::Error::other("no exec in a test")
+        let tries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut replacing = Replacing::new(installed.authority(), {
+            let tries = tries.clone();
+            move |_: &Build| {
+                tries.fetch_add(1, Ordering::AcqRel);
+                std::io::Error::other("no exec in a test")
+            }
         });
+        let quiet =
+            tokio::time::timeout(Duration::from_millis(1500), replacing.until_current()).await;
+        assert!(quiet.is_err(), "still stale");
+        assert_eq!(tries.load(Ordering::Acquire), 1, "tried once, then waited");
         let restoring = std::thread::spawn({
             let path = installed.path.clone();
             move || {
@@ -1262,10 +1368,80 @@ pub(crate) mod tests {
                 std::fs::rename(&tmp, &path).unwrap();
             }
         });
-        tokio::time::timeout(Duration::from_secs(5), replacing.until_current())
+        let back = tokio::time::timeout(Duration::from_secs(5), replacing.until_current())
             .await
             .expect("current again");
+        assert_eq!(back, Ok(()));
         restoring.join().unwrap();
+    }
+
+    /// An installation that cannot be watched, for want of a directory to
+    /// watch or because its watch would not arm, ends a park at once with
+    /// why, and so does a watch that fails once armed: none is taken for a
+    /// quiet one. A failed replacement waiting on it ends the same way.
+    #[tokio::test(start_paused = true)]
+    async fn an_installation_that_cannot_be_heard_ends_the_park() {
+        let gone = tempfile::tempdir().unwrap();
+        let mut unwatchable = Replacing::new(
+            Authority::watching(
+                Installation::at(gone.path().join("no-such-dir/clank")),
+                crate::build_stamp::running(),
+            ),
+            never,
+        );
+        let deaf = tokio::time::timeout(Duration::from_secs(60), unwatchable.parked())
+            .await
+            .expect("it ends");
+        assert!(deaf.contains("no directory holding"), "{deaf}");
+
+        let installed = Installed::current();
+        let mut refused = Replacing::new(installed.authority(), never)
+            .hearing_through(|_, _, _| Err("no descriptors left".into()));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(60), refused.parked())
+                .await
+                .expect("it ends"),
+            "cannot watch the installation: no descriptors left"
+        );
+
+        type Failed = Box<dyn Fn(String) + Send + Sync>;
+        static FAIL: Mutex<Option<Failed>> = Mutex::new(None);
+        installed.replace(1);
+        let mut failing = Replacing::new(installed.authority(), |_: &Build| {
+            std::io::Error::other("no exec in a test")
+        })
+        .hearing_through(|_, _, failed| {
+            *FAIL.lock().unwrap() = Some(failed);
+            Ok(Some(Box::new(())))
+        });
+        {
+            let waiting = failing.until_current();
+            tokio::pin!(waiting);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(60), &mut waiting)
+                    .await
+                    .is_err(),
+                "a failed replacement waits on a live watch"
+            );
+            (FAIL.lock().unwrap().take().expect("armed"))("the stream died".into());
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(60), waiting)
+                    .await
+                    .expect("it ends"),
+                Err("the watch on the installation failed: the stream died".into())
+            );
+        }
+        let again = failing.until_current();
+        tokio::pin!(again);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), &mut again)
+                .await
+                .is_err()
+        );
+        assert!(
+            FAIL.lock().unwrap().is_some(),
+            "the next park arms a watch of its own"
+        );
     }
 
     /// An installation that cannot be read proves nothing either way.

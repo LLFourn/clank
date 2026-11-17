@@ -100,8 +100,22 @@ impl RepoSession {
             // Registered and answered at once: the answer is a later
             // `confirmed` frame, because this connector handles one
             // request at a time and a held reply would stall it.
-            BrowserRequest::Verify { tab, id, panes } => match &self.verify {
-                Some(verify) if verify.send(super::Verify { tab, id, panes }).is_ok() => {
+            BrowserRequest::Verify {
+                tab,
+                id,
+                panes,
+                retry,
+            } => match &self.verify {
+                Some(verify)
+                    if verify
+                        .send(super::Verify {
+                            tab,
+                            id,
+                            panes,
+                            retry,
+                        })
+                        .is_ok() =>
+                {
                     plain(204, "")
                 }
                 _ => plain(409, "screen verification is unavailable"),

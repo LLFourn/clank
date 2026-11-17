@@ -656,6 +656,18 @@ pub(super) fn retries_monitor(key: Key, unattached: bool) -> bool {
     unattached && key == Key::Char(b'm')
 }
 
+/// Whether `key` in the log asks to watch the installation again: `w`,
+/// and only while it cannot be watched.
+pub(super) fn rewatches_installs(key: Key, lost: bool) -> bool {
+    lost && key == Key::Char(b'w')
+}
+
+/// Whether `key` in the log asks for a failed rebuild to be tried again:
+/// `s`, and only while the last one failed.
+pub(super) fn retries_rebuild(key: Key, failing: bool) -> bool {
+    failing && key == Key::Char(b's')
+}
+
 pub(super) fn list_nav(sel: usize, len: usize, key: Key) -> ListNav {
     match key {
         Key::Quit => ListNav::Quit,

@@ -454,6 +454,8 @@ struct VerifyInput {
     tab: String,
     id: String,
     panes: Vec<String>,
+    #[serde(default)]
+    retry: bool,
 }
 
 fn parse_action(path: &str, bytes: &[u8]) -> anyhow::Result<BrowserRequest> {
@@ -464,6 +466,7 @@ fn parse_action(path: &str, bytes: &[u8]) -> anyhow::Result<BrowserRequest> {
                 tab: input.tab,
                 id: input.id,
                 panes: input.panes,
+                retry: input.retry,
             }
         }
         "questions/reconnect" => BrowserRequest::QuestionReconnect {
@@ -699,6 +702,21 @@ fn bytes(status: StatusCode, body: impl Into<Bytes>, content_type: &'static str)
 
 #[cfg(test)]
 mod tests {
+    /// The page's retry reaches the repo as one; a verification without it
+    /// does not.
+    #[test]
+    fn a_verify_carries_the_pages_retry() {
+        let parse = |body: &str| super::parse_action("verify", body.as_bytes()).unwrap();
+        let retry = |request| match request {
+            crate::request::BrowserRequest::Verify { retry, .. } => retry,
+            other => panic!("{other:?}"),
+        };
+        assert!(retry(parse(
+            r#"{"tab":"t","id":"i","panes":["p"],"retry":true}"#
+        )));
+        assert!(!retry(parse(r#"{"tab":"t","id":"i","panes":["p"]}"#)));
+    }
+
     /// A quiet pane that arrived in the connector's snapshot and sat in
     /// the host for five minutes replays to a late browser five minutes
     /// older: ingress stamps the snapshot, and replay ages it.
