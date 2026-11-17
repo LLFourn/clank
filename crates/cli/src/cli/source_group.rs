@@ -88,6 +88,8 @@ pub(crate) fn activation() -> Vec<u8> {
 pub(crate) struct Owners {
     table: Mutex<Table>,
     settled: Condvar,
+    /// Rung when the registry begins closing.
+    closed: tokio::sync::Notify,
     retirement: fn(&Entry, Ending<'_>) -> (Retired, Option<Drained>),
 }
 
@@ -186,6 +188,7 @@ impl Owners {
                 readers: BTreeMap::new(),
             }),
             settled: Condvar::new(),
+            closed: tokio::sync::Notify::const_new(),
             retirement,
         }
     }
@@ -340,7 +343,7 @@ impl Owners {
     /// attempt from here; one that still defers keeps its record for a
     /// successor and is reported, and nothing is retried forever.
     pub(crate) fn retire_all(&self) {
-        self.table().closing = true;
+        self.close(&mut self.table());
         loop {
             let batch = {
                 let mut table = self.table();
@@ -408,7 +411,7 @@ impl Owners {
         let mut table = self.table();
         let now = std::time::Instant::now();
         let cutoff = now + grace;
-        table.closing = true;
+        self.close(&mut table);
         match &mut table.drain {
             Some(drain) => drain.cutoff = drain.cutoff.min(cutoff),
             None => {
@@ -534,6 +537,24 @@ impl Owners {
     /// draining or exiting.
     pub(crate) fn closing(&self) -> bool {
         self.table().closing
+    }
+
+    fn close(&self, table: &mut Table) {
+        table.closing = true;
+        self.closed.notify_waiters();
+    }
+
+    /// Once this registry is [closing](Self::closing), which may be at once.
+    pub(crate) async fn closed(&self) {
+        loop {
+            let closed = self.closed.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            if self.closing() {
+                return;
+            }
+            closed.await;
+        }
     }
 
     #[cfg(test)]

@@ -280,7 +280,7 @@ impl BridgeInstance {
         let feed = Feed::new();
         feed.panes(table.clone());
         feed.status(seed);
-        let subscription = Arc::new(Mutex::new(super::subscribe(&*panes, &table, &feed)));
+        let subscription = super::subscribe(&*panes, &table, &feed);
         let (cancel, cancelled) = watch::channel(false);
         let blocking = Arc::new(Blocking::default());
         let questions = Arc::new(super::native_questions::Owners::new(
@@ -613,6 +613,14 @@ impl Drop for BridgeInstance {
     }
 }
 
+/// Failed connections in a row after which the connector stops trying.
+const RECONNECTS: u32 = 3;
+
+/// Connect the repo to its host, and again at once each time the
+/// connection ends: its end is the event a reconnect answers, so none
+/// waits on a clock. [`RECONNECTS`] attempts in a row that never attach
+/// end it, with why in `attached`, which the TUI shows; switching the
+/// remote off and on is what tries again.
 async fn connector(
     endpoint: String,
     session: String,
@@ -621,30 +629,40 @@ async fn connector(
     attached: watch::Sender<clank_web::bridge::ConnectionStatus>,
     mut cancelled: watch::Receiver<bool>,
 ) {
+    let mut failed = 0;
     loop {
         let result = tokio::select! {
             _ = cancelled.changed() => return,
             result = clank_web::bridge::connect_signaled(&endpoint, &session, &credential, backend.clone(), Some(attached.clone())) => result,
         };
-        if let Err(error) = result {
-            attached.send_replace(clank_web::bridge::ConnectionStatus::Disconnected(format!(
-                "connector: {error:#}"
-            )));
-            if error
-                .downcast_ref::<clank_web::bridge::ProtocolMismatch>()
-                .is_some()
-            {
-                return;
-            }
+        if *attached.borrow() == clank_web::bridge::ConnectionStatus::Ready {
+            failed = 0;
         } else {
-            attached.send_replace(clank_web::bridge::ConnectionStatus::Disconnected(
-                "repo connector disconnected".into(),
-            ));
+            failed += 1;
         }
-        tokio::select! {
-            _ = cancelled.changed() => return,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+        let why = match result {
+            Err(error) => {
+                let why = format!("connector: {error:#}");
+                if error
+                    .downcast_ref::<clank_web::bridge::ProtocolMismatch>()
+                    .is_some()
+                {
+                    attached.send_replace(clank_web::bridge::ConnectionStatus::Disconnected(why));
+                    return;
+                }
+                why
+            }
+            Ok(()) => "repo connector disconnected".into(),
+        };
+        if failed >= RECONNECTS {
+            attached.send_replace(clank_web::bridge::ConnectionStatus::Disconnected(format!(
+                "{why}; not reconnecting after {failed} failed attempts in a row: switch the \
+                 remote off and on to try again"
+            )));
+            let _ = cancelled.changed().await;
+            return;
         }
+        attached.send_replace(clank_web::bridge::ConnectionStatus::Disconnected(why));
     }
 }
 
@@ -1454,6 +1472,17 @@ mod tests {
         })
         .await
         .expect("the TUI must show the host disconnect");
+        let gave_up = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match instance.connection_problem() {
+                    Some(why) if why.contains("not reconnecting") => return why,
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("reconnects at once on each end, and stops after its budget");
+        assert!(gave_up.contains("off and on"), "{gave_up}");
         panes.say("terminal_1", "after host crash").unwrap();
         assert_eq!(sent.lock().unwrap().as_slice(), &["after host crash"]);
         instance.stop().await;

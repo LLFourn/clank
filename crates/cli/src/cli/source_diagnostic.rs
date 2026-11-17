@@ -211,7 +211,7 @@ impl Ended {
         }
     }
 
-    fn describe(&self, secrets: &[String]) -> String {
+    pub(crate) fn describe(&self, secrets: &[String]) -> String {
         match self {
             Ended::Exit(code) => format!("exited with exit {code}"),
             Ended::Signal(signal) => format!("was killed by signal {signal}"),
@@ -231,7 +231,8 @@ pub(crate) fn failure_text(
     secrets: &[String],
 ) -> String {
     let mut text = format!(
-        "`{}` has stopped {stops} times in a row and is being restarted. Its last run {}.",
+        "`{}` has stopped {stops} times in a row and is not started again until it is \
+         restarted (`r` on its page in `clank tui`) or its definition changes. Its last run {}.",
         sanitize(&command.join(" "), secrets),
         ended.describe(secrets)
     );

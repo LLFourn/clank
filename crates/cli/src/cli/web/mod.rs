@@ -433,12 +433,18 @@ pub(crate) struct Verify {
     pub(crate) tab: String,
     pub(crate) id: String,
     pub(crate) panes: Vec<String>,
+    /// The viewer asked for a stopped subscription to be started again.
+    pub(crate) retry: bool,
 }
 
 /// The child reading one Zellij pane subscription.
 struct Subscription {
     child: SubscribeChild,
     reader: std::thread::JoinHandle<()>,
+    /// Set by the reader before it asks for a relist, so the wake that
+    /// relist gives finds the subscription over.
+    ended: Arc<std::sync::atomic::AtomicBool>,
+    started: std::time::Instant,
 }
 
 impl Subscription {
@@ -451,11 +457,21 @@ impl Subscription {
 
 /// Subscribe to the panes that are alive; the child's lines feed the
 /// page until the child ends.
-fn subscribe(panes: &dyn Panes, table: &[PaneMeta], feed: &Feed) -> Option<Subscription> {
-    subscribe_in(panes, table, feed, feed.next_generation())
+/// The first subscription for `table`'s live panes, failing as any later
+/// one does: viewers are told it could not be started, and their retry
+/// is what tries again.
+fn subscribe(
+    panes: &dyn Panes,
+    table: &[PaneMeta],
+    feed: &Feed,
+) -> Arc<Mutex<Option<Subscription>>> {
+    let subscription = Arc::new(Mutex::new(None));
+    resubscribe(panes, table, feed, &subscription, None);
+    subscription
 }
 
-/// [`subscribe`], in a generation the caller already started.
+/// A subscription for `table`'s live panes, in a generation the caller
+/// already started: `None` when it could not be started.
 fn subscribe_in(
     panes: &dyn Panes,
     table: &[PaneMeta],
@@ -470,19 +486,29 @@ fn subscribe_in(
     let mut child = panes.subscribe(&ids)?;
     let stdout = child.take_stdout()?;
     let feed = feed.clone();
-    let reader = std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            if let Ok(ev) = serde_json::from_str::<SubscribeEvent>(&line) {
-                feed.event_in(generation, ev);
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = std::thread::spawn({
+        let ended = ended.clone();
+        move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(ev) = serde_json::from_str::<SubscribeEvent>(&line) {
+                    feed.event_in(generation, ev);
+                }
             }
+            ended.store(true, std::sync::atomic::Ordering::Release);
+            // The subscription is over: its panes may be gone, and the
+            // supervisor looks at once rather than at its next event.
+            feed.relist();
         }
-        // The subscription is over: its panes may be gone, and the
-        // supervisor looks at once rather than at its next event.
-        feed.relist();
     });
-    Some(Subscription { child, reader })
+    Some(Subscription {
+        child,
+        reader,
+        ended,
+        started: std::time::Instant::now(),
+    })
 }
 
 /// A transcript being followed for one agent, for one session, from
@@ -828,10 +854,12 @@ fn window_turns(
     turns
 }
 
-/// The first wait before a dead subscription is restarted; it doubles
-/// on each failed restart, up to [`RESTART_MAX`].
-const RESTART_MIN: std::time::Duration = std::time::Duration::from_secs(1);
-const RESTART_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// How many times in a row a subscription that ends is restarted at its
+/// end before the supervisor stops restarting it.
+const RESTARTS: u32 = 3;
+/// A subscription that lasted this long ended in health: the restarts
+/// it was owed begin again.
+const HEALTHY_SUBSCRIPTION: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Replace the subscription with one for `table`'s live panes, in a
 /// new generation, and end the old one.
@@ -844,6 +872,7 @@ fn resubscribe(
 ) {
     let generation = generation.unwrap_or_else(|| feed.next_generation());
     let fresh = subscribe_in(panes, table, feed, generation);
+    let started = fresh.is_some();
     let old = std::mem::replace(
         &mut *subscription.lock().unwrap_or_else(|e| e.into_inner()),
         fresh,
@@ -851,6 +880,10 @@ fn resubscribe(
     if let Some(old) = old {
         old.end();
     }
+    feed.stalled(
+        (!started && table.iter().any(|p| !p.exited))
+            .then(|| "the panes' subscription could not be started".to_string()),
+    );
 }
 
 /// The repo's pane supervisor. Zellij announces no change to its
@@ -861,10 +894,12 @@ fn resubscribe(
 /// a viewer asking to verify a pane the table does not hold as open. A
 /// pane moved, renamed or opened by hand is seen at the next of those.
 ///
-/// It also restarts a subscription whose reader ended, with backoff, and
-/// runs the verification samples [`freshness::Freshness`] calls for,
-/// answering viewers' `verify` requests; both wait on deadlines, not a
-/// clock. Ends on the cancel signal, its subscription with it (`stop`
+/// A subscription whose reader ends is restarted at that end, which is
+/// the event it waits on, up to [`RESTARTS`] times in a row; then viewers
+/// are told it stopped, and it is started again only when the panes
+/// change or a viewer asks to retry: never on a routine verification. It also runs the verification samples
+/// [`freshness::Freshness`] calls for, answering viewers' `verify`
+/// requests, on their deadlines. Ends on the cancel signal, its subscription with it (`stop`
 /// ends that).
 async fn pane_supervisor(
     panes: Arc<dyn Panes>,
@@ -874,7 +909,6 @@ async fn pane_supervisor(
     blocking: Arc<Blocking>,
     mut verify: tokio::sync::mpsc::UnboundedReceiver<Verify>,
 ) {
-    use std::time::Instant;
     // The runtime's clock, so a paused test drives the schedule.
     let clock = || tokio::time::Instant::now().into_std();
     let mut fresh = freshness::Freshness::default();
@@ -882,13 +916,10 @@ async fn pane_supervisor(
     type Sample = Option<Option<std::collections::BTreeMap<String, Vec<String>>>>;
     let mut sampling: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Sample> + Send>>> =
         None;
-    let mut backoff = RESTART_MIN;
-    let mut restart_at: Option<Instant> = None;
+    let mut restarts = 0;
     loop {
-        let due = [restart_at, fresh.next_due(&feed.freshness_view())]
-            .into_iter()
-            .flatten()
-            .min()
+        let due = fresh
+            .next_due(&feed.freshness_view())
             .map(tokio::time::Instant::from_std);
         tokio::select! {
             _ = cancelled.changed() => return,
@@ -899,6 +930,14 @@ async fn pane_supervisor(
                     .any(|id| !table.iter().any(|p| &p.id == id && !p.exited));
                 if unknown {
                     feed.relist();
+                }
+                let gone = subscription
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none();
+                if ask.retry && gone && table.iter().any(|p| !p.exited) {
+                    restarts = 0;
+                    resubscribe(&*panes, &table, &feed, &subscription, None);
                 }
                 fresh.verify(
                     freshness::RequestId { tab: ask.tab, id: ask.id },
@@ -930,6 +969,7 @@ async fn pane_supervisor(
                     let change = feed.panes(listed_now.clone());
                     table = listed_now;
                     if change == TableChange::Membership {
+                        restarts = 0;
                         resubscribe(&*panes, &table, &feed, &subscription, None);
                     }
                 }
@@ -940,24 +980,36 @@ async fn pane_supervisor(
             return;
         }
         let now = clock();
-        let dead = table.iter().any(|p| !p.exited)
-            && subscription
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_none_or(|s| s.reader.is_finished());
-        match (dead, restart_at) {
-            (false, _) => {
-                restart_at = None;
-                backoff = RESTART_MIN;
+        let ended = subscription
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|s| s.ended.load(std::sync::atomic::Ordering::Acquire))
+            .map(|s| s.started.elapsed());
+        if let Some(lasted) = ended
+            && table.iter().any(|p| !p.exited)
+        {
+            if lasted >= HEALTHY_SUBSCRIPTION {
+                restarts = 0;
             }
-            (true, None) => restart_at = Some(now + backoff),
-            (true, Some(at)) if now >= at => {
+            if restarts < RESTARTS {
+                restarts += 1;
                 resubscribe(&*panes, &table, &feed, &subscription, None);
-                backoff = (backoff * 2).min(RESTART_MAX);
-                restart_at = Some(now + backoff);
+            } else {
+                let spent = subscription
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some(spent) = spent {
+                    spent.end();
+                }
+                let why = format!(
+                    "the panes' subscription ended {RESTARTS} times in a row; it is started \
+                     again when the panes change or a viewer asks to retry"
+                );
+                tracing::warn!("{why}");
+                feed.stalled(Some(why));
             }
-            (true, Some(_)) => {}
         }
         if fresh.timed_out(now) {
             sampling = None;
@@ -1711,6 +1763,8 @@ mod tests {
             samples: Mutex<VecDeque<&'static str>>,
             /// When each subscription was started, on the paused clock.
             subscribed: Mutex<Vec<tokio::time::Instant>>,
+            /// Subscriptions cannot be started while set.
+            refused: std::sync::atomic::AtomicBool,
             sampled: AtomicUsize,
             listed: AtomicUsize,
         }
@@ -1721,6 +1775,7 @@ mod tests {
                     alive,
                     samples: Mutex::new(samples.iter().copied().collect()),
                     subscribed: Mutex::new(Vec::new()),
+                    refused: std::sync::atomic::AtomicBool::new(false),
                     sampled: AtomicUsize::new(0),
                     listed: AtomicUsize::new(0),
                 })
@@ -1744,6 +1799,9 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(tokio::time::Instant::now());
+                if self.refused.load(Ordering::SeqCst) {
+                    return None;
+                }
                 let script = if self.alive {
                     "exec sleep 300"
                 } else {
@@ -1800,7 +1858,7 @@ mod tests {
         fn supervise(panes: Arc<Scripted>) -> Running {
             let feed = Feed::new();
             feed.panes(table());
-            let subscription = Arc::new(Mutex::new(subscribe(&*panes, &table(), &feed)));
+            let subscription = subscribe(&*panes, &table(), &feed);
             frame(&feed, "a");
             let (cancel, cancelled) = tokio::sync::watch::channel(false);
             let (verify, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1823,11 +1881,19 @@ mod tests {
 
         impl Running {
             fn ask(&self, id: &str) {
+                self.asking(id, false);
+            }
+            /// The viewer's retry, as no routine verification asks.
+            fn retry(&self, id: &str) {
+                self.asking(id, true);
+            }
+            fn asking(&self, id: &str, retry: bool) {
                 self.verify
                     .send(Verify {
                         tab: "t".into(),
                         id: id.into(),
                         panes: vec!["p".into()],
+                        retry,
                     })
                     .unwrap();
             }
@@ -1909,9 +1975,6 @@ mod tests {
             run.stop().await;
         }
 
-        /// The paused clock's step while the supervisor restarts.
-        const STEP: Duration = Duration::from_millis(250);
-
         impl Running {
             /// Block until the live subscription's reader has seen its
             /// child's EOF. The reader is a real thread the paused clock
@@ -1935,37 +1998,111 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
-
-            /// Step the paused clock until the supervisor subscribes again,
-            /// each step only once the subscription it holds is dead.
-            async fn resubscribed(&self, panes: &Scripted) {
-                let before = panes.subscriptions();
-                while panes.subscriptions() == before {
-                    self.died();
-                    tokio::time::sleep(STEP).await;
-                }
-            }
         }
 
+        /// A subscription that ends is restarted at its end, the clock not
+        /// moving at all, up to [`RESTARTS`] times in a row; then viewers
+        /// are told it stopped, and it is not restarted, however long
+        /// passes and however many routine verifications the page sends,
+        /// until a viewer asks to retry.
         #[tokio::test(start_paused = true)]
-        async fn a_dead_subscription_is_restarted_with_backoff() {
+        async fn a_dead_subscription_is_restarted_at_its_end_until_its_budget() {
             let panes = Scripted::new(false, &[]);
             let run = supervise(panes.clone());
-            for _ in 0..5 {
-                run.resubscribed(&panes).await;
-            }
-            let at = panes.subscribed.lock().unwrap().clone();
-            let gaps: Vec<Duration> = at.windows(2).map(|w| w[1] - w[0]).collect();
+            let began = tokio::time::Instant::now();
+            let real = std::time::Instant::now();
+            let budget = 1 + RESTARTS as usize;
+            let spend = |upto: usize| {
+                let (run, panes) = (&run, &panes);
+                async move {
+                    while panes.subscriptions() < upto || run.subscription.lock().unwrap().is_some()
+                    {
+                        assert!(
+                            real.elapsed() < Duration::from_secs(10),
+                            "{} subscriptions",
+                            panes.subscriptions()
+                        );
+                        run.died();
+                        tokio::task::spawn_blocking(|| {
+                            std::thread::sleep(Duration::from_millis(3))
+                        })
+                        .await
+                        .unwrap();
+                    }
+                }
+            };
+            spend(budget).await;
             assert!(
-                gaps[0].abs_diff(Duration::from_secs(1)) <= STEP,
-                "the first restart waits about a second: {gaps:?}"
+                panes
+                    .subscribed
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|at| *at == began),
+                "no restart waited on the clock"
             );
-            for pair in gaps.windows(2) {
-                assert!(
-                    pair[1] > pair[0] && pair[1].abs_diff(pair[0] * 2) <= STEP,
-                    "each wait doubles the one before: {gaps:?}"
-                );
+            pass(120).await;
+            assert_eq!(
+                panes.subscriptions(),
+                budget,
+                "nothing more after its budget"
+            );
+            assert!(
+                run.feed
+                    .snapshot()
+                    .stalled
+                    .is_some_and(|why| why.contains("times in a row")),
+                "the viewers are told"
+            );
+            for n in 0..10 {
+                run.ask(&format!("routine-{n}"));
+                pass(15).await;
             }
+            assert_eq!(
+                panes.subscriptions(),
+                budget,
+                "routine verifications start nothing"
+            );
+            run.retry("again");
+            spend(2 * budget).await;
+            pass(120).await;
+            assert_eq!(
+                panes.subscriptions(),
+                2 * budget,
+                "a viewer's retry starts one, with a budget of its own"
+            );
+            run.stop().await;
+        }
+
+        /// A first subscription that cannot be started is reported like any
+        /// later one: the retained panes frame says why, so a viewer
+        /// arriving now sees it, with no sample to stand in, and the
+        /// viewer's retry is what starts one.
+        #[tokio::test(start_paused = true)]
+        async fn a_first_subscription_that_cannot_start_is_reported_and_retried() {
+            let panes = Scripted::new(true, &[]);
+            panes.refused.store(true, Ordering::SeqCst);
+            let run = supervise(panes.clone());
+            assert_eq!(panes.subscriptions(), 1, "it was tried");
+            assert!(run.subscription.lock().unwrap().is_none());
+            let replayed = run.feed.snapshot().frames();
+            let shown = format!("{:?}", replayed.first().expect("the panes frame"));
+            assert!(shown.contains("could not be started"), "{shown}");
+            pass(60).await;
+            run.ask("routine");
+            pass(15).await;
+            assert_eq!(panes.subscriptions(), 1, "nothing tries it again by itself");
+
+            panes.refused.store(false, Ordering::SeqCst);
+            run.retry("again");
+            pass(1).await;
+            assert_eq!(panes.subscriptions(), 2, "the viewer's retry starts one");
+            assert!(run.subscription.lock().unwrap().is_some());
+            assert_eq!(
+                run.feed.snapshot().stalled,
+                None,
+                "and the report is cleared"
+            );
             run.stop().await;
         }
 
@@ -2009,6 +2146,7 @@ mod tests {
                     tab: "t".into(),
                     id: "gone".into(),
                     panes: vec!["q".into()],
+                    retry: false,
                 })
                 .unwrap();
             pass(1).await;

@@ -1830,12 +1830,12 @@ fn failing<'a>(
     })
 }
 
-/// A parked hook under a newer install tries to become it on a beat. Each
-/// attempt that fails leaves the park exactly as it was: still held, the
-/// attempt repeated, and the verdict that finally comes is the one it
-/// frames.
+/// A parked hook under a newer install tries to become it. An attempt
+/// that fails leaves the park exactly as it was: still held, tried again
+/// by no clock while nothing more is installed, and the verdict that
+/// finally comes is the one it frames.
 #[tokio::test(start_paused = true)]
-async fn a_parked_hook_whose_replacement_fails_stays_parked_and_retries() {
+async fn a_parked_hook_whose_replacement_fails_stays_parked_and_tries_no_more() {
     let installed = crate::upgrade::tests::Installed::current();
     installed.replace(1);
     let tried = std::cell::Cell::new(0);
@@ -1856,7 +1856,7 @@ async fn a_parked_hook_whose_replacement_fails_stays_parked_and_retries() {
     )
     .await;
     assert_eq!(got.ok().map(|(frame, _)| frame), Some(delivered()));
-    assert!(tried.get() > 3, "retried through the park: {}", tried.get());
+    assert_eq!(tried.get(), 1, "tried once through the park");
 }
 
 /// With its own build still installed a parked hook asks for nothing.
@@ -1973,9 +1973,10 @@ impl Host for Replaced {
 
 /// The whole Stop under a newer install. While parked it offers the
 /// installed build a handoff holding its input byte for byte and the very
-/// report its carrier was armed with; each failed attempt leaves no file,
-/// no second carrier and nothing emitted; and the presentation that then
-/// arrives is the Stop's answer.
+/// report its carrier was armed with; a failed attempt leaves no file,
+/// no second carrier and nothing emitted, and is not made again while
+/// nothing more is installed; and the presentation that then arrives is
+/// the Stop's answer.
 #[tokio::test(start_paused = true)]
 async fn a_stale_parked_stop_hands_over_its_input_and_report_and_survives_failure() {
     use tokio::io::AsyncWriteExt;
@@ -2027,7 +2028,11 @@ async fn a_stale_parked_stop_hands_over_its_input_and_report_and_survives_failur
     let carriers = host.carriers.borrow();
     assert_eq!(carriers.len(), 1, "one carrier throughout");
     let handoffs = host.handoffs.borrow();
-    assert!(handoffs.len() > 1, "a failed attempt is made again");
+    assert_eq!(
+        handoffs.len(),
+        1,
+        "a failed attempt is not made again on a clock"
+    );
     for (path, read) in handoffs.iter() {
         let handoff = read.as_ref().expect("the installed build can read it");
         assert_eq!(handoff.input, raw);

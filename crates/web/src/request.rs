@@ -61,6 +61,10 @@ pub enum BrowserRequest {
         tab: String,
         id: String,
         panes: Vec<String>,
+        /// The viewer asked for a stopped subscription to be started
+        /// again, as no routine verification does.
+        #[serde(default)]
+        retry: bool,
     },
 }
 
@@ -182,6 +186,25 @@ impl BrowserReply {
 #[cfg(test)]
 mod tests {
     use super::{BrowserReply, BrowserRequest, Content};
+
+    /// A verification sent without the retry flag, as every routine one
+    /// and every page before it was, is not a retry.
+    #[test]
+    fn a_verify_without_retry_is_routine() {
+        let routine: BrowserRequest = serde_json::from_value(serde_json::json!({
+            "operation": "verify", "tab": "t", "id": "i", "panes": ["p"],
+        }))
+        .unwrap();
+        assert_eq!(
+            routine,
+            BrowserRequest::Verify {
+                tab: "t".into(),
+                id: "i".into(),
+                panes: vec!["p".into()],
+                retry: false,
+            }
+        );
+    }
 
     #[test]
     fn request_round_trip_keeps_the_target_and_revision() {

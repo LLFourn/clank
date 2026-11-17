@@ -132,8 +132,9 @@ struct Member<P: Panel> {
     state: State<P>,
     line: Option<String>,
     sig: Option<P::Sig>,
-    failures: u32,
-    retry_at: Option<Instant>,
+    /// The inputs a refresh last failed on, which a wake must move before
+    /// it is tried again.
+    failed: Option<P::Sig>,
     due: bool,
 }
 
@@ -187,7 +188,10 @@ pub(crate) struct StatusWatch<P: Panel, O: Write, E> {
     control: Control,
     mover: Mover,
     exec: E,
-    _installs: crate::upgrade::Subscription,
+    _installs: Option<crate::upgrade::Subscription>,
+    /// Why the watch on the installation failed: from then on no install
+    /// is heard, so the watch ends rather than go on stale.
+    install_fault: crate::fs_notice::Fault,
     said_stale: bool,
 }
 
@@ -209,12 +213,25 @@ where
         stdin: Stdin,
     ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel();
-        let installs = authority.subscribe({
-            let wake = Wake::new(tx.clone(), Ring::Install);
-            move || {
-                wake.ring();
-            }
-        });
+        let install_fault = crate::fs_notice::Fault::default();
+        let installs = authority
+            .subscribe(
+                {
+                    let wake = Wake::new(tx.clone(), Ring::Install);
+                    move || {
+                        wake.ring();
+                    }
+                },
+                {
+                    let (wake, fault) =
+                        (Wake::new(tx.clone(), Ring::Install), install_fault.clone());
+                    move |why| {
+                        crate::fs_notice::record(&fault, why);
+                        wake.ring();
+                    }
+                },
+            )
+            .map_err(|why| anyhow::anyhow!("status watch: cannot watch the installation: {why}"))?;
         let control = match stdin {
             Stdin::Unread => Control::Unread,
             Stdin::Ended => Control::Ended,
@@ -237,6 +254,7 @@ where
             mover: Mover::new(authority),
             exec,
             _installs: installs,
+            install_fault,
             said_stale: false,
         })
     }
@@ -267,8 +285,7 @@ where
             state: State::Starting,
             line: None,
             sig: None,
-            failures: 0,
-            retry_at: None,
+            failed: None,
             due: false,
         });
         if let State::Failed { .. } = member.state {
@@ -294,8 +311,7 @@ where
         member.generation = generation;
         member.git = GitStatus::default();
         member.sig = None;
-        member.failures = 0;
-        member.retry_at = None;
+        member.failed = None;
         member.state = State::Starting;
         let git = member.git.clone();
         let first = match self.panel.watch(key, wake.clone(), &git) {
@@ -348,7 +364,6 @@ where
         };
         member.generation = generation;
         member.due = false;
-        member.retry_at = None;
         let (why, path) = match self.panel.await_path(key, wake) {
             Ok(path) => (why, Some(path)),
             Err(e) => (unwatchable(&why, &e), None),
@@ -368,6 +383,9 @@ where
             && let Some(why) = crate::fs_notice::read(&reader.fault)
         {
             anyhow::bail!("status watch: {why}");
+        }
+        if let Some(why) = crate::fs_notice::read(&self.install_fault) {
+            anyhow::bail!("status watch: the watch on the installation failed: {why}");
         }
         let keys: Vec<PathBuf> = self.members.keys().cloned().collect();
         for key in &keys {
@@ -460,7 +478,7 @@ where
             wire,
             ..
         } = self;
-        let pass = mover.pass(Instant::now(), Hosting::Nothing, |_| match wire {
+        let pass = mover.pass(Hosting::Nothing, |_| match wire {
             Wire::One { .. } => exec(Resume::AsStarted),
             Wire::Many => exec(Resume::Handoff(&Handoff::new(
                 members.keys().cloned().collect(),
@@ -473,8 +491,8 @@ where
                 },
             ))),
         });
-        if let Pass::Failed { why, retry_in } = &pass {
-            tracing::debug!(%why, ?retry_in, "could not become the installed clank");
+        if let Pass::Failed { why } = &pass {
+            tracing::debug!(%why, "could not become the installed clank");
         }
         let stale = pass.stale();
         if stale && !self.said_stale {
@@ -485,32 +503,29 @@ where
 
     /// The nothing-changed gate (lloyd's invariant): a snapshot is built
     /// only when an input it depends on moved. A failure after the first
-    /// snapshot keeps the last line and retries the same state on the
-    /// next event or after [`watch_retry`]'s pause.
+    /// snapshot keeps the last line, and is tried again only on a wake
+    /// that moved its inputs from where the failure found them.
     async fn refresh(&mut self, key: &Path) -> anyhow::Result<()> {
-        let Some(member) = self.members.get_mut(key) else {
+        let Some(member) = self.members.get(key) else {
             return Ok(());
         };
-        member.retry_at = None;
         let git = member.git.clone();
         let sig = match self.panel.probe(key, &git) {
             Ok(sig) => sig,
-            Err(e) => return self.refresh_failed(key, "input probe", e),
+            Err(e) => return self.refresh_failed(key, "input probe", e, None),
         };
-        if self.members[key].sig.as_ref() == Some(&sig) {
-            if let Some(member) = self.members.get_mut(key) {
-                member.failures = 0;
-            }
+        let member = &self.members[key];
+        if member.sig.as_ref() == Some(&sig) || member.failed.as_ref() == Some(&sig) {
             return Ok(());
         }
         let shown = match self.panel.build(key, &git).await {
             Ok(shown) => shown,
-            Err(e) => return self.refresh_failed(key, "refresh", e),
+            Err(e) => return self.refresh_failed(key, "refresh", e, Some(sig)),
         };
         let line = self.wire.line(key, &shown, self.paint);
         self.write(key, line)?;
         if let Some(member) = self.members.get_mut(key) {
-            member.failures = 0;
+            member.failed = None;
             member.sig = Some(sig);
             if let State::Watching(watch) = &mut member.state {
                 watch.shown(key);
@@ -519,20 +534,23 @@ where
         Ok(())
     }
 
-    fn refresh_failed(&mut self, key: &Path, stage: &str, e: anyhow::Error) -> anyhow::Result<()> {
+    fn refresh_failed(
+        &mut self,
+        key: &Path,
+        stage: &str,
+        e: anyhow::Error,
+        at: Option<P::Sig>,
+    ) -> anyhow::Result<()> {
         let Some(member) = self.members.get_mut(key) else {
             return Ok(());
         };
-        member.failures += 1;
         let bootstrapped = member.sig.is_some();
-        if bootstrapped {
-            member.retry_at = watch_retry(member.failures).map(|pause| Instant::now() + pause);
-        }
+        member.failed = at;
         match self.wire {
             Wire::One { .. } => watch_failure(bootstrapped, stage, format!("{e:#}")),
             Wire::Many if bootstrapped => {
                 eprintln!(
-                    "status watch: {}: {stage} failed ({e:#}); kept last output, retrying",
+                    "status watch: {}: {stage} failed ({e:#}); kept last output, {RETRIED}",
                     key.display()
                 );
                 Ok(())
@@ -559,41 +577,19 @@ where
         Ok(())
     }
 
-    /// How long the loop may sleep before a timer of its own is due: a
-    /// failed refresh's retry, or a failed replacement's. With neither,
-    /// `None`: idle repos cost nothing until an event.
-    pub(crate) fn timer(&self) -> Option<Duration> {
-        let now = Instant::now();
-        self.members
-            .values()
-            .filter_map(|m| m.retry_at)
-            .map(|at| at.saturating_duration_since(now))
-            .chain(self.mover.retry_in(now))
-            .min()
-    }
-
-    /// Wait for the next wake, or for [`Self::timer`], and take every
-    /// wake that lands within [`COALESCE`] of the first.
+    /// Wait for the next wake, and take every wake that lands within
+    /// [`COALESCE`] of the first. The loop has no timer of its own: idle
+    /// repos, and failed ones, cost nothing until an event.
     pub(crate) fn wait(&mut self) -> anyhow::Result<()> {
-        let mut rings = Vec::new();
-        match self.timer() {
-            Some(timer) => match self.rx.recv_timeout(timer) {
-                Ok(ring) => rings.push(ring),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => disconnected()?,
-            },
-            None => match self.rx.recv() {
-                Ok(ring) => rings.push(ring),
-                Err(_) => disconnected()?,
-            },
-        }
-        if !rings.is_empty() {
-            let until = Instant::now() + COALESCE;
-            while let Some(left) = until.checked_duration_since(Instant::now())
-                && let Ok(ring) = self.rx.recv_timeout(left)
-            {
-                rings.push(ring);
-            }
+        let mut rings = match self.rx.recv() {
+            Ok(ring) => vec![ring],
+            Err(_) => return disconnected(),
+        };
+        let until = Instant::now() + COALESCE;
+        while let Some(left) = until.checked_duration_since(Instant::now())
+            && let Ok(ring) = self.rx.recv_timeout(left)
+        {
+            rings.push(ring);
         }
         for ring in rings {
             match ring {
@@ -610,12 +606,6 @@ where
                 }
                 Ring::Install => {}
                 Ring::Stdin => self.read_stdin()?,
-            }
-        }
-        let now = Instant::now();
-        for member in self.members.values_mut() {
-            if member.retry_at.is_some_and(|at| at <= now) {
-                member.due = true;
             }
         }
         Ok(())
@@ -679,28 +669,22 @@ fn unwatchable(why: &str, path: &anyhow::Error) -> String {
     )
 }
 
+const RETRIED: &str = "trying again when its inputs change";
+
 /// The watch loop's failure policy for one repo (tui-transient-refresh-
 /// resilience, codex 697cdb1): BEFORE the first successful snapshot there
 /// is no prior output to retain, so a probe or build failure is FATAL,
 /// exactly like the one-shot path. AFTER one success, failures degrade to
-/// a stderr warning with the last output kept; the signature is left
-/// untouched, so the SAME state retries on the next event or after
-/// [`watch_retry`]'s pause (recovery is the ordinary success path).
+/// a stderr warning with the last output kept; the accepted signature is
+/// left untouched, and the repo is refreshed again on the next wake that
+/// moves its inputs (recovery is the ordinary success path).
 fn watch_failure(bootstrapped: bool, stage: &str, e: impl std::fmt::Display) -> anyhow::Result<()> {
     if bootstrapped {
-        eprintln!("status watch: {stage} failed ({e}); kept last output, retrying");
+        eprintln!("status watch: {stage} failed ({e}); kept last output, {RETRIED}");
         Ok(())
     } else {
         Err(anyhow::anyhow!("status watch: {stage} failed: {e}"))
     }
-}
-
-/// The pause before retrying after `failures` failed refreshes in a
-/// row: 1s, 2s, 4s … capped at 30s. A timer the loop sets itself after
-/// a failure, so a transient one recovers without waiting for an edit.
-fn watch_retry(failures: u32) -> Option<Duration> {
-    (failures > 0)
-        .then(|| Duration::from_secs(1u64 << (failures - 1).min(5)).min(Duration::from_secs(30)))
 }
 
 #[derive(Debug, PartialEq, Eq)]

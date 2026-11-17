@@ -325,15 +325,22 @@ fn handler<M: Clone + Send + Sync + 'static>(
     }
 }
 
-/// A timer's log under an agent's directory, or an ancestor of one.
+/// A timer's log or seen index under an agent's directory, anything in
+/// that index, or an ancestor of one: what a timer's acceptance reads and
+/// writes, so its repair is heard.
 fn is_timer_inventory(path: &Path, clank: &Path) -> bool {
+    let timer = |path: &Path, ext: &str| {
+        path.extension().is_some_and(|e| e == ext)
+            && path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("timer-"))
+    };
     (path.starts_with(clank.join("agents")) || path.starts_with(clank.join("watch-events")))
         && (path.extension().is_none()
-            || (path.extension().is_some_and(|ext| ext == "jsonl")
-                && path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("timer-"))))
+            || timer(path, "jsonl")
+            || timer(path, "seen")
+            || path.parent().is_some_and(|index| timer(index, "seen")))
 }
 
 /// Event custody or inventory changed; ordinary git/config/feedback changes do
@@ -561,6 +568,101 @@ mod tests {
         ] {
             assert!(!watches_content(&p(path), &clank), "{path}");
         }
+    }
+
+    /// A timer that will not accept because its seen index is blocked is
+    /// tried again through the watcher's own routing: the index's repair
+    /// invalidates the timers and the owner's retry accepts it, while
+    /// another source's index, or a notice that changes none of its files,
+    /// tries nothing.
+    #[tokio::test]
+    async fn a_timer_index_repair_is_heard_and_tries_the_failed_timer() {
+        use crate::fs_notice::tests::event;
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let clank = root.path().join(".clank");
+        let events = clank.join("agents/codex/events");
+        std::fs::create_dir_all(&events).unwrap();
+        let timer = clank_core::agent_config::TimerSource {
+            interrupt: false,
+            interrupt_message: None,
+            name: "blocked".into(),
+            repeat_every: None,
+            due_at: "1970-01-01T00:00:01Z".into(),
+            content: Some("owed".into()),
+        };
+        let key = timer.source_key(None);
+        let index = events.join(format!("{key}.seen"));
+        std::fs::write(&index, "not an index").unwrap();
+        let (into, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut timers = crate::cli::timer_source::TimerSet::new(
+            &[(
+                clank_core::agent_config::WaitEventSource::Timer(timer),
+                crate::cli::event_source::SourceOrigin::Config,
+            )],
+            &events,
+            None,
+            into.into(),
+        )
+        .unwrap();
+        timers.due();
+        assert_eq!(timers.next_deadline(), None, "it failed");
+
+        let (tx, _woken) = std::sync::mpsc::channel();
+        let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handle = handler(
+            tx.into(),
+            clank.clone(),
+            root.path().join(".git"),
+            root.path().join(".git"),
+            Some(dirty.clone()),
+            None,
+            crate::fs_notice::Fault::default(),
+        );
+        let changed = |path: &Path| {
+            event(
+                notify::EventKind::Modify(notify::event::ModifyKind::Any),
+                path,
+            )
+        };
+        let heard = |timers: &mut crate::cli::timer_source::TimerSet| {
+            if dirty.swap(false, Ordering::AcqRel) {
+                timers.inventory_changed();
+                timers.due();
+                true
+            } else {
+                false
+            }
+        };
+
+        handle(changed(&events.join("command-x.seen/0123.tmp")));
+        assert!(!heard(&mut timers), "another source's index");
+        handle(changed(&index));
+        assert!(heard(&mut timers), "its index is routed");
+        assert_eq!(timers.next_deadline(), None, "but nothing changed");
+        assert!(rx.try_recv().is_err());
+
+        std::fs::remove_file(&index).unwrap();
+        handle(event(
+            notify::EventKind::Remove(notify::event::RemoveKind::File),
+            &index,
+        ));
+        assert!(heard(&mut timers), "the repair is routed");
+        // A child another test forks holds this process's locks until its
+        // exec: contention, which a release retries.
+        for _ in 0..200 {
+            if !timers.awaiting_retry() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            timers.retry_contended();
+            timers.due();
+        }
+        assert!(rx.try_recv().is_ok(), "and accepted");
+
+        handle(changed(&index.join("0123.tmp")));
+        assert!(heard(&mut timers), "its staging is routed too");
+        assert!(rx.try_recv().is_err(), "and accepts nothing twice");
     }
 
     /// Reading the files it watches is not a change: the owner's own

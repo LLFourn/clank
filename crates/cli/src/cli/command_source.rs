@@ -136,23 +136,9 @@ pub(crate) fn display_glyph(glyph: &str) -> Option<&str> {
     Some(glyph)
 }
 
-/// How long to wait before restarting a producer that stopped.
-///
-/// Doubling from [`BACKOFF_FIRST`] to [`BACKOFF_CAP`]. `failures` is
-/// the count of consecutive failures, so the FIRST restart is prompt
-/// — a producer that exits cleanly on a deploy should come back
-/// quickly, and only a source that keeps dying is made to wait.
-pub(crate) fn backoff(failures: u32) -> std::time::Duration {
-    let shift = failures.saturating_sub(1).min(16);
-    let secs = BACKOFF_FIRST.as_secs().saturating_mul(1u64 << shift);
-    std::time::Duration::from_secs(secs.min(BACKOFF_CAP.as_secs()))
-}
-
-pub(crate) const BACKOFF_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
-pub(crate) const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Consecutive failures before a source's inability to run becomes an
-/// EVENT rather than a silence.
+/// Consecutive failed runs a source is restarted for: at this many its
+/// inability to run becomes an EVENT rather than a silence, and it is not
+/// started again until a person restarts it or its definition changes.
 ///
 /// An agent waiting on a producer that will never start should find
 /// out; waiting forever on a typo in an argv is the failure this
@@ -1265,22 +1251,6 @@ mod tests {
         }
     }
 
-    /// Backoff is prompt, doubles, and caps.
-    #[test]
-    fn backoff_is_prompt_then_doubles_then_caps() {
-        assert_eq!(backoff(1), BACKOFF_FIRST, "the first restart is quick");
-        assert_eq!(backoff(2), BACKOFF_FIRST * 2);
-        assert_eq!(backoff(3), BACKOFF_FIRST * 4);
-        assert_eq!(backoff(30), BACKOFF_CAP, "and never grows past the cap");
-        let mut last = std::time::Duration::ZERO;
-        for n in 1..1000 {
-            let d = backoff(n);
-            assert!(d >= last, "backoff must not go backwards at {n}");
-            assert!(d <= BACKOFF_CAP);
-            last = d;
-        }
-    }
-
     #[test]
     fn icons_are_visible_graphemes_not_single_column_scalars() {
         for glyph in ["*", "→", "💬", "💤", "☁️", "e\u{0301}", "👩‍💻", "🇦🇺", "1️⃣"]
@@ -1799,6 +1769,88 @@ impl Os for Native<'_> {
     }
 }
 
+/// Tell `heard` of the first exit of a member of `group`, its leader
+/// included, or of the kernel wait failing, for as long as the returned
+/// watch is kept. `Ok(None)` when the group has no member left. A group
+/// that cannot be listed, or a member whose exit cannot be watched, is an
+/// error: an exit it missed would never be heard, and nothing else would
+/// try the retirement again.
+pub(crate) fn hear_member_exits(
+    group: crate::signal::Pgid,
+    heard: impl Fn(Result<(), String>) + Send + 'static,
+) -> Result<Option<crate::proc_identity::exit_watch::ExitWatch<i32>>, String> {
+    use crate::proc_identity::exit_watch::{Armed, ExitWatch, Wake};
+    use crate::proc_identity::inspect::Life;
+    let watch = ExitWatch::<i32>::new(None, move |wake| match wake {
+        Wake::Exited(_) => heard(Ok(())),
+        Wake::Failed(why) => heard(Err(why)),
+        Wake::Dir => {}
+    })
+    .map_err(|e| format!("no exit can be watched: {e}"))?;
+    let covered = cover_members(
+        group,
+        &mut || {
+            crate::signal::group_members(group).map(|members| {
+                members
+                    .into_iter()
+                    .filter(|pid| crate::proc_identity::inspect::life_of(*pid) != Life::Gone)
+                    .collect()
+            })
+        },
+        &mut |pid| match crate::proc_identity::token_for(pid) {
+            Some(token) => watch.arm(pid, pid, &token),
+            None => Armed::Unknown,
+        },
+    )?;
+    Ok(covered.then_some(watch))
+}
+
+/// Arm `arm` on every member `members` lists, then list again and arm any
+/// that joined, so no member is left unwatched: whether any is watched.
+/// One that ended before its arming is as good as heard, so the caller,
+/// which looks again once armed, is not waiting on it.
+pub(crate) fn cover_members(
+    group: crate::signal::Pgid,
+    members: &mut dyn FnMut() -> Option<Vec<i32>>,
+    arm: &mut dyn FnMut(i32) -> crate::proc_identity::exit_watch::Armed,
+) -> Result<bool, String> {
+    use crate::proc_identity::exit_watch::Armed;
+    let (mut armed, mut ended) = (
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    );
+    for _ in 0..2 {
+        let listed = members()
+            .ok_or_else(|| format!("the producer group (pgid {group}) cannot be listed"))?;
+        let joined: Vec<i32> = listed
+            .into_iter()
+            .filter(|pid| !armed.contains(pid) && !ended.contains(pid))
+            .collect();
+        if joined.is_empty() {
+            return Ok(!armed.is_empty());
+        }
+        for pid in joined {
+            match arm(pid) {
+                Armed::Watching => {
+                    armed.insert(pid);
+                }
+                Armed::Ended => {
+                    ended.insert(pid);
+                }
+                Armed::Unknown => {
+                    return Err(format!(
+                        "pid {pid} of the producer group (pgid {group}) cannot be watched: \
+                         its identity cannot be read"
+                    ));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "the producer group (pgid {group}) gained members while it was being watched"
+    ))
+}
+
 /// The members of `anchor`'s group, the anchor aside, that may still be
 /// at work: `None` when the group cannot be listed. One that has exited
 /// but is not yet collected still occupies the group and does nothing,
@@ -2168,11 +2220,6 @@ pub(crate) fn recorded_group(
     crate::signal::Pgid::new(record.pgid())
 }
 
-/// The first pause before a deferred retirement is tried again with no
-/// exit to prompt it, and its cap.
-pub(crate) const DEFERRAL_FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
-pub(crate) const DEFERRAL_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// [`reap_previous_producer`] with the system calls supplied.
 pub(crate) fn reap_previous_producer_with(
     store_dir: &std::path::Path,
@@ -2253,6 +2300,66 @@ mod producer_tests {
         assert_eq!(
             watch_members(anchor, &mut || None, &mut |_| Armed::Watching),
             Watched::Wait
+        );
+    }
+
+    /// Every member of a retiring group is watched, the leader included,
+    /// or the cover fails: a group that cannot be listed, a member whose
+    /// exit cannot be armed, and one that keeps gaining members are each
+    /// an error. A member that ended before its arming, listed again while
+    /// uncollected, is not one.
+    #[test]
+    fn a_retiring_group_is_covered_whole_or_not_at_all() {
+        use crate::proc_identity::exit_watch::Armed;
+        let group = Pgid::new(4242).unwrap();
+        let mut armed = Vec::new();
+        assert_eq!(
+            cover_members(group, &mut || Some(vec![4242, 4243]), &mut |pid| {
+                armed.push(pid);
+                Armed::Watching
+            }),
+            Ok(true)
+        );
+        assert_eq!(armed, [4242, 4243], "the leader too");
+        assert_eq!(
+            cover_members(group, &mut || Some(vec![]), &mut |_| Armed::Watching),
+            Ok(false)
+        );
+        assert_eq!(
+            cover_members(group, &mut || Some(vec![4243]), &mut |_| Armed::Ended),
+            Ok(false),
+            "an ended member listed again"
+        );
+        assert!(
+            cover_members(group, &mut || None, &mut |_| Armed::Watching)
+                .unwrap_err()
+                .contains("cannot be listed")
+        );
+        assert!(
+            cover_members(group, &mut || Some(vec![4243]), &mut |_| Armed::Unknown)
+                .unwrap_err()
+                .contains("4243")
+        );
+        let mut next = 4300;
+        assert!(
+            cover_members(
+                group,
+                &mut || {
+                    next += 1;
+                    Some(vec![next])
+                },
+                &mut |_| Armed::Watching
+            )
+            .unwrap_err()
+            .contains("gained members")
+        );
+        let mut lists = vec![Some(vec![4243, 4244]), Some(vec![4243])].into_iter();
+        assert_eq!(
+            cover_members(group, &mut || lists.next().flatten(), &mut |_| {
+                Armed::Watching
+            }),
+            Ok(true),
+            "a member gone by the second look is fine"
         );
     }
 

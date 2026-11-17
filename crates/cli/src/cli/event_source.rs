@@ -47,7 +47,9 @@ pub(crate) enum Lifecycle {
     },
     /// A github watch polling, as of its last attempt.
     Polling(crate::cli::github::progress::PollRecord),
-    /// Waiting to start it again after it ended or failed to start.
+    /// Waiting to start it again after it ended or failed to start. No
+    /// longer reported, since a restart answers a run's end at once; read
+    /// so an account an older monitor published still shows.
     BackingOff {
         until: u64,
         failures: u32,

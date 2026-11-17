@@ -105,6 +105,9 @@ pub(crate) struct Retained {
     /// The status event's data as last published.
     pub(crate) status: Option<serde_json::Value>,
     pub(crate) panes: Vec<PaneMeta>,
+    /// Why the panes' updates stopped, while their subscription is not
+    /// restarted.
+    pub(crate) stalled: Option<String>,
     /// The latest full viewport per pane id.
     pub(crate) viewports: BTreeMap<String, Vec<String>>,
     /// Panes the child reported closed; a listing that drops them
@@ -129,7 +132,7 @@ impl Retained {
     pub(crate) fn frames(&self) -> Vec<clank_web::service::BrowserFrame> {
         let mut out = vec![browser_frame(
             "panes",
-            &panes_data(&self.panes, &self.closed),
+            &panes_data(&self.panes, &self.closed, self.stalled.as_deref()),
         )];
         if let Some(status) = &self.status {
             out.push(browser_frame("status", status));
@@ -239,11 +242,19 @@ fn turn_frame(
     )
 }
 
-fn panes_data(panes: &[PaneMeta], closed: &BTreeSet<String>) -> serde_json::Value {
-    serde_json::json!({
+fn panes_data(
+    panes: &[PaneMeta],
+    closed: &BTreeSet<String>,
+    stalled: Option<&str>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
         "panes": panes,
         "closed": closed.iter().collect::<Vec<_>>(),
-    })
+    });
+    if let Some(why) = stalled {
+        data["stalled"] = why.into();
+    }
+    data
 }
 
 /// What a fresh listing changed, decided against the retained table.
@@ -538,7 +549,10 @@ impl Feed {
                     // content arrives, because content never carries
                     // lifecycle.
                     if s.closed.remove(&id) {
-                        frames.push(browser_frame("panes", &panes_data(&s.panes, &s.closed)));
+                        frames.push(browser_frame(
+                            "panes",
+                            &panes_data(&s.panes, &s.closed, s.stalled.as_deref()),
+                        ));
                     }
                     frames.push(s.take(id, viewport));
                     frames
@@ -553,7 +567,10 @@ impl Feed {
                         return Vec::new();
                     }
                     s.closed.insert(id);
-                    vec![browser_frame("panes", &panes_data(&s.panes, &s.closed))]
+                    vec![browser_frame(
+                        "panes",
+                        &panes_data(&s.panes, &s.closed, s.stalled.as_deref()),
+                    )]
                 });
                 self.relist();
             }
@@ -563,6 +580,20 @@ impl Feed {
 
     /// A fresh listing. Says what changed so the caller can restart
     /// the subscription when the set of panes did.
+    /// Tell viewers why the panes' updates stopped, or that they go on.
+    pub(crate) fn stalled(&self, why: Option<String>) {
+        self.publish(|s| {
+            if s.stalled == why {
+                return Vec::new();
+            }
+            s.stalled = why;
+            vec![browser_frame(
+                "panes",
+                &panes_data(&s.panes, &s.closed, s.stalled.as_deref()),
+            )]
+        });
+    }
+
     pub(crate) fn panes(&self, table: Vec<PaneMeta>) -> TableChange {
         let mut change = TableChange::Unchanged;
         self.publish(|s| {
@@ -576,7 +607,10 @@ impl Feed {
             s.taken.retain(|id, _| ids.contains(id));
             s.closed.retain(|id| ids.contains(id));
             s.panes = table;
-            vec![browser_frame("panes", &panes_data(&s.panes, &s.closed))]
+            vec![browser_frame(
+                "panes",
+                &panes_data(&s.panes, &s.closed, s.stalled.as_deref()),
+            )]
         });
         change
     }

@@ -576,10 +576,11 @@ async fn items_with_context(
     // watcher took as its baseline, so the loop refolds once now.
     let _ = tx.send(());
     drop(tx);
-    // Close the admission race: ack may have happened after the initial fold
-    // but before this watcher existed. Later writes leave dirty set for a wake.
+    // Close the admission race: an ack, or a repair of a timer that failed,
+    // may have happened after the initial fold but before this watcher
+    // existed. Later writes leave dirty set for a wake.
     if let Some(timers) = &mut timers {
-        timers.refresh();
+        timers.inventory_changed();
     }
     timer_backlog.invalidate();
 
@@ -605,6 +606,7 @@ async fn items_with_context(
     // — a guard disables that select branch so it can't hot-loop the
     // wait (codex 1bbb61d).
     let mut sources_open = true;
+    let mut held = HeldLocks::under(&events_dir);
 
     let outcome: anyhow::Result<Vec<WaitItem>> = async {
         loop {
@@ -612,17 +614,21 @@ async fn items_with_context(
             // the repo projection yields — one emitted result).
             let mut external: Vec<WaitItem> = Vec::new();
             let timer_deadline = timers.as_ref().and_then(|timers| timers.next_deadline());
-            let timer_retry = timers.as_mut().and_then(|timers| timers.retry_due());
-            let existing_wake = tokio::select! {
+            if timers
+                .as_ref()
+                .is_some_and(|timers| timers.awaiting_retry())
+            {
+                held.arm()?;
+            }
+            tokio::select! {
                 _ = crate::cli::timer_source::clock::sleep_until(timer_deadline) => {
                     if let Some(timers) = &mut timers { timers.due(); }
                     timer_backlog.invalidate();
-                    false
                 }
-                _ = crate::cli::timer_source::clock::sleep_until(timer_retry) => {
-                    if let Some(timers) = &mut timers { timers.retry_failed(); }
+                released = held.released() => {
+                    released?;
+                    if let Some(timers) = &mut timers { timers.retry_contended(); }
                     timer_backlog.invalidate();
-                    false
                 }
                 w = beat.rx.recv() => {
                     if w.is_none() {
@@ -632,7 +638,6 @@ async fn items_with_context(
                     // one logical change, one refold.
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     while beat.rx.try_recv().is_ok() {}
-                    true
                 }
                 item = source_rx.recv(), if sources_open => {
                     match item {
@@ -642,18 +647,14 @@ async fn items_with_context(
                         Some((item, _)) => external.push(item),
                         None => sources_open = false,
                     }
-                    true
                 }
             };
             let timers_changed = timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
             if timers_changed {
                 if let Some(timers) = &mut timers {
-                    timers.refresh();
-                    timers.retry_one_shots();
+                    timers.inventory_changed();
                 }
                 timer_backlog.invalidate();
-            } else if existing_wake && let Some(timers) = &mut timers {
-                timers.retry();
             }
             // The same beat that notices repo changes also notices a
             // new incarnation. No second hook-side poller is needed.
@@ -1020,6 +1021,7 @@ where
     use crate::upgrade::{Hosting, Pass};
     let mut absence = Absence::new(ears);
     let session = binding.0.as_ref().map(|(_, session)| session);
+    let mut deaf_to_installs: Option<String> = None;
     loop {
         binding.ensure_current(repo, author)?;
         let who = crate::cli::monitor::Who::Agent {
@@ -1038,7 +1040,11 @@ where
                         // Items in hand go out before anything else is considered.
                         biased;
                         ended = &mut shared => ended?,
-                        never = replacing.parked() => match never {},
+                        deaf = replacing.parked(), if deaf_to_installs.is_none() => {
+                            tracing::warn!(%deaf, "this wait stops looking for the installed clank");
+                            deaf_to_installs = Some(deaf);
+                            shared.await?
+                        }
                     }
                 };
                 match ended {
@@ -1055,13 +1061,22 @@ where
         let why = unserved.why();
         tracing::debug!(%why, "no monitor serves this wait");
         if replacing.pass(Hosting::Nothing) != Pass::Current {
-            replacing.until_current().await;
+            if let Err(deaf) = replacing.until_current().await {
+                anyhow::bail!(
+                    "this wait runs a clank build that is no longer installed and has no \
+                     monitor ({why}), and it cannot become the installed one: {deaf}"
+                );
+            }
             continue;
         }
         loop {
             let next = tokio::select! {
                 next = absence.after(&unserved) => next,
-                never = replacing.parked() => match never {},
+                deaf = replacing.parked(), if deaf_to_installs.is_none() => {
+                    tracing::warn!(%deaf, "this wait stops looking for the installed clank");
+                    deaf_to_installs = Some(deaf);
+                    absence.after(&unserved).await
+                }
             };
             match next {
                 Next::Attempt => break,
@@ -1810,7 +1825,7 @@ pub(crate) async fn run_command_source_with(
     let mut freed: Option<
         tokio::sync::oneshot::Receiver<std::io::Result<crate::cli::github::log::IngestLease>>,
     > = None;
-    let mut deferral_pause = cs::DEFERRAL_FIRST_RETRY;
+    let mut settling: Option<Settling> = None;
     let mut handed: Option<std::io::Result<crate::cli::github::log::IngestLease>> = None;
     loop {
         let taken = match handed.take() {
@@ -1892,6 +1907,9 @@ pub(crate) async fn run_command_source_with(
                     crate::cli::github::log::IngestLease::when_free(&store_dir, &key)
                 });
                 let ours_deferred = owners.deferred(&cs::producer_path(&store_dir, &key));
+                if !ours_deferred {
+                    settling = None;
+                }
                 let mut unstoppable = StopRequest::never();
                 tokio::select! {
                     _ = stop.requested() => return,
@@ -1914,8 +1932,16 @@ pub(crate) async fn run_command_source_with(
                         freed = None;
                         handed = Some(waited.unwrap_or_else(|e| Err(std::io::Error::other(e))));
                     }
-                    _ = until_retirement_may_settle(&store_dir, &key, &mut unstoppable, deferral_pause), if ours_deferred => {
-                        deferral_pause = (deferral_pause * 2).min(cs::DEFERRAL_RETRY_CAP);
+                    settled = until_retirement_may_settle(&store_dir, &key, &mut settling, &mut unstoppable, owners), if ours_deferred => {
+                        match settled {
+                            Ok(true) => return,
+                            Ok(false) => {}
+                            Err(why) => {
+                                eprintln!("wait: command source `{}` — {why}", src.name);
+                                tx.report(&key, crate::cli::event_source::Lifecycle::Stopped { why });
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -1933,6 +1959,57 @@ pub(crate) async fn run_command_source_with(
                 return;
             }
         }
+    }
+}
+
+/// The locks this wait's own timers found held, each waited on by a thread
+/// of its own until its release, which is what tries them again (I9, I10).
+struct HeldLocks {
+    under: PathBuf,
+    watching: std::collections::BTreeSet<PathBuf>,
+    tx: tokio::sync::mpsc::UnboundedSender<(PathBuf, std::io::Result<()>)>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, std::io::Result<()>)>,
+}
+
+impl HeldLocks {
+    fn under(dir: &Path) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        HeldLocks {
+            under: dir.to_path_buf(),
+            watching: Default::default(),
+            tx,
+            rx,
+        }
+    }
+
+    /// Wait for the release of each lock under this wait's directory found
+    /// held and not yet waited on. One no waiter can be started for ends
+    /// the wait: nothing else would try its timer again.
+    fn arm(&mut self) -> anyhow::Result<()> {
+        for (path, exclusive) in crate::cli::github::log::found_held() {
+            if !path.starts_with(&self.under) || self.watching.contains(&path) {
+                continue;
+            }
+            let (tx, waited) = (self.tx.clone(), path.clone());
+            std::thread::Builder::new()
+                .name("lock-release".into())
+                .spawn(move || {
+                    let released = crate::cli::github::log::when_released(&waited, exclusive);
+                    let _ = tx.send((waited, released));
+                })
+                .map_err(|e| {
+                    anyhow::anyhow!("cannot wait for {} to be released: {e}", path.display())
+                })?;
+            self.watching.insert(path);
+        }
+        Ok(())
+    }
+
+    /// The next release, or why a lock's waiter could not hear one.
+    async fn released(&mut self) -> anyhow::Result<()> {
+        let (path, released) = self.rx.recv().await.expect("this holds a sender");
+        self.watching.remove(&path);
+        released.map_err(|e| anyhow::anyhow!("waiting on {} failed: {e}", path.display()))
     }
 }
 
@@ -1986,37 +2063,114 @@ impl StopRequest {
     }
 }
 
-/// Wait for a deferred retirement to be worth trying again: a member of
-/// the group recorded for `key` exiting, or `pause`, the backoff of a
-/// retirement that goes on deferring — or a stop. Whether one was.
-async fn until_retirement_may_settle(
-    store_dir: &Path,
-    key: &str,
-    stop: &mut StopRequest,
-    pause: Duration,
-) -> bool {
-    use crate::cli::command_source::{self as cs, Os as _};
-    let Some(group) = cs::recorded_group(store_dir, key) else {
-        return pause_unless_stopped(stop, pause).await;
-    };
-    // A thread of its own, for the reason `IngestLease::when_free` gives.
-    let (tx, exited) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let by = std::time::Instant::now() + pause;
-        cs::Native { children: &[] }.until_a_member_exits(group, &|| Some(by));
-        let _ = tx.send(());
-    });
-    tokio::select! {
-        _ = stop.requested() => true,
-        _ = exited => stop.is_requested(),
+/// What can end a deferred retirement of one source's group, heard until
+/// one of them moves: a member of the group its record names exiting, and
+/// that record changing, as a person removing it once they have
+/// established what its group is. Nothing else, so neither the source's
+/// own log nor any other file in its directory tries it again.
+struct Settling {
+    heard: tokio::sync::mpsc::UnboundedReceiver<Result<(), String>>,
+    _record: crate::proc_identity::tree_watch::KernelWatcher,
+    _members: Option<crate::proc_identity::exit_watch::ExitWatch<i32>>,
+}
+
+type HearMembers = fn(
+    crate::signal::Pgid,
+    Box<dyn Fn(Result<(), String>) + Send>,
+) -> Result<Option<crate::proc_identity::exit_watch::ExitWatch<i32>>, String>;
+
+impl Settling {
+    fn arm(store_dir: &Path, key: &str) -> Result<Self, String> {
+        Self::arm_with(store_dir, key, |group, heard| {
+            crate::cli::command_source::hear_member_exits(group, heard)
+        })
+    }
+
+    fn arm_with(store_dir: &Path, key: &str, members: HearMembers) -> Result<Self, String> {
+        use crate::cli::command_source as cs;
+        use notify::Watcher as _;
+        let (tx, heard) = tokio::sync::mpsc::unbounded_channel();
+        let record = cs::producer_path(store_dir, key);
+        let mut watcher = crate::proc_identity::tree_watch::KernelWatcher::new(
+            {
+                let record = record.clone();
+                move |file| file == record
+            },
+            {
+                let (tx, record) = (tx.clone(), record.clone());
+                move |res: notify::Result<notify::Event>| {
+                    use crate::fs_notice::Notice;
+                    match crate::fs_notice::notice(&res) {
+                        Notice::Changed(paths) if paths.contains(&record) => drop(tx.send(Ok(()))),
+                        Notice::Changed(_) | Notice::Read => {}
+                        Notice::Rescan => drop(tx.send(Ok(()))),
+                        Notice::Failed(why) => drop(tx.send(Err(why))),
+                    }
+                }
+            },
+        )
+        .map_err(|e| format!("cannot watch {}: {e}", record.display()))?;
+        watcher
+            .watch(store_dir, notify::RecursiveMode::NonRecursive)
+            .map_err(|e| format!("cannot watch {}: {e}", store_dir.display()))?;
+        let members = match cs::recorded_group(store_dir, key) {
+            Some(group) => {
+                let exits = tx.clone();
+                members(group, Box::new(move |heard| drop(exits.send(heard))))?
+            }
+            None => None,
+        };
+        Ok(Settling {
+            heard,
+            _record: watcher,
+            _members: members,
+        })
     }
 }
 
-/// Sleep for `d`, unless a stop is asked for first. Whether one was.
-async fn pause_unless_stopped(stop: &mut StopRequest, d: Duration) -> bool {
-    tokio::select! {
-        _ = stop.requested() => true,
-        _ = tokio::time::sleep(d) => stop.is_requested(),
+/// Wait for a deferred retirement of `key`'s group to be worth trying
+/// again, or a stop or the registry's closing: whether one of those came. With nothing armed yet it
+/// arms what can end it and returns at once, so a change between the
+/// look that deferred and the arming is not lost; what it armed is spent
+/// by the move it hears. An error when that cannot be heard: nothing
+/// else would try the retirement again.
+async fn until_retirement_may_settle(
+    store_dir: &Path,
+    key: &str,
+    settling: &mut Option<Settling>,
+    stop: &mut StopRequest,
+    owners: &crate::cli::source_group::Owners,
+) -> Result<bool, String> {
+    let Some(armed) = settling else {
+        *settling = Some(Settling::arm(store_dir, key)?);
+        return Ok(stop.is_requested());
+    };
+    let heard = tokio::select! {
+        _ = stop.requested() => return Ok(true),
+        () = owners.closed() => return Ok(true),
+        heard = armed.heard.recv() => heard,
+    };
+    *settling = None;
+    match heard {
+        Some(Ok(())) => Ok(stop.is_requested()),
+        Some(Err(why)) => Err(format!("the watch on its retirement failed: {why}")),
+        None => Err("the watch on its retirement stopped".into()),
+    }
+}
+
+/// A deferred retirement can no longer be heard: the source stops, saying
+/// why, and a group of its own not confirmed gone stays owned.
+async fn deaf_to_retirement(
+    src: &clank_core::agent_config::CommandSource,
+    key: &str,
+    tx: &crate::cli::event_source::EmissionSink,
+    why: String,
+    unended: Option<crate::cli::source_group::Owned>,
+) {
+    eprintln!("wait: command source `{}` — {why}", src.name);
+    tx.report(key, crate::cli::event_source::Lifecycle::Stopped { why });
+    if let Some(owned) = unended {
+        leave_unended(owned).await;
     }
 }
 
@@ -2212,7 +2366,7 @@ async fn run_leased_command_source(
 
     source_group::retire_on_termination();
     let mut deferral_warned = false;
-    let mut deferral_pause = cs::DEFERRAL_FIRST_RETRY;
+    let mut settling: Option<Settling> = None;
     // This host's own group, when its retirement could not confirm it
     // ended. Still owned, so nothing replaces it until it does.
     let mut unended: Option<source_group::Owned> = None;
@@ -2241,8 +2395,11 @@ async fn run_leased_command_source(
                 deferral_warned = true;
             }
             unended = Some(owned);
-            until_retirement_may_settle(&store_dir, &key, stop, deferral_pause).await;
-            deferral_pause = (deferral_pause * 2).min(cs::DEFERRAL_RETRY_CAP);
+            if let Err(why) =
+                until_retirement_may_settle(&store_dir, &key, &mut settling, stop, owners).await
+            {
+                return deaf_to_retirement(&src, &key, tx, why, unended).await;
+            }
             continue;
         }
         // Holding the lease means the previous owner is GONE — a lease
@@ -2268,12 +2425,15 @@ async fn run_leased_command_source(
                 );
                 deferral_warned = true;
             }
-            until_retirement_may_settle(&store_dir, &key, stop, deferral_pause).await;
-            deferral_pause = (deferral_pause * 2).min(cs::DEFERRAL_RETRY_CAP);
+            if let Err(why) =
+                until_retirement_may_settle(&store_dir, &key, &mut settling, stop, owners).await
+            {
+                return deaf_to_retirement(&src, &key, tx, why, unended).await;
+            }
             continue;
         }
         deferral_warned = false;
-        deferral_pause = cs::DEFERRAL_FIRST_RETRY;
+        settling = None;
 
         let started = std::time::Instant::now();
         let cmd = crate::proc_run::Spec::new(&src.command[0])
@@ -2307,7 +2467,6 @@ async fn run_leased_command_source(
                 None
             }
         };
-        let mut exit = None;
         let mut ended = match &launch_error {
             Some(why) => crate::cli::source_diagnostic::Ended::Launch(why.clone()),
             None => crate::cli::source_diagnostic::Ended::Unknown,
@@ -2431,7 +2590,6 @@ async fn run_leased_command_source(
                     status = child.wait_async() => break status.ok(),
                 }
             };
-            exit = status.and_then(|status| status.code());
             ended = crate::cli::source_diagnostic::Ended::of(status);
             if let Some(reader) = stderr_reader {
                 let by = cutoff.unwrap_or_else(|| output_cutoff(owners, run.stopping_by()));
@@ -2493,17 +2651,25 @@ async fn run_leased_command_source(
                 return;
             }
         }
-        let backoff = cs::backoff(failures);
-        tx.report(
-            &key,
-            crate::cli::event_source::Lifecycle::BackingOff {
-                until: crate::cli::github::log::now_epoch() + backoff.as_secs(),
-                failures,
-                exit,
-                error: launch_error,
-            },
-        );
-        pause_unless_stopped(stop, backoff).await;
+        // Its end is the event a restart answers, so none waits on a clock;
+        // the budget is what keeps one that cannot run from spinning.
+        if failures >= cs::FAILURES_BEFORE_SURFACING {
+            let why = format!(
+                "stopped {failures} times in a row; its last run {}; not started again until \
+                 it is restarted or its definition changes",
+                ended.describe(&secrets)
+            );
+            eprintln!("wait: command source `{}` {why}", src.name);
+            tx.report(&key, crate::cli::event_source::Lifecycle::Stopped { why });
+            tokio::select! {
+                _ = stop.requested() => {}
+                () = owners.closed() => return,
+            }
+            if let Some(owned) = unended.take() {
+                leave_unended(owned).await;
+            }
+            return;
+        }
     }
 }
 
@@ -4140,8 +4306,8 @@ mod shared_tests {
 
     /// The stranded waiter of 10 Nov: a parked wait outlived by install
     /// after install, refused by each new monitor. It asks to become every
-    /// build as it is installed, backs off when it cannot, and never fails
-    /// its agent with an outage or an upgrade notice.
+    /// build as it is installed, asks nothing more while none is, and never
+    /// fails its agent with an outage or an upgrade notice.
     #[tokio::test(start_paused = true)]
     async fn a_wait_outlived_by_installs_asks_to_become_each_and_never_fails() {
         use crate::cli::monitor::Attempt;
@@ -4164,17 +4330,93 @@ mod shared_tests {
             );
             tokio::pin!(waiting);
             for n in 1..=4 {
-                builds.push(installed.replace(n));
-                let outlived =
-                    tokio::time::timeout(crate::cli::monitor::OUTAGE_BUDGET * 2, &mut waiting)
-                        .await;
-                assert!(outlived.is_err(), "the wait ended: {outlived:?}");
+                let build = installed.replace(n);
+                builds.push(build);
+                // The install is heard on the kernel's time, not the
+                // paused clock's.
+                let began = std::time::Instant::now();
+                while !asked.borrow().contains(&build) {
+                    assert!(
+                        began.elapsed() < Duration::from_secs(10),
+                        "build {n} never asked"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                    let outlived =
+                        tokio::time::timeout(crate::cli::monitor::OUTAGE_BUDGET * 2, &mut waiting)
+                            .await;
+                    assert!(outlived.is_err(), "the wait ended: {outlived:?}");
+                }
             }
+            let before = asked.borrow().len();
+            let outlived =
+                tokio::time::timeout(crate::cli::monitor::OUTAGE_BUDGET * 10, &mut waiting).await;
+            assert!(outlived.is_err(), "the wait ended: {outlived:?}");
+            assert_eq!(
+                asked.borrow().len(),
+                before,
+                "nothing installed, nothing asked"
+            );
         }
         let mut asked = asked.into_inner();
-        assert!(asked.len() > builds.len(), "a failed attempt is retried");
         asked.dedup();
         assert_eq!(asked, builds, "each build, as it was installed");
+    }
+
+    /// A wait whose installation cannot be heard is not replaced, and is
+    /// served all the same: its monitor's items reach it. With no monitor,
+    /// stale and deaf, it ends saying so, not as an outage.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_cannot_hear_its_installation_is_served_or_says_why() {
+        use crate::cli::monitor::Attempt;
+        let (repo, author, binding) = unbound();
+        let installed = crate::upgrade::tests::Installed::current();
+        let deaf = |_: &_, _, _| Err("no descriptors left".into());
+        let mut replacing = crate::upgrade::Replacing::new(installed.authority(), |_| {
+            std::io::Error::other("no exec in a test")
+        })
+        .hearing_through(deaf);
+        let (items, _) = monitored(
+            repo.path(),
+            &author,
+            &binding,
+            &mut replacing,
+            |_| async {
+                Attempt::Shared(monitor_saying(vec![Note::Items {
+                    source_cwd: None,
+                    items: vec![promote()],
+                }]))
+            },
+            Ears::default(),
+        )
+        .await
+        .expect("served");
+        assert!(
+            matches!(items.as_slice(), [WaitItem::PromoteFromQueue { .. }]),
+            "{items:?}"
+        );
+
+        installed.replace(1);
+        let mut stale = crate::upgrade::Replacing::new(installed.authority(), |_| {
+            std::io::Error::other("no exec in a test")
+        })
+        .hearing_through(deaf);
+        let failed = tokio::time::timeout(
+            Duration::from_secs(60),
+            monitored(
+                repo.path(),
+                &author,
+                &binding,
+                &mut stale,
+                |_| async { Attempt::Newer("the monitor speaks proto 99".into()) },
+                Ears::default(),
+            ),
+        )
+        .await
+        .expect("it ends")
+        .expect_err("nothing serves it");
+        let said = format!("{failed:#}");
+        assert!(said.contains("cannot become the installed one"), "{said}");
+        assert!(said.contains("no descriptors left"), "{said}");
     }
 
     /// A refusal by a newer monitor, with this build still the installed
@@ -4285,6 +4527,49 @@ mod shared_tests {
             body.contains("crate::upgrade::process().clone()")
                 && body.contains("crate::upgrade::exec_installed_as_started()"),
             "this process's own authority, and the same arguments: {body}"
+        );
+    }
+
+    /// The wait's own loop tries a failed timer again only when a timer's
+    /// files changed, and looks once as its watcher is armed, for a repair
+    /// made before it: it sleeps for no timer but the next deadline, and
+    /// no other wake reaches the failed entries. Read, since the loop runs
+    /// only as a whole wait.
+    #[test]
+    fn the_own_loop_tries_a_failed_timer_only_on_a_timer_log_change() {
+        let src = include_str!("wait.rs");
+        let from = src.find("async fn items_with_context(").expect("the loop");
+        let body = &src[from..from + src[from..].find("\n}\n").expect("its end")];
+        let flat: String = body.split_whitespace().collect();
+        let sleeps: Vec<_> = flat.match_indices("clock::sleep_until(").collect();
+        assert_eq!(sleeps.len(), 1, "{sleeps:?}");
+        assert!(flat.contains("clock::sleep_until(timer_deadline)"));
+        let retries: Vec<_> = flat.match_indices("timers.inventory_changed();").collect();
+        assert_eq!(
+            retries.len(),
+            2,
+            "once the watcher is armed, and on a timer log's change"
+        );
+        let attached = flat
+            .find("RepoStateWatcher::attach_with_timer_invalidation(")
+            .expect("the watcher");
+        let admitted = flat
+            .find("ifletSome(timers)=&muttimers{timers.inventory_changed();}timer_backlog.invalidate();")
+            .expect("the look once it is armed");
+        assert!(attached < admitted, "the look follows the arming");
+        let guarded = "iftimers_changed{ifletSome(timers)=&muttimers{timers.inventory_changed();}";
+        assert!(flat.contains(guarded), "and only for a timer log's change");
+        assert!(
+            flat.contains(
+                "iftimers.as_ref().is_some_and(|timers|timers.awaiting_retry()){held.arm()?;}tokio::select!{"
+            ),
+            "a held lock is waited for before the loop sleeps"
+        );
+        assert!(
+            flat.contains(
+                "released=held.released()=>{released?;ifletSome(timers)=&muttimers{timers.retry_contended();}"
+            ),
+            "and its release tries what it held off"
         );
     }
 
@@ -5428,9 +5713,9 @@ mod tests {
             while let Some((who, at, instance, state)) = heard.recv().await {
                 assert_eq!(instance, 1);
                 assert_eq!((who, at.as_str()), (author.clone().into(), key.as_str()));
-                let backing_off = matches!(state, Lifecycle::BackingOff { .. });
+                let stopped = matches!(state, Lifecycle::Stopped { .. });
                 states.push(state);
-                if backing_off {
+                if stopped {
                     break;
                 }
             }
@@ -5444,7 +5729,15 @@ mod tests {
             .parse()
             .unwrap();
         assert!(
-            matches!(states.as_slice(), [Lifecycle::Running { pid: p, .. }, Lifecycle::BackingOff { failures: 1, exit: Some(3), error: None, .. }] if *p == pid),
+            matches!(
+                states.as_slice(),
+                [
+                    Lifecycle::Running { .. },
+                    Lifecycle::Running { .. },
+                    Lifecycle::Running { pid: p, .. },
+                    Lifecycle::Stopped { why },
+                ] if *p == pid && why.contains("exit 3") && why.contains("3 times in a row")
+            ),
             "{states:?}"
         );
     }
@@ -5670,7 +5963,7 @@ mod tests {
             ))
         };
 
-        tokio::time::sleep(cs::DEFERRAL_FIRST_RETRY * 2).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
             !marker.exists(),
             "a deferral must not start a second producer beside the first"
@@ -5681,8 +5974,9 @@ mod tests {
             "nor overwrite the record that caused the deferral"
         );
 
-        // Settled, and the launch follows.
+        // Settled, and the record's change is what tries it again.
         defer.store(false, std::sync::atomic::Ordering::Release);
+        std::fs::write(cs::producer_path(&events, &key), &before).unwrap();
         tokio::time::timeout(Duration::from_secs(20), rx.recv())
             .await
             .expect("a retired predecessor releases the launch")
@@ -5696,6 +5990,249 @@ mod tests {
 
         task.abort();
         let _ = task.await;
+    }
+
+    /// A source whose runs keep failing is restarted on each run's end,
+    /// with no pause, until its budget: then its failure is raised once,
+    /// it is said to have stopped, and nothing more is started or woken
+    /// for, however long it is left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_source_is_restarted_on_its_ends_until_its_budget() {
+        let owners = crate::cli::source_group::tests::owners();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let runs = root.path().join("runs");
+        let src = command_source(
+            "broken",
+            &[
+                "sh",
+                "-c",
+                &format!("echo run >> '{}'; exit 3", runs.display()),
+            ],
+        );
+        let key = src.source_key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reports, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        let author = AgentLabel::parse("alpha").unwrap();
+        let sink = crate::cli::event_source::EmissionSink::for_author(tx, author.clone())
+            .reporting(reports, author, 1);
+        let (stop, stopping) = StopRequest::channel();
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            sink,
+            Some(events),
+            key,
+            crate::cli::command_source::reap_previous_producer,
+            owners,
+            stopping,
+        ));
+        let began = std::time::Instant::now();
+        let stopped = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let (_, _, _, crate::cli::event_source::Lifecycle::Stopped { why }) =
+                    heard.recv().await.expect("reports")
+                {
+                    return why;
+                }
+            }
+        })
+        .await
+        .expect("it stops");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "no pause between restarts: {:?}",
+            began.elapsed()
+        );
+        assert!(stopped.contains("not started again"), "{stopped}");
+        let budget = crate::cli::command_source::FAILURES_BEFORE_SURFACING as usize;
+        let count = || std::fs::read_to_string(&runs).unwrap().lines().count();
+        assert_eq!(count(), budget);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(count(), budget, "nothing started after its budget");
+        assert!(heard.try_recv().is_err(), "nothing more reported");
+        let raised = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|emitted| format!("{emitted:?}").contains("has stopped 3 times"))
+            .count();
+        assert_eq!(raised, 1, "its failure is raised once");
+        assert!(!task.is_finished(), "it waits for its stop, not a clock");
+        drop(stop);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("a stop ends it")
+            .unwrap();
+    }
+
+    /// A deferred retirement is tried again on what can end it and on
+    /// nothing else: no clock, and no change to another file beside its
+    /// record. A member of the recorded group exiting is one such move.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deferred_retirement_waits_for_a_member_to_exit() {
+        use crate::cli::command_source as cs;
+        use std::os::unix::process::CommandExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().to_path_buf();
+        let marker = dir.path().join("it-ran");
+        let src = command_source(
+            "deploys",
+            &[
+                "sh",
+                "-c",
+                Box::leak(
+                    format!(
+                        r#"touch '{}'; printf '{{"id":"A","content":"x"}}\n'; sleep 300"#,
+                        marker.display()
+                    )
+                    .into_boxed_str(),
+                ),
+            ],
+        );
+        let key = src.source_key();
+        let mut left = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::fs::write(
+            cs::producer_path(&events, &key),
+            format!(
+                r#"{{"pgid":{},"started":"Thu 1 Oct 16:58:08 2026"}}"#,
+                left.id()
+            ),
+        )
+        .unwrap();
+        let defer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let looks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = {
+            let (defer, looks) = (defer.clone(), looks.clone());
+            tokio::spawn(run_command_source_with(
+                src,
+                crate::cli::event_source::EmissionSink::from(tx),
+                Some(events.clone()),
+                key.clone(),
+                move |_: &Path, _: &str| {
+                    looks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if defer.load(std::sync::atomic::Ordering::Acquire) {
+                        cs::Retired::Deferred("still running".into())
+                    } else {
+                        cs::Retired::Clear
+                    }
+                },
+                &crate::cli::source_group::OWNERS,
+                StopRequest::never(),
+            ))
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::fs::write(events.join("unrelated.jsonl"), "{}\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(
+            looks.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "the look that deferred, and the one once its watches were armed"
+        );
+        assert!(!marker.exists());
+
+        defer.store(false, std::sync::atomic::Ordering::Release);
+        left.kill().unwrap();
+        left.wait().unwrap();
+        tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("the member's exit releases the launch")
+            .expect("the channel closed");
+        assert!(marker.exists());
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// The wait's own timers, held off by a lock, are waited on by its
+    /// release: the waiter armed for the held lock answers when it is let
+    /// go, and a lock outside the wait's directory is not its to wait on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_timer_lock_is_heard_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let held = crate::cli::github::log::tests::hold(&[
+            (dir.path(), "timer-x"),
+            (other.path(), "timer-y"),
+        ]);
+        for path in held.paths() {
+            crate::cli::github::log::held_elsewhere(path, true);
+        }
+        let mut locks = HeldLocks::under(dir.path());
+        locks.arm().unwrap();
+        assert_eq!(locks.watching.len(), 1, "{:?}", locks.watching);
+        let waiting = locks.released();
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "nothing while it is held"
+        );
+        held.release();
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("its release is heard")
+            .unwrap();
+    }
+
+    /// A recorded group whose members cannot all be watched, because it
+    /// cannot be listed or a member's exit cannot be armed, is no quiet
+    /// retirement: arming it fails with why, which stops the source.
+    #[test]
+    fn a_group_that_cannot_be_covered_does_not_arm_its_retirement() {
+        use crate::cli::command_source as cs;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cs::producer_path(dir.path(), "command-x"),
+            br#"{"pgid":4242,"started":"Thu 1 Oct 16:58:08 2026"}"#,
+        )
+        .unwrap();
+        let refused = Settling::arm_with(dir.path(), "command-x", |group, _| {
+            cs::cover_members(group, &mut || None, &mut |_| unreachable!()).map(|_| None)
+        });
+        assert_eq!(
+            refused.err().as_deref(),
+            Some("the producer group (pgid 4242) cannot be listed")
+        );
+    }
+
+    /// A retirement's watch that fails, or whose every sender is gone,
+    /// ends the wait with why: it is never taken for a quiet one.
+    #[tokio::test]
+    async fn a_failed_retirement_watch_ends_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let owners = crate::cli::source_group::tests::owners();
+        let mut stop = StopRequest::never();
+        let mut settling = None;
+        assert_eq!(
+            until_retirement_may_settle(dir.path(), "command-x", &mut settling, &mut stop, owners)
+                .await,
+            Ok(false),
+            "arming looks again at once"
+        );
+        let armed = settling.as_mut().unwrap();
+        let (tx, heard) = tokio::sync::mpsc::unbounded_channel();
+        armed.heard = heard;
+        tx.send(Err("the stream died".into())).unwrap();
+        assert_eq!(
+            until_retirement_may_settle(dir.path(), "command-x", &mut settling, &mut stop, owners)
+                .await,
+            Err("the watch on its retirement failed: the stream died".into())
+        );
+        assert!(settling.is_none());
+        until_retirement_may_settle(dir.path(), "command-x", &mut settling, &mut stop, owners)
+            .await
+            .unwrap();
+        let (tx, heard) = tokio::sync::mpsc::unbounded_channel();
+        settling.as_mut().unwrap().heard = heard;
+        drop(tx);
+        assert_eq!(
+            until_retirement_may_settle(dir.path(), "command-x", &mut settling, &mut stop, owners)
+                .await,
+            Err("the watch on its retirement stopped".into())
+        );
     }
 
     /// A running producer's group is written down, led by its anchor,
@@ -6754,7 +7291,10 @@ mod tests {
     fn a_self_folding_wait_has_no_tick() {
         let src = include_str!("wait.rs");
         let from = src
-            .find("            let existing_wake = tokio::select! {")
+            .find(concat!(
+                "            tokio::select! {\n",
+                "                _ = crate::cli::timer_source::clock::sleep_until(timer_deadline)",
+            ))
             .expect("the loop's select");
         let arms = &src[from..from + src[from..].find("\n            };\n").expect("its end")];
         assert!(!arms.contains("_ = tokio::time::sleep("), "{arms}");
@@ -8377,7 +8917,10 @@ mod tests {
             .expect("a closing host kept relaunching")
             .unwrap();
         let ran = std::fs::read_to_string(&runs).unwrap().lines().count();
-        assert!(ran <= 2, "it kept starting producers: {ran} runs");
+        assert!(
+            ran <= crate::cli::command_source::FAILURES_BEFORE_SURFACING as usize,
+            "it kept starting producers: {ran} runs"
+        );
         while let Ok((item, _)) = rx.try_recv() {
             assert!(
                 !format!("{item:?}").contains("has stopped"),
@@ -8430,7 +8973,7 @@ mod tests {
             .expect("the host did not end")
             .unwrap();
         assert!(
-            closed.elapsed() < crate::cli::command_source::BACKOFF_FIRST,
+            closed.elapsed() < Duration::from_secs(1),
             "it waited out a backoff: {:?}",
             closed.elapsed()
         );
@@ -8468,8 +9011,8 @@ mod tests {
             .unwrap();
     }
 
-    /// Two real failures, then the registry closes during the backoff
-    /// before the third attempt: no false third failure is raised.
+    /// Two real failures, then the registry closes during the third run:
+    /// that run did not fail, and no false failure is raised.
     #[tokio::test(flavor = "multi_thread")]
     async fn closing_after_two_failures_raises_no_third() {
         let owners = crate::cli::source_group::tests::owners();
@@ -8482,7 +9025,10 @@ mod tests {
             &[
                 "sh",
                 "-c",
-                &format!("echo run >> '{}'; exit 3", runs.display()),
+                &format!(
+                    "echo run >> '{0}'; [ $(wc -l < '{0}') -ge 3 ] && exec sleep 300; exit 3",
+                    runs.display()
+                ),
             ],
         );
         let key = src.source_key();
@@ -8502,12 +9048,12 @@ mod tests {
                 .unwrap_or(0)
         };
         for _ in 0..600 {
-            if count() >= 2 {
+            if count() >= 3 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(count(), 2, "two runs first");
+        assert_eq!(count(), 3, "two failed runs, and a third running");
         tokio::time::sleep(Duration::from_millis(300)).await;
         tokio::task::spawn_blocking(move || owners.retire_all())
             .await
@@ -8516,7 +9062,7 @@ mod tests {
             .await
             .expect("the host did not stop")
             .unwrap();
-        assert_eq!(count(), 2, "a third producer started");
+        assert_eq!(count(), 3, "a fourth producer started");
         while let Ok((item, _)) = rx.try_recv() {
             assert!(
                 !format!("{item:?}").contains("has stopped"),

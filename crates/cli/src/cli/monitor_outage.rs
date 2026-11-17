@@ -424,7 +424,7 @@ impl Ears for Kernel {
                 let (moved, failed) = (tell.clone(), tell.clone());
                 match self
                     .authority
-                    .hear_installs(move || moved.moved(), move |why| failed.failed(why))?
+                    .subscribe(move || moved.moved(), move |why| failed.failed(why))?
                 {
                     Some(subscription) => Ok(Box::new(subscription)),
                     // Nothing watched is a process never replaced: a source
