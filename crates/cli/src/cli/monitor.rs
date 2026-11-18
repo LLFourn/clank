@@ -3583,6 +3583,18 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 {
                     anyhow::bail!("the watch on the installation failed: {why}");
                 }
+                if owner {
+                    let acts = recovery.installed(crate::cli::recovery::unix_now());
+                    act_on_recovery(
+                        &repo,
+                        &clients,
+                        acts,
+                        &recovery_answers,
+                        &asks,
+                        &records,
+                        &mut owned,
+                    );
+                }
             }
             Wake::LeaseChanged | Wake::Collected | Wake::Settled => {}
             Wake::Released => {
@@ -3597,7 +3609,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         &mut turns,
                     ));
                     if let Some(state) = &folded_state {
-                        let acts = recovery.reconcile(
+                        let acts = recovery.released(
                             recovery_facts(
                                 &repo,
                                 state,
@@ -5024,7 +5036,7 @@ fn due_gate(
         return crate::cli::recovery::Gate::Hold;
     };
     let Some(owed) = owed_now(repo, state, author, hosted, timer_backlogs, pending) else {
-        return crate::cli::recovery::Gate::Hold;
+        return crate::cli::recovery::Gate::Contended;
     };
     recovery_gate(repo, clients, turns, author, session, &owed)
 }
@@ -5234,7 +5246,7 @@ fn last_look(
         &reviews,
         head.as_ref(),
     ) else {
-        return Some((crate::cli::recovery::Gate::Hold, Vec::new()));
+        return Some((crate::cli::recovery::Gate::Contended, Vec::new()));
     };
     let gate = recovery_gate(repo, clients, turns, &a.author, &a.attempt.session, &owed);
     Some((gate, owed))
@@ -15564,6 +15576,10 @@ mod tests {
             .expect("the retry runs");
         let facts = arm.find("recovery_facts(").expect("recovery looks again");
         assert!(owner < ran && ran < facts, "{arm}");
+        assert!(
+            arm[..facts].ends_with("let acts = recovery.released(\n                            "),
+            "the fold is recovery's release, which owes a look a lock held: {arm}"
+        );
     }
 
     /// A monitor that cannot watch its installation does not serve, and one
@@ -15577,8 +15593,36 @@ mod tests {
             flat.contains(".map_err(|why|anyhow::anyhow!(\"cannotwatchtheinstallation:{why}\"))?;")
         );
         assert!(flat.contains(
-            "Wake::Installed=>{ifletSome(why)=installs_lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(){anyhow::bail!(\"thewatchontheinstallationfailed:{why}\");}}"
+            "Wake::Installed=>{ifletSome(why)=installs_lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(){anyhow::bail!(\"thewatchontheinstallationfailed:{why}\");}"
         ));
+    }
+
+    /// An install is what a decision a stale build could not store waits
+    /// on, so the loop's install wake hands it to recovery, as owner, and
+    /// acts on what that decides. Read, since no test may run a monitor.
+    #[test]
+    fn an_install_wake_reaches_recovery() {
+        let src = include_str!("monitor.rs");
+        let body = &src[src.find("    let ended = loop {").expect("the loop")..];
+        let select = body
+            .find("        let wake = tokio::select! {")
+            .expect("the select");
+        let arms = &body[select..select + body[select..].find("\n        };\n").unwrap()];
+        assert!(
+            arms.contains("_ = installs.notified() => Wake::Installed,"),
+            "{arms}"
+        );
+        let arm = &body[body
+            .find("            Wake::Installed => {")
+            .expect("the arm")..];
+        let arm = &arm[..arm.find("            Wake::LeaseChanged").expect("its end")];
+        let flat: String = arm.split_whitespace().collect();
+        assert!(
+            flat.contains(
+                "ifowner{letacts=recovery.installed(crate::cli::recovery::unix_now());act_on_recovery("
+            ),
+            "{arm}"
+        );
     }
 
     #[test]

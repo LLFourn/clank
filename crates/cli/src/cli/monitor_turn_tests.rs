@@ -3699,7 +3699,7 @@ async fn a_held_event_log_holds_a_due_recovery_attempt() {
     let during = gates.clone();
     assert_eq!(
         crate::cli::github::log::tests::within("the gates", during),
-        (Some(Gate::Hold), Gate::Hold),
+        (Some(Gate::Contended), Gate::Contended),
         "held, nothing is decided on part of the work"
     );
     held.release();

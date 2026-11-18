@@ -275,7 +275,7 @@ impl RepoStateWatcher {
 }
 
 /// The watcher's callback, apart from the backend so a test can drive it.
-fn handler<M: Clone + Send + Sync + 'static>(
+pub(crate) fn handler<M: Clone + Send + Sync + 'static>(
     tx: crate::fs_notice::Wake<M>,
     cr: PathBuf,
     gd: PathBuf,

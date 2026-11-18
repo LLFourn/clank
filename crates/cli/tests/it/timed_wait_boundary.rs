@@ -80,12 +80,12 @@ enum Class {
 enum Residual {
     Github,
     /// A poll still owed a replacement, by the plan that owes it.
+    // None is owed now; the variant stays for the next one.
+    #[allow(dead_code)]
     Plan(&'static str),
 }
 
 use Class::*;
-
-const RECOVERY: Residual = Residual::Plan("recovery-looks-when-something-moves");
 
 struct Site {
     /// Relative to `crates/`.
@@ -154,7 +154,7 @@ const SITES: &[Site] = &[
     site("cli/src/cli/monitor.rs", "attach_or_spawn_until", "wait_for_ownership_by", 1, BoundedRetry, "probes the lease until the handoff deadline"),
     site("cli/src/cli/monitor.rs", "attach_or_spawn_until", "look_after", 2, BoundedRetry, "looks for the started monitor until the handoff deadline"),
     site("cli/src/cli/monitor.rs", "look_after", "sleep", 0, Helper, "one step, never past the caller's deadline"),
-    site("cli/src/cli/monitor.rs", "start", "deadline", 0, Poll(RECOVERY), "recovery re-looks every RETRY_LOOK at an episode it cannot watch or whose gate is not Go, with no bound"),
+    site("cli/src/cli/monitor.rs", "start", "deadline", 0, Scheduled, "recovery's domain windows (settles, stall warn and nudge, fallback checks, answer and confirm bounds, an absent transport's UNAVAILABLE_LIMIT tries, a held decision's one report) and a gate look owed on the next pass; a held or unwatchable episode waits on events"),
     site("cli/src/cli/monitor.rs", "start", "deadline", 1, Scheduled, "attendance check-ins and report deadlines the agents set"),
     site("cli/src/cli/monitor.rs", "start", "sleep_until", 2, Scheduled, "the hosted timers' due_at and repeat_every"),
     site("cli/src/cli/monitor.rs", "start", "deadline", 3, BoundedRetry, "a failing fold backs off; the watchdog stands the monitor down after BUDGET of them"),
