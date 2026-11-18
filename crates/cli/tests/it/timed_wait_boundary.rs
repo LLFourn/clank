@@ -140,7 +140,7 @@ const SITES: &[Site] = &[
     site("cli/src/cli/command_source.rs", "retire_after", "pause", 0, BoundedRetry, "settles a transition in at most SETTLE_LOOKS steps"),
     site("cli/src/cli/command_source.rs", "retire_after", "pause", 1, OneShot, "the grace between SIGTERM and SIGKILL, once"),
     site("cli/src/cli/event_interrupt.rs", "dispatch", "timeout", 0, OneShot, "bounds one interrupt's transport"),
-    site("cli/src/cli/github/coordinator.rs", "poll_loop", "sleep_until", 0, Poll(Residual::Github), "GitHub's feed and checks, at its cadence and X-Poll-Interval"),
+    site("cli/src/cli/github/coordinator.rs", "poll_loop_on", "sleep_until", 0, Poll(Residual::Github), "GitHub's feed and checks, at its cadence and X-Poll-Interval"),
     site("cli/src/cli/github/session.rs", "github_client_with", "timeout", 0, OneShot, "bounds each HTTP request"),
     site("cli/src/cli/github/session.rs", "GithubSession::token_within_deadline", "timeout", 0, OneShot, "bounds one token acquisition"),
     site("cli/src/cli/github/session.rs", "GithubSession::send_within_deadline", "timeout", 0, OneShot, "bounds one send"),

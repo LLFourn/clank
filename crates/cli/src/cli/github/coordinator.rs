@@ -347,13 +347,40 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     checks: ChecksSide<'_, C>,
     tx: &crate::cli::event_source::EmissionSink,
     key: &str,
+    log: Option<crate::cli::github::log::EventLog>,
+    suppress_backlog: std::collections::HashSet<(u64, String)>,
+) {
+    poll_loop_on(
+        crate::cli::github::log::now_epoch,
+        src,
+        feed_side,
+        checks,
+        tx,
+        key,
+        log,
+        suppress_backlog,
+    )
+    .await
+}
+
+/// [`poll_loop`], stamping what it reports with `wall`'s Unix seconds.
+#[allow(clippy::too_many_arguments)]
+async fn poll_loop_on<F: EventFetcher, R: LoginResolver, C: CiReader>(
+    wall: impl Fn() -> u64,
+    src: &GithubSource,
+    feed_side: FeedSide<'_, F, R>,
+    checks: ChecksSide<'_, C>,
+    tx: &crate::cli::event_source::EmissionSink,
+    key: &str,
     mut log: Option<crate::cli::github::log::EventLog>,
     suppress_backlog: std::collections::HashSet<(u64, String)>,
 ) {
     let sel = Selection::of(src);
     let wants_ci = sel.wants_ci();
     let every = configured_interval(src);
-    let mut progress = Progress::start(wants_ci);
+    let mut progress = Progress::start(wants_ci, wall());
+    let until =
+        |at: tokio::time::Instant| at.saturating_duration_since(tokio::time::Instant::now());
     let mut feed = FeedState {
         horizon: FeedHorizon {
             seen: SeenSet::new(SEEN_CAP),
@@ -477,7 +504,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
             match checks.reader.read().await {
                 Ok(results) => {
                     checks_work.work.succeeded();
-                    progress.succeeded(Half::Checks);
+                    progress.succeeded(Half::Checks, wall());
                     let wakes = crate::cli::github::ci::wakes(&src.repo, &sel, &results);
                     let in_scope: std::collections::BTreeSet<u64> =
                         results.iter().map(|(pr, _)| pr.number).collect();
@@ -495,7 +522,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
                 Err(e) => {
                     checks_work.work.failed(&e, None);
                     let retry = checks_work.wake(checks_not_before);
-                    progress.failed(Half::Checks, &e, retry);
+                    progress.failed(Half::Checks, &e, wall(), until(retry));
                     eprintln!("wait: github {} ci read failed: {e:#}", src.repo);
                 }
             }
@@ -508,14 +535,14 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
             match read_feed(src, &sel, &feed_side, &mut feed, &mut coordinator, &wal).await {
                 Ok(true) => {
                     feed_work.work.succeeded();
-                    progress.succeeded(Half::Feed);
+                    progress.succeeded(Half::Feed, wall());
                 }
                 Ok(false) => return, // wait gone
                 Err(e) => {
                     // GitHub's X-Poll-Interval binds a retry too.
                     let floor = feed.horizon.floor.map(std::time::Duration::from_secs);
                     feed_work.work.failed(&e, floor);
-                    progress.failed(Half::Feed, &e, feed_work.wake(None));
+                    progress.failed(Half::Feed, &e, wall(), until(feed_work.wake(None)));
                     eprintln!("wait: github {} feed read failed: {e:#}", src.repo);
                 }
             }
@@ -2605,6 +2632,37 @@ mod tests {
         out
     }
 
+    /// A wall clock that moves with paused tokio time, and that a test
+    /// can move alone, as a machine's sleep does: tokio's clock stops
+    /// while the wall's runs on.
+    #[derive(Clone)]
+    struct TestWall {
+        start: tokio::time::Instant,
+        slept: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl TestWall {
+        const EPOCH: u64 = 1_800_000_000;
+
+        fn new() -> Self {
+            Self {
+                start: tokio::time::Instant::now(),
+                slept: Default::default(),
+            }
+        }
+
+        fn now(&self) -> u64 {
+            Self::EPOCH
+                + self.start.elapsed().as_secs()
+                + self.slept.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn sleep(&self, secs: u64) {
+            self.slept
+                .fetch_add(secs, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     fn spawn_watch<
         L: LoginResolver + Send + Sync + 'static,
         C: CiReader + Send + Sync + 'static,
@@ -2616,8 +2674,24 @@ mod tests {
         log: Option<crate::cli::github::log::EventLog>,
         tx: crate::cli::event_source::EmissionSink,
     ) -> tokio::task::JoinHandle<()> {
+        spawn_watch_on(TestWall::new(), s, fetcher, login, reader, log, tx)
+    }
+
+    fn spawn_watch_on<
+        L: LoginResolver + Send + Sync + 'static,
+        C: CiReader + Send + Sync + 'static,
+    >(
+        wall: TestWall,
+        s: GithubSource,
+        fetcher: std::sync::Arc<ScriptFetcher>,
+        login: std::sync::Arc<L>,
+        reader: std::sync::Arc<C>,
+        log: Option<crate::cli::github::log::EventLog>,
+        tx: crate::cli::event_source::EmissionSink,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            poll_loop(
+            poll_loop_on(
+                move || wall.now(),
                 &s,
                 FeedSide {
                     fetcher: &*fetcher,
@@ -2823,6 +2897,59 @@ mod tests {
         assert_eq!(feed_reads(&f), 3);
         tokio::time::sleep(Duration::from_secs(60) + Duration::from_millis(1)).await;
         assert_eq!(feed_reads(&f), 4, "and polling resumes at its interval");
+        run.abort();
+    }
+
+    /// A machine's sleep stops tokio's clock while the wall's runs on.
+    /// What the watch reports is judged against the wall, so a failure
+    /// and a completed poll after the sleep are stamped with the wall's
+    /// time: a source polling on after a sleep is healthy once a poll
+    /// completes, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_after_the_machine_slept_is_stamped_with_the_wall_clock() {
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![
+            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+            Box::new(|_p, _e| Err(anyhow::anyhow!("github /events: 502"))),
+        ]));
+        let (tx, _emitted, mut heard) = reporting_sink();
+        let wall = TestWall::new();
+        let run = spawn_watch_on(
+            wall.clone(),
+            src(&[GithubEventKind::IssueOpened], false),
+            f.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            std::sync::Arc::new(NoCi),
+            None,
+            tx,
+        );
+        settle().await;
+        let before = records(&mut heard).pop().expect("reported");
+        assert_eq!(before.checked, Some(wall.now()));
+        wall.sleep(20 * 3600);
+        assert!(
+            matches!(
+                before.health(wall.now()),
+                crate::cli::source_status::Health::Failing { .. }
+            ),
+            "until a poll completes after the sleep, its last one is old"
+        );
+        tokio::time::sleep(Duration::from_secs(60) + Duration::from_millis(1)).await;
+        settle().await;
+        let failed = records(&mut heard).pop().expect("reported");
+        let error = failed.errors.first().expect("the failure is reported");
+        assert_eq!(
+            (error.since, error.retry_at),
+            (wall.now(), wall.now() + 5),
+            "a failure after the sleep is dated by the wall"
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        settle().await;
+        let healed = records(&mut heard).pop().expect("reported");
+        assert_eq!(healed.checked, Some(wall.now()));
+        assert_eq!(
+            healed.health(wall.now()),
+            crate::cli::source_status::Health::Healthy
+        );
         run.abort();
     }
 
