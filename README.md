@@ -521,7 +521,12 @@ its installation, it says so once, and `w` in the log watches it again. The `rem
 remote: Space there (or `r` from the log view) is the switch. From a
 shell, `clank remote on|off` asks the repo's running `clank tui` to do
 the same, and `clank remote status` shows its state and address; on
-while on and off while off change nothing. In the
+while on and off while off change nothing. `clank remote link` prints
+the link the page's `p` shows, alone on stdout, for a remote that is
+already on: for the default host a fresh one-time login link, so
+whoever reads that output — an agent included — can log in. An
+existing host has no such link; it prints that host's own browser URL,
+whose login is its own. In the
 default mode, the TUI starts a separate host process on the port the
 repo remembers in `.clank/config.json`, attaches this repo to it,
 and sends your browser in. Switching off, or closing the TUI, stops
@@ -647,7 +652,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `team` | Your saved teams (`save` / `list` / `show` / `remove`) and your agent library (`agent add` / `agent remove` / `agent list`), shared across repos |
 | `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove`; `recover <agent> --child <id>` / `--forget` settles an OpenCode fork whose reply was lost |
 | `open` | The team workspace in zellij: a tab inside a session, a session of its own outside one |
-| `remote` | This repo's remote, through the `clank tui` that owns it: `status` / `on` / `off` |
+| `remote` | This repo's remote, through the `clank tui` that owns it: `status` / `on` / `off` / `link` (prints a one-time login link; whoever reads it can log in) |
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`); `--diagnostics` inspects history reconstruction issues |
 | `html` | Render the event log + status to a static site; `html open` |
 | `diff` | Launch the configured editor on a plan / range diff |

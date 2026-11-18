@@ -4,6 +4,13 @@
 
 use crate::cli::remote_control::{self as rc, Control, Outcome, Want};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// Where a minted login link, or why there is none, is handed back.
+pub(super) type Minted = Box<dyn FnOnce(anyhow::Result<String>) + Send>;
+
+/// A link request's id, and its minted link or why there is none.
+type MintedFor = (String, anyhow::Result<String>);
 
 /// The remote as a request sees it.
 pub(super) trait Switch {
@@ -15,6 +22,9 @@ pub(super) trait Switch {
     fn failure(&self) -> Option<String>;
     /// Every credential this remote has held, for masking what it says.
     fn secrets(&self) -> Vec<String>;
+    /// Mint the remote page's login link without waiting for it: `done`
+    /// is called once, perhaps later and from another task.
+    fn mint(&mut self, done: Minted);
 }
 
 /// How long answered request and result files are kept.
@@ -26,6 +36,9 @@ pub(super) struct Served {
     control: Control,
     reason: Option<String>,
     in_flight: Option<(String, Want)>,
+    /// Link requests whose link is being minted.
+    minting: std::collections::HashSet<String>,
+    minted: Arc<Mutex<Vec<MintedFor>>>,
     answered: std::collections::HashSet<String>,
     published: Option<rc::Status>,
 }
@@ -49,6 +62,8 @@ impl Served {
             control: Control::Starting,
             reason: None,
             in_flight: None,
+            minting: Default::default(),
+            minted: Default::default(),
             answered: Default::default(),
             published: None,
         };
@@ -123,10 +138,29 @@ impl Served {
         let Some(request) = rc::read::<rc::Request>(&rc::request_path(&self.repo, id)) else {
             return;
         };
-        let answered = self.answered.contains(id) || rc::result_path(&self.repo, id).exists();
-        let in_flight = self.in_flight.as_ref().map(|(id, _)| id.as_str());
-        match rc::decide(&request, &me, remote.shown(), in_flight, answered) {
-            rc::Decision::Ignore => {}
+        let seen = self.answered.contains(id)
+            || self.minting.contains(id)
+            || self.in_flight.as_ref().is_some_and(|(at, _)| at == id)
+            || rc::result_path(&self.repo, id).exists();
+        match rc::admit(&request, &me, seen) {
+            rc::Admit::Seen => {}
+            rc::Admit::Stale => self.respond(id, Outcome::StaleOwner),
+            rc::Admit::Act => match request.ask {
+                rc::Ask::Switch { want } => self.switch(id, want, remote, snap),
+                rc::Ask::Link => self.link(id, remote),
+            },
+        }
+        self.progress(remote);
+    }
+
+    fn switch(
+        &mut self,
+        id: &str,
+        want: Want,
+        remote: &mut impl Switch,
+        snap: &crate::cli::status::StatusSnapshot,
+    ) {
+        match rc::decide(want, remote.shown(), self.in_flight.is_some()) {
             rc::Decision::Answer(outcome) => self.respond(id, outcome),
             rc::Decision::Start => match remote.switch_on(snap) {
                 Some(why) => self.respond(
@@ -142,11 +176,49 @@ impl Served {
                 self.in_flight = Some((id.to_string(), Want::Off));
             }
         }
-        self.progress(remote);
     }
 
-    /// Answer the request in flight once the remote has finished.
+    /// Answered from the state the remote is in now; a link is minted
+    /// off the loop and answered by a later [`Self::progress`].
+    fn link(&mut self, id: &str, remote: &mut impl Switch) {
+        let failure = remote.failure();
+        if let Some(why) = rc::unlinkable(remote.shown(), failure.as_deref()) {
+            let reason = rc::safe_reason(&why, &remote.secrets());
+            return self.respond(id, Outcome::Failed { reason });
+        }
+        self.minting.insert(id.to_string());
+        let (id, minted) = (id.to_string(), self.minted.clone());
+        remote.mint(Box::new(move |link| {
+            minted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((id, link));
+        }));
+    }
+
+    /// Answer the links minted since the last turn, and the request in
+    /// flight once the remote has finished.
     pub(super) fn progress(&mut self, remote: &impl Switch) {
+        let minted = std::mem::take(&mut *self.minted.lock().unwrap_or_else(|e| e.into_inner()));
+        for (id, link) in minted {
+            self.minting.remove(&id);
+            // The CLI removes its request when it stops waiting: a link
+            // written after that would rest in a file no one takes.
+            if !rc::request_path(&self.repo, &id).exists() {
+                self.answered.insert(id);
+                continue;
+            }
+            let outcome = match link {
+                Ok(link) => Outcome::Link { link },
+                Err(e) => Outcome::Failed {
+                    reason: rc::safe_reason(
+                        &format!("could not mint a login link: {e:#}"),
+                        &remote.secrets(),
+                    ),
+                },
+            };
+            self.respond(&id, outcome);
+        }
         if let Some((id, want)) = self.in_flight.clone() {
             let failure = remote.failure();
             if let Some(outcome) = rc::completion(want, remote.shown(), failure.as_deref()) {
@@ -226,6 +298,9 @@ impl<O: super::remote::Opener> Switch for super::remote::Remote<O> {
     fn secrets(&self) -> Vec<String> {
         super::remote::Remote::secrets(self)
     }
+    fn mint(&mut self, done: Minted) {
+        super::remote::Remote::mint(self, done)
+    }
 }
 
 /// One turn of the remote for the TUI loop: requests heard, the
@@ -266,6 +341,10 @@ mod tests {
         starts: usize,
         stops: usize,
         started: Option<std::sync::mpsc::Sender<()>>,
+        /// What a mint answers at once; `None` holds it in `held`.
+        minted: Option<Result<String, String>>,
+        held: Vec<Minted>,
+        mints: usize,
     }
 
     impl Switch for Fake {
@@ -296,6 +375,14 @@ mod tests {
         }
         fn secrets(&self) -> Vec<String> {
             self.secrets.clone()
+        }
+        fn mint(&mut self, done: Minted) {
+            self.mints += 1;
+            match self.minted.clone() {
+                Some(Ok(link)) => done(Ok(link)),
+                Some(Err(why)) => done(Err(anyhow::anyhow!(why))),
+                None => self.held.push(done),
+            }
         }
     }
 
@@ -367,7 +454,7 @@ mod tests {
         let repo = TempRepo::new();
         let _lease = super::super::lease::acquire(repo.path()).unwrap();
         let owner = Owner::serve(repo.path(), Fake::default(), true);
-        let answer = rc::set(repo.path(), rc::Want::On, Duration::from_secs(10));
+        let answer = rc::ask(repo.path(), rc::Want::On, Duration::from_secs(10));
         assert_eq!(
             answer,
             rc::Answer::Done(Outcome::Applied {
@@ -375,7 +462,7 @@ mod tests {
             })
         );
         assert_eq!(owner.fake.lock().unwrap().starts, 1);
-        let again = rc::set(repo.path(), rc::Want::On, Duration::from_secs(10));
+        let again = rc::ask(repo.path(), rc::Want::On, Duration::from_secs(10));
         assert_eq!(
             again,
             rc::Answer::Done(Outcome::Applied {
@@ -417,9 +504,9 @@ mod tests {
         );
         let path = repo.path().to_path_buf();
         let first =
-            std::thread::spawn(move || rc::set(&path, rc::Want::On, Duration::from_secs(10)));
+            std::thread::spawn(move || rc::ask(&path, rc::Want::On, Duration::from_secs(10)));
         seen.recv_timeout(Duration::from_secs(5)).unwrap();
-        let second = rc::set(repo.path(), rc::Want::On, Duration::from_secs(10));
+        let second = rc::ask(repo.path(), rc::Want::On, Duration::from_secs(10));
         assert_eq!(
             second,
             rc::Answer::Done(Outcome::Busy {
@@ -460,7 +547,7 @@ mod tests {
             },
             true,
         );
-        let answer = rc::set(repo.path(), rc::Want::On, Duration::from_secs(10));
+        let answer = rc::ask(repo.path(), rc::Want::On, Duration::from_secs(10));
         let rc::Answer::Done(Outcome::Failed { reason }) = &answer else {
             panic!("{answer:?}");
         };
@@ -498,7 +585,7 @@ mod tests {
         let repo = TempRepo::new();
         let _lease = super::super::lease::acquire(repo.path()).unwrap();
         let _owner = Owner::serve(repo.path(), Fake::default(), false);
-        let answer = rc::set(repo.path(), rc::Want::On, Duration::from_secs(10));
+        let answer = rc::ask(repo.path(), rc::Want::On, Duration::from_secs(10));
         assert!(
             matches!(&answer, rc::Answer::Unavailable { reason, .. } if reason.contains("cannot be watched")),
             "{answer:?}"
@@ -510,7 +597,7 @@ mod tests {
     fn a_current_owner_that_has_not_published_is_waited_for_never_called_older() {
         let repo = TempRepo::new();
         let _lease = super::super::lease::acquire(repo.path()).unwrap();
-        let answer = rc::set(repo.path(), rc::Want::On, Duration::from_millis(300));
+        let answer = rc::ask(repo.path(), rc::Want::On, Duration::from_millis(300));
         assert!(
             matches!(&answer, rc::Answer::Unconfirmed(why) if why.contains("did not become ready")),
             "{answer:?}"
@@ -551,7 +638,7 @@ mod tests {
         assert!(_watch.unavailable.is_none());
         let path = repo.path().to_path_buf();
         let asked =
-            std::thread::spawn(move || rc::set(&path, rc::Want::On, Duration::from_secs(10)));
+            std::thread::spawn(move || rc::ask(&path, rc::Want::On, Duration::from_secs(10)));
         written.recv_timeout(Duration::from_secs(5)).unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
@@ -570,7 +657,7 @@ mod tests {
         served.armed(None, &fake);
         let request = rc::Request {
             id: "dup-1".into(),
-            want: rc::Want::On,
+            ask: rc::Want::On.into(),
             owner: me().unwrap(),
         };
         rc::write_atomic(&rc::request_path(repo.path(), "dup-1"), &request).unwrap();
@@ -606,7 +693,7 @@ mod tests {
         let _lease = super::super::lease::acquire(repo.path()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_millis(200);
         let mut flood = Flood { deadline, woken: 0 };
-        let answer = rc::set_observed(repo.path(), rc::Want::On, deadline, &mut flood);
+        let answer = rc::ask_observed(repo.path(), rc::Want::On.into(), deadline, &mut flood);
         assert!(
             matches!(&answer, rc::Answer::Unconfirmed(why) if why.contains("did not become ready")),
             "{answer:?}"
@@ -618,7 +705,7 @@ mod tests {
         served.armed(None, &Fake::default());
         let deadline = std::time::Instant::now() + Duration::from_millis(200);
         let mut flood = Flood { deadline, woken: 0 };
-        let answer = rc::set_observed(repo.path(), rc::Want::On, deadline, &mut flood);
+        let answer = rc::ask_observed(repo.path(), rc::Want::On.into(), deadline, &mut flood);
         assert!(
             matches!(&answer, rc::Answer::Unconfirmed(why) if why.contains("did not answer")),
             "{answer:?}"
@@ -712,7 +799,7 @@ mod tests {
         let path = repo.path().to_path_buf();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let asked = std::thread::spawn(move || {
-            rc::set_observed(&path, rc::Want::On, deadline, &mut hooked)
+            rc::ask_observed(&path, rc::Want::On.into(), deadline, &mut hooked)
         });
         let id = written.recv_timeout(Duration::from_secs(5)).unwrap();
         let request = rc::read::<rc::Request>(&rc::request_path(repo.path(), &id)).unwrap();
@@ -743,7 +830,7 @@ mod tests {
             },
         );
         assert_eq!(
-            rc::set(repo.path(), rc::Want::On, Duration::from_secs(1)),
+            rc::ask(repo.path(), rc::Want::On, Duration::from_secs(1)),
             rc::Answer::Unsupported {
                 pid: me.pid,
                 protocol: rc::PROTOCOL + 1
@@ -770,5 +857,230 @@ mod tests {
         );
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    const LINK: &str = "https://host.example/x/login?t=LINKTOKEN";
+
+    fn on(minted: Option<Result<String, String>>) -> Fake {
+        Fake {
+            shown: Some(rc::Shown::On),
+            minted,
+            ..Fake::default()
+        }
+    }
+
+    fn ask_for(repo: &Path, id: &str, ask: rc::Ask, owner: rc::Owner) {
+        let request = rc::Request {
+            id: id.into(),
+            ask,
+            owner,
+        };
+        rc::write_atomic(&rc::request_path(repo, id), &request).unwrap();
+    }
+
+    fn result(repo: &Path, id: &str) -> Option<Outcome> {
+        rc::read::<rc::Response>(&rc::result_path(repo, id)).map(|r| r.outcome)
+    }
+
+    #[test]
+    fn a_link_is_answered_from_the_on_remote_without_switching_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = TempRepo::new();
+        let mut served = Served::starting(repo.path());
+        let mut fake = on(Some(Ok(LINK.into())));
+        served.armed(None, &fake);
+        ask_for(repo.path(), "link-1", rc::Ask::Link, me().unwrap());
+        served.request("link-1", &mut fake, &snap());
+        assert_eq!(
+            result(repo.path(), "link-1"),
+            Some(Outcome::Link { link: LINK.into() })
+        );
+        assert_eq!((fake.starts, fake.stops, fake.mints), (0, 0, 1));
+        assert!(served.in_flight.is_none());
+        let mode = std::fs::metadata(rc::result_path(repo.path(), "link-1"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        let published = std::fs::read_to_string(rc::status_path(repo.path())).unwrap();
+        assert!(published.contains("\"on\""), "{published}");
+        assert!(
+            !published.contains("LINKTOKEN") && !published.contains("login"),
+            "{published}"
+        );
+    }
+
+    #[test]
+    fn a_link_while_off_says_to_switch_on_and_starts_nothing() {
+        let repo = TempRepo::new();
+        let mut served = Served::starting(repo.path());
+        let mut fake = Fake {
+            minted: Some(Ok(LINK.into())),
+            ..Fake::default()
+        };
+        served.armed(None, &fake);
+        ask_for(repo.path(), "link-off", rc::Ask::Link, me().unwrap());
+        served.request("link-off", &mut fake, &snap());
+        let Some(Outcome::Failed { reason }) = result(repo.path(), "link-off") else {
+            panic!("{:?}", result(repo.path(), "link-off"));
+        };
+        assert!(reason.contains("clank remote on"), "{reason}");
+        assert_eq!((fake.starts, fake.mints), (0, 0));
+    }
+
+    #[test]
+    fn a_link_request_for_another_owner_is_stale_and_mints_nothing() {
+        let repo = TempRepo::new();
+        let mut served = Served::starting(repo.path());
+        let mut fake = on(Some(Ok(LINK.into())));
+        served.armed(None, &fake);
+        let mut previous = me().unwrap();
+        previous.birth = crate::proc_identity::ProcToken::MacStart { sec: 0, usec: 9 };
+        ask_for(repo.path(), "link-stale", rc::Ask::Link, previous);
+        served.request("link-stale", &mut fake, &snap());
+        assert_eq!(result(repo.path(), "link-stale"), Some(Outcome::StaleOwner));
+        assert_eq!(fake.mints, 0);
+    }
+
+    /// The link is minted off the loop: while it is, the same request
+    /// heard again is not minted again, and another request is answered.
+    #[test]
+    fn a_link_being_minted_is_minted_once_and_holds_nothing_else_back() {
+        let repo = TempRepo::new();
+        let mut served = Served::starting(repo.path());
+        let mut fake = on(None);
+        served.armed(None, &fake);
+        ask_for(repo.path(), "link-dup", rc::Ask::Link, me().unwrap());
+        served.request("link-dup", &mut fake, &snap());
+        served.request("link-dup", &mut fake, &snap());
+        assert_eq!(fake.mints, 1);
+        assert_eq!(result(repo.path(), "link-dup"), None);
+        ask_for(
+            repo.path(),
+            "on-meanwhile",
+            rc::Want::On.into(),
+            me().unwrap(),
+        );
+        served.request("on-meanwhile", &mut fake, &snap());
+        assert_eq!(
+            result(repo.path(), "on-meanwhile"),
+            Some(Outcome::Applied {
+                shown: rc::Shown::On
+            })
+        );
+        let done = fake.held.pop().unwrap();
+        done(Ok(LINK.into()));
+        assert_eq!(result(repo.path(), "link-dup"), None, "taken by a turn");
+        served.progress(&fake);
+        assert_eq!(
+            result(repo.path(), "link-dup"),
+            Some(Outcome::Link { link: LINK.into() })
+        );
+        std::fs::remove_file(rc::result_path(repo.path(), "link-dup")).unwrap();
+        served.request("link-dup", &mut fake, &snap());
+        assert_eq!(fake.mints, 1);
+        assert_eq!(result(repo.path(), "link-dup"), None, "answered once");
+    }
+
+    #[test]
+    fn a_link_minted_after_the_cli_left_is_not_written() {
+        let repo = TempRepo::new();
+        let mut served = Served::starting(repo.path());
+        let mut fake = on(None);
+        served.armed(None, &fake);
+        ask_for(repo.path(), "link-late", rc::Ask::Link, me().unwrap());
+        served.request("link-late", &mut fake, &snap());
+        std::fs::remove_file(rc::request_path(repo.path(), "link-late")).unwrap();
+        fake.held.pop().unwrap()(Ok(LINK.into()));
+        served.progress(&fake);
+        assert!(!rc::result_path(repo.path(), "link-late").exists());
+    }
+
+    #[test]
+    fn the_switch_in_flight_heard_again_is_not_answered_busy() {
+        let repo = TempRepo::new();
+        let mut served = Served::starting(repo.path());
+        let mut fake = Fake {
+            lands: Some(rc::Shown::Starting),
+            ..Fake::default()
+        };
+        served.armed(None, &fake);
+        ask_for(repo.path(), "on-slow", rc::Want::On.into(), me().unwrap());
+        served.request("on-slow", &mut fake, &snap());
+        served.request("on-slow", &mut fake, &snap());
+        assert_eq!(fake.starts, 1);
+        assert_eq!(
+            result(repo.path(), "on-slow"),
+            None,
+            "its own result is owed"
+        );
+    }
+
+    #[test]
+    fn a_mint_that_fails_is_a_failure_never_the_base_url() {
+        let repo = TempRepo::new();
+        let mut served = Served::starting(repo.path());
+        let mut fake = Fake {
+            secrets: vec!["abc12".into()],
+            ..on(Some(Err(LEAKY.into())))
+        };
+        served.armed(None, &fake);
+        ask_for(repo.path(), "link-fails", rc::Ask::Link, me().unwrap());
+        served.request("link-fails", &mut fake, &snap());
+        let Some(Outcome::Failed { reason }) = result(repo.path(), "link-fails") else {
+            panic!("{:?}", result(repo.path(), "link-fails"));
+        };
+        assert!(reason.contains("could not mint a login link"), "{reason}");
+        assert!(!leaks(&reason), "{reason}");
+    }
+
+    #[test]
+    fn the_cli_prints_the_link_and_leaves_no_file_holding_it() {
+        let repo = TempRepo::new();
+        let _lease = super::super::lease::acquire(repo.path()).unwrap();
+        let _owner = Owner::serve(repo.path(), on(Some(Ok(LINK.into()))), true);
+        let answer = rc::ask(repo.path(), rc::Ask::Link, Duration::from_secs(10));
+        assert_eq!(
+            answer,
+            rc::Answer::Done(Outcome::Link { link: LINK.into() })
+        );
+        assert!(!answer.to_string().contains("LINKTOKEN"), "{answer}");
+        let dir = rc::status_path(repo.path());
+        let ours = rc::request_prefix(repo.path()).replacen("remote-req-", "", 1);
+        let held: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&ours))
+            .filter(|e| std::fs::read_to_string(e.path()).is_ok_and(|s| s.contains("LINKTOKEN")))
+            .map(|e| e.path())
+            .collect();
+        assert!(held.is_empty(), "{held:?}");
+    }
+
+    /// The protocol of TUIs built before link requests.
+    const LINKLESS: u32 = 1;
+
+    #[test]
+    fn an_owner_on_the_previous_protocol_is_told_to_restart() {
+        let repo = TempRepo::new();
+        let me = me().unwrap();
+        let _lease = super::super::lease::hold_as(
+            repo.path(),
+            &rc::Holder {
+                pid: me.pid,
+                birth: Some(me.birth.clone()),
+                remote_protocol: Some(LINKLESS),
+            },
+        );
+        let answer = rc::ask(repo.path(), rc::Ask::Link, Duration::from_secs(10));
+        assert_eq!(
+            answer,
+            rc::Answer::Unsupported {
+                pid: me.pid,
+                protocol: LINKLESS
+            }
+        );
+        assert!(answer.to_string().contains("restart"), "{answer}");
+        assert_eq!(requests_written(repo.path()), 0);
     }
 }
