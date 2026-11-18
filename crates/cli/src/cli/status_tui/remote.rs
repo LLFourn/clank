@@ -142,6 +142,8 @@ enum State {
     },
 }
 
+pub(super) type Minting = futures_util::future::BoxFuture<'static, anyhow::Result<String>>;
+
 pub(super) struct Remote<O: Opener> {
     repo: PathBuf,
     home: Option<PathBuf>,
@@ -486,20 +488,37 @@ impl<O: Opener> Remote<O> {
     /// the config's: a domain changed while the remote is on belongs
     /// to the next start (codex on 6f60efa).
     pub(super) async fn link(&self) -> Option<String> {
-        match &self.state {
-            State::On { instance } => {
-                let base = instance
-                    .public_url
-                    .clone()
-                    .unwrap_or_else(|| instance.url.clone());
-                if !instance.owns_host() {
-                    return Some(base);
-                }
-                let token = instance.admin_link().await.ok()?;
-                Some(format!("{}/login?t={token}", base.trim_end_matches('/')))
-            }
-            _ => None,
+        self.minting()?.await.ok()
+    }
+
+    /// [`Self::link`] as a future that borrows nothing, while on; an
+    /// owned host's failure to mint is an error, never its base URL.
+    pub(super) fn minting(&self) -> Option<Minting> {
+        let State::On { instance } = &self.state else {
+            return None;
+        };
+        let base = instance
+            .public_url
+            .clone()
+            .unwrap_or_else(|| instance.url.clone());
+        if !instance.owns_host() {
+            return Some(Box::pin(std::future::ready(Ok(base))));
         }
+        Some(Box::pin(instance.login_link(base)))
+    }
+
+    /// Mint [`Self::link`] off the loop: `done` gets the answer from a
+    /// task, and the loop is woken to take it.
+    pub(super) fn mint(&self, done: super::remote_owner::Minted) {
+        let Some(minting) = self.minting() else {
+            done(Err(anyhow::anyhow!("the remote is not on")));
+            return;
+        };
+        let wake = self.wake.clone();
+        tokio::spawn(async move {
+            done(minting.await);
+            wake();
+        });
     }
 
     pub(super) async fn admin_state(&self) -> anyhow::Result<Option<crate::cli::web::AdminState>> {
@@ -758,7 +777,7 @@ mod tests {
             &rc::request_path(repo.path(), id),
             &rc::Request {
                 id: id.into(),
-                want: rc::Want::On,
+                ask: rc::Want::On.into(),
                 owner: remote_owner::me().unwrap(),
             },
         )
@@ -1015,6 +1034,16 @@ mod tests {
         slow: std::time::Duration,
         grace: std::time::Duration,
     ) -> (Remote<Recorder>, Recorder) {
+        remote_waking(repo, answers, slow, grace, Arc::new(|| {}))
+    }
+
+    fn remote_waking(
+        repo: &std::path::Path,
+        answers: bool,
+        slow: std::time::Duration,
+        grace: std::time::Duration,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> (Remote<Recorder>, Recorder) {
         // A tunnel needs a home for its lease, and this fake one
         // needs the port before the instance binds it, so the port
         // is settled up front — but ONLY when zellij will answer,
@@ -1052,7 +1081,7 @@ mod tests {
             }),
             grace,
             rec.clone(),
-            Arc::new(|| {}),
+            wake,
         )
         .tunnel_from(Arc::new(move || {
             Ok(Some((
@@ -1923,7 +1952,7 @@ mod tests {
         ] {
             let request = rc::Request {
                 id: id.into(),
-                want,
+                ask: want.into(),
                 owner: remote_owner::me().unwrap(),
             };
             rc::write_atomic(&rc::request_path(repo.path(), id), &request).unwrap();
@@ -1945,6 +1974,73 @@ mod tests {
                 "the instance's credentials are kept for masking, after it too"
             );
         }
+        r.stop().await;
+    }
+
+    /// A link request through the loop's pump: the pump returns before
+    /// the owned host has minted it, the mint wakes the loop, and the
+    /// next pump answers with the page's link. Single-threaded, so a
+    /// mint awaited inside the pump would answer before it returned.
+    #[tokio::test]
+    async fn a_link_is_minted_off_the_pump_and_answered_when_it_wakes_the_loop() {
+        use super::super::remote_owner::{self, Served};
+        use crate::cli::remote_control as rc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        crate::cli::monitor::ensure_runtime_dir().unwrap();
+        let repo = repo_with_config();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let woken = wakes.clone();
+        let (mut r, _rec) = remote_waking(
+            repo.path(),
+            true,
+            std::time::Duration::ZERO,
+            crate::cli::web::STOP_GRACE,
+            Arc::new(move || {
+                woken.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let snap = snap();
+        r.toggle(&snap);
+        settle(&mut r, &snap).await;
+        assert_eq!(r.shown(), Shown::On);
+        let mut served = Served::starting(repo.path());
+        served.armed(None, &r);
+        let id = "pump-link";
+        rc::write_atomic(
+            &rc::request_path(repo.path(), id),
+            &rc::Request {
+                id: id.into(),
+                ask: rc::Ask::Link,
+                owner: remote_owner::me().unwrap(),
+            },
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(id.to_string()).unwrap();
+        let before = wakes.load(Ordering::SeqCst);
+        remote_owner::pump(&mut served, &mut r, &rx, &snap).await;
+        assert!(
+            rc::read::<rc::Response>(&rc::result_path(repo.path(), id)).is_none(),
+            "answered inside the pump"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wakes.load(Ordering::SeqCst) == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the mint never woke the loop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        remote_owner::pump(&mut served, &mut r, &rx, &snap).await;
+        let answer = rc::read::<rc::Response>(&rc::result_path(repo.path(), id))
+            .expect("the woken turn answers");
+        let rc::Outcome::Link { link } = &answer.outcome else {
+            panic!("{answer:?}");
+        };
+        let shown = r.detail().unwrap();
+        assert!(link.starts_with(&format!("{shown}/login?t=")), "{link}");
+        let published = std::fs::read_to_string(rc::status_path(repo.path())).unwrap();
+        assert!(!published.contains("login"), "{published}");
         r.stop().await;
     }
 

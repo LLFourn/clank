@@ -64,6 +64,64 @@ impl OwnedHost {
     }
 }
 
+/// An owned host's administration endpoint, held apart from its
+/// instance so a request can outlive the borrow that started it.
+struct Admin {
+    client: reqwest::Client,
+    url: String,
+    credential: Option<String>,
+}
+
+impl Admin {
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let capability = self
+            .credential
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("this host did not grant administration"))?;
+        let mut request = self
+            .client
+            .request(
+                method,
+                format!("{}/admin/{path}", self.url.trim_end_matches('/')),
+            )
+            .header("x-clank-admin", capability);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let (status, bytes) = tokio::time::timeout(Duration::from_secs(3), async {
+            let answer = request.send().await?;
+            let status = answer.status();
+            let bytes = answer.bytes().await?;
+            Ok::<_, reqwest::Error>((status, bytes))
+        })
+        .await??;
+        anyhow::ensure!(
+            status.is_success(),
+            "host administration failed ({status}): {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    async fn link(&self) -> anyhow::Result<String> {
+        let answer = self.request(reqwest::Method::POST, "link", None).await?;
+        Ok(answer["token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("host returned no login link"))?
+            .to_owned())
+    }
+
+    async fn login_link(self, base: String) -> anyhow::Result<String> {
+        let token = self.link().await?;
+        Ok(format!("{}/login?t={token}", base.trim_end_matches('/')))
+    }
+}
+
 /// One repo attachment to its owned local host child. All browser
 /// traffic crosses the same `clank-web` connector as an external host.
 pub(crate) struct BridgeInstance {
@@ -466,39 +524,21 @@ impl BridgeInstance {
         self.owns_host() && self.admin_credential.is_some()
     }
 
+    fn admin(&self) -> Admin {
+        Admin {
+            client: self.admin_client.clone(),
+            url: self.url.clone(),
+            credential: self.admin_credential.clone(),
+        }
+    }
+
     async fn admin_request(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
-        let capability = self
-            .admin_credential
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("this host did not grant administration"))?;
-        let mut request = self
-            .admin_client
-            .request(
-                method,
-                format!("{}/admin/{path}", self.url.trim_end_matches('/')),
-            )
-            .header("x-clank-admin", capability);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let (status, bytes) = tokio::time::timeout(Duration::from_secs(3), async {
-            let answer = request.send().await?;
-            let status = answer.status();
-            let bytes = answer.bytes().await?;
-            Ok::<_, reqwest::Error>((status, bytes))
-        })
-        .await??;
-        anyhow::ensure!(
-            status.is_success(),
-            "host administration failed ({status}): {}",
-            String::from_utf8_lossy(&bytes)
-        );
-        Ok(serde_json::from_slice(&bytes)?)
+        self.admin().request(method, path, body).await
     }
 
     pub(crate) async fn admin_state(&self) -> anyhow::Result<AdminState> {
@@ -508,14 +548,14 @@ impl BridgeInstance {
         )?)
     }
 
-    pub(crate) async fn admin_link(&self) -> anyhow::Result<String> {
-        let answer = self
-            .admin_request(reqwest::Method::POST, "link", None)
-            .await?;
-        Ok(answer["token"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("host returned no login link"))?
-            .to_owned())
+    /// A one-time login link at `base`. The future borrows nothing from
+    /// this instance, so it can be spawned off the TUI loop; a failure
+    /// is an error, never `base` alone.
+    pub(crate) fn login_link(
+        &self,
+        base: String,
+    ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send + 'static {
+        self.admin().login_link(base)
     }
 
     pub(crate) async fn admin_rotate(&self) -> anyhow::Result<()> {
@@ -754,7 +794,7 @@ mod tests {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    use super::{BridgeInstance, Panes, Startup, start_host};
+    use super::{Admin, BridgeInstance, Panes, Startup, start_host};
     use crate::cli::config::WebAttach;
     use crate::cli::open_zellij::{PaneMeta, SubscribeChild};
     use crate::cli::web::door::Door;
@@ -1277,7 +1317,7 @@ mod tests {
             if owned {
                 let before = instance.admin_state().await.unwrap();
                 assert_eq!(before.sessions.len(), 1);
-                let link = instance.admin_link().await.unwrap();
+                let link = instance.admin().link().await.unwrap();
                 assert!(
                     door.consume_shared(super::super::door::Link::Login, &link)
                         .unwrap()
@@ -1486,5 +1526,21 @@ mod tests {
         panes.say("terminal_1", "after host crash").unwrap();
         assert_eq!(sent.lock().unwrap().as_slice(), &["after host crash"]);
         instance.stop().await;
+    }
+
+    /// An owned host that cannot be reached mints no link: an error
+    /// that carries no credential, never the base URL as a link.
+    #[tokio::test]
+    async fn a_login_link_that_cannot_be_minted_is_an_error() {
+        let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let admin = Admin {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            url: url.clone(),
+            credential: Some("ADMINCAPABILITY".into()),
+        };
+        let why = format!("{:#}", admin.login_link(url).await.unwrap_err());
+        assert!(!why.contains("ADMINCAPABILITY"), "{why}");
     }
 }

@@ -671,8 +671,8 @@ pub struct MonitorArgs {
     pub command: MonitorCmd,
 }
 
-/// `clank remote`: switch this repo's remote through the `clank tui`
-/// that owns it.
+/// `clank remote`: this repo's remote, through the `clank tui` that
+/// owns it.
 #[derive(clap::Args, Debug)]
 pub struct RemoteArgs {
     #[command(subcommand)]
@@ -692,6 +692,12 @@ pub enum RemoteCmd {
     On,
     /// Stop serving; already off is done at once.
     Off,
+    /// Print a one-time login link; whoever reads it can log in.
+    ///
+    /// The link alone, on stdout, while the remote is on. An existing
+    /// host has none: its own browser URL is printed, whose login is
+    /// its own.
+    Link,
 }
 
 #[derive(clap::Subcommand, Debug)]

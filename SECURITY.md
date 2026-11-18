@@ -74,7 +74,9 @@ remove one.
 
 The token is shown deliberately in two places, as before: the TUI's
 remote page (its QR code and link) and an already signed-in browser
-session. No command prints it.
+session. No command prints it. `clank remote link` prints a one-time
+login link instead, on stdout only: whoever reads that output, an agent
+included, can open a session with it once within five minutes.
 
 ## Exposures
 

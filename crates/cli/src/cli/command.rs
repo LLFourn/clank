@@ -272,7 +272,7 @@ pub enum Command {
     /// you do not run it yourself.
     #[command(hide = true)]
     Monitor(crate::cli::MonitorArgs),
-    /// Switch this repo's remote on or off through its `clank tui`.
+    /// Switch this repo's remote, or get a login link, via its TUI.
     Remote(crate::cli::RemoteArgs),
     /// Print the repo timeline: commits, reviews, github events
     ///
@@ -1268,6 +1268,20 @@ mod tests {
                 .any(|l| l.starts_with("  ") && l.split_whitespace().next() == Some(*name));
             assert!(!listed, "`{name}` is listed:\n{help}");
         }
+    }
+
+    #[test]
+    fn remote_link_takes_the_groups_repo_and_timeout() {
+        let parsed =
+            Cli::try_parse_from(["clank", "remote", "link", "--repo", "/r", "--timeout", "5"])
+                .unwrap()
+                .command;
+        let Command::Remote(args) = parsed else {
+            panic!("not remote")
+        };
+        assert!(matches!(args.command, crate::cli::RemoteCmd::Link));
+        assert_eq!(args.repo.as_deref(), Some(std::path::Path::new("/r")));
+        assert_eq!(args.timeout, 5);
     }
 
     /// A group's `--repo` is accepted before or after its subcommand, and

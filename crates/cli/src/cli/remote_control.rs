@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// The protocol a current owner's lease holder record advertises.
-pub(crate) const PROTOCOL: u32 = 1;
+pub(crate) const PROTOCOL: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Owner {
@@ -40,7 +40,8 @@ pub(crate) enum Shown {
 }
 
 /// What the owner publishes: a fixed projection, never configuration,
-/// credentials or login links.
+/// credentials or login links. A login link is only ever in the result
+/// file of the request that asked for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Status {
     pub(crate) protocol: u32,
@@ -60,20 +61,46 @@ pub(crate) enum Want {
     Off,
 }
 
+/// What a request is for. A link is not a state to switch to, so it
+/// never reaches [`decide`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "ask", rename_all = "snake_case")]
+pub(crate) enum Ask {
+    Switch { want: Want },
+    Link,
+}
+
+impl From<Want> for Ask {
+    fn from(want: Want) -> Self {
+        Ask::Switch { want }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Request {
     pub(crate) id: String,
-    pub(crate) want: Want,
+    #[serde(flatten)]
+    pub(crate) ask: Ask,
     pub(crate) owner: Owner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub(crate) enum Outcome {
-    Applied { shown: Shown },
-    Busy { shown: Shown },
-    Failed { reason: String },
+    Applied {
+        shown: Shown,
+    },
+    Busy {
+        shown: Shown,
+    },
+    Failed {
+        reason: String,
+    },
     StaleOwner,
+    /// A login link: whoever reads it can log in.
+    Link {
+        link: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,35 +220,41 @@ fn addresses_only(text: &str) -> String {
     out
 }
 
-/// What the owner does with a request it has just seen.
+/// Whether the owner acts on a request it has just seen, whatever it asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admit {
+    /// Already answered, or already being worked on.
+    Seen,
+    /// Written for an owner this process is not.
+    Stale,
+    Act,
+}
+
+/// `seen`: this id has a result, or is the one being worked on.
+pub(crate) fn admit(request: &Request, me: &Owner, seen: bool) -> Admit {
+    if seen {
+        Admit::Seen
+    } else if request.owner != *me {
+        Admit::Stale
+    } else {
+        Admit::Act
+    }
+}
+
+/// What the owner does with an admitted switch request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decision {
-    /// Already answered, or the request already in flight seen again.
-    Ignore,
     Answer(Outcome),
     Start,
     Stop,
 }
 
-/// The owner's decision. `in_flight` is the id it is working on, if any;
-/// `answered` whether this id already has a result.
-pub(crate) fn decide(
-    request: &Request,
-    me: &Owner,
-    shown: Shown,
-    in_flight: Option<&str>,
-    answered: bool,
-) -> Decision {
-    if answered || in_flight == Some(request.id.as_str()) {
-        return Decision::Ignore;
-    }
-    if request.owner != *me {
-        return Decision::Answer(Outcome::StaleOwner);
-    }
-    if in_flight.is_some() {
+/// `busy`: another request's transition is in flight.
+pub(crate) fn decide(want: Want, shown: Shown, busy: bool) -> Decision {
+    if busy {
         return Decision::Answer(Outcome::Busy { shown });
     }
-    match (request.want, shown) {
+    match (want, shown) {
         (_, Shown::Starting | Shown::Stopping) => Decision::Answer(Outcome::Busy { shown }),
         (Want::On, Shown::On) | (Want::Off, Shown::Off | Shown::Unconfigured) => {
             Decision::Answer(Outcome::Applied { shown })
@@ -232,6 +265,22 @@ pub(crate) fn decide(
         (Want::On, Shown::Off | Shown::Failed) => Decision::Start,
         (Want::Off, Shown::On | Shown::Failed) => Decision::Stop,
     }
+}
+
+/// Why there is no link to give while the remote is `shown`, quoting
+/// `failure` when it failed; `None` when on.
+pub(crate) fn unlinkable(shown: Shown, failure: Option<&str>) -> Option<String> {
+    Some(match shown {
+        Shown::On => return None,
+        Shown::Off => "the remote is off; run `clank remote on` first".into(),
+        Shown::Starting => "the remote is starting; try again once it is on".into(),
+        Shown::Stopping => "the remote is stopping".into(),
+        Shown::Failed => format!(
+            "the remote failed: {}",
+            failure.unwrap_or("no reason given")
+        ),
+        Shown::Unconfigured => "no remote is configured for this repo".into(),
+    })
 }
 
 /// Whether the transition a request started has finished, and how.
@@ -377,6 +426,7 @@ impl std::fmt::Display for Answer {
                 )
             }
             Answer::Done(Outcome::Failed { reason }) => write!(f, "failed: {reason}"),
+            Answer::Done(Outcome::Link { .. }) => write!(f, "answered with a login link"),
             Answer::Done(Outcome::StaleOwner) => {
                 write!(
                     f,
@@ -395,7 +445,7 @@ impl std::fmt::Display for Answer {
             Answer::Unsupported { pid, protocol } => write!(
                 f,
                 "the owner (pid {pid}) speaks remote-control protocol {protocol}, \
-                 this clank speaks {PROTOCOL}; use the same clank build for both"
+                 this clank speaks {PROTOCOL}; restart that `clank tui` with this build"
             ),
             Answer::Unavailable { pid, reason } => {
                 write!(
@@ -420,7 +470,7 @@ fn current(repo: &Path) -> (Readiness, Option<Status>) {
     (readiness, status)
 }
 
-/// How `set` hears the runtime directory and the owner's exit.
+/// How `ask` hears the runtime directory and the owner's exit.
 pub(crate) trait Observe {
     /// Report `owner`'s exit from now on.
     fn arm(&mut self, owner: &Owner) -> crate::proc_identity::exit_watch::Armed;
@@ -477,8 +527,9 @@ impl Observe for Watched {
     }
 }
 
-/// Ask the owning TUI for `want`, and wait up to `timeout` for its answer.
-pub(crate) fn set(repo: &Path, want: Want, timeout: std::time::Duration) -> Answer {
+/// Ask the owning TUI, and wait up to `timeout` for its answer.
+pub(crate) fn ask(repo: &Path, ask: impl Into<Ask>, timeout: std::time::Duration) -> Answer {
+    let ask = ask.into();
     let deadline = std::time::Instant::now() + timeout;
     if let r @ (Readiness::NoOwner
     | Readiness::Unknown(_)
@@ -489,18 +540,19 @@ pub(crate) fn set(repo: &Path, want: Want, timeout: std::time::Duration) -> Answ
         return settled(r);
     }
     match Watched::new(repo) {
-        Ok(mut watched) => set_observed(repo, want, deadline, &mut watched),
+        Ok(mut watched) => ask_observed(repo, ask, deadline, &mut watched),
         Err(e) => Answer::Unconfirmed(format!("cannot watch for the owner's answer: {e}")),
     }
 }
 
-/// `set`, through `observe`. Everything it concludes is about the one
+/// `ask`, through `observe`. Everything it concludes is about the one
 /// owner its exit watch is armed on: a replacement seen before the
 /// request is written is armed and re-read first, and any other
-/// owner's exit is not this request's.
-pub(crate) fn set_observed(
+/// owner's exit is not this request's. The result file is removed once
+/// read: it may hold a login link.
+pub(crate) fn ask_observed(
     repo: &Path,
-    want: Want,
+    ask: Ask,
     deadline: std::time::Instant,
     observe: &mut impl Observe,
 ) -> Answer {
@@ -564,7 +616,7 @@ pub(crate) fn set_observed(
     );
     let request = Request {
         id: id.clone(),
-        want,
+        ask,
         owner: owner.clone(),
     };
     let request_file = request_path(repo, &id);
@@ -596,6 +648,7 @@ pub(crate) fn set_observed(
         }
     };
     let _ = std::fs::remove_file(&request_file);
+    let _ = std::fs::remove_file(result_path(repo, &id));
     answer
 }
 
@@ -651,21 +704,26 @@ pub(crate) fn status_text(repo: &Path) -> String {
 pub async fn run(args: crate::cli::RemoteArgs) -> anyhow::Result<()> {
     let repo = crate::cli::resolve_repo(args.repo.as_deref())?;
     let timeout = std::time::Duration::from_secs(args.timeout);
-    let want = match args.command {
+    let asked = match args.command {
         crate::cli::RemoteCmd::Status => {
             println!("{}", status_text(&repo));
             return Ok(());
         }
-        crate::cli::RemoteCmd::On => Want::On,
-        crate::cli::RemoteCmd::Off => Want::Off,
+        crate::cli::RemoteCmd::On => Want::On.into(),
+        crate::cli::RemoteCmd::Off => Want::Off.into(),
+        crate::cli::RemoteCmd::Link => Ask::Link,
     };
-    let answer = tokio::task::spawn_blocking(move || set(&repo, want, timeout)).await?;
-    match answer {
-        Answer::Done(Outcome::Applied { .. }) => {
+    let answer = tokio::task::spawn_blocking(move || ask(&repo, asked, timeout)).await?;
+    match (asked, answer) {
+        (Ask::Switch { .. }, answer @ Answer::Done(Outcome::Applied { .. })) => {
             println!("{answer}");
             Ok(())
         }
-        other => anyhow::bail!("{other}"),
+        (Ask::Link, Answer::Done(Outcome::Link { link })) => {
+            println!("{link}");
+            Ok(())
+        }
+        (_, other) => anyhow::bail!("{other}"),
     }
 }
 
@@ -680,10 +738,10 @@ mod tests {
         }
     }
 
-    fn ask(id: &str, want: Want, owner: Owner) -> Request {
+    fn ask(id: &str, ask: Ask, owner: Owner) -> Request {
         Request {
             id: id.into(),
-            want,
+            ask,
             owner,
         }
     }
@@ -691,60 +749,37 @@ mod tests {
     #[test]
     fn asking_for_the_state_it_is_in_is_applied_without_a_transition() {
         assert_eq!(
-            decide(&ask("a", Want::On, me()), &me(), Shown::On, None, false),
+            decide(Want::On, Shown::On, false),
             Decision::Answer(Outcome::Applied { shown: Shown::On })
         );
         assert_eq!(
-            decide(&ask("a", Want::Off, me()), &me(), Shown::Off, None, false),
+            decide(Want::Off, Shown::Off, false),
             Decision::Answer(Outcome::Applied { shown: Shown::Off })
         );
-        assert_eq!(
-            decide(&ask("a", Want::On, me()), &me(), Shown::Off, None, false),
-            Decision::Start
-        );
-        assert_eq!(
-            decide(&ask("a", Want::Off, me()), &me(), Shown::On, None, false),
-            Decision::Stop
-        );
+        assert_eq!(decide(Want::On, Shown::Off, false), Decision::Start);
+        assert_eq!(decide(Want::Off, Shown::On, false), Decision::Stop);
     }
 
     #[test]
     fn a_transition_in_progress_or_another_request_is_busy() {
         for shown in [Shown::Starting, Shown::Stopping] {
             assert_eq!(
-                decide(&ask("a", Want::On, me()), &me(), shown, None, false),
+                decide(Want::On, shown, false),
                 Decision::Answer(Outcome::Busy { shown })
             );
         }
         assert_eq!(
-            decide(
-                &ask("b", Want::On, me()),
-                &me(),
-                Shown::Off,
-                Some("a"),
-                false
-            ),
+            decide(Want::On, Shown::Off, true),
             Decision::Answer(Outcome::Busy { shown: Shown::Off })
         );
     }
 
     #[test]
-    fn the_in_flight_request_seen_again_or_an_answered_one_is_ignored() {
-        assert_eq!(
-            decide(
-                &ask("a", Want::On, me()),
-                &me(),
-                Shown::Starting,
-                Some("a"),
-                false
-            ),
-            Decision::Ignore,
-            "never answered busy over its own eventual result"
-        );
-        assert_eq!(
-            decide(&ask("a", Want::On, me()), &me(), Shown::Off, None, true),
-            Decision::Ignore
-        );
+    fn a_request_already_seen_is_not_acted_on_whatever_it_asks() {
+        for asked in [Want::On.into(), Ask::Link] {
+            assert_eq!(admit(&ask("a", asked, me()), &me(), true), Admit::Seen);
+            assert_eq!(admit(&ask("a", asked, me()), &me(), false), Admit::Act);
+        }
     }
 
     #[test]
@@ -753,16 +788,44 @@ mod tests {
             pid: 40,
             birth: ProcToken::MacStart { sec: 0, usec: 9 },
         };
-        assert_eq!(
-            decide(
-                &ask("a", Want::On, previous),
-                &me(),
-                Shown::Off,
-                None,
-                false
-            ),
-            Decision::Answer(Outcome::StaleOwner)
+        for asked in [Want::On.into(), Ask::Link] {
+            assert_eq!(
+                admit(&ask("a", asked, previous.clone()), &me(), false),
+                Admit::Stale
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_on_remote_has_a_link_and_off_says_how_to_get_one() {
+        assert_eq!(unlinkable(Shown::On, None), None);
+        let off = unlinkable(Shown::Off, None).unwrap();
+        assert!(off.contains("run `clank remote on` first"), "{off}");
+        for shown in [
+            Shown::Starting,
+            Shown::Stopping,
+            Shown::Failed,
+            Shown::Unconfigured,
+        ] {
+            let why = unlinkable(shown, Some("tunnel refused")).unwrap();
+            assert!(!why.contains("remote on"), "{shown:?}: {why}");
+        }
+        assert!(
+            unlinkable(Shown::Failed, Some("tunnel refused"))
+                .unwrap()
+                .contains("tunnel refused")
         );
+    }
+
+    #[test]
+    fn a_link_request_is_its_own_kind_on_the_wire() {
+        let link = serde_json::to_value(ask("a", Ask::Link, me())).unwrap();
+        assert_eq!(link["ask"], "link");
+        assert!(link.get("want").is_none(), "{link}");
+        let on = serde_json::to_value(ask("a", Want::On.into(), me())).unwrap();
+        assert_eq!((&on["ask"], &on["want"]), (&"switch".into(), &"on".into()));
+        let back: Request = serde_json::from_value(link).unwrap();
+        assert_eq!(back.ask, Ask::Link);
     }
 
     #[test]
@@ -811,7 +874,7 @@ mod tests {
             Readiness::Unknown(_)
         ));
         assert!(matches!(
-            readiness(false, Some(&holder(Some(1))), no, None),
+            readiness(false, Some(&holder(Some(PROTOCOL))), no, None),
             Readiness::Unknown(_)
         ));
         assert_eq!(
@@ -819,14 +882,14 @@ mod tests {
             Readiness::Older { pid: 40 }
         );
         assert_eq!(
-            readiness(false, Some(&holder(Some(1))), yes, None),
+            readiness(false, Some(&holder(Some(PROTOCOL))), yes, None),
             Readiness::Wait(me()),
             "a current holder with no status yet is waited for, never called older"
         );
         assert_eq!(
             readiness(
                 false,
-                Some(&holder(Some(1))),
+                Some(&holder(Some(PROTOCOL))),
                 yes,
                 Some(&status(Control::Starting))
             ),
@@ -835,14 +898,14 @@ mod tests {
         assert_eq!(
             readiness(
                 false,
-                Some(&holder(Some(1))),
+                Some(&holder(Some(PROTOCOL))),
                 yes,
                 Some(&status(Control::Ready))
             ),
             Readiness::Go(me())
         );
         assert!(matches!(
-            readiness(false, Some(&holder(Some(1))), yes, Some(&status(Control::Unavailable))),
+            readiness(false, Some(&holder(Some(PROTOCOL))), yes, Some(&status(Control::Unavailable))),
             Readiness::Unavailable { reason, .. } if reason == "no native watch"
         ));
         assert_eq!(
@@ -864,7 +927,7 @@ mod tests {
         let mut other = status(Control::Ready);
         other.owner.birth = ProcToken::MacStart { sec: 9, usec: 9 };
         assert_eq!(
-            readiness(false, Some(&holder(Some(1))), yes, Some(&other)),
+            readiness(false, Some(&holder(Some(PROTOCOL))), yes, Some(&other)),
             Readiness::Wait(me()),
             "a previous owner's status is not this owner's"
         );
