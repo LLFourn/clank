@@ -181,7 +181,7 @@ The implementation has not yet reached the reviewer handoff.
   The earlier Python-denied workspace passed every case except the two native
   `ps` probes refused by macOS's sandbox; both passed outside it, including
   in the final workspace. Python is absent from test/release execution paths.
-  The Python-looking argv in `monitor_upgrade` is inert matching data.
+  The Python-looking argv in `monitor::upgrade` is inert matching data.
 - Optional installed Claude 2.1.308 acceptance passed remote answer, local
   answer and cancellation both standalone and through Clank's broker.
   Installed Grok and Codex acceptance, the browser/Playwright suite and live

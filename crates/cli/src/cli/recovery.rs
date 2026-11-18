@@ -10,7 +10,7 @@
 //!   ends, since hook timing cannot order them;
 //! - the one durable episode per agent that bounds and attributes retries.
 //!
-//! The monitor owns the side effects (`monitor.rs`). The full contract is
+//! The monitor owns the side effects (`monitor/`). The full contract is
 //! the research plan `research-agent-stalls-and-provider-capacity-recovery`.
 
 use std::path::{Path, PathBuf};

@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::cli::agent_state::Activity;
+use crate::cli::monitor::fixtures::*;
 use crate::cli::turn_custody::Turns;
 use clank_core::Tool;
 
@@ -151,15 +152,15 @@ impl Handing {
 
     /// The top of a loop round.
     fn tend(&mut self) {
-        let _ = tend(
-            self.repo.path(),
-            &mut self.clients,
-            None,
-            &[],
-            &Default::default(),
-            &mut self.turns,
-            &mut self.recovery,
-        );
+        let _ = in_custody(&mut self.turns, &mut self.recovery, |custody| {
+            tend(
+                self.repo.path(),
+                &mut self.clients,
+                None,
+                &mut Sources::hosting(Default::default()),
+                custody,
+            )
+        });
     }
 
     fn owed(&self, owed: bool) -> crate::cli::turn_custody::Gathered {

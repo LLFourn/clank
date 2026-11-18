@@ -6,6 +6,7 @@ use super::*;
 use crate::cli::agent_state::{
     Activity, Alarm, Case, HandsOff, Reachability, UNREACHABLE_AFTER, View,
 };
+use crate::cli::monitor::fixtures::*;
 use crate::cli::recovery::{Stall, Transport};
 use crate::cli::turn_custody::Turns;
 use crate::cli::turn_wire::{Report, WireVerdict};
@@ -246,15 +247,15 @@ impl Reached {
     /// reconciled with a message owed since `owed` or nothing.
     fn round(&mut self, owed: Option<u64>, now: u64, served: Duration) {
         use crate::cli::ledger::{Delivery, Entry, Ledger, Obligation, Since};
-        let _ = tend(
-            self.repo.path(),
-            &mut self.clients,
-            None,
-            &[],
-            &Default::default(),
-            &mut self.turns,
-            &mut self.recovery,
-        );
+        let _ = in_custody(&mut self.turns, &mut self.recovery, |custody| {
+            tend(
+                self.repo.path(),
+                &mut self.clients,
+                None,
+                &mut Sources::hosting(Default::default()),
+                custody,
+            )
+        });
         self.recovery.reach(waiters(&self.clients, served), now);
         let g = self.gathered(owed.is_some());
         let facts = crate::cli::recovery::Facts {
@@ -698,12 +699,16 @@ async fn a_hook_woken_at_its_deadline_is_past_its_stop() {
     );
     a.turns.answer(&agent(), conn, &report, true, &g).unwrap();
     assert!(a.turns.state(&agent()).unwrap().stopped.is_some());
-    let _ = expire_reports(&mut a.clients, Some(&mut a.turns), 1_999_999);
+    let _ = in_turns(&mut a.turns, |custody| {
+        expire_reports(&mut a.clients, Some(custody), 1_999_999)
+    });
     assert!(
         a.turns.state(&agent()).unwrap().stopped.is_some(),
         "not yet"
     );
-    let _ = expire_reports(&mut a.clients, Some(&mut a.turns), 2_000_000);
+    let _ = in_turns(&mut a.turns, |custody| {
+        expire_reports(&mut a.clients, Some(custody), 2_000_000)
+    });
     assert!(a.clients.is_empty(), "told to re-arm, and retired");
     assert_eq!(a.turns.state(&agent()).unwrap().stopped, None);
     let stored = crate::cli::turn_custody::stored_record(&a.dir()).unwrap();
@@ -723,7 +728,9 @@ async fn a_report_with_no_deadline_is_never_expired() {
             None
         );
         assert_eq!(report_deadline(&a.clients), None, "{tool:?}: no timer");
-        let _ = expire_reports(&mut a.clients, Some(&mut a.turns), u64::MAX);
+        let _ = in_turns(&mut a.turns, |custody| {
+            expire_reports(&mut a.clients, Some(custody), u64::MAX)
+        });
         assert_eq!(a.clients.len(), 1, "{tool:?}: still held");
         assert!(
             a.turns.state(&agent()).unwrap().stopped.is_some(),
@@ -1214,7 +1221,7 @@ async fn an_unplaced_stop_kept_without_what_its_hook_saw_ends_no_turn() {
     a.write(&[claude_prompt("p1")], 1000);
     crate::cli::turn_custody::place_stored(
         &a.dir(),
-        include_str!("../../tests/fixtures/formats/turn-stopped-unobserved.json"),
+        include_str!("../../../tests/fixtures/formats/turn-stopped-unobserved.json"),
     );
     let mut a = a.restart();
     a.round(Some(1000), 50_000, SETTLED);

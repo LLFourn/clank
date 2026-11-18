@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli::monitor::fixtures::*;
 use crate::cli::teams_config::{AgentDescription, RosterRole};
 use clank_core::{AutoMode, SessionId, Tool};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -62,14 +63,9 @@ fn joining(
     clients: &mut Vec<Client>,
     client: Client,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
-    admit_into(
-        repo,
-        clients,
-        client,
-        None,
-        &mut vec![],
-        &Default::default(),
-    )
+    in_sources(&mut Default::default(), &mut Vec::new(), |sources| {
+        admit_into(repo, clients, client, None, sources)
+    })
 }
 
 #[tokio::test]
@@ -304,15 +300,15 @@ async fn lost_automatic_wait(registered_before_close: bool) {
     );
     let mut turns = crate::cli::turn_custody::Turns::new(repo.path().to_path_buf());
     let mut round = |clients: &mut Vec<Client>, turns: &mut crate::cli::turn_custody::Turns| {
-        let _ = tend(
-            repo.path(),
-            clients,
-            None,
-            &[],
-            &Default::default(),
-            turns,
-            &mut recovery,
-        );
+        let _ = in_custody(turns, &mut recovery, |custody| {
+            tend(
+                repo.path(),
+                clients,
+                None,
+                &mut Sources::hosting(Default::default()),
+                custody,
+            )
+        });
     };
     let (wait, peer) = connecting(repo.path(), &author, &session).await;
     let closed = wait.out.clone();
@@ -379,16 +375,17 @@ async fn handoff_answer(
     let (report, mut peer) = reporting(repo, author, session).await;
     clients.push(report);
     let mut turns = crate::cli::turn_custody::Turns::new(repo.to_path_buf());
-    for writer in serve_reports(
-        repo,
-        clients,
-        None,
-        None,
-        &[],
-        &mut Default::default(),
-        &Default::default(),
-        &mut turns,
-    ) {
+    for writer in in_turns(&mut turns, |custody| {
+        serve_reports(
+            repo,
+            clients,
+            None,
+            None,
+            &mut Reading::afresh(),
+            &mut Sources::hosting(Default::default()),
+            custody,
+        )
+    }) {
         writer.await.unwrap();
     }
     loop {
@@ -498,16 +495,17 @@ async fn groks_check_in_rides_its_stop_and_never_its_background_wait() {
     let (report, mut peer) = reporting(repo.path(), &author, &session).await;
     let conn = report.conn;
     clients.push(report);
-    for writer in serve_reports(
-        repo.path(),
-        &mut clients,
-        None,
-        None,
-        &[],
-        &mut Default::default(),
-        &Default::default(),
-        &mut turns,
-    ) {
+    for writer in in_turns(&mut turns, |custody| {
+        serve_reports(
+            repo.path(),
+            &mut clients,
+            None,
+            None,
+            &mut Reading::afresh(),
+            &mut Sources::hosting(Default::default()),
+            custody,
+        )
+    }) {
         writer.await.unwrap();
     }
     let frame = loop {

@@ -198,7 +198,7 @@ const UNFOLLOWABLE: &[Unfollowable] = &[
         why: "frames what the monitor heard",
     },
     Unfollowable {
-        at: "crate::cli::monitor::connect_within",
+        at: "crate::cli::monitor::connect::connect_within",
         form: "offset_of!",
         subject: "offset_of!",
         why: "a field offset of `sockaddr_un`, a constant",

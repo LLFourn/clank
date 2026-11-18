@@ -1138,7 +1138,7 @@ fn status_watch_never_reaches_a_starter() {
     for starting in ["keeper", "spawn", "attempt", "attach_or_spawn"] {
         assert!(!paths.contains(starting), "{starting} in {paths}");
     }
-    let monitor = include_str!("monitor.rs");
+    let monitor = include_str!("monitor/spawn.rs");
     let from = monitor
         .find("pub(crate) fn core_wakes")
         .expect("core_wakes");

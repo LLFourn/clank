@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::monitor::{Seen, Who};
+use super::{Seen, Who};
 
 /// How many probes or starts run at once.
 pub(crate) const AT_ONCE: usize = 8;
@@ -168,13 +168,13 @@ fn discover(dirs: &[PathBuf], me: u32, deadline: Instant) -> (Namespaces, Vec<(P
             namespaces.push((dir.clone(), Err("not reached by the deadline".to_string())));
             continue;
         }
-        match super::monitor::trusted_dir(dir, me) {
-            super::monitor::Trust::Ours => {}
-            super::monitor::Trust::Absent => {
+        match super::trusted_dir(dir, me) {
+            super::Trust::Ours => {}
+            super::Trust::Absent => {
                 namespaces.push((dir.clone(), Err("absent".to_string())));
                 continue;
             }
-            super::monitor::Trust::Theirs(why) => {
+            super::Trust::Theirs(why) => {
                 namespaces.push((dir.clone(), Err(why)));
                 continue;
             }
@@ -433,12 +433,12 @@ fn classify(seen: Seen) -> Outcome {
 
 /// Greet the monitor at `socket` as an observer of `repo`.
 fn probe(socket: &Path, repo: &Path, deadline: Instant) -> Outcome {
-    classify(super::monitor::greet_at(
+    classify(super::greet_at(
         &socket.to_string_lossy(),
         repo,
         Who::Observer,
         deadline,
-        super::monitor::connect_within,
+        super::connect_within,
     ))
 }
 
@@ -477,7 +477,7 @@ fn repo_in_argv(argv: &[std::ffi::OsString]) -> Option<PathBuf> {
     argv.get(at + 1).map(PathBuf::from)
 }
 
-type Spawn = fn(&Path) -> std::io::Result<Box<dyn super::monitor::Started>>;
+type Spawn = fn(&Path) -> std::io::Result<Box<dyn super::Started>>;
 
 /// End the verified old monitor `pid`: TERM, then KILL if it has not
 /// exited within [`TERM_GRACE`], each sent only while the pid still has
@@ -572,9 +572,9 @@ fn start(repo: &Path, deadline: Instant, created: &(dyn Fn() + Sync)) -> Success
     start_with(
         repo,
         deadline,
-        super::monitor::spawn_monitor,
-        super::monitor::connect_within,
-        |repo| super::monitor::acquire_lease(repo).is_ok(),
+        super::spawn_monitor,
+        super::connect_within,
+        |repo| super::acquire_lease(repo).is_ok(),
         created,
     )
 }
@@ -598,12 +598,12 @@ fn start_with(
         .build()
         .map_err(|e| e.to_string())
         .map(|runtime| {
-            super::monitor::Attached::from(runtime.block_on(super::monitor::attach_or_spawn_until(
+            super::Attached::from(runtime.block_on(super::attach_or_spawn_until(
                 repo,
                 Who::Observer,
                 deadline,
-                super::monitor::ATTACH_BUDGET,
-                super::monitor::SPAWN_SETTLE / super::monitor::SHARE_ATTEMPTS,
+                super::ATTACH_BUDGET,
+                super::SPAWN_SETTLE / super::SHARE_ATTEMPTS,
                 |repo| {
                     let started = spawn(repo);
                     if started.is_ok() {
@@ -618,9 +618,9 @@ fn start_with(
         });
     let spawned = spawned.load(std::sync::atomic::Ordering::Acquire);
     match attached {
-        Ok(super::monitor::Attached::Shared(_)) if spawned => Successor::Spawned,
-        Ok(super::monitor::Attached::Shared(_)) => Successor::Reused,
-        Ok(super::monitor::Attached::Alone(why)) => Successor::Unestablished { spawned, why },
+        Ok(super::Attached::Shared(_)) if spawned => Successor::Spawned,
+        Ok(super::Attached::Shared(_)) => Successor::Reused,
+        Ok(super::Attached::Alone(why)) => Successor::Unestablished { spawned, why },
         Err(why) => Successor::Unestablished {
             spawned,
             why: format!("no runtime to start it on: {why}"),
@@ -647,7 +647,7 @@ pub async fn run() -> anyhow::Result<()> {
     let me = rustix::process::getuid().as_raw();
     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let report = upgrade_with(
-        super::monitor::socket_dirs(me, xdg.as_deref()),
+        super::socket_dirs(me, xdg.as_deref()),
         me,
         Effects {
             repo_of: Box::new(move |pid| repo_of_monitor(pid, me)),
@@ -1004,7 +1004,7 @@ mod tests {
     fn obsolete_from_12() -> String {
         format!(
             "{{\"t\":\"decline\",\"proto\":12,\"why\":\"this monitor speaks proto 12, the client speaks {}\"}}\n",
-            super::super::monitor::PROTO
+            super::super::PROTO
         )
     }
 
@@ -1076,7 +1076,7 @@ mod tests {
 
     struct NoProcess;
 
-    impl super::super::monitor::Started for NoProcess {
+    impl super::super::Started for NoProcess {
         fn reap(self: Box<Self>) {}
     }
 
@@ -1084,19 +1084,17 @@ mod tests {
         Err(std::io::ErrorKind::ConnectionRefused.into())
     }
 
-    fn cannot_spawn(_: &Path) -> std::io::Result<Box<dyn super::super::monitor::Started>> {
+    fn cannot_spawn(_: &Path) -> std::io::Result<Box<dyn super::super::Started>> {
         Err(std::io::ErrorKind::NotFound.into())
     }
 
-    fn spawns_nothing_that_answers(
-        _: &Path,
-    ) -> std::io::Result<Box<dyn super::super::monitor::Started>> {
+    fn spawns_nothing_that_answers(_: &Path) -> std::io::Result<Box<dyn super::super::Started>> {
         Ok(Box::new(NoProcess))
     }
 
     static SPAWNS: AtomicUsize = AtomicUsize::new(0);
 
-    fn counted(_: &Path) -> std::io::Result<Box<dyn super::super::monitor::Started>> {
+    fn counted(_: &Path) -> std::io::Result<Box<dyn super::super::Started>> {
         SPAWNS.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(NoProcess))
     }
@@ -1114,8 +1112,7 @@ mod tests {
                 let _ = (&stream).write_all(answer.as_bytes());
             }
         });
-        super::super::monitor::publish(repo, &super::super::monitor::describe(repo, 4242, &socket))
-            .unwrap();
+        super::super::publish(repo, &super::super::describe(repo, 4242, &socket)).unwrap();
         dir
     }
 
@@ -1157,11 +1154,7 @@ mod tests {
         let _serving = serving(
             repo.path(),
             Box::leak(
-                format!(
-                    "{{\"t\":\"ok\",\"proto\":{}}}\n",
-                    super::super::monitor::PROTO
-                )
-                .into_boxed_str(),
+                format!("{{\"t\":\"ok\",\"proto\":{}}}\n", super::super::PROTO).into_boxed_str(),
             ),
         );
         assert_eq!(
@@ -1169,7 +1162,7 @@ mod tests {
                 repo.path(),
                 soon(),
                 counted,
-                super::super::monitor::connect_within,
+                super::super::connect_within,
                 |_| true,
                 &|| {}
             ),

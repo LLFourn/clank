@@ -43,9 +43,9 @@ whether its assertions protect the invariant. Reviewers check that.
   `crates/core/src/turn_policy/tests.rs::a_codex_run_ending_mid_turn_is_told_at_the_next_stop`,
   `crates/core/src/turn_policy/tests.rs::a_claude_run_ending_is_left_to_the_harness`,
   `crates/core/src/turn_policy/tests.rs::a_run_going_mid_retirement_is_never_retired_without_its_notice`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_codex_run_ending_wakes_its_parked_agent`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_codex_run_ending_is_never_told_to_a_rebound_session`,
-  `crates/cli/src/cli/monitor_grok_tests.rs::a_grok_stop_the_monitor_answers_late_still_arms_its_wait`
+  `crates/cli/src/cli/monitor/turn_tests.rs::a_codex_run_ending_wakes_its_parked_agent`,
+  `crates/cli/src/cli/monitor/turn_tests.rs::a_codex_run_ending_is_never_told_to_a_rebound_session`,
+  `crates/cli/src/cli/monitor/grok_tests.rs::a_grok_stop_the_monitor_answers_late_still_arms_its_wait`
 
 ## I2. Reading blocks never changes them.
 
@@ -69,7 +69,7 @@ whether its assertions protect the invariant. Reviewers check that.
 - Terms: a transport attempt is a try to put an item in front of the model;
   a presentation is the model being shown it; an acknowledgement is the agent
   saying it is handled. Only inbox events have acknowledgements.
-- Tests: `crates/cli/src/cli/monitor_turn_tests.rs::unacked_inbox_events_outlive_a_rebind_until_each_is_acked`,
+- Tests: `crates/cli/src/cli/monitor/turn_tests.rs::unacked_inbox_events_outlive_a_rebind_until_each_is_acked`,
   `crates/cli/src/agent_store/state.rs::a_rebind_drops_every_bound_part_and_keeps_the_kept_ones`,
   `crates/cli/src/cli/presentation_tests.rs::a_rebind_cannot_land_inside_an_old_sessions_receipt`
 
@@ -140,9 +140,9 @@ whether its assertions protect the invariant. Reviewers check that.
   `PINS`. The bump is enforced by review of `PINS`: editing the last pair's
   hash in place, without a bump, passes the test, so reviewers check that
   `PINS` only ever grows.
-- Tests: `crates/cli/src/cli/monitor_wire_golden_tests.rs::the_wire_shape_is_pinned_to_the_protocol`,
-  `crates/cli/src/cli/monitor_wire_golden_tests.rs::every_variant_has_a_sample`,
-  `crates/cli/src/cli/monitor_wire_golden_tests.rs::pins_are_a_history`
+- Tests: `crates/cli/src/cli/monitor/wire_golden_tests.rs::the_wire_shape_is_pinned_to_the_protocol`,
+  `crates/cli/src/cli/monitor/wire_golden_tests.rs::every_variant_has_a_sample`,
+  `crates/cli/src/cli/monitor/wire_golden_tests.rs::pins_are_a_history`
 
 ## I9. The monitor's serve loop never blocks on a lock an agent process can hold.
 
@@ -171,13 +171,13 @@ whether its assertions protect the invariant. Reviewers check that.
   it without waiting and follows until it is handed over. `messages.writer.lock` only serializes message writers.
   Corrupt or unreadable logs are skipped as before
   (`event_source::owed_from_sources`), which reads as no events.
-- Tests: `crates/cli/src/cli/monitor_turn_tests.rs::a_held_state_lock_stalls_no_serve_and_its_release_writes_what_it_left`,
+- Tests: `crates/cli/src/cli/monitor/turn_tests.rs::a_held_state_lock_stalls_no_serve_and_its_release_writes_what_it_left`,
   `crates/cli/src/cli/github/supervisor.rs::a_held_lease_parks_no_runtime_thread_and_its_release_hands_it_over`,
   `crates/cli/src/agent_store/state.rs::a_held_lock_is_contended_for_a_take_that_does_not_wait`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_blocks_lock_stalls_no_serve`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_event_log_stalls_no_serve_and_the_retry_presents_it`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_legacy_inbox_and_message_writer_lock_stall_no_serve_and_leave_the_old_inbox`,
+  `crates/cli/src/cli/monitor/turn_tests.rs::a_held_blocks_lock_stalls_no_serve`,
+  `crates/cli/src/cli/monitor/turn_tests.rs::a_held_event_log_stalls_no_serve_and_the_retry_presents_it`,
+  `crates/cli/src/cli/monitor/turn_tests.rs::a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once`,
+  `crates/cli/src/cli/monitor/turn_tests.rs::a_held_legacy_inbox_and_message_writer_lock_stall_no_serve_and_leave_the_old_inbox`,
   `crates/cli/src/cli/timer_source.rs::held_sidecars_leave_timers_pending_until_the_contention_retry`,
   `crates/cli/src/cli/timer_source.rs::a_held_ingest_lease_leaves_acceptances_pending_until_the_contention_retry`,
   `crates/cli/src/cli/timer_source.rs::each_loop_timer_operation_takes_its_sidecar_once`
@@ -241,25 +241,25 @@ whether its assertions protect the invariant. Reviewers check that.
   what it runs changes; routine verifications never restart a pane.
 - Tests: `crates/cli/tests/it/timed_wait_boundary.rs::every_timed_wait_is_classified`,
   `crates/cli/tests/it/timed_wait_boundary.rs::invariant_status_matches_the_inventory`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_sidecar_wakes_the_loop_only_on_its_release`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_release_before_the_waiter_is_armed_still_wakes_the_loop`,
+  `crates/cli/src/cli/monitor/turn_tests.rs::a_held_sidecar_wakes_the_loop_only_on_its_release`,
+  `crates/cli/src/cli/monitor/turn_tests.rs::a_release_before_the_waiter_is_armed_still_wakes_the_loop`,
   `crates/web-cloudflare/src/host.rs::an_unchanged_store_is_not_read_again_while_the_session_lasts`,
   `crates/web-cloudflare/src/host.rs::a_revocation_before_the_watch_is_armed_is_not_lost`,
-  `crates/cli/src/cli/monitor_outage.rs::a_monitor_published_before_its_watch_is_armed_is_found`,
-  `crates/cli/src/cli/monitor_outage.rs::a_held_leases_release_leads_to_an_attach`,
-  `crates/cli/src/cli/monitor_outage.rs::a_lease_held_forever_is_reported_at_its_deadline_with_no_attempt_between`,
-  `crates/cli/src/cli/monitor_outage.rs::a_reported_outage_waits_on_its_events_alone`,
-  `crates/cli/src/cli/monitor_outage.rs::a_watch_refused_or_stopped_ends_the_wait`,
-  `crates/cli/src/cli/monitor_outage.rs::the_kernel_hears_a_held_lease_released`,
-  `crates/cli/src/cli/monitor_keeper.rs::an_unattached_keeper_reports_once_at_its_deadline_and_attempts_nothing_more`,
-  `crates/cli/src/cli/monitor_keeper.rs::a_watch_refused_or_stopped_is_shown_and_ends_the_attempts`,
+  `crates/cli/src/cli/monitor/outage.rs::a_monitor_published_before_its_watch_is_armed_is_found`,
+  `crates/cli/src/cli/monitor/outage.rs::a_held_leases_release_leads_to_an_attach`,
+  `crates/cli/src/cli/monitor/outage.rs::a_lease_held_forever_is_reported_at_its_deadline_with_no_attempt_between`,
+  `crates/cli/src/cli/monitor/outage.rs::a_reported_outage_waits_on_its_events_alone`,
+  `crates/cli/src/cli/monitor/outage.rs::a_watch_refused_or_stopped_ends_the_wait`,
+  `crates/cli/src/cli/monitor/outage.rs::the_kernel_hears_a_held_lease_released`,
+  `crates/cli/src/cli/monitor/keeper.rs::an_unattached_keeper_reports_once_at_its_deadline_and_attempts_nothing_more`,
+  `crates/cli/src/cli/monitor/keeper.rs::a_watch_refused_or_stopped_is_shown_and_ends_the_attempts`,
   `crates/cli/src/cli/wait.rs::a_bound_wait_fails_once_for_an_outage_and_then_waits_on_its_events`,
   `crates/cli/src/cli/turn_child_tests.rs::a_stale_child_waits_quietly_and_tells_its_agent_nothing`,
   `crates/cli/src/cli/timer_source.rs::a_failed_entry_waits_for_its_files_to_change`,
   `crates/cli/src/cli/timer_source.rs::a_failed_attempts_own_writes_try_nothing_again`,
   `crates/cli/src/cli/timer_source.rs::a_staging_files_rewrite_is_not_a_change`,
   `crates/cli/src/repo_watch.rs::a_timer_index_repair_is_heard_and_tries_the_failed_timer`,
-  `crates/cli/src/cli/monitor.rs::a_hosted_timer_that_will_not_write_waits_for_a_timer_log_to_change`,
+  `crates/cli/src/cli/monitor/hosted_tests.rs::a_hosted_timer_that_will_not_write_waits_for_a_timer_log_to_change`,
   `crates/cli/src/cli/wait.rs::the_own_loop_tries_a_failed_timer_only_on_a_timer_log_change`,
   `crates/cli/src/cli/status_watch_tests.rs::a_failed_refresh_waits_for_its_inputs_to_move`,
   `crates/cli/src/cli/status_tui/mod.rs::a_failed_rebuild_is_owed_again_only_for_a_cause`,
@@ -276,7 +276,7 @@ whether its assertions protect the invariant. Reviewers check that.
   `crates/cli/src/cli/status_tui/mod.rs::a_lost_install_watch_is_shown_once_the_screen_is_free_and_w_arms_it_again`,
   `crates/cli/src/cli/status_tui/mod.rs::the_loop_reports_a_lost_install_watch_and_w_rearms_it`,
   `crates/cli/src/cli/status_watch_tests.rs::a_watch_that_cannot_hear_its_installation_ends`,
-  `crates/cli/src/cli/monitor.rs::a_monitor_deaf_to_installs_ends`,
+  `crates/cli/src/cli/monitor/loop_tests.rs::a_monitor_deaf_to_installs_ends`,
   `crates/cli/src/upgrade.rs::a_rearmed_watch_tries_a_failed_replacement_once_more`,
   `crates/web/src/request.rs::a_verify_without_retry_is_routine`,
   `crates/web/src/service.rs::a_verify_carries_the_pages_retry`,
@@ -298,11 +298,11 @@ whether its assertions protect the invariant. Reviewers check that.
   `crates/cli/src/cli/recovery.rs::a_recovery_that_cannot_be_recorded_is_still_due`,
   `crates/cli/src/cli/recovery.rs::nothing_writes_during_a_storage_hold_and_nothing_is_lost`,
   `crates/cli/src/cli/recovery.rs::an_issued_number_fault_keeps_answers`,
-  `crates/cli/src/cli/monitor.rs::an_install_wake_reaches_recovery`,
+  `crates/cli/src/cli/monitor/loop_tests.rs::an_install_wake_reaches_recovery`,
   `crates/cli/src/cli/recovery.rs::a_released_lock_owes_the_look_it_held_and_nothing_else_does`,
   `crates/cli/src/cli/recovery.rs::a_repair_between_a_failure_and_its_hold_is_not_lost`,
-  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_event_log_holds_a_due_recovery_attempt`,
-  `crates/cli/src/cli/monitor.rs::the_loop_waits_for_held_locks_releases_and_retries_on_one`
+  `crates/cli/src/cli/monitor/turn_tests.rs::a_held_event_log_holds_a_due_recovery_attempt`,
+  `crates/cli/src/cli/monitor/loop_tests.rs::the_loop_waits_for_held_locks_releases_and_retries_on_one`
 
 ## I11. `clank open` works when no zellij session exists.
 

@@ -48,7 +48,6 @@ pub mod licenses;
 pub mod log;
 pub(crate) mod message;
 pub mod monitor;
-pub mod monitor_upgrade;
 pub mod nudge;
 pub(crate) mod nudge_log;
 pub mod open_zellij;

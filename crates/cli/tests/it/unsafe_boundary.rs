@@ -45,7 +45,7 @@ const RESIDUAL: &[Residual] = &[
         why: "a C signal handler reaches its saved termios through a static, and calls _exit",
     },
     Residual {
-        file: "cli/src/cli/monitor.rs",
+        file: "cli/src/cli/monitor/runtime.rs",
         item: "remove_private_test_runtime_at_exit",
         why: "a test process's private runtime must go at exit, and only atexit runs then",
     },
