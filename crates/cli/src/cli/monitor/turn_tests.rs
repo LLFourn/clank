@@ -3,8 +3,10 @@
 //! turn policy's terminal-failure contract rests on.
 
 use super::*;
+use crate::cli::monitor::fixtures::*;
 use crate::cli::turn_custody::Turns;
 use crate::cli::turn_wire::{Frame, Report, TurnResult, WireVerdict};
+use crate::cli::watch_store::Producer;
 
 const SESSION: &str = "session-handshake";
 
@@ -31,14 +33,7 @@ fn gathered_with(
     state: &crate::repo_state::RepoState,
     pending: &[(Stream, WaitItem)],
 ) -> crate::cli::turn_custody::Gathered {
-    gather(
-        repo,
-        Some(state),
-        author,
-        &Default::default(),
-        &mut Default::default(),
-        pending,
-    )
+    holding(pending.to_vec()).gather(repo, Some(state), author, &mut Reading::afresh())
 }
 
 /// What the next Stop of another connection is presented.
@@ -67,16 +62,19 @@ async fn a_failed_emit_keeps_unlogged_work_owed() {
         let mut clients = vec![client];
         let mut turns = Turns::new(repo.path().to_path_buf());
         let mut pending = transient(&author);
-        let leaving = serve_reports(
-            repo.path(),
-            &mut clients,
-            Some(&state),
-            None,
-            &pending,
-            &mut Default::default(),
-            &Default::default(),
-            &mut turns,
-        );
+        let leaving = in_sources(&mut Default::default(), &mut pending, |sources| {
+            in_turns(&mut turns, |custody| {
+                serve_reports(
+                    repo.path(),
+                    &mut clients,
+                    Some(&state),
+                    None,
+                    &mut Reading::afresh(),
+                    sources,
+                    custody,
+                )
+            })
+        });
         let (frame, mut hook) = tokio::task::spawn_blocking(move || (hook.frame(), hook))
             .await
             .unwrap();
@@ -96,15 +94,19 @@ async fn a_failed_emit_keeps_unlogged_work_owed() {
                 let (_, Heard::Line(line)) = next_heard(&mut heard).await else {
                     panic!("expected a result");
                 };
-                let settled = settle_result(
-                    repo.path(),
-                    &mut turns,
-                    &mut pending,
-                    &author,
-                    conn,
-                    serde_json::from_str(&line).unwrap(),
-                    |pending| gathered_with(repo.path(), &author, &state, pending),
-                );
+                let settled = holding_in(&mut pending, |sources| {
+                    in_turns(&mut turns, |custody| {
+                        settle_result(
+                            repo.path(),
+                            Some(&state),
+                            &author,
+                            conn,
+                            serde_json::from_str(&line).unwrap(),
+                            sources,
+                            custody,
+                        )
+                    })
+                });
                 assert!(settled.unwrap().is_none(), "nothing commits");
             }
             _ => turns.closed(
@@ -154,17 +156,20 @@ async fn a_presentation_its_carrier_never_received_fails_at_once() {
         })),
     }];
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let pending = transient(&author);
-    serve_reports(
-        repo.path(),
-        &mut clients,
-        Some(&state),
-        None,
-        &pending,
-        &mut Default::default(),
-        &Default::default(),
-        &mut turns,
-    );
+    let mut pending = transient(&author);
+    in_sources(&mut Default::default(), &mut pending, |sources| {
+        in_turns(&mut turns, |custody| {
+            serve_reports(
+                repo.path(),
+                &mut clients,
+                Some(&state),
+                None,
+                &mut Reading::afresh(),
+                sources,
+                custody,
+            )
+        })
+    });
     assert!(clients.is_empty(), "the carrier is retired");
     assert_eq!(turns.state(&author).unwrap().outstanding, None);
     let g = gathered_with(repo.path(), &author, &state, &pending);
@@ -186,16 +191,19 @@ async fn a_delivery_discharges_the_transient_work_it_presented() {
     let other = AgentLabel::parse("other").unwrap();
     let mut pending = transient(&author);
     pending.extend(transient(&other));
-    let leaving = serve_reports(
-        repo.path(),
-        &mut clients,
-        Some(&state),
-        None,
-        &pending,
-        &mut Default::default(),
-        &Default::default(),
-        &mut turns,
-    );
+    let leaving = in_sources(&mut Default::default(), &mut pending, |sources| {
+        in_turns(&mut turns, |custody| {
+            serve_reports(
+                repo.path(),
+                &mut clients,
+                Some(&state),
+                None,
+                &mut Reading::afresh(),
+                sources,
+                custody,
+            )
+        })
+    });
     let (frame, mut hook) = tokio::task::spawn_blocking(move || (hook.frame(), hook))
         .await
         .unwrap();
@@ -225,15 +233,19 @@ async fn a_delivery_discharges_the_transient_work_it_presented() {
     let (_, Heard::Line(line)) = next_heard(&mut heard).await else {
         panic!("expected a result");
     };
-    let settled = settle_result(
-        repo.path(),
-        &mut turns,
-        &mut pending,
-        &author,
-        conn,
-        serde_json::from_str(&line).unwrap(),
-        |pending| gathered_with(repo.path(), &author, &state, pending),
-    );
+    let settled = holding_in(&mut pending, |sources| {
+        in_turns(&mut turns, |custody| {
+            settle_result(
+                repo.path(),
+                Some(&state),
+                &author,
+                conn,
+                serde_json::from_str(&line).unwrap(),
+                sources,
+                custody,
+            )
+        })
+    });
     assert!(settled.unwrap().is_some(), "the delivery commits");
     let mut kept = transient(&other);
     kept.push(arrived);
@@ -264,14 +276,13 @@ async fn an_unbinding_seen_by_a_fold_retires_the_check_in_it_owed() {
         &clank_core::SessionId::parse(SESSION).unwrap(),
     )
     .unwrap();
-    recovery_facts(
-        repo.path(),
-        &state,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
-        &mut turns,
-    );
+    in_turns(&mut turns, |custody| {
+        custody.facts(
+            repo.path(),
+            &state,
+            &mut Sources::hosting(Default::default()),
+        )
+    });
     assert_eq!(turns.next_deadline(), None);
     assert!(
         !crate::agent_store::agents_root(repo.path())
@@ -298,16 +309,19 @@ async fn a_deadline_with_no_waiter_owes_its_check_in_and_is_not_due_again() {
     let mut clients = Vec::new();
     let mut recovery =
         crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
-    let leaving = deadline_round(
-        repo.path(),
-        &mut clients,
-        Some(&state),
-        &[],
-        &Default::default(),
-        &mut turns,
-        &mut recovery,
-        due,
-    );
+    let leaving = in_clients(&mut clients, |clients| {
+        in_custody(&mut turns, &mut recovery, |custody| {
+            deadline_round(
+                repo.path(),
+                Some(&state),
+                clients,
+                &mut Sources::hosting(Default::default()),
+                custody,
+                due,
+            )
+        })
+    })
+    .1;
     assert!(leaving.is_empty());
     assert!(turns.due_authors(u64::MAX).is_empty(), "not due again");
     assert!(!turns.presenting(&author), "nothing presented");
@@ -375,14 +389,7 @@ fn attended(
             .join("turn.json"),
     );
     let mut turns = Turns::new(repo.to_path_buf());
-    let g = gather(
-        repo,
-        Some(state),
-        author,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
-    );
+    let g = gathered(repo, author, state);
     attend_run(&mut turns, author, "sleeper", &g);
     let due = turns.next_deadline().expect("a check-in is owed");
     (turns, due)
@@ -694,16 +701,17 @@ fn serve(
     state: &crate::repo_state::RepoState,
     turns: &mut Turns,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
-    serve_reports(
-        repo,
-        clients,
-        Some(state),
-        None,
-        &[],
-        &mut Default::default(),
-        &Default::default(),
-        turns,
-    )
+    in_turns(turns, |custody| {
+        serve_reports(
+            repo,
+            clients,
+            Some(state),
+            None,
+            &mut Reading::afresh(),
+            &mut Sources::hosting(Default::default()),
+            custody,
+        )
+    })
 }
 
 fn gathered(
@@ -711,14 +719,7 @@ fn gathered(
     author: &AgentLabel,
     state: &crate::repo_state::RepoState,
 ) -> crate::cli::turn_custody::Gathered {
-    gather(
-        repo,
-        Some(state),
-        author,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
-    )
+    Sources::hosting(Default::default()).gather(repo, Some(state), author, &mut Reading::afresh())
 }
 
 /// The handshake, end to end: the verdict reaches the hook while the
@@ -793,26 +794,25 @@ async fn an_attending_agents_turn_end_parks_and_a_later_event_wakes_it() {
     let (repo, author, timer) = timer_repo();
     let state = folded(repo.path()).await.unwrap();
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gather(
+    let g = Sources::hosting(Default::default()).gather(
         repo.path(),
         Some(&state),
         &author,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
+        &mut Reading::afresh(),
     );
     attend_sleeper(&mut turns, &author, &g);
     let serve_now = |clients: &mut Vec<Client>, state, turns: &mut Turns| {
-        serve_reports(
-            repo.path(),
-            clients,
-            Some(state),
-            None,
-            &[],
-            &mut Default::default(),
-            &Default::default(),
-            turns,
-        )
+        in_turns(turns, |custody| {
+            serve_reports(
+                repo.path(),
+                clients,
+                Some(state),
+                None,
+                &mut Reading::afresh(),
+                &mut Sources::hosting(Default::default()),
+                custody,
+            )
+        })
     };
 
     let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
@@ -980,13 +980,11 @@ async fn recovery_after_a_lost_park(later: Later) {
     log_timer_event(repo.path(), &timer);
     let state = folded(repo.path()).await.unwrap();
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gather(
+    let g = Sources::hosting(Default::default()).gather(
         repo.path(),
         Some(&state),
         &author,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
+        &mut Reading::afresh(),
     );
     let shown = turns.answer(&author, 1, &stop_report(), true, &g).unwrap();
     let presentation = shown.presentation().expect("presented").clone();
@@ -999,14 +997,9 @@ async fn recovery_after_a_lost_park(later: Later) {
 
     type Pending = [(Stream, WaitItem)];
     let facts = |state: &crate::repo_state::RepoState, pending: &Pending, turns: &mut Turns| {
-        let [facts] = recovery_facts(
-            repo.path(),
-            state,
-            &Default::default(),
-            &mut Default::default(),
-            pending,
-            turns,
-        )
+        let [facts] = in_sources(&mut Default::default(), &mut pending.to_vec(), |sources| {
+            in_turns(turns, |custody| custody.facts(repo.path(), state, sources))
+        })
         .facts
         .try_into()
         .unwrap();
@@ -1014,7 +1007,7 @@ async fn recovery_after_a_lost_park(later: Later) {
     };
     let look = |state: &crate::repo_state::RepoState,
                 pending: &Pending,
-                clients: &[Client],
+                clients: &mut Vec<Client>,
                 turns: &mut Turns| {
         let (reply, _) = tokio::sync::oneshot::channel();
         let ask = Authorize {
@@ -1029,26 +1022,21 @@ async fn recovery_after_a_lost_park(later: Later) {
             state: Some(state.clone()),
             reply,
         };
-        let last = last_look(
-            repo.path(),
-            clients,
-            &Default::default(),
-            pending,
-            turns,
-            &ask,
-        )
-        .map(|(gate, _)| gate);
-        let due = due_gate(
-            repo.path(),
-            clients,
-            turns,
-            Some(state),
-            &Default::default(),
-            &mut Default::default(),
-            pending,
-            &author,
-            SESSION,
-        );
+        let mut sources = holding(pending.to_vec());
+        let (last, _) = in_clients(clients, |clients| {
+            last_look(repo.path(), clients, &sources, turns, &ask).map(|(gate, _)| gate)
+        });
+        let (due, _) = in_clients(clients, |clients| {
+            due_gate(
+                repo.path(),
+                clients,
+                turns,
+                Some(state),
+                &mut sources,
+                &author,
+                SESSION,
+            )
+        });
         assert_eq!(
             last,
             Some(due),
@@ -1061,22 +1049,26 @@ async fn recovery_after_a_lost_park(later: Later) {
         !held.ledger.owed().is_empty() && held.attended,
         "received work: {held:?}"
     );
-    assert_eq!(look(&state, &[], &[], &mut turns), Some(Gate::Hold));
+    assert_eq!(
+        look(&state, &[], &mut Vec::new(), &mut turns),
+        Some(Gate::Hold)
+    );
 
     let (heard_tx, _heard) = tokio::sync::mpsc::unbounded_channel();
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let hook = Hook::carrying(repo.path(), &author, &stop_report(), ours);
     let mut clients = vec![admitted(theirs, repo.path(), &heard_tx).await];
-    let _ = serve_reports(
-        repo.path(),
-        &mut clients,
-        Some(&state),
-        None,
-        &[],
-        &mut Default::default(),
-        &Default::default(),
-        &mut turns,
-    );
+    let _ = in_turns(&mut turns, |custody| {
+        serve_reports(
+            repo.path(),
+            &mut clients,
+            Some(&state),
+            None,
+            &mut Reading::afresh(),
+            &mut Sources::hosting(Default::default()),
+            custody,
+        )
+    });
     let (frame, hook) = tokio::task::spawn_blocking(move || {
         let mut hook = hook;
         (hook.frame(), hook)
@@ -1097,7 +1089,10 @@ async fn recovery_after_a_lost_park(later: Later) {
         !parked.ledger.owed().is_empty() && !parked.attended,
         "{later:?}: owed, and no parked hook stands in for its delivery: {parked:?}"
     );
-    assert_eq!(look(&now, &pending, &clients, &mut turns), Some(Gate::Go));
+    assert_eq!(
+        look(&now, &pending, &mut clients, &mut turns),
+        Some(Gate::Go)
+    );
 
     clients.clear();
     drop(hook.stdin);
@@ -1107,7 +1102,10 @@ async fn recovery_after_a_lost_park(later: Later) {
         !lost.ledger.owed().is_empty() && !lost.attended,
         "{later:?}: unseen work is recoverable: {lost:?}"
     );
-    assert_eq!(look(&now, &pending, &[], &mut turns), Some(Gate::Go));
+    assert_eq!(
+        look(&now, &pending, &mut Vec::new(), &mut turns),
+        Some(Gate::Go)
+    );
 }
 
 /// EOF on the hook's pipe before a result is a failed emit: the child
@@ -1515,13 +1513,11 @@ async fn attend_and_clear_requests_are_scoped_to_their_entry() {
     let (repo, author, state) = owed_repo().await;
     let mut turns = Turns::new(repo.path().to_path_buf());
     let now = || {
-        gather(
+        Sources::hosting(Default::default()).gather(
             repo.path(),
             Some(&state),
             &author,
-            &Default::default(),
-            &mut Default::default(),
-            &[],
+            &mut Reading::afresh(),
         )
     };
     let session = clank_core::SessionId::parse(SESSION).unwrap();
@@ -1633,16 +1629,19 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
     let mut recovery =
         crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
     let mut round = |clients: &mut Vec<Client>, turns: &mut Turns, now| {
-        deadline_round(
-            repo.path(),
-            clients,
-            Some(&state),
-            &[],
-            &Default::default(),
-            turns,
-            &mut recovery,
-            now,
-        )
+        in_clients(clients, |clients| {
+            in_custody(turns, &mut recovery, |custody| {
+                deadline_round(
+                    repo.path(),
+                    Some(&state),
+                    clients,
+                    &mut Sources::hosting(Default::default()),
+                    custody,
+                    now,
+                )
+            })
+        })
+        .1
     };
 
     round(&mut clients, &mut turns, deadline - 1);
@@ -1732,16 +1731,19 @@ async fn a_run_ending_presents_its_parked_agent_the_work_it_held_quiet() {
     let mut recovery =
         crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
     let mut retire = |clients: &mut Vec<Client>, turns: &mut Turns| {
-        retire_gone_runs(
-            repo.path(),
-            clients,
-            Some(&state),
-            &[],
-            &Default::default(),
-            turns,
-            &mut recovery,
-            &author,
-        )
+        in_clients(clients, |clients| {
+            in_custody(turns, &mut recovery, |custody| {
+                retire_gone_runs(
+                    repo.path(),
+                    &author,
+                    Some(&state),
+                    clients,
+                    &mut Sources::hosting(Default::default()),
+                    custody,
+                )
+            })
+        })
+        .1
     };
 
     retire(&mut clients, &mut turns);
@@ -1851,16 +1853,19 @@ async fn a_codex_run_ending_wakes_its_parked_agent() {
         crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
     child.kill().unwrap();
     child.wait().unwrap();
-    retire_gone_runs(
-        repo.path(),
-        &mut clients,
-        Some(&state),
-        &[],
-        &Default::default(),
-        &mut turns,
-        &mut recovery,
-        &author,
-    );
+    let _ = in_clients(&mut clients, |clients| {
+        in_custody(&mut turns, &mut recovery, |custody| {
+            retire_gone_runs(
+                repo.path(),
+                &author,
+                Some(&state),
+                clients,
+                &mut Sources::hosting(Default::default()),
+                custody,
+            )
+        })
+    })
+    .1;
     let note = queue.try_recv().expect("the parked wait was served");
     assert!(note.contains(r#"Run \"slow build\" ended"#), "{note}");
     assert!(
@@ -1962,15 +1967,15 @@ async fn a_park_whose_hook_dies_is_nudged_on_the_stop_it_reported() {
     let round = |clients: &mut Vec<Client>,
                  turns: &mut Turns,
                  recovery: &mut crate::cli::recovery::Driver| {
-        tend(
-            repo.path(),
-            clients,
-            Some(&state),
-            &[],
-            &Default::default(),
-            turns,
-            recovery,
-        )
+        in_custody(turns, recovery, |custody| {
+            tend(
+                repo.path(),
+                clients,
+                Some(&state),
+                &mut Sources::hosting(Default::default()),
+                custody,
+            )
+        })
     };
     let _ = round(&mut clients, &mut turns, &mut recovery);
 
@@ -1978,29 +1983,28 @@ async fn a_park_whose_hook_dies_is_nudged_on_the_stop_it_reported() {
     hook.child.join().unwrap();
     let (from, said) = next_heard(&mut heard).await;
     assert_eq!((from, matches!(said, Heard::Closed)), (conn, true));
-    let _ = ended(
-        from,
-        repo.path(),
-        &mut clients,
-        Some(&state),
-        &[],
-        &Default::default(),
-        &mut turns,
-        &mut recovery,
-    );
+    let _ = in_custody(&mut turns, &mut recovery, |custody| {
+        ended(
+            from,
+            repo.path(),
+            &mut clients,
+            Some(&state),
+            &mut Sources::hosting(Default::default()),
+            custody,
+        )
+    });
     assert!(turns.state(&author).unwrap().unwatched.is_some());
 
     log_timer_event(repo.path(), &timer);
     let state = folded(repo.path()).await.unwrap();
     let now = crate::cli::recovery::unix_now();
-    let facts = recovery_facts(
-        repo.path(),
-        &state,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
-        &mut turns,
-    )
+    let facts = in_turns(&mut turns, |custody| {
+        custody.facts(
+            repo.path(),
+            &state,
+            &mut Sources::hosting(Default::default()),
+        )
+    })
     .facts;
     recovery.reconcile(facts, now);
     let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
@@ -2042,15 +2046,15 @@ async fn a_park_that_delivered_records_no_loss() {
     .await
     .unwrap();
     assert_eq!(parked.verdict, WireVerdict::Park);
-    let _ = tend(
-        repo.path(),
-        &mut clients,
-        Some(&state),
-        &[],
-        &Default::default(),
-        &mut turns,
-        &mut recovery,
-    );
+    let _ = in_custody(&mut turns, &mut recovery, |custody| {
+        tend(
+            repo.path(),
+            &mut clients,
+            Some(&state),
+            &mut Sources::hosting(Default::default()),
+            custody,
+        )
+    });
 
     log_timer_event(repo.path(), &timer);
     let state = folded(repo.path()).await.unwrap();
@@ -2074,16 +2078,16 @@ async fn a_park_that_delivered_records_no_loss() {
     hook.child.join().unwrap();
     let (from, said) = next_heard(&mut heard).await;
     assert_eq!((from, matches!(said, Heard::Closed)), (conn, true));
-    let _ = ended(
-        from,
-        repo.path(),
-        &mut clients,
-        Some(&state),
-        &[],
-        &Default::default(),
-        &mut turns,
-        &mut recovery,
-    );
+    let _ = in_custody(&mut turns, &mut recovery, |custody| {
+        ended(
+            from,
+            repo.path(),
+            &mut clients,
+            Some(&state),
+            &mut Sources::hosting(Default::default()),
+            custody,
+        )
+    });
     assert_eq!(turns.state(&author).unwrap().unwatched, None);
 }
 
@@ -2173,25 +2177,16 @@ async fn a_compaction_rearms_the_park_that_replaces_the_stops() {
     let mut recovery = crate::cli::recovery::Driver::new("/".into(), "/nonexistent-home".into());
     let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
     let mut clients = Vec::new();
-    let hosted = Default::default();
+    let mut hosted = std::collections::BTreeMap::new();
     let mut admit = |clients: &mut Vec<Client>, client: Client, turns: &mut Turns| {
-        let mut leaving = admit_into(
-            root,
-            clients,
-            client,
-            Some(&state),
-            &mut Vec::new(),
-            &hosted,
-        );
-        leaving.extend(tend(
-            root,
-            clients,
-            Some(&state),
-            &[],
-            &hosted,
-            turns,
-            &mut recovery,
-        ));
+        let mut leaving = in_sources(&mut hosted, &mut Vec::new(), |sources| {
+            admit_into(root, clients, client, Some(&state), sources)
+        });
+        leaving.extend(in_sources(&mut hosted, &mut Vec::new(), |sources| {
+            in_custody(turns, &mut recovery, |custody| {
+                tend(root, clients, Some(&state), sources, custody)
+            })
+        }));
         leaving
     };
 
@@ -2235,7 +2230,7 @@ async fn a_compaction_rearms_the_park_that_replaces_the_stops() {
     let transcript = root.join("t.jsonl");
     std::fs::write(
         &transcript,
-        include_str!("../../tests/fixtures/claude_idle_compaction.jsonl"),
+        include_str!("../../../tests/fixtures/claude_idle_compaction.jsonl"),
     )
     .unwrap();
     let (carriers, reached) = std::sync::mpsc::channel();
@@ -2372,46 +2367,50 @@ async fn the_loop_gives_up_a_presentation_its_carrier_never_answered_for() {
     log_timer_event(repo.path(), &timer);
     let state = folded(repo.path()).await.unwrap();
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gather(
+    let g = Sources::hosting(Default::default()).gather(
         repo.path(),
         Some(&state),
         &author,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
+        &mut Reading::afresh(),
     );
     let shown = turns.answer(&author, 1, &stop_report(), true, &g).unwrap();
     assert!(shown.presentation().is_some(), "{shown:?}");
     let expires = turns.next_deadline().expect("the result has a bound");
-    let owed = owed_now(
-        repo.path(),
-        &state,
-        &author,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
-    )
-    .expect("no log is held");
+    let owed = Sources::hosting(Default::default())
+        .owed_now(repo.path(), &state, &author)
+        .expect("no log is held");
     let mut recovery =
         crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
     let mut clients = Vec::new();
     let mut round = |turns: &mut Turns, now| {
-        drop(expire_deliveries(
-            repo.path(),
-            &mut clients,
-            Some(&state),
-            &[],
-            &Default::default(),
-            turns,
-            &mut recovery,
-            now,
-        ))
+        drop(
+            in_clients(&mut clients, |clients| {
+                in_custody(turns, &mut recovery, |custody| {
+                    expire_deliveries(
+                        repo.path(),
+                        Some(&state),
+                        clients,
+                        &mut Sources::hosting(Default::default()),
+                        custody,
+                        now,
+                    )
+                })
+            })
+            .1,
+        )
     };
 
     round(&mut turns, expires - 1);
     assert!(turns.presenting(&author), "inside its bound");
     assert_eq!(
-        recovery_gate(repo.path(), &[], &mut turns, &author, SESSION, &owed),
+        recovery_gate(
+            repo.path(),
+            &Clients::new(),
+            &mut turns,
+            &author,
+            SESSION,
+            &owed
+        ),
         Gate::Hold,
         "being delivered"
     );
@@ -2420,7 +2419,14 @@ async fn the_loop_gives_up_a_presentation_its_carrier_never_answered_for() {
     assert!(!turns.presenting(&author), "given up at the bound");
     assert_eq!(turns.next_deadline(), None, "and never due again");
     assert_eq!(
-        recovery_gate(repo.path(), &[], &mut turns, &author, SESSION, &owed),
+        recovery_gate(
+            repo.path(),
+            &Clients::new(),
+            &mut turns,
+            &author,
+            SESSION,
+            &owed
+        ),
         Gate::Go,
         "the agent moves to recovery"
     );
@@ -2518,38 +2524,35 @@ impl Reached<'_> {
             &mut self.clients,
             client,
             Some(self.state),
-            &mut Vec::new(),
-            &Default::default(),
+            &mut Sources::hosting(Default::default()),
         ));
         assert_eq!(
             self.clients.iter().map(|c| c.conn).collect::<Vec<_>>()[..parked.len()],
             parked[..],
             "it supersedes no wait"
         );
-        self.leaving.extend(tend(
-            self.root,
-            &mut self.clients,
-            Some(self.state),
-            &[],
-            &Default::default(),
-            &mut self.turns,
-            &mut self.recovery,
-        ));
-        let hosted = Default::default();
-        let serving = Serving {
-            repo: self.root,
-            state: Some(self.state),
-            pending: &[],
-            hosted: &hosted,
-        };
-        self.leaving.extend(serve_newcomer(
-            &serving,
-            &mut self.clients,
-            self.author,
-            true,
-            &mut self.turns,
-            &mut self.recovery,
-        ));
+        self.leaving
+            .extend(in_custody(&mut self.turns, &mut self.recovery, |custody| {
+                tend(
+                    self.root,
+                    &mut self.clients,
+                    Some(self.state),
+                    &mut Sources::hosting(Default::default()),
+                    custody,
+                )
+            }));
+        self.leaving
+            .extend(in_custody(&mut self.turns, &mut self.recovery, |custody| {
+                serve_newcomer(
+                    self.root,
+                    &mut self.clients,
+                    Some(self.state),
+                    self.author,
+                    true,
+                    &mut Sources::hosting(Default::default()),
+                    custody,
+                )
+            }));
         let host = tokio::task::spawn_blocking(move || hook.join().unwrap())
             .await
             .unwrap();
@@ -2697,17 +2700,20 @@ async fn the_subagent_hooks_hold_a_parked_agents_work_and_release_it_with_no_sto
         &mut monitor.clients,
         client,
         Some(&state),
-        &mut Vec::new(),
-        &Default::default(),
+        &mut Sources::hosting(Default::default()),
     ));
-    monitor.leaving.extend(tend(
-        root,
-        &mut monitor.clients,
-        Some(&state),
-        &[],
-        &Default::default(),
+    monitor.leaving.extend(in_custody(
         &mut monitor.turns,
         &mut monitor.recovery,
+        |custody| {
+            tend(
+                root,
+                &mut monitor.clients,
+                Some(&state),
+                &mut Sources::hosting(Default::default()),
+                custody,
+            )
+        },
     ));
     monitor.leaving.extend(serve(
         root,
@@ -3007,14 +3013,13 @@ fn a_held_blocks_lock_stalls_no_serve() {
     let (facts_tx, facts) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut turns = Turns::new(facts_repo.clone());
-        let found = recovery_facts(
-            &facts_repo,
-            &facts_state,
-            &Default::default(),
-            &mut Default::default(),
-            &[],
-            &mut turns,
-        )
+        let found = in_turns(&mut turns, |custody| {
+            custody.facts(
+                &facts_repo,
+                &facts_state,
+                &mut Sources::hosting(Default::default()),
+            )
+        })
         .facts;
         let _ = facts_tx.send(found.len());
     });
@@ -3085,15 +3090,16 @@ fn served_retried_then_retired(
                 let mut leaving = serve(&repo, &mut clients, &state, &mut turns);
                 let first = unavailable(&clients);
                 between();
-                leaving.extend(retry_contended(
-                    &repo,
-                    &mut clients,
-                    Some(&state),
-                    &mut Vec::new(),
-                    &mut Default::default(),
-                    &mut Default::default(),
-                    &mut turns,
-                ));
+                leaving.extend(
+                    in_clients(&mut clients, |clients| {
+                        in_sources(&mut Default::default(), &mut Vec::new(), |sources| {
+                            in_turns(&mut turns, |custody| {
+                                retry_contended(&repo, Some(&state), clients, sources, custody)
+                            })
+                        })
+                    })
+                    .1,
+                );
                 let retried = unavailable(&clients);
                 let _ = retire(
                     clients,
@@ -3143,14 +3149,13 @@ fn a_held_event_log_stalls_no_serve_and_the_retry_presents_it() {
     let (repo, authors, state) = runtime.block_on(two_agents_claude_told());
     let claude_dir = crate::agent_store::agents_root(repo.path()).join("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let free = recovery_facts(
-        repo.path(),
-        &state,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
-        &mut turns,
-    );
+    let free = in_turns(&mut turns, |custody| {
+        custody.facts(
+            repo.path(),
+            &state,
+            &mut Sources::hosting(Default::default()),
+        )
+    });
     assert!(free.unknown.is_empty());
     let owed = crate::cli::ledger::load(&claude_dir);
     assert!(
@@ -3178,14 +3183,13 @@ fn a_held_event_log_stalls_no_serve_and_the_retry_presents_it() {
     let (facts_repo, facts_state) = (repo.path().to_path_buf(), state.clone());
     let observed = crate::cli::github::log::tests::within("recovery", move || {
         let mut turns = Turns::new(facts_repo.clone());
-        recovery_facts(
-            &facts_repo,
-            &facts_state,
-            &Default::default(),
-            &mut Default::default(),
-            &[],
-            &mut turns,
-        )
+        in_turns(&mut turns, |custody| {
+            custody.facts(
+                &facts_repo,
+                &facts_state,
+                &mut Sources::hosting(Default::default()),
+            )
+        })
     });
     assert_eq!(
         observed.unknown,
@@ -3214,14 +3218,13 @@ fn a_held_event_log_stalls_no_serve_and_the_retry_presents_it() {
         "the retry presents the event once released: {read:?}"
     );
     assert!(retried.iter().all(|u| !u), "and settles it: {retried:?}");
-    let complete = recovery_facts(
-        repo.path(),
-        &state,
-        &Default::default(),
-        &mut Default::default(),
-        &[],
-        &mut Turns::new(repo.path().to_path_buf()),
-    );
+    let complete = in_turns(&mut Turns::new(repo.path().to_path_buf()), |custody| {
+        custody.facts(
+            repo.path(),
+            &state,
+            &mut Sources::hosting(Default::default()),
+        )
+    });
     recovery.reconcile(complete, crate::cli::recovery::unix_now());
     assert!(
         !recovery.awaits_a_complete_fold(),
@@ -3371,7 +3374,7 @@ fn a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once() {
     let recovery =
         || crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
     assert!(
-        unavailable_somewhere(&hosted, &[], &recovery()),
+        unavailable_in(&mut hosted, &mut Vec::new(), &mut recovery()),
         "the acceptances await the contention retry"
     );
     let (shutdown, read) = served_then_retired(repo.path(), state.clone(), &authors)
@@ -3392,15 +3395,14 @@ fn a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once() {
     let _runtime = runtime.enter();
     let mut turns = Turns::new(repo.path().to_path_buf());
     let mut retry_and_accept = |hosted: &mut std::collections::BTreeMap<Producer, Hosted>| {
-        let leaving = retry_contended(
-            repo.path(),
-            &mut Vec::new(),
-            Some(&state),
-            &mut Vec::new(),
-            &mut Default::default(),
-            hosted,
-            &mut turns,
-        );
+        let leaving = in_clients(&mut Vec::new(), |clients| {
+            in_sources(hosted, &mut Vec::new(), |sources| {
+                in_turns(&mut turns, |custody| {
+                    retry_contended(repo.path(), Some(&state), clients, sources, custody)
+                })
+            })
+        })
+        .1;
         assert!(leaving.is_empty());
         for host in hosted.values_mut() {
             host.timers.as_mut().unwrap().due();
@@ -3420,7 +3422,11 @@ fn a_held_ingest_lease_stalls_no_serve_and_the_retry_accepts_each_once() {
         ["every", "once"],
         "each accepted once"
     );
-    assert!(!unavailable_somewhere(&hosted, &[], &recovery()));
+    assert!(!unavailable_in(
+        &mut hosted,
+        &mut Vec::new(),
+        &mut recovery()
+    ));
     assert!(retry_and_accept(&mut hosted).is_empty(), "and never again");
 }
 
@@ -3455,14 +3461,13 @@ fn a_wait_served_while_its_log_is_held_is_left_for_the_retry() {
     let held = crate::cli::github::log::tests::hold(&[(&events, &key)]);
     let (path, held_state) = (repo.path().to_path_buf(), state.clone());
     let mut clients = crate::cli::github::log::tests::within("the wait's serve", move || {
-        serve_to_cached(
+        present_to(
             &path,
             &mut clients,
             &held_state,
             None,
-            &mut Vec::new(),
-            &mut Default::default(),
-            &Default::default(),
+            &mut Sources::hosting(Default::default()),
+            &mut Reading::afresh(),
         );
         clients
     });
@@ -3477,14 +3482,13 @@ fn a_wait_served_while_its_log_is_held_is_left_for_the_retry() {
         );
     }
     held.release();
-    serve_to_cached(
+    present_to(
         repo.path(),
         &mut clients,
         &state,
         None,
-        &mut Vec::new(),
-        &mut Default::default(),
-        &Default::default(),
+        &mut Sources::hosting(Default::default()),
+        &mut Reading::afresh(),
     );
     let mut frames = String::new();
     while let Ok(frame) = queued.try_recv() {
@@ -3674,16 +3678,20 @@ async fn a_held_event_log_holds_a_due_recovery_attempt() {
                 state: Some(state.clone()),
                 reply,
             };
-            let last = last_look(&path, &[], &Default::default(), &[], &mut turns, &ask)
-                .map(|(gate, _)| gate);
+            let last = last_look(
+                &path,
+                &Clients::new(),
+                &Sources::hosting(Default::default()),
+                &mut turns,
+                &ask,
+            )
+            .map(|(gate, _)| gate);
             let due = due_gate(
                 &path,
-                &[],
+                &Clients::new(),
                 &mut turns,
                 Some(&state),
-                &Default::default(),
-                &mut Default::default(),
-                &[],
+                &mut Sources::hosting(Default::default()),
                 &author,
                 SESSION,
             );
@@ -3945,15 +3953,9 @@ async fn unacked_inbox_events_outlive_a_rebind_until_each_is_acked() {
     crate::inbox::deliver(repo.path(), &author, None, "1", "Rebase please").unwrap();
     let state = folded(repo.path()).await.unwrap();
     let owed = || {
-        owed_now(
-            repo.path(),
-            &state,
-            &author,
-            &Default::default(),
-            &mut Default::default(),
-            &[],
-        )
-        .unwrap()
+        Sources::hosting(Default::default())
+            .owed_now(repo.path(), &state, &author)
+            .unwrap()
     };
     let kinds = |items: &[WaitItem]| {
         let mut kinds: Vec<&'static str> = items
@@ -3972,13 +3974,11 @@ async fn unacked_inbox_events_outlive_a_rebind_until_each_is_acked() {
 
     let mut turns = Turns::new(repo.path().to_path_buf());
     let present = |turns: &mut Turns, conn: u64, session: &str| {
-        let g = gather(
+        let g = Sources::hosting(Default::default()).gather(
             repo.path(),
             Some(&state),
             &author,
-            &Default::default(),
-            &mut Default::default(),
-            &[],
+            &mut Reading::afresh(),
         );
         let mut report = stop_report();
         if let Report::TurnEnd { stop, .. } = &mut report {

@@ -1202,7 +1202,7 @@ fn the_wire_shape_is_pinned_to_the_protocol() {
     if pinned == PROTO {
         assert_eq!(
             pin, hash,
-            "the monitor wire changed but PROTO is still {PROTO}: bump PROTO in monitor.rs \
+            "the monitor wire changed but PROTO is still {PROTO}: bump PROTO in monitor/wire.rs \
              and append the (PROTO, hash) pair this test then reports to PINS; never edit \
              an existing pair"
         );

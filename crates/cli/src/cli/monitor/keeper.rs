@@ -14,7 +14,8 @@
 //! read-only through [`super::core_wakes`].
 
 use super::outage::{Ears, Heard, Hearing, Outage, Unserved};
-use super::{Attached, Conn, Hangup, Started, Who, attempt_with, reconcile_after, subscribe};
+use super::spawn::reconcile_after;
+use super::{Attached, Conn, Hangup, Started, Who, attempt_with, subscribe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;

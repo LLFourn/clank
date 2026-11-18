@@ -131,7 +131,7 @@ pub(crate) fn start(busy: Arc<Busy>, lease: Arc<LeaseWatch>, budget: Duration) {
     std::thread::spawn(move || {
         let mut state = busy.lock();
         loop {
-            let now_ms = super::unix_ms();
+            let now_ms = super::lease::unix_ms();
             let decided = look(
                 state.turn,
                 state.failing,
@@ -157,13 +157,54 @@ pub(crate) fn start(busy: Arc<Busy>, lease: Arc<LeaseWatch>, budget: Duration) {
                          not drained",
                         lease.path.display(),
                         lease.held(),
-                        super::timestamp(),
+                        super::lease::timestamp(),
                     );
-                    crate::cli::source_group::exit(super::STOOD_DOWN_EXIT);
+                    crate::cli::source_group::exit(super::retire::STOOD_DOWN_EXIT);
                 }
             };
         }
     });
+}
+
+/// What watches the loop from beside it: the watchdog over its turns and
+/// folds, and the watch on the lease's directory, whose failure is told
+/// on `failed`.
+pub(super) struct Vigil {
+    _lease_entries: crate::proc_identity::exit_watch::ExitWatch<()>,
+    busy: std::sync::Arc<Busy>,
+}
+
+impl Vigil {
+    pub(super) fn start(
+        lease: &std::sync::Arc<LeaseWatch>,
+        failed: tokio::sync::mpsc::UnboundedSender<Result<clank_core::ids::AgentLabel, String>>,
+    ) -> anyhow::Result<Self> {
+        let busy = std::sync::Arc::new(Busy::default());
+        start(busy.clone(), lease.clone(), BUDGET);
+        // The lease's path is looked at when an entry of its directory
+        // changes: a removed or replaced lease file is one.
+        let lease_entries = {
+            let watch = lease.clone();
+            crate::proc_identity::exit_watch::ExitWatch::<()>::new(
+                lease.path.parent(),
+                move |wake| match wake {
+                    crate::proc_identity::exit_watch::Wake::Failed(why) => {
+                        let _ = failed.send(Err(format!("the lease's watch failed: {why}")));
+                    }
+                    _ => watch.observe(),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("cannot watch the lease's directory: {e}"))?
+        };
+        Ok(Vigil {
+            _lease_entries: lease_entries,
+            busy,
+        })
+    }
+
+    pub(super) fn busy(&self) -> &std::sync::Arc<Busy> {
+        &self.busy
+    }
 }
 
 #[cfg(test)]

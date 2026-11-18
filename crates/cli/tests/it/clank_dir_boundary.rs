@@ -610,7 +610,7 @@ fn production_creates_no_undeclared_path_under_clank() {
 /// the repo scan uses.
 #[test]
 fn the_gate_rejects_every_ordinary_spelling_of_a_forbidden_path() {
-    let caught = |src: &str| strays_in(src, "cli/src/cli/monitor.rs");
+    let caught = |src: &str| strays_in(src, "cli/src/cli/monitor/published.rs");
 
     for src in [
         // The one the first version did catch.

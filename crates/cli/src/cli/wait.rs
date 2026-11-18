@@ -4800,13 +4800,13 @@ mod shared_tests {
     /// proved elsewhere, where they CAN fail (codex and ruthless on
     /// 153f450):
     ///
-    /// - cross-author delivery, by `monitor::two_authors_sources_do_not_cross`,
+    /// - cross-author delivery, by `monitor::clients::serving::tests::two_authors_sources_do_not_cross`,
     ///   which writes a row into each author's events dir and serves
     ///   both through one `serve_to`;
     /// - a scoped log being invisible to the monitor, by
-    ///   `monitor::the_monitor_reads_only_an_authors_configured_logs`;
+    ///   `monitor::clients::serving::tests::the_monitor_reads_only_an_authors_configured_logs`;
     /// - and that nothing the monitor hosts is an invocation's, by
-    ///   `monitor::nothing_the_monitor_hosts_belongs_to_an_invocation`.
+    ///   `monitor::hosted::tests::nothing_the_monitor_hosts_belongs_to_an_invocation`.
     ///
     /// What this one does establish, and what the mutation check
     /// confirms, is that the CLI source RUNS and DELIVERS: it fails if
@@ -4888,7 +4888,7 @@ mod shared_tests {
 
         // `claude` is config-only, so it is ELIGIBLE to share. What
         // this reads is its own config source emitting, not a monitor
-        // presenting: the presentation path is `monitor::serve_to`'s
+        // presenting: the presentation path is `monitor::clients::serving::serve_to`'s
         // own tests, and this half is here to show the eligibility and
         // the emission are both real for the same author.
         let theirs = resolve_wait_event_sources(dir.path(), &claude, &[]).unwrap();
