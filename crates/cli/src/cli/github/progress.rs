@@ -100,29 +100,24 @@ struct HalfProgress {
     error: Option<PollError>,
 }
 
-/// The poll loop's running account, on the tokio clock so a paused-time
-/// test sees the times its own schedule makes.
+/// The poll loop's running account. Its times are wall times the caller
+/// passes in, never derived from the tokio clock: that clock stops while
+/// the machine sleeps, and these are judged against wall time.
 pub(super) struct Progress {
     epoch: u64,
-    start: tokio::time::Instant,
     wants_ci: bool,
     feed: HalfProgress,
     checks: HalfProgress,
 }
 
 impl Progress {
-    pub(super) fn start(wants_ci: bool) -> Self {
+    pub(super) fn start(wants_ci: bool, now: u64) -> Self {
         Self {
-            epoch: crate::cli::github::log::now_epoch(),
-            start: tokio::time::Instant::now(),
+            epoch: now,
             wants_ci,
             feed: HalfProgress::default(),
             checks: HalfProgress::default(),
         }
-    }
-
-    fn at(&self, instant: tokio::time::Instant) -> u64 {
-        self.epoch + instant.saturating_duration_since(self.start).as_secs()
     }
 
     fn half(&mut self, half: Half) -> &mut HalfProgress {
@@ -132,17 +127,22 @@ impl Progress {
         }
     }
 
-    pub(super) fn succeeded(&mut self, half: Half) {
-        let now = self.at(tokio::time::Instant::now());
+    pub(super) fn succeeded(&mut self, half: Half, now: u64) {
         let h = self.half(half);
         h.ok = Some(now);
         h.error = None;
     }
 
-    /// `half` failed with `e`, and may next be read at `retry_at`.
-    pub(super) fn failed(&mut self, half: Half, e: &anyhow::Error, retry_at: tokio::time::Instant) {
-        let now = self.at(tokio::time::Instant::now());
-        let retry_at = self.at(retry_at);
+    /// `half` failed with `e` at `now`, and may next be read `retry_in`
+    /// from then.
+    pub(super) fn failed(
+        &mut self,
+        half: Half,
+        e: &anyhow::Error,
+        now: u64,
+        retry_in: std::time::Duration,
+    ) {
+        let retry_at = now + retry_in.as_secs();
         let what = match half {
             Half::Feed => "feed",
             Half::Checks => "checks",
@@ -262,52 +262,48 @@ mod tests {
 
     /// Each failing half carries its own retry: the other half's
     /// schedule is not when this one is read again.
-    #[tokio::test(start_paused = true)]
-    async fn an_error_lasts_until_its_half_succeeds_and_keeps_its_start() {
+    #[test]
+    fn an_error_lasts_until_its_half_succeeds_and_keeps_its_start() {
         let every = std::time::Duration::from_secs(60);
-        let in_secs = |s| tokio::time::Instant::now() + std::time::Duration::from_secs(s);
-        let mut p = Progress::start(true);
-        p.succeeded(Half::Feed);
+        let secs = std::time::Duration::from_secs;
+        let t0 = 1_000;
+        let mut p = Progress::start(true, t0);
+        p.succeeded(Half::Feed, t0);
         assert_eq!(
             p.record(every, Default::default()).checked,
             None,
             "a CI watch has completed a poll only once both halves have"
         );
-        p.succeeded(Half::Checks);
-        assert_eq!(p.record(every, Default::default()).checked, Some(p.epoch));
-        tokio::time::advance(std::time::Duration::from_secs(10)).await;
-        p.failed(Half::Checks, &anyhow::anyhow!("boom"), in_secs(5));
-        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        p.succeeded(Half::Checks, t0);
+        assert_eq!(p.record(every, Default::default()).checked, Some(t0));
+        p.failed(Half::Checks, &anyhow::anyhow!("boom"), t0 + 10, secs(5));
         p.failed(
             Half::Checks,
             &anyhow::Error::new(crate::cli::github::session::RateLimited {
                 url: "u".into(),
-                retry_in: std::time::Duration::from_secs(600),
+                retry_in: secs(600),
             }),
-            in_secs(600),
+            t0 + 20,
+            secs(600),
         );
-        p.failed(Half::Feed, &anyhow::anyhow!("502"), in_secs(5));
+        p.failed(Half::Feed, &anyhow::anyhow!("502"), t0 + 20, secs(5));
         let failing = p.record(every, Default::default());
         let [feed, checks] = &failing.errors[..] else {
             panic!("both halves: {:?}", failing.errors)
         };
-        assert_eq!((feed.since, feed.retry_at), (p.epoch + 20, p.epoch + 25));
-        assert_eq!(checks.since, p.epoch + 10, "dated from the first failure");
-        assert_eq!(
-            checks.retry_at,
-            p.epoch + 620,
-            "its own retry, not the feed's"
-        );
+        assert_eq!((feed.since, feed.retry_at), (t0 + 20, t0 + 25));
+        assert_eq!(checks.since, t0 + 10, "dated from the first failure");
+        assert_eq!(checks.retry_at, t0 + 620, "its own retry, not the feed's");
         assert!(checks.rate_limited && checks.why.starts_with("checks read failed"));
-        p.succeeded(Half::Feed);
+        p.succeeded(Half::Feed, t0 + 20);
         assert_eq!(
             p.record(every, Default::default()).errors.len(),
             1,
             "the other half succeeding is not this half's recovery"
         );
-        p.succeeded(Half::Checks);
+        p.succeeded(Half::Checks, t0 + 20);
         let healed = p.record(every, Default::default());
         assert!(healed.errors.is_empty());
-        assert_eq!(healed.checked, Some(p.epoch + 20));
+        assert_eq!(healed.checked, Some(t0 + 20));
     }
 }
