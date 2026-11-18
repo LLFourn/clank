@@ -186,16 +186,28 @@ whether its assertions protect the invariant. Reviewers check that.
 
 - Why: many clank processes each polling cost real CPU; work happens only
   when something happens.
-- Status: target
+- Status: holds
 - Scope: a poll wakes again while what it observes may be unchanged, with no
   bound. Scheduled domain work, one-shot deadlines, bounded retries and
   throttles of an event's work are not polls. Every production timed wait is
   classified so in `timed_wait_boundary`; the gate sees forms by name, so
   the classes themselves are the reviewers' check.
-- Today: besides GitHub's, one residual poll remains: recovery's
-  `RETRY_LOOK`, which stands for three different waits (the gate, which
-  only `Driver::due` asks; the record showing the failed turn; a turn it
-  cannot watch) behind one `next_at`.
+- Today: GitHub's is the one poll. Recovery types what an episode waits
+  on: a gate look owed on the loop's next pass, which that look spends; an
+  event (a fold, the record, an answer, a binding, its turns' custody or
+  connections moving from what its last decision was made from); or a
+  domain window (an idle settle, a stall's warning and nudge, a fallback's
+  check, an answer's or confirmation's bound, an absent transport's few
+  tries). Only windows and owed looks wake the loop, so a held or
+  unwatchable episode, or a record that does not show the failed turn,
+  sleeps through folds that move nothing; a look the gate held is owed
+  again by what held it, its turns' custody moving or a held log's
+  release. A decision that cannot be read or stored waits for what failed
+  to move (the agent's `state.json` as it stood before the failed read or
+  write, or the installation for a stale build), its answers kept and
+  nothing sent, with
+  one report deadline its first failure sets, shown in status as waiting
+  for you.
   A held event-log sidecar or ingest lease wakes the monitor on its release,
   and a remote's browser streams wake on a sessions-store write or their
   expiry. A client with no monitor (a parked wait, a turn child, the TUI's
@@ -272,8 +284,25 @@ whether its assertions protect the invariant. Reviewers check that.
   `crates/cli/src/cli/wait.rs::a_held_timer_lock_is_heard_released`,
   `crates/cli/src/cli/wait.rs::a_deferred_retirement_withholds_the_launch_and_keeps_the_record`,
   `crates/cli/src/cli/web/mod.rs::a_dead_subscription_is_restarted_at_its_end_until_its_budget`,
-  `crates/cli/src/cli/web/bridge_instance.rs::host_crash_reports_disconnection_without_stopping_local_panes`
-- Plans: recovery-looks-when-something-moves
+  `crates/cli/src/cli/web/bridge_instance.rs::host_crash_reports_disconnection_without_stopping_local_panes`,
+  `crates/cli/src/cli/recovery.rs::a_held_look_sleeps_through_unchanged_folds_and_wakes_on_a_move`,
+  `crates/cli/src/cli/recovery.rs::a_move_after_a_held_look_is_not_lost`,
+  `crates/cli/src/cli/recovery.rs::a_held_gate_waits_and_an_end_of_need_forgets_the_episode`,
+  `crates/cli/src/cli/recovery.rs::a_native_retry_holds_the_episode_and_its_success_closes_it`,
+  `crates/cli/src/cli/recovery.rs::a_due_attempt_asks_the_gate_about_the_agent_now`,
+  `crates/cli/src/cli/recovery.rs::a_due_attempt_on_an_unreadable_record_dispatches_nothing`,
+  `crates/cli/src/cli/recovery.rs::a_claim_that_cannot_be_stored_dispatches_nothing_and_waits_to_retry`,
+  `crates/cli/src/cli/recovery.rs::a_repaired_state_file_is_heard_and_tries_the_held_claim`,
+  `crates/cli/src/cli/recovery.rs::a_stale_claim_waits_for_the_installation_to_move`,
+  `crates/cli/src/cli/recovery.rs::folds_inside_a_hold_do_not_move_it`,
+  `crates/cli/src/cli/recovery.rs::a_recovery_that_cannot_be_recorded_is_still_due`,
+  `crates/cli/src/cli/recovery.rs::nothing_writes_during_a_storage_hold_and_nothing_is_lost`,
+  `crates/cli/src/cli/recovery.rs::an_issued_number_fault_keeps_answers`,
+  `crates/cli/src/cli/monitor.rs::an_install_wake_reaches_recovery`,
+  `crates/cli/src/cli/recovery.rs::a_released_lock_owes_the_look_it_held_and_nothing_else_does`,
+  `crates/cli/src/cli/recovery.rs::a_repair_between_a_failure_and_its_hold_is_not_lost`,
+  `crates/cli/src/cli/monitor_turn_tests.rs::a_held_event_log_holds_a_due_recovery_attempt`,
+  `crates/cli/src/cli/monitor.rs::the_loop_waits_for_held_locks_releases_and_retries_on_one`
 
 ## I11. `clank open` works when no zellij session exists.
 
