@@ -2822,6 +2822,8 @@ async fn two_agents_claude_told() -> (TempRepo, [AgentLabel; 2], crate::repo_sta
         &clank_core::SessionId::parse(OTHER_SESSION).unwrap(),
     )
     .unwrap();
+    // Unset, it would fall back to the running user's `~/.clank` default.
+    crate::agent_store::set_auto_mode(repo.path(), &other, clank_core::AutoMode::On).unwrap();
     crate::agent_store::told_of_an_outage(repo.path(), &claude, SESSION);
     let state = folded(repo.path()).await.unwrap();
     (repo, [claude, other], state)
@@ -3032,16 +3034,24 @@ fn a_held_blocks_lock_stalls_no_serve() {
     holder.join().unwrap();
 }
 
+/// A client the monitor still holds after a pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Held {
+    answered: bool,
+    unavailable: bool,
+}
+
 /// Each agent's first Stop served over a real writer, then `between`,
 /// then the contention retry, then retirement, on a thread of its own;
-/// what each agent's end read comes back, with whether each client was
-/// left unavailable by the first serve and by the retry.
+/// what each agent's end read comes back, with how each agent's client
+/// was held, in `authors`' order, after the first serve and after the
+/// retry: `None` once it has left.
 fn served_retried_then_retired(
     repo: &std::path::Path,
     state: crate::repo_state::RepoState,
     authors: &[AgentLabel; 2],
     between: impl FnOnce() + Send + 'static,
-) -> (Vec<String>, Vec<bool>, Vec<bool>) {
+) -> (Vec<String>, [Option<Held>; 2], [Option<Held>; 2]) {
     let (repo, authors) = (repo.to_path_buf(), authors.clone());
     crate::cli::github::log::tests::within("the serve", move || {
         tokio::runtime::Builder::new_current_thread()
@@ -3081,14 +3091,19 @@ fn served_retried_then_retired(
                     theirs.push(their);
                 }
                 let mut turns = Turns::new(repo.clone());
-                let unavailable = |clients: &[Client]| {
-                    let mut by_conn: Vec<_> =
-                        clients.iter().map(|c| (c.conn, c.unavailable)).collect();
-                    by_conn.sort();
-                    by_conn.into_iter().map(|(_, u)| u).collect::<Vec<_>>()
+                let held = |clients: &[Client]| {
+                    authors.clone().map(|author| {
+                        clients
+                            .iter()
+                            .find(|c| matches!(&c.who, Served::Agent { author: a } if a == &author))
+                            .map(|c| Held {
+                                answered: c.report.as_ref().is_some_and(|r| r.stepped),
+                                unavailable: c.unavailable,
+                            })
+                    })
                 };
                 let mut leaving = serve(&repo, &mut clients, &state, &mut turns);
-                let first = unavailable(&clients);
+                let first = held(&clients);
                 between();
                 leaving.extend(
                     in_clients(&mut clients, |clients| {
@@ -3100,7 +3115,7 @@ fn served_retried_then_retired(
                     })
                     .1,
                 );
-                let retried = unavailable(&clients);
+                let retried = held(&clients);
                 let _ = retire(
                     clients,
                     leaving,
@@ -3212,12 +3227,37 @@ fn a_held_event_log_stalls_no_serve_and_the_retry_presents_it() {
 
     let (read, first, retried) =
         served_retried_then_retired(repo.path(), state.clone(), &authors, move || held.release());
-    assert_eq!(first, [true, false], "claude's serve is left to the retry");
-    assert!(
-        read[0].contains("timer:"),
-        "the retry presents the event once released: {read:?}"
+    assert_eq!(
+        first[0],
+        Some(Held {
+            answered: false,
+            unavailable: true
+        }),
+        "claude's serve is left to the retry"
     );
-    assert!(retried.iter().all(|u| !u), "and settles it: {retried:?}");
+    assert!(
+        first[1].is_none_or(|h| h.answered),
+        "the agent owed nothing is answered by the first serve, held or not: {first:?}"
+    );
+    assert!(
+        read[1].contains(r#""t":"verdict""#),
+        "and receives its verdict: {read:?}"
+    );
+    let verdicts: Vec<&str> = read[0]
+        .lines()
+        .filter(|line| line.contains(r#""t":"verdict""#))
+        .collect();
+    assert!(
+        matches!(verdicts[..], [only] if only.contains("timer:")),
+        "claude's one verdict is the retry presenting the event once released: {read:?}"
+    );
+    assert!(
+        retried
+            .iter()
+            .flatten()
+            .all(|h| h.answered && !h.unavailable),
+        "and settles it: {retried:?}"
+    );
     let complete = in_turns(&mut Turns::new(repo.path().to_path_buf()), |custody| {
         custody.facts(
             repo.path(),
