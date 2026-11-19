@@ -302,11 +302,15 @@ if it has one, or starting a fresh one if it doesn't. `clank open` is
 what brings up the whole team.)
 
 **A pane is named by its agent, and that name is its identity.** Each
-agent pane is titled with its label alone; the TUI puts the agent's
-status glyph in front (`👀 codex`) and changes only the glyph as its
-state or role changes. Clank finds an agent's pane by that name, not by
-the command it runs, so a pane you start by hand, named for the agent,
-is that agent's pane. Rename one by hand and clank believes you.
+agent pane is titled with its label and its repo's tab name, `codex ·
+clankstack`, so a session holding several repos still tells their agents
+apart in zellij's pane lists; the TUI puts the agent's status glyph in
+front (`👀 codex · clankstack`) and changes only the glyph as its state
+or role changes. Clank finds an agent's pane by that name within the
+repo's tab, not by the command it runs, so a pane you start by hand,
+named for the agent, is that agent's pane: the label alone, or with the
+repo's name after ` · `, but not another repo's. Rename one by hand and
+clank believes you; the TUI then puts the glyph and the repo back.
 
 Everything clank types into an agent (`clank nudge`, an interrupting
 event, recovery's nudges and retries, user
@@ -358,12 +362,13 @@ executable and `launch.env` in the fork; a profile selecting a server
 another store. A forked OpenCode agent with no source session starts fresh
 and is asked to bind itself. Nothing to type.
 Only a session you started yourself needs `clank as <label>`. Inside the
-repo's workspace, `clank as` also renames its own pane to the label, so
-clank can find it. It refuses, before binding anything, when another
+repo's workspace, `clank as` also renames its own pane to the label and
+the repo, so clank can find it. It refuses, before binding anything, when another
 live pane there already has that name; when the workspace cannot be
 determined it binds and says the pane was not renamed; a rename zellij
-refuses leaves the binding and exits non-zero. A renamed pane is that
-agent's pane like any other.
+refuses still binds and exits non-zero. The pane is renamed before the
+session is bound, since the new binding is what has the TUI put the
+glyph back on it. A renamed pane is that agent's pane like any other.
 
 From then on the session's binding is its identity, for every hook and
 every clank command it runs. `CLANK_AGENT` only binds a session that

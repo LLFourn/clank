@@ -13,8 +13,8 @@
 //! uniqueness invariant without duplicating the stale-clear
 //! logic.
 //!
-//! Inside zellij the pane is then renamed to the label, which is its
-//! identity to clank. Whether that may happen is decided BEFORE the
+//! Inside zellij the pane is then renamed to the label and the repo,
+//! which is its identity to clank. Whether that may happen is decided BEFORE the
 //! bind, so a refusal changes nothing.
 
 use std::collections::BTreeSet;
@@ -24,7 +24,7 @@ use super::open_zellij::{self, CallerIdentity, Lookup, Workspace, ZellijPane};
 use super::zellij_endpoint::Endpoint;
 use super::{AsArgs, resolve_repo};
 use crate::agent_env::detect_session_from_env;
-use crate::agent_store::bind_session_to_agent;
+use crate::agent_store::{BindOutcome, bind_session_to_agent};
 use anyhow::Context;
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::Tool;
@@ -45,14 +45,21 @@ pub async fn run(args: AsArgs) -> anyhow::Result<()> {
     run_with(&repo, &label, tool, &session_id, &mut Live)
 }
 
-/// What `clank as` reads and does outside its binding, injected so each
-/// outcome is testable without zellij.
+/// What `clank as` reads and does, injected so each outcome and their
+/// order is testable without zellij.
 trait AsIo {
     fn caller(&mut self) -> CallerIdentity;
     /// This session's panes; `None` when zellij did not answer.
     fn listing(&mut self, session: &Endpoint) -> Option<Vec<ZellijPane>>;
     fn owned(&mut self, repo: &Path) -> anyhow::Result<Option<BTreeSet<String>>>;
     fn rename(&mut self, session: &Endpoint, pane: &str, name: &str) -> Result<(), String>;
+    fn bind(
+        &mut self,
+        repo: &Path,
+        label: &AgentLabel,
+        tool: Tool,
+        session_id: &SessionId,
+    ) -> anyhow::Result<BindOutcome>;
     fn own(&mut self, repo: &Path, label: &str) -> anyhow::Result<()>;
     fn say(&mut self, line: &str);
 }
@@ -72,6 +79,15 @@ impl AsIo for Live {
     fn rename(&mut self, session: &Endpoint, pane: &str, name: &str) -> Result<(), String> {
         open_zellij::rename_pane_checked(session, pane, name)
     }
+    fn bind(
+        &mut self,
+        repo: &Path,
+        label: &AgentLabel,
+        tool: Tool,
+        session_id: &SessionId,
+    ) -> anyhow::Result<BindOutcome> {
+        bind_session_to_agent(repo, label, tool, session_id)
+    }
     fn own(&mut self, repo: &Path, label: &str) -> anyhow::Result<()> {
         super::pane_owners::update(repo, &BTreeSet::from([label.to_string()]), &BTreeSet::new())
             .map(drop)
@@ -87,7 +103,8 @@ enum PaneStep {
     Untouched,
     /// Inside zellij, but the pane is not renamed, for this reason.
     NotRenamed(String),
-    Rename(Endpoint, String),
+    /// Rename the pane, in that session, to the title.
+    Rename(Endpoint, String, String),
 }
 
 /// Decide what may be done to the calling pane, refusing when another
@@ -149,7 +166,8 @@ fn pane_step(
             open_zellij::describe_ambiguities(&doubts)
         ),
     }
-    Ok(PaneStep::Rename(session, pane_id))
+    let title = ws.pane_title(label.as_str());
+    Ok(PaneStep::Rename(session, pane_id, title))
 }
 
 fn run_with(
@@ -161,12 +179,18 @@ fn run_with(
 ) -> anyhow::Result<()> {
     let roster = super::pane_owners::roster_labels(repo);
     let step = pane_step(repo, label, &roster, io)?;
+    // Renamed BEFORE binding: the binding write is the TUI's cue to read
+    // pane titles again, so it must follow the rename it is to correct.
+    let renamed = match &step {
+        PaneStep::Rename(session, pane, title) => Some(io.rename(session, pane, title)),
+        _ => None,
+    };
 
     // `clank as` binds a session — pure per-agent STATE. Under
     // the team model, binding a session for a label that isn't in
     // the repo's team just produces orphan state (ignored by
     // gates / lists). No sentinel gate anymore.
-    let outcome = bind_session_to_agent(repo, label, tool, session_id)?;
+    let outcome = io.bind(repo, label, tool, session_id)?;
 
     io.say(&format!(
         "bound {tool} session {sid} to agent `{label}`",
@@ -180,23 +204,18 @@ fn run_with(
             other.as_str()
         ));
     }
-    let pane = match step {
+    let title = match step {
         PaneStep::Untouched => return Ok(()),
         PaneStep::NotRenamed(why) => {
             io.say(&format!("this pane was not renamed: {why}"));
             return Ok(());
         }
-        PaneStep::Rename(session, pane) => (session, pane),
+        PaneStep::Rename(_, _, title) => title,
     };
-    let (session, pane) = pane;
-    if let Err(e) = io.rename(
-        &session,
-        &pane,
-        &open_zellij::agent_pane_title(label.as_str()),
-    ) {
-        anyhow::bail!("the session is bound, but this pane was not renamed to `{label}`: {e}");
+    if let Some(Err(e)) = renamed {
+        anyhow::bail!("the session is bound, but this pane was not renamed to `{title}`: {e}");
     }
-    io.say(&format!("renamed this pane to `{label}`"));
+    io.say(&format!("renamed this pane to `{title}`"));
     // Owning a label off the roster would have the TUI close this pane
     // as a departed agent's on its next pass.
     if roster.contains(label.as_str()) {
@@ -238,6 +257,8 @@ mod tests {
         listing: Option<String>,
         rename: Result<(), String>,
         renamed: Vec<(String, String)>,
+        /// Each rename and bind, in the order run.
+        effects: Vec<&'static str>,
         /// The ownership record as `owned` reads it.
         record: Option<BTreeSet<String>>,
         owned: Vec<String>,
@@ -256,6 +277,7 @@ mod tests {
                 listing,
                 rename: Ok(()),
                 renamed: Vec::new(),
+                effects: Vec::new(),
                 record: None,
                 owned: Vec::new(),
                 said: Vec::new(),
@@ -277,7 +299,18 @@ mod tests {
         }
         fn rename(&mut self, _: &Endpoint, pane: &str, name: &str) -> Result<(), String> {
             self.renamed.push((pane.into(), name.into()));
+            self.effects.push("rename");
             self.rename.clone()
+        }
+        fn bind(
+            &mut self,
+            repo: &Path,
+            label: &AgentLabel,
+            tool: Tool,
+            session_id: &SessionId,
+        ) -> anyhow::Result<BindOutcome> {
+            self.effects.push("bind");
+            bind_session_to_agent(repo, label, tool, session_id)
         }
         fn own(&mut self, _: &Path, label: &str) -> anyhow::Result<()> {
             self.owned.push(label.into());
@@ -334,6 +367,12 @@ mod tests {
         format!("[{}]", panes.join(","))
     }
 
+    /// `label`'s pane title in `repo`, spelled out rather than composed,
+    /// so a writer that drops the repo fails.
+    fn titled(label: &str, repo: &Path) -> String {
+        format!("{label} · {}", repo.file_name().unwrap().to_string_lossy())
+    }
+
     fn painter() -> AgentLabel {
         AgentLabel::parse("painter").unwrap()
     }
@@ -355,7 +394,9 @@ mod tests {
     }
 
     /// In the repo's tab, the calling pane is renamed to the label and the
-    /// label recorded as owned.
+    /// repo's directory, then the session bound, and the label recorded
+    /// as owned. The binding comes last because it is what makes the TUI
+    /// read the pane's new title.
     #[test]
     fn it_renames_its_pane_and_owns_the_label() {
         let repo = repo();
@@ -364,9 +405,10 @@ mod tests {
         assert_eq!(bound_to(repo.path(), "painter").as_deref(), Some(MINE));
         assert_eq!(
             io.renamed,
-            [("terminal_5".to_string(), "painter".to_string())]
+            [("terminal_5".to_string(), titled("painter", repo.path()))]
         );
         assert_eq!(io.owned, ["painter"]);
+        assert_eq!(io.effects, ["rename", "bind"]);
     }
 
     /// Another live pane already named `💤 painter` in the tab: refused
@@ -419,6 +461,7 @@ mod tests {
         );
         assert_eq!(bound_to(repo.path(), "painter").as_deref(), Some(MINE));
         assert!(io.owned.is_empty());
+        assert_eq!(io.effects, ["rename", "bind"], "bound after the refusal");
     }
 
     /// No TUI pane in the session (unresolved workspace), or the caller in
@@ -469,7 +512,7 @@ mod tests {
         run(repo.path(), &AgentLabel::parse("guest").unwrap(), &mut io).unwrap();
         assert_eq!(
             io.renamed,
-            [("terminal_5".to_string(), "guest".to_string())]
+            [("terminal_5".to_string(), titled("guest", repo.path()))]
         );
         assert!(io.owned.is_empty());
     }

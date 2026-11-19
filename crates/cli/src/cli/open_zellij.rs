@@ -701,7 +701,7 @@ fn compose_multitab(tabs: &[TabSpec], term: (u16, u16)) -> anyhow::Result<String
             &tab.master,
             ReviewerStack::Roster(&tab.reviewers),
             orientation,
-        )
+        )?
         .lines()
         {
             if line.is_empty() {
@@ -1012,9 +1012,16 @@ fn parent_name(repo: &Path) -> Option<String> {
         .map(|n| n.to_string_lossy().into_owned())
 }
 
+/// The name `clank open` gives `repo`'s tab before telling same-named
+/// tabs apart: the repo's directory, or the worktree's. Agent pane
+/// titles name the repo by it.
+pub(crate) fn tab_base_name(repo: &Path) -> anyhow::Result<String> {
+    repo_basename(repo)
+}
+
 /// A tab name for `repo` that no tab in `tabs` has, glyphs aside.
 fn unused_tab_name(repo: &Path, tabs: &[String]) -> anyhow::Result<String> {
-    let basename = repo_basename(repo)?;
+    let basename = tab_base_name(repo)?;
     let parent = parent_name(repo).unwrap_or_default();
     Ok(first_untaken(
         |n| match n {
@@ -1147,7 +1154,7 @@ pub(crate) fn compose_live_layout(
     reviewers: &[String],
     orientation: Orientation,
 ) -> anyhow::Result<String> {
-    let basename = repo_basename(repo)?;
+    let basename = tab_base_name(repo)?;
     let template = user_layout_template(home)?;
     compose_kdl(
         &basename,
@@ -1300,7 +1307,7 @@ fn compose_kdl(
         master,
         ReviewerStack::Roster(reviewers),
         orientation,
-    );
+    )?;
     let composed = match user_template {
         // User templates: unchanged marker contract — the detected
         // orientation's group, NO swap blocks (swap_tiled_layout is
@@ -1549,7 +1556,8 @@ fn agent_group_kdl(
     master: &str,
     stack: ReviewerStack<'_>,
     orientation: Orientation,
-) -> String {
+) -> anyhow::Result<String> {
+    let repo_name = tab_base_name(Path::new(repo_path))?;
     let mut out = String::new();
     let (outer, inner) = match orientation {
         Orientation::Landscape => ("vertical", "horizontal"),
@@ -1557,7 +1565,14 @@ fn agent_group_kdl(
     };
     out.push_str(&format!("pane split_direction=\"{outer}\" {{\n"));
     // The stage.
-    push_agent_pane(&mut out, "    ", " size=\"65%\"", master, repo_path);
+    push_agent_pane(
+        &mut out,
+        "    ",
+        " size=\"65%\"",
+        master,
+        repo_path,
+        &repo_name,
+    );
     // The side region: reviewer stack + instrument pane.
     out.push_str(&format!(
         "    pane size=\"35%\" split_direction=\"{inner}\" {{\n"
@@ -1567,7 +1582,14 @@ fn agent_group_kdl(
         ReviewerStack::Roster(reviewers) => {
             out.push_str("        pane stacked=true {\n");
             for reviewer in reviewers {
-                push_agent_pane(&mut out, "            ", "", reviewer.as_str(), repo_path);
+                push_agent_pane(
+                    &mut out,
+                    "            ",
+                    "",
+                    reviewer.as_str(),
+                    repo_path,
+                    &repo_name,
+                );
             }
             out.push_str("        }\n");
         }
@@ -1602,7 +1624,7 @@ fn agent_group_kdl(
     out.push_str("        }\n");
     out.push_str("    }\n");
     out.push_str("}\n");
-    out
+    Ok(out)
 }
 
 /// Insert `swap_tiled_layout` blocks (one per orientation) into
@@ -1621,7 +1643,7 @@ fn add_swap_variants(base: &str, repo_path: &str, master: &str) -> anyhow::Resul
     for o in [Orientation::Landscape, Orientation::Portrait] {
         swaps.push_str(&format!("swap_tiled_layout name=\"{}\" {{\n", o.name()));
         swaps.push_str("    tab {\n");
-        for line in agent_group_kdl(repo_path, master, ReviewerStack::AnyPresent, o).lines() {
+        for line in agent_group_kdl(repo_path, master, ReviewerStack::AnyPresent, o)?.lines() {
             swaps.push_str("        ");
             swaps.push_str(line);
             swaps.push('\n');
@@ -1697,14 +1719,18 @@ pub(crate) fn validate_template(template: &str) -> anyhow::Result<()> {
     substitute_marker(template, "pane\n").map(|_| ())
 }
 
-/// The pane name for an agent: its label, and nothing else. The name is
-/// the pane's identity ([`resolve_title`]), so a role in it would go
-/// stale the moment the role changed. The single source of the format
-/// for every writer: the layout, `new-pane`, `clank as` and the TUI's
-/// glyph retitle.
-pub(crate) fn agent_pane_title(label: &str) -> String {
-    label.to_string()
+/// The pane name for an agent: `<label> · <repo>`, `repo` being its
+/// workspace's [`tab_base_name`]. The name is the pane's identity
+/// ([`resolve_title`]), so a role in it would go stale the moment the
+/// role changed; the repo is there because zellij's pane lists drop the
+/// tab, and one session holds many repos' tabs. The single source of
+/// the format for every writer: the layout, `new-pane`, `clank as` and
+/// the TUI's glyph retitle.
+pub(crate) fn agent_pane_title(label: &str, repo: &str) -> String {
+    format!("{label}{REPO_SEPARATOR}{repo}")
 }
+
+const REPO_SEPARATOR: &str = " · ";
 
 /// The glyphs the TUI writes before an agent's pane name. Closed, so a
 /// title is read as `<glyph> <label>` only for these.
@@ -1726,9 +1752,11 @@ pub(crate) enum PaneIdentity {
     Unknown,
 }
 
-/// Every label `title` can be read as: the title itself, `<glyph>
-/// <label>`, and the old `<label> (<role>)` with or without a glyph.
-fn title_readings(title: &str) -> Vec<&str> {
+/// Every label `title` can be read as in the workspace of `repo`: the
+/// title itself, `<glyph> <label>`, either with a ` · <repo>` suffix
+/// naming `repo` and no other, and the old `<label> (<role>)` with or
+/// without a glyph. The most stripped reading is last.
+fn title_readings<'a>(title: &'a str, repo: &str) -> Vec<&'a str> {
     let mut bare = vec![title];
     bare.extend(
         AGENT_PANE_GLYPHS
@@ -1738,6 +1766,10 @@ fn title_readings(title: &str) -> Vec<&str> {
     let mut out = bare.clone();
     for t in bare {
         out.extend(
+            t.strip_suffix(repo)
+                .and_then(|t| t.strip_suffix(REPO_SEPARATOR)),
+        );
+        out.extend(
             OLD_TITLE_ROLES
                 .iter()
                 .filter_map(|role| t.strip_suffix(')')?.strip_suffix(role)?.strip_suffix(" (")),
@@ -1746,14 +1778,16 @@ fn title_readings(title: &str) -> Vec<&str> {
     out
 }
 
-/// The one reading of a pane title as an agent: every reading that is a
-/// candidate is collected before choosing, so a literal label is never
-/// preferred over another label's decorated title.
+/// The one reading of a pane title as an agent of `repo`'s workspace:
+/// every reading that is a candidate is collected before choosing, so a
+/// literal label is never preferred over another label's decorated
+/// title.
 pub(crate) fn resolve_title(
     title: &str,
+    repo: &str,
     candidates: &std::collections::BTreeSet<String>,
 ) -> PaneIdentity {
-    let mut found: std::collections::BTreeSet<String> = title_readings(title)
+    let mut found: std::collections::BTreeSet<String> = title_readings(title, repo)
         .into_iter()
         .filter(|r| candidates.contains(*r))
         .map(str::to_string)
@@ -1768,10 +1802,13 @@ pub(crate) fn resolve_title(
 /// A repo's workspace: one tab of one session, established by the repo's
 /// TUI pane (or, for the TUI itself, its own pane), never by the agent
 /// names it scopes. `candidates` are the labels a pane in it may be
-/// identified as.
+/// identified as. `repo` is the [`tab_base_name`] its pane titles carry:
+/// it is read off a title, never used to find the workspace, since two
+/// repos may share it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Workspace {
     tab: u32,
+    repo: String,
     candidates: std::collections::BTreeSet<String>,
 }
 
@@ -1785,6 +1822,7 @@ impl Workspace {
     ) -> Option<Self> {
         Some(Self {
             tab: repo_tab_id(panes, repo)?,
+            repo: tab_base_name(repo).ok()?,
             candidates,
         })
     }
@@ -1799,13 +1837,21 @@ impl Workspace {
         candidates: std::collections::BTreeSet<String>,
     ) -> Option<Self> {
         match caller.and_then(|c| owned_tab(panes, c)) {
-            Some(tab) => Some(Self { tab, candidates }),
+            Some(tab) => Some(Self {
+                tab,
+                repo: tab_base_name(repo).ok()?,
+                candidates,
+            }),
             None => Self::anchored(panes, repo, candidates),
         }
     }
 
     pub(crate) fn tab(&self) -> u32 {
         self.tab
+    }
+
+    pub(crate) fn pane_title(&self, label: &str) -> String {
+        agent_pane_title(label, &self.repo)
     }
 
     /// What `pane` is in this workspace: `Unknown` outside its tab and for
@@ -1823,7 +1869,7 @@ impl Workspace {
         if pane.is_plugin || pane.tab_id != Some(self.tab) {
             return PaneIdentity::Unknown;
         }
-        resolve_title(&pane.title, &self.candidates)
+        resolve_title(&pane.title, &self.repo, &self.candidates)
     }
 
     /// The agent `pane` is, if exactly one. `None` is NOT absence: an
@@ -1993,9 +2039,17 @@ pub(crate) fn scan_workspace(
         .collect();
     match anchors.as_slice() {
         [] => Err(Unresolved::NoAnchor),
-        [one] => match one.pane.tab_id {
-            Some(tab) => Ok((one.session.clone(), Workspace { tab, candidates })),
-            None => Err(Unresolved::NoAnchor),
+        // A repo with no name has no tab: `clank open` refuses to name one.
+        [one] => match (one.pane.tab_id, tab_base_name(repo)) {
+            (Some(tab), Ok(repo)) => Ok((
+                one.session.clone(),
+                Workspace {
+                    tab,
+                    repo,
+                    candidates,
+                },
+            )),
+            _ => Err(Unresolved::NoAnchor),
         },
         many => Err(Unresolved::ManyAnchors(
             many.iter()
@@ -2016,8 +2070,9 @@ fn push_agent_pane(
     extra_attrs: &str,
     label: &str,
     repo_path: &str,
+    repo_name: &str,
 ) {
-    let name_esc = kdl_escape(&agent_pane_title(label));
+    let name_esc = kdl_escape(&agent_pane_title(label, repo_name));
     let repo_esc = kdl_escape(repo_path);
     out.push_str(&format!(
         "{indent}pane{extra_attrs} name=\"{name_esc}\" cwd=\"{repo_esc}\" {{\n"
@@ -2350,12 +2405,30 @@ pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], ws: &Workspace) -> Vec<(Str
         .collect()
 }
 
-/// `(pane id, label)` for every pane in the listing that is one of the
-/// workspace's agents. The retitler's map.
-pub(crate) fn agent_panes_by_title(panes: &[ZellijPane], ws: &Workspace) -> Vec<(String, String)> {
+/// One of a workspace's agent panes, as the retitler reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TitledPane {
+    pub(crate) pane: String,
+    pub(crate) label: String,
+    /// The title the pane carries.
+    pub(crate) shown: String,
+    /// The title it should carry, before the TUI's glyph.
+    pub(crate) name: String,
+}
+
+/// Every pane in the listing that is one of the workspace's agents. The
+/// retitler's map.
+pub(crate) fn agent_panes_by_title(panes: &[ZellijPane], ws: &Workspace) -> Vec<TitledPane> {
     panes
         .iter()
-        .filter_map(|p| ws.agent_of(p).map(|l| (p.pane_id(), l)))
+        .filter_map(|p| {
+            ws.agent_of(p).map(|label| TitledPane {
+                pane: p.pane_id(),
+                name: ws.pane_title(&label),
+                shown: p.title.clone(),
+                label,
+            })
+        })
         .collect()
 }
 
@@ -2380,7 +2453,7 @@ pub(crate) fn unclaimed_labels(
         .filter(|p| !is_anchor(p, repo) && Some(p.pane_id().as_str()) != caller)
         .filter(|p| ws.identify(p) == PaneIdentity::Unknown)
         .filter_map(|p| {
-            title_readings(&p.title)
+            title_readings(&p.title, &ws.repo)
                 .into_iter()
                 .rev()
                 .find(|r| clank_core::ids::AgentLabel::parse(r).is_ok())
@@ -2448,7 +2521,7 @@ pub(crate) fn open_agent_pane(
     let in_tab = open_beside(panes, ws, label)?;
     let repo_str = repo.to_string_lossy();
     zellij_action(ep, &["focus-pane-id", &in_tab]);
-    let new_pane = new_pane_argv(label, &repo_str);
+    let new_pane = new_pane_argv(ws, label, &repo_str);
     let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
     let out = zellij_action(ep, &refs)?;
     let created = String::from_utf8_lossy(&out).trim().to_string();
@@ -2860,11 +2933,11 @@ fn scan_sessions(
 /// The `new-pane` argv, split out so it is assertable without
 /// spawning a zellij. Never `--stacked`: where the pane belongs is the
 /// layout's decision, applied right after.
-fn new_pane_argv(label: &str, repo: &str) -> Vec<String> {
+fn new_pane_argv(ws: &Workspace, label: &str, repo: &str) -> Vec<String> {
     let mut argv = vec!["new-pane".to_string()];
     argv.extend([
         "--name".to_string(),
-        agent_pane_title(label),
+        ws.pane_title(label),
         "--cwd".to_string(),
         repo.to_string(),
         "--".to_string(),
@@ -2926,10 +2999,6 @@ pub(crate) fn owned_tab(panes: &[ZellijPane], caller: &str) -> Option<u32> {
         return None;
     }
     one.tab_id
-}
-
-pub(crate) fn rename_pane(ep: &Endpoint, id: &str, name: &str) {
-    let _ = rename_pane_checked(ep, id, name);
 }
 
 /// Rename the pane `id` in `ep`, or say what zellij answered.
@@ -3343,14 +3412,20 @@ mod tests {
             .to_string()
     }
 
-    /// The workspace of `panes`' first pane's tab, with each pane's title,
-    /// stripped of glyph and role, as a candidate.
+    /// The workspace of `panes`' first pane's tab, for the repo `repo`,
+    /// with each pane's title, stripped of glyph, repo and role, as a
+    /// candidate.
     fn every(panes: &[ZellijPane]) -> Workspace {
         Workspace {
             tab: panes[0].tab_id.expect("fixture pane has a tab"),
+            repo: "repo".into(),
             candidates: panes
                 .iter()
-                .filter_map(|p| title_readings(&p.title).last().map(|r| r.to_string()))
+                .filter_map(|p| {
+                    title_readings(&p.title, "repo")
+                        .last()
+                        .map(|r| r.to_string())
+                })
                 .filter(|t| !t.is_empty())
                 .collect(),
         }
@@ -3966,7 +4041,8 @@ mod tests {
                 "alice",
                 ReviewerStack::Roster(&["bob".to_string()]),
                 o,
-            );
+            )
+            .unwrap();
             let status_line = kdl
                 .lines()
                 .find(|l| l.contains("name=\"\""))
@@ -4120,9 +4196,12 @@ ttys004   zellij attach clank-foo
             LAND,
         )
         .unwrap();
-        assert!(kdl.contains("name=\"alice\""));
-        assert!(kdl.contains("name=\"bob\""));
-        assert!(kdl.contains("name=\"carol\""));
+        for label in ["alice", "bob", "carol"] {
+            assert!(
+                kdl.contains(&format!("name=\"{label} · test-repo\"")),
+                "{label}'s pane names the repo; got:\n{kdl}"
+            );
+        }
         assert!(kdl.contains("command \"clank\""));
         // Each pane's args MUST pin --repo per codex 361b104.
         assert!(
@@ -4608,40 +4687,81 @@ ttys004   zellij attach clank-foo
         labels.iter().map(|l| l.to_string()).collect()
     }
 
-    /// The exact label, `<glyph> <label>`, and the old `<label> (<role>)`
-    /// with and without a glyph all name the agent, for every real glyph
-    /// and labels with spaces or emoji in them.
+    /// The exact label, `<glyph> <label>`, `<label> · <repo>` with and
+    /// without a glyph, and the old `<label> (<role>)` with and without a
+    /// glyph all name the agent, for every real glyph and labels with
+    /// spaces or emoji in them.
     #[test]
     fn every_title_form_names_its_agent() {
         for label in ["codex", "two words", "🔥bot"] {
             let roster = set(&[label, "claude"]);
-            let mut titles = vec![label.to_string(), format!("{label} (reviewer)")];
+            let mut titles = vec![
+                label.to_string(),
+                format!("{label} · clank"),
+                format!("{label} (reviewer)"),
+            ];
             for glyph in AGENT_PANE_GLYPHS {
                 titles.push(format!("{glyph} {label}"));
+                titles.push(format!("{glyph} {label} · clank"));
                 titles.push(format!("{glyph} {label} (master)"));
             }
             for title in titles {
                 assert_eq!(
-                    resolve_title(&title, &roster),
+                    resolve_title(&title, "clank", &roster),
                     PaneIdentity::Agent(label.to_string()),
                     "{title:?}"
                 );
             }
         }
         assert_eq!(
-            resolve_title("zsh", &set(&["codex"])),
+            resolve_title("zsh", "clank", &set(&["codex"])),
             PaneIdentity::Unknown
         );
         assert_eq!(
-            resolve_title("🚀 codex", &set(&["codex"])),
+            resolve_title("🚀 codex", "clank", &set(&["codex"])),
             PaneIdentity::Unknown,
             "only the TUI's own glyphs are stripped"
         );
         assert_eq!(
-            resolve_title("codex (painter)", &set(&["codex"])),
+            resolve_title("codex (painter)", "clank", &set(&["codex"])),
             PaneIdentity::Unknown,
             "only role words are stripped"
         );
+    }
+
+    /// The titles every writer composes are the ones read back.
+    #[test]
+    fn a_written_title_resolves_in_its_own_workspace() {
+        let roster = set(&["codex", "claude"]);
+        let written = agent_pane_title("codex", "clank");
+        assert_eq!(written, "codex · clank");
+        for title in [written.clone(), format!("💤 {written}")] {
+            assert_eq!(
+                resolve_title(&title, "clank", &roster),
+                PaneIdentity::Agent("codex".into()),
+                "{title:?}"
+            );
+        }
+    }
+
+    /// A title naming another repo is not this workspace's agent, glyph
+    /// or not, nor is a suffix that merely ends with the repo's name.
+    #[test]
+    fn a_suffix_naming_another_repo_does_not_resolve() {
+        let roster = set(&["codex"]);
+        for title in [
+            "codex · clankstack",
+            "💤 codex · clankstack",
+            "codex · myclank",
+            "codex·clank",
+            "codex · clank (reviewer)",
+        ] {
+            assert_eq!(
+                resolve_title(title, "clank", &roster),
+                PaneIdentity::Unknown,
+                "{title:?}"
+            );
+        }
     }
 
     /// A title that reads as two distinct roster labels is refused, never
@@ -4651,24 +4771,31 @@ ttys004   zellij attach clank-foo
     fn a_title_reading_as_two_candidates_is_ambiguous() {
         let glyphed = format!("{} bob", AGENT_PANE_GLYPHS[1]);
         let old_glyphed = format!("{} x (plan)", AGENT_PANE_GLYPHS[0]);
+        let suffixed_glyphed = format!("{glyphed} · clank");
         for (title, roster) in [
             (glyphed.as_str(), set(&["bob", &glyphed])),
             ("x (plan)", set(&["x (plan)", "x"])),
             (old_glyphed.as_str(), set(&["x (plan)", "x"])),
+            ("bob · clank", set(&["bob · clank", "bob"])),
+            (suffixed_glyphed.as_str(), set(&[&glyphed, "bob"])),
         ] {
             assert!(
-                matches!(resolve_title(title, &roster), PaneIdentity::Ambiguous(ref c) if c.len() == 2),
+                matches!(resolve_title(title, "clank", &roster), PaneIdentity::Ambiguous(ref c) if c.len() == 2),
                 "{title:?} with {roster:?}"
             );
         }
         assert_eq!(
-            resolve_title("x (plan)", &set(&["x (plan)"])),
+            resolve_title("x (plan)", "clank", &set(&["x (plan)"])),
             PaneIdentity::Agent("x (plan)".into()),
             "a literal label that is the only candidate is itself"
         );
         assert_eq!(
-            resolve_title(&glyphed, &set(&[&glyphed])),
+            resolve_title(&glyphed, "clank", &set(&[&glyphed])),
             PaneIdentity::Agent(glyphed.clone())
+        );
+        assert_eq!(
+            resolve_title("bob · clank", "clank", &set(&["bob · clank"])),
+            PaneIdentity::Agent("bob · clank".into()),
         );
     }
 
@@ -4686,6 +4813,7 @@ ttys004   zellij attach clank-foo
         .unwrap();
         let ws = Workspace {
             tab: 0,
+            repo: "repo".into(),
             candidates: set(&["claude", "painter", "💤 painter"]),
         };
         for label in ["painter", "💤 painter"] {
@@ -4713,16 +4841,31 @@ ttys004   zellij attach clank-foo
               {"id":1,"is_plugin":true,"title":"codex","tab_id":0},
               {"id":2,"title":"codex","tab_id":1},
               {"id":3,"title":"editor","terminal_command":"clank agent start codex --repo /a","tab_id":0},
-              {"id":4,"title":"👀 codex","terminal_command":"bash","tab_id":0}
+              {"id":4,"title":"👀 codex","terminal_command":"bash","tab_id":0},
+              {"id":5,"title":"👀 codex · repo","tab_id":1},
+              {"id":6,"title":"👀 codex · repo","tab_id":0}
             ]"#,
         )
         .unwrap();
         let ws = Workspace {
             tab: 0,
+            repo: "repo".into(),
             candidates: set(&["codex"]),
         };
         let named: Vec<Option<String>> = panes.iter().map(|p| ws.agent_of(p)).collect();
-        assert_eq!(named, [None, None, None, Some("codex".to_string())]);
+        assert_eq!(
+            named,
+            [
+                None,
+                None,
+                None,
+                Some("codex".into()),
+                None,
+                Some("codex".into())
+            ],
+            "a pane naming this repo in another tab, another repo of the same name's, is not \
+             this workspace's"
+        );
     }
 
     /// One session holding two repos' tabs, each with `claude` and
@@ -4750,7 +4893,7 @@ ttys004   zellij attach clank-foo
                 Workspace::anchored(&panes, Path::new(repo), set(&["claude", "codex"])).unwrap();
             let mine: Vec<String> = agent_panes_by_title(&panes, &ws)
                 .into_iter()
-                .map(|(id, _)| id)
+                .map(|row| row.pane)
                 .collect();
             assert_eq!(mine, ids, "{repo}");
             assert_eq!(
@@ -4783,6 +4926,42 @@ ttys004   zellij attach clank-foo
             Workspace::local(&none, repo, Some("terminal_2"), set(&[]))
                 .is_some_and(|w| w.tab() == 4)
         );
+    }
+
+    /// However a workspace is found, its pane titles name its repo's tab
+    /// name, so what its writers compose is what it reads back.
+    #[test]
+    fn every_way_to_a_workspace_names_its_repo() {
+        let listing = || -> Vec<ZellijPane> {
+            serde_json::from_str(
+                r#"[
+                  {"id":1,"terminal_command":"clank tui --repo /src/a","tab_id":3},
+                  {"id":2,"title":"zsh","tab_id":4}
+                ]"#,
+            )
+            .unwrap()
+        };
+        let panes = listing();
+        let repo = Path::new("/src/a");
+        let scan = SessionScan {
+            panes: listing()
+                .into_iter()
+                .map(|pane| SessionPane {
+                    session: "s".into(),
+                    pane,
+                })
+                .collect(),
+            unanswered: Vec::new(),
+            listing_failed: false,
+        };
+        let found = [
+            Workspace::anchored(&panes, repo, set(&[])).unwrap(),
+            Workspace::local(&panes, repo, Some("terminal_2"), set(&[])).unwrap(),
+            scan_workspace(&scan, repo, set(&[])).unwrap().1,
+        ];
+        for ws in found {
+            assert_eq!(ws.pane_title("codex"), "codex · a", "{ws:?}");
+        }
     }
 
     /// Across sessions a workspace is resolved only from a complete scan
@@ -4937,7 +5116,17 @@ ttys004   zellij attach clank-foo
     /// holder). A pane that launched the tool directly would skip it.
     #[test]
     fn every_new_pane_launches_through_agent_start() {
-        let argv = new_pane_argv("ruthless", "/repo");
+        let ws = Workspace {
+            tab: 0,
+            repo: "repo".into(),
+            candidates: set(&["ruthless"]),
+        };
+        let argv = new_pane_argv(&ws, "ruthless", "/repo");
+        assert_eq!(
+            argv[..3],
+            ["new-pane", "--name", "ruthless · repo"],
+            "{argv:?}"
+        );
         let sep = argv
             .iter()
             .position(|a| a == "--")
@@ -5037,11 +5226,11 @@ ttys004   zellij attach clank-foo
         )
         .unwrap();
         assert!(
-            kdl.contains(&format!("name=\"alice\" cwd=\"{TEST_REPO}\"")),
+            kdl.contains(&format!("name=\"alice · test-repo\" cwd=\"{TEST_REPO}\"")),
             "master pane should set cwd; got:\n{kdl}"
         );
         assert!(
-            kdl.contains(&format!("name=\"bob\" cwd=\"{TEST_REPO}\"")),
+            kdl.contains(&format!("name=\"bob · test-repo\" cwd=\"{TEST_REPO}\"")),
             "reviewer pane should set cwd; got:\n{kdl}"
         );
     }
@@ -5057,9 +5246,9 @@ ttys004   zellij attach clank-foo
             LAND,
         )
         .unwrap();
-        let bob_idx = kdl.find("name=\"bob\"").unwrap();
-        let alice_idx = kdl.find("name=\"alice\"").unwrap();
-        let codex_idx = kdl.find("name=\"codex\"").unwrap();
+        let bob_idx = kdl.find("name=\"bob · test-repo\"").unwrap();
+        let alice_idx = kdl.find("name=\"alice · test-repo\"").unwrap();
+        let codex_idx = kdl.find("name=\"codex · test-repo\"").unwrap();
         assert!(bob_idx < alice_idx, "bob must come before alice");
         assert!(alice_idx < codex_idx, "alice must come before codex");
     }
@@ -5214,8 +5403,8 @@ ttys004   zellij attach clank-foo
         assert!(!kdl.contains("zellij:tab-bar"));
         // Marker replaced with the agent group.
         assert!(!kdl.contains(AGENTS_MARKER));
-        assert!(kdl.contains("name=\"alice\""));
-        assert!(kdl.contains("name=\"bob\""));
+        assert!(kdl.contains("name=\"alice · test-repo\""));
+        assert!(kdl.contains("name=\"bob · test-repo\""));
         let _: kdl::KdlDocument = kdl.parse().expect("substituted output is valid KDL");
     }
 
@@ -5231,7 +5420,7 @@ ttys004   zellij attach clank-foo
 "##;
         let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LAND).unwrap();
         assert!(!kdl.contains(AGENTS_MARKER));
-        assert!(kdl.contains("name=\"m\""));
+        assert!(kdl.contains("name=\"m · test-repo\""));
     }
 
     /// (how many root `keybinds` nodes, the first one's first global
@@ -5322,7 +5511,7 @@ layout {
             "{kdl}"
         );
         assert!(kdl.contains("unbind \"Ctrl w\"\n"), "{kdl}");
-        assert!(kdl.contains("name=\"m\""));
+        assert!(kdl.contains("name=\"m · test-repo\""));
     }
 
     /// A template whose `keybinds` has modes but no global `unbind`
@@ -5446,7 +5635,7 @@ keybinds {
         // replaced.
         assert!(kdl.contains("// put clank_agents here someday"));
         assert!(kdl.contains("tab name=\"clank_agents\""));
-        assert!(kdl.contains("name=\"m\""));
+        assert!(kdl.contains("name=\"m · test-repo\""));
     }
 
     #[test]
@@ -5481,7 +5670,7 @@ keybinds {
         .unwrap();
         // Stage: master gets the big pane.
         assert!(
-            kdl.contains("pane size=\"65%\" name=\"alice\""),
+            kdl.contains("pane size=\"65%\" name=\"alice · test-repo\""),
             "master is the 65% stage:\n{kdl}"
         );
         // Reviewers stack (one visible, rest collapsed bars).
@@ -6085,6 +6274,7 @@ keybinds {
         );
         let ws = Workspace {
             tab: 6,
+            repo: "a".into(),
             candidates: set(&["claude", "codex", "other"]),
         };
         assert_eq!(
