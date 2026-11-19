@@ -1,8 +1,8 @@
 # Release checklist
 
-Current preparation: **v0.2.0**, 2026-11-12. This is the first published release;
-0.1.0 was a development version, not a published tag. Earlier planning details
-and implementation evidence remain in `.clank/finished/`.
+Current preparation: **v0.3.0**, 2026-11-19. v0.2.0 (2026-11-12) was the first
+published release; 0.1.0 was a development version, not a published tag. Earlier
+planning details and implementation evidence remain in `.clank/finished/`.
 
 ## Release policy
 
@@ -26,13 +26,16 @@ and implementation evidence remain in `.clank/finished/`.
   fixture-based tests, maintenance tests, workflow linting and licence checks.
   Each test run isolates its runtime and clears inherited session identities.
   A separate job checks the release validator from a production-only Cargo cache.
-- [x] **Versions and changelog.** Workspace and internal dependencies use 0.2.0.
+- [x] **Versions and changelog.** Workspace and internal dependencies use 0.3.0.
   `scripts/release-check.sh` requires matching tag, Cargo version, binary version
   and changelog section. The release notes come from `CHANGELOG.md`.
 - [x] **Durable configuration and upgrades.** Versioned config boundaries reject
   malformed or unsupported documents instead of silently applying defaults.
-  Monitors and other long-lived processes retire on build replacement. Repository
-  blocks migrate legacy state with occurrence and delivery evidence preserved.
+  Monitors and other long-lived processes retire on build replacement. Durable
+  state changes are breaking, not migrated: v0.3.0 reads neither per-agent
+  blocks nor the old file inbox, and moves agent state into one `state.json`
+  that leaves every agent unbound until restarted. `CHANGELOG.md` says what
+  to do on upgrade.
 - [x] **Post-rewrite hooks.** Init and doctor share Git's effective hook location;
   plain hooks can be chained, managed/symlinked hooks are left alone.
 - [x] **Security work.** `SECURITY.md` documents the threat model and residual
@@ -68,16 +71,19 @@ Ignored live tunnel and installed-harness tests are reported as not run, never
 counted as passes. These limitations remain documented in the release notes and
 support record; they do not become successful checks merely because a tag exists.
 
-## v0.2.0 publication run
+## v0.3.0 publication run
 
 These operations follow review/finalization of the preparation commit. Record
 actual results in the release handoff, rather than checking them off in advance.
 
-- [ ] Push the reviewed commit to `origin/master` without rewriting history.
-- [ ] Require successful CI for that exact commit before pushing `v0.2.0`.
+- [ ] Push the reviewed commit to a release branch and open a pull request to
+  master. Once its CI passes, land it with `gh pr merge --rebase`, never a merge
+  commit, and move local master onto `origin/master`.
+- [ ] Require successful CI for that exact `origin/master` commit before pushing
+  `v0.3.0`.
 - [ ] Confirm the Release workflow built all four archives and published the
   release with the expected changelog notes and `SHA256SUMS`.
-- [ ] Verify asset checksums and exercise the v0.2.0 installer with a temporary
+- [ ] Verify asset checksums and exercise the v0.3.0 installer with a temporary
   destination, leaving the developer's installed binaries untouched.
 - [ ] Report the GitHub release URL and the observed build/install results.
 

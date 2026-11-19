@@ -7,6 +7,14 @@ All notable changes to clank are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0]
+
+Released 2026-11-19.
+
+This release changes what clank stores about each agent and how its monitor
+talks to clients, with no migration from v0.2.0: read Breaking and Upgrading
+before installing it over a running team.
+
 ### Breaking
 
 - An agent's runtime state is one file, `.clank/agents/<label>/state.json`:
@@ -20,8 +28,8 @@ All notable changes to clank are recorded here. The format follows
   longer read or written and can be deleted, with the long-dead
   `repeat.json`, `repeat.lock` and `attending.holder`, as can a `session`,
   `resume_pending` or `outage_notified` left in an agent's `config.json`.
-- The monitor protocol is 25. v0.2.0 and the development builds before it
-  speak 23 or 24, so they and this release do not serve each other: a newer
+- The monitor protocol is 25. v0.2.0 speaks 23 and the development builds
+  since it speak 24, so they and this release do not serve each other: a newer
   client replaces an older monitor, and an older client is declined. Restart
   agents still running an older binary after upgrading. Protocol 25 names the
   producer of a source restart, and of each source in the published sources
@@ -46,6 +54,124 @@ All notable changes to clank are recorded here. The format follows
   pending or answered and undelivered, is refused. Answers already recorded
   are delivered once more after upgrading, and `.received` files are no
   longer read and can be deleted.
+- Only the master raises a block. `clank block ask` from a reviewer or any
+  other agent, `--permission` included, is refused before anything is
+  written: a reviewer is told to write REQUEST_CHANGES so the master can
+  raise it, anyone else to `clank send --master`. A person at a shell with
+  no agent identity can still ask. An identity that fails to resolve (a bad
+  session variable, an unbound session) is refused rather than taken for a
+  person. Reviewer and standby wakes no longer suggest `clank block ask`.
+
+### Added
+
+- `clank remote link` prints a fresh one-time login link for the repo's
+  remote, the one the TUI's remote page shows, alone on stdout. Whoever
+  reads that output can log in, an agent included. It does not switch the
+  remote on; when the remote is off it says to run `clank remote on` first.
+- Codex and OpenCode agents are told when a `clank run` they started ends:
+  a parked agent is woken at once, and one that is busy hears at its next
+  Stop. Clank does not know the run's exit status, so the notice asks the
+  agent to collect the result where it started the run. Claude Code and
+  Grok report the end themselves and get nothing extra. A bare
+  `clank attend` still stands until cleared and checks in at `--expect`.
+- `clank doctor` has a "harness fixtures" section. It warns when an
+  installed harness's version differs from the one clank's recorded hook
+  payloads came from. No recording yet names its version, so an installed
+  Claude Code or Codex currently reports this warning; it is advisory.
+- The TUI can be told to try again where a failure is waiting on you: `m`
+  in the log attempts a monitor when none could be attached, `s` retries a
+  failed status rebuild and `w` watches the installation again. A stalled
+  pane in the remote browser view has a retry button.
+
+### Changed
+
+- Agent pane titles name their repo: `<glyph> <label> · <repo>`, for example
+  `💤 codex · clankstack`, so zellij's pane list tells apart same-named
+  agents of different repos in one session. `<repo>` is the base name of the
+  repo's tab. Panes opened by older builds are still found and are retitled
+  once a TUI of this build is running. The TUI also retitles panes it
+  previously missed.
+- No more polling except GitHub's. Retries that ran on a timer with no end
+  now wait for an event that can end the failure, and give up and report it
+  by a fixed deadline when none comes:
+  - a `clank wait`, hook or TUI with no monitor waits for the repository's
+    lease to be released, a monitor to start, an installation or a config
+    file change, instead of retrying every few seconds. A wait whose
+    session was already told of the outage stays parked quietly until one
+    of those happens;
+  - recovery no longer re-looks at a stalled agent every minute; it acts
+    when something it waits on moves, and a recovery that cannot proceed is
+    shown in `clank status` after its deadline;
+  - timers that cannot be written, failed status rebuilds, failed
+    self-replacement after an install, failing command sources, the remote
+    bridge's reconnect and the remote host's session checks wait on their
+    cause, not a backoff.
+- The monitor never waits on a lock another clank process holds (an agent's
+  state, blocks, event logs, the ingest lease). A held lock delays only the
+  work that needs it, and serving every other agent goes on.
+- Claude Code shows an `AskUserQuestion` prompt at once: the question hook
+  no longer waits for a monitor to start before answering, and it no longer
+  prints a routing error for permission requests.
+- The agent detail menu always offers `reopen pane` when the agent's zellij
+  session can be found, whatever the pane's last known state. Choosing it on
+  a live pane says it is already open. When no session can be found the
+  page says why.
+- Watches: adding or retargeting a watch that would give an agent two
+  producers of the same source is refused, naming the other one, and
+  `clank events watch retarget` or `transfer` to an agent not on the roster
+  is refused. A master change is never refused because of watches; where
+  it creates a duplicate, one producer hosts, the other ingests nothing new
+  while its existing events stay owed, and `clank status` reports which
+  won.
+- Documentation, skills and `clank run --help` say per harness who reports
+  a background run's end, rather than promising that every harness does.
+
+### Fixed
+
+- After a machine sleeps, `clank status` no longer reports a GitHub source
+  as failing ("no completed poll for 20h") while it polls normally. Poll
+  times are wall-clock times.
+- A Grok Stop that the monitor answers late arms Grok's background wait
+  instead of leaving the agent stranded until someone steps in.
+- `clank open`, `clank as`, the TUI and the remote view work outside zellij
+  when the shell's ancestry cannot be read, as in a new Ghostty window on
+  macOS. Inside zellij an unreadable ancestry no longer stops `clank open`
+  either. The TUI no longer claims "no Zellij session found" before its
+  first listing.
+- An agent labelled like a watch (`watch:1`) can read and acknowledge its
+  own events and is not confused with repository watch 1.
+- A rebound master is no longer shown every uncleaned block answer again,
+  one per turn.
+- An agent with no `config.json`, on the defaults, is bound, recoverable and
+  healthy in `clank doctor`.
+- A held block, event-log, inbox or agent lock can no longer stall the
+  monitor for every agent in the repository.
+
+### Upgrading from v0.2.0
+
+- After upgrading every agent is unbound: its session was stored in a file
+  this release no longer reads. Restart each agent (a pane `clank open`
+  launched binds again as it starts), or run `clank as <label>` inside the
+  agent's session.
+- Restart TUIs, monitors and anything else still on the older build. An
+  older monitor is replaced by the first client of this build; an older
+  client is declined. `clank remote` commands tell you to restart a TUI of
+  the older build, whose remote-control protocol they no longer speak.
+  Agent panes take their new `<label> · <repo>` titles once the TUI is
+  restarted.
+- Run `clank setup` to refresh the installed skills and hooks; `clank doctor`
+  reports the ones an older setup wrote.
+- Before upgrading, read or delete messages left in an old per-agent inbox.
+  After upgrading, ask again any block that was still pending in the
+  per-agent layout.
+
+### Platform and verification notes
+
+- Platforms, packaging and licence are as in 0.2.0: macOS and Linux, arm64
+  and x86_64; Linux binaries are static musl and need Linux 5.3 or newer;
+  macOS binaries are unsigned and not notarized.
+- Clean-account, installed-harness acceptance walks are still not recorded
+  as passed for any harness.
 
 ### Missing from the 0.2.0 notes
 
@@ -133,5 +259,6 @@ review each other's commits, and hand work over through their harness's Stop hoo
   from tested versions; automated fixture tests do not establish those claims.
 - Clank is licensed under 0BSD. `clank licenses` prints bundled licence notices.
 
-[Unreleased]: https://github.com/LLFourn/clank/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/LLFourn/clank/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/LLFourn/clank/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/LLFourn/clank/releases/tag/v0.2.0
