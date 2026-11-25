@@ -3,7 +3,11 @@
 // (no live opencode, no model, no clank binary):
 //
 //   node crates/cli/tests/opencode_plugin_lifecycle.mjs \
-//        crates/cli/src/cli/setup_assets/opencode_plugin.js
+//        crates/cli/src/cli/setup_assets/opencode_plugin.js '<bound marker>'
+//
+// The bound marker is the session metadata clank writes once a session is
+// bound (`clank::cli::opencode_session::bound_marker`), passed in by the
+// Rust driver so the plugin is tested against what clank really sends.
 //
 // `load` below is a stub of OpenCode 2.1.4's loader: it accepts a module
 // only by the schema 2.1.4 enforces on its default export, calls
@@ -23,6 +27,8 @@ const assert = (cond, msg) => {
 
 const pluginPath = process.argv[2]
 assert(pluginPath, "plugin path argument missing")
+assert(process.argv[3], "bound marker argument missing")
+const BOUND_MARKER = JSON.parse(process.argv[3])
 const mod = await import(pathToFileURL(pluginPath))
 
 const loaderAccepts = (m) => {
@@ -113,6 +119,8 @@ const makeService = () => {
   const waitGates = new Map()
   const sessionDirs = new Map()
   const signals = []
+  const listed = []
+  const updates = []
 
   const run = (args, { input, env, cwd, signal }) => {
     const command = { args: args.slice(3), input: JSON.parse(input), env, cwd }
@@ -157,7 +165,22 @@ const makeService = () => {
         if (gate === "error") throw new Error("session not found")
         if (gate) await gate.promise
       },
-      get: async ({ sessionID }) => ({ data: { id: sessionID, location: { directory: sessionDirs.get(sessionID) } } }),
+      get: async ({ sessionID }) => ({
+        data: {
+          id: sessionID,
+          location: { directory: sessionDirs.get(sessionID) },
+          ...(listed.find((s) => s.id === sessionID)?.metadata ? { metadata: listed.find((s) => s.id === sessionID).metadata } : {}),
+        },
+      }),
+      list: async () => ({ data: listed.map((s) => ({ ...s })) }),
+      // As 2.1.4 does: the metadata is replaced, and every instance hears
+      // session.metadata.updated.
+      update: async ({ sessionID, metadata }) => {
+        updates.push({ sessionID, metadata })
+        const row = listed.find((s) => s.id === sessionID)
+        if (row) row.metadata = metadata
+        bus.publish(ev("session.metadata.updated", sessionID, { metadata }, sessionDirs.get(sessionID)))
+      },
       prompt: async (input) => {
         prompts.push(input)
         const r = promptResults.shift()
@@ -190,6 +213,8 @@ const makeService = () => {
     waitGates,
     sessionDirs,
     signals,
+    listed,
+    updates,
     waits,
     reports,
     gate,
@@ -872,6 +897,186 @@ for (const [label, promptResult, stale, expected] of [
   await settle()
   assert(svc.waits().length === 2, `a reloaded instance owns the session again: ${svc.waits().length}`)
   await third.unload()
+}
+
+// ── clank's bound marker: a session the service saw before its binding ──
+{
+  // OpenCode 2.1.4 as recorded in a running service: clank's own
+  // session.create reaches an already-loaded instance as session.created
+  // before clank has written the binding, so that first sighting's wait
+  // hears the stop-hook's unbound diagnostic. clank then binds and writes
+  // its marker; the same instance, with no new setup and no prompt, arms
+  // on the marker's session.metadata.updated and delivers owed work.
+  const unbound = {
+    exitCode: 0,
+    stdout: "",
+    stderr: "no agent is bound to opencode session " + SID + " in this repo — run `clank as <label>` first\n",
+  }
+  const created = () => ({
+    id: `evt_${++eventSeq}`,
+    created: Date.now(),
+    type: "session.created",
+    durable: { aggregateID: SID, seq: 0, version: 1 },
+    location: { directory: DIR },
+    data: { sessionID: SID, projectID: "global", location: { directory: DIR }, subpath: "", slug: "s", version: "2.1.4" },
+  })
+  const marked = (metadata) => ({
+    id: `evt_${++eventSeq}`,
+    created: Date.now(),
+    type: "session.metadata.updated",
+    durable: { aggregateID: SID, seq: 1, version: 1 },
+    location: { directory: DIR },
+    data: { sessionID: SID, metadata },
+  })
+  // What clank's announce does: the store's metadata, then its event.
+  const mark = (svc, metadata = BOUND_MARKER) => {
+    const row = svc.listed.find((s) => s.id === SID)
+    if (row) row.metadata = metadata
+    else svc.listed.push({ id: SID, metadata, location: { directory: DIR } })
+    svc.bus.publish(marked(metadata))
+  }
+  const standing = (svc) => same(svc.listed.find((s) => s.id === SID)?.metadata, BOUND_MARKER)
+
+  {
+    const svc = makeService()
+    svc.sessionDirs.set(SID, DIR)
+    await withToken(undefined, () => svc.instance(DIR))
+    await settle()
+    svc.waitResults.push(unbound)
+    svc.bus.publish(created())
+    await settle()
+    assert(svc.waits().length === 1 && svc.prompts.length === 0, `the pre-binding sighting waited and heard it was unbound: ${svc.waits().length}`)
+    svc.waitResults.push({ exitCode: 0, stdout: "owed-work\n", stderr: "" })
+    mark(svc)
+    await settle()
+    assert(
+      same(svc.waits().map((w) => w.input.session_id), [SID, SID]),
+      `the marker registers a second wait: ${JSON.stringify(svc.waits())}`,
+    )
+    assert(svc.prompts.length === 1 && svc.prompts[0].sessionID === SID && svc.prompts[0].text === "owed-work", `the owed work is delivered without a turn: ${JSON.stringify(svc.prompts)}`)
+    assert(same(svc.updates, [{ sessionID: SID, metadata: {} }]), `the wait that served the marker clears it: ${JSON.stringify(svc.updates)}`)
+    svc.bus.publish(marked({ other: true }))
+    await settle()
+    assert(svc.waits().length === 2, "metadata that is not clank's marker arms nothing")
+  }
+  {
+    // The marker lands while the unbound wait is still out: that wait ends
+    // unbound, and the marker it outran re-arms once.
+    const svc = makeService()
+    svc.sessionDirs.set(SID, DIR)
+    await withToken(undefined, () => svc.instance(DIR))
+    let release
+    svc.waitResults.push((resolve) => (release = () => resolve(unbound)))
+    svc.bus.publish(created())
+    await settle()
+    mark(svc)
+    await settle()
+    assert(svc.waits().length === 1, `one wait at a time: ${svc.waits().length}`)
+    svc.waitResults.push({ exitCode: 0, stdout: "owed-work\n", stderr: "" })
+    release()
+    await settle()
+    assert(svc.updates.length <= 1, `the outrun wait did not serve the marker: ${JSON.stringify(svc.updates)}`)
+    assert(svc.waits().length === 2 && svc.prompts.length === 1 && svc.prompts[0].text === "owed-work", `the outrun marker re-arms: ${svc.waits().length} ${JSON.stringify(svc.prompts)}`)
+    svc.waitResults.push({ exitCode: 0, stdout: "", stderr: "" })
+    svc.emit("session.execution.succeeded", SID, {}, DIR)
+    await settle()
+    assert(svc.waits().length === 3, "the injected turn's settle arms as always")
+    await settle()
+    assert(svc.waits().length === 3, `a served marker re-arms nothing more: ${svc.waits().length}`)
+  }
+  {
+    // An instance loaded after the marker was written (its location booted
+    // by the marker's own write) finds it by listing once subscribed.
+    // Clearing it keeps the rest of the session's metadata, and a later
+    // OpenCode in the location finds nothing to arm.
+    const svc = makeService()
+    const ELSEWHERE = "ses_0elsewhere0000000000000"
+    svc.sessionDirs.set(SID, DIR)
+    svc.listed.push({ id: SID, metadata: { keep: 1, clank: { ...BOUND_MARKER.clank, other: 2 } }, location: { directory: DIR } })
+    svc.listed.push({ id: ELSEWHERE, metadata: BOUND_MARKER, location: { directory: "/repos/other" } })
+    svc.waitResults.push({ exitCode: 0, stdout: "owed-work\n", stderr: "" })
+    const first = await withToken(undefined, () => svc.instance(DIR))
+    await settle()
+    assert(
+      same(svc.waits().map((w) => w.input.session_id), [SID]),
+      `only a marker in the instance's own location arms: ${JSON.stringify(svc.waits())}`,
+    )
+    assert(svc.prompts.length === 1 && svc.prompts[0].text === "owed-work", "its owed work is delivered")
+    assert(
+      same(svc.listed[0].metadata, { keep: 1, clank: { other: 2 } }) && same(svc.listed[1].metadata, BOUND_MARKER),
+      `only the armed marker is consumed, and nothing else with it: ${JSON.stringify(svc.listed)}`,
+    )
+    await settle()
+    assert(svc.waits().length === 1, `its own clearing event arms nothing: ${svc.waits().length}`)
+    await first.unload()
+    await withToken(undefined, () => svc.instance(DIR))
+    await settle()
+    assert(svc.waits().length === 1, `a consumed marker arms nothing in a later instance: ${svc.waits().length}`)
+  }
+  {
+    // Two instances of one location in one service, both loaded while the
+    // marker stands, and both hearing it: the session's owner alone arms.
+    const svc = makeService()
+    svc.sessionDirs.set(SID, DIR)
+    svc.listed.push({ id: SID, metadata: BOUND_MARKER, location: { directory: DIR } })
+    svc.waitResults.push("pending")
+    await Promise.all([withToken(undefined, () => svc.instance(DIR)), withToken(undefined, () => svc.instance(DIR))])
+    svc.bus.publish(marked(BOUND_MARKER))
+    await settle()
+    assert(svc.waits().length === 1, `one marker, one wait: ${svc.waits().length}`)
+    assert(standing(svc), "a wait still out has not served the marker")
+  }
+  // A marker nothing served stays for the next healthy instance: one whose
+  // idle check failed, one unloaded before it could arm, one whose
+  // stop-hook failed, and one whose wait died with it.
+  for (const [why, before] of [
+    ["the idle check failed", async (svc) => {
+      svc.waitGates.set(SID, "error")
+      const first = await withToken(undefined, () => svc.instance(DIR))
+      await settle()
+      svc.waitGates.delete(SID)
+      return first
+    }],
+    ["it was unloaded before arming", async (svc) => {
+      const open = svc.gate(SID)
+      const first = await withToken(undefined, () => svc.instance(DIR))
+      await settle()
+      return { unload: async () => { await first.unload(); open() } }
+    }],
+    ["its stop-hook failed", async (svc) => {
+      svc.waitResults.push({ exitCode: 1, stdout: "", stderr: "crashed" })
+      return await withToken(undefined, () => svc.instance(DIR))
+    }],
+    ["its wait died with it", async (svc) => {
+      svc.waitResults.push("pending")
+      return await withToken(undefined, () => svc.instance(DIR))
+    }],
+  ]) {
+    const svc = makeService()
+    svc.sessionDirs.set(SID, DIR)
+    svc.listed.push({ id: SID, metadata: BOUND_MARKER, location: { directory: DIR } })
+    const first = await before(svc)
+    await settle()
+    await first.unload()
+    await settle()
+    assert(standing(svc), `${why}: the marker stands: ${JSON.stringify(svc.listed)}`)
+    const waitsBefore = svc.waits().length
+    svc.waitResults.push({ exitCode: 0, stdout: "owed-work\n", stderr: "" })
+    await withToken(undefined, () => svc.instance(DIR))
+    await settle()
+    assert(svc.waits().length === waitsBefore + 1, `${why}: the next healthy instance registers the owed wait: ${svc.waits().length}`)
+    assert(svc.prompts.length === 1 && svc.prompts[0].text === "owed-work", `${why}: and delivers its work: ${JSON.stringify(svc.prompts)}`)
+    assert(!standing(svc), `${why}: the wait that served it clears it`)
+  }
+  {
+    // A launch with its own server arms its bootstrap session only.
+    const svc = makeService()
+    svc.sessionDirs.set(TOKEN, DIR)
+    svc.listed.push({ id: SID, metadata: BOUND_MARKER, location: { directory: DIR } })
+    await withToken(TOKEN, () => svc.instance(DIR))
+    await settle()
+    assert(same(svc.waits().map((w) => w.input.session_id), [TOKEN]), `a private server lists nothing: ${JSON.stringify(svc.waits())}`)
+  }
 }
 
 console.log("OK")

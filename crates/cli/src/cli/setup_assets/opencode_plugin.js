@@ -48,9 +48,32 @@
 //    - first sighting of a session — only once `session.wait` has said
 //      it is idle, and only if nothing happened to it meanwhile. Its
 //      session.created counts as a sighting even when the bootstrap arm
-//      came first: clank launches a fresh session with
-//      `--session <id>`, so the bootstrap id can name a session that
-//      does not exist yet, whose idle check failed.
+//      came first: OpenCode opens `--session <id>` for an id it lacks with
+//      no session and creates it only when a prompt is submitted, so a
+//      bootstrap id clank could not confirm stored may name a session
+//      whose idle check failed;
+//    - clank's BOUND marker (`metadata.clank.bound`), which clank sets on
+//      a session it created through a shared server only once the session
+//      is bound. That server's instance may have seen the session.created
+//      of clank's own create before the binding existed, and its wait then
+//      ended unbound; nothing else would arm it. So the marker's
+//      session.metadata.updated arms it, and a marker that arrives while a
+//      wait is out re-arms once that wait ends without injecting. An
+//      instance loaded after the marker was written (OpenCode 2.1.4 boots
+//      a location, and loads its plugins, only when a session is first
+//      used there, which can be the marker's own write) finds it by
+//      listing its location's sessions once subscribed. A marker is cleared
+//      only once a wait started on it has run to an answer (the stop-hook
+//      exited 0, so clank admitted that wait), so it means "bound, and no
+//      wait has served it yet". A failed idle check, an unload before the
+//      arm, or a wait that died leaves it for the next instance's listing,
+//      and for clank's next start of the agent, which writes a standing
+//      marker again. Within one process only the session's owner arms.
+//      Two processes holding one standing marker can both arm; clank's
+//      monitor keeps one parked wait per session, the one admitted last,
+//      so the work is delivered once. A launch with
+//      CLANK_BOOTSTRAP_SESSION_ID runs its own server for that one session
+//      and skips the listing.
 //
 // Loop discipline:
 // - At most ONE in-flight stop-hook wait per session.
@@ -121,6 +144,14 @@ const SHELL_BLANKS = Object.fromEntries(
 
 const OWNERS = Symbol.for("clank.opencode.sessions")
 
+const boundMarker = (metadata) => typeof metadata?.clank?.bound === "string"
+
+const withoutMarker = (metadata) => {
+  const { bound, ...clank } = metadata.clank
+  const { clank: _, ...rest } = metadata
+  return Object.keys(clank).length ? { ...rest, clank } : rest
+}
+
 export const runClank = (args, { input, env, cwd, signal }) =>
   new Promise((resolve) => {
     const out = []
@@ -180,6 +211,8 @@ export const makePlugin = ({ run = runClank, log = consoleLog } = {}) => ({
           reports: Promise.resolve(),
           inputs: new Map(),
           tags: new Map(),
+          owed: false,
+          marked: false,
         }
         sessions.set(id, s)
       }
@@ -227,6 +260,34 @@ export const makePlugin = ({ run = runClank, log = consoleLog } = {}) => ({
       })().catch((e) => log(`${why} failed`, { sessionID: s.id, error: String(e) }))
     }
 
+    const owe = (s) => {
+      s.owed = true
+      armWhenIdle(s, "bound")
+    }
+
+    const claim = (s) => {
+      s.marked = true
+      owe(s)
+    }
+
+    // Read just before the write: 2.1.4 replaces metadata whole, so a write
+    // by anyone else between the two is lost.
+    const serveMarker = async (s) => {
+      s.marked = false
+      try {
+        const res = await ctx.session.get({ sessionID: s.id })
+        const metadata = (res?.data ?? res)?.metadata
+        if (!boundMarker(metadata)) return
+        await ctx.session.update({ sessionID: s.id, metadata: withoutMarker(metadata) })
+      } catch (e) {
+        log("bound marker not cleared", { sessionID: s.id, error: String(e) })
+      }
+    }
+
+    const armIfOwed = (s) => {
+      if (s.owed && !disposed) armWhenIdle(s, "bound")
+    }
+
     const arm = async (s, why, gen) => {
       if (disposed || s.inflight) return
       if (s.aborted) return log("arm suppressed after an interruption", { sessionID: s.id, why })
@@ -237,11 +298,14 @@ export const makePlugin = ({ run = runClank, log = consoleLog } = {}) => ({
       s.inflight = true
       const seen = s.activity
       let proc
+      let serving = false
       try {
         const dir = await directory(s)
         if (!dir) return log("arm dropped: the session's directory is unknown", { sessionID: s.id, why })
         if (disposed) return
         log("arm", { sessionID: s.id, why })
+        s.owed = false
+        serving = s.marked
         proc = await clank(s, dir, [])
       } finally {
         // The guard covers ONLY the wait. It must be released before the
@@ -251,8 +315,10 @@ export const makePlugin = ({ run = runClank, log = consoleLog } = {}) => ({
         s.inflight = false
       }
       if (disposed || !proc) return
+      if (serving && proc.exitCode === 0) void serveMarker(s)
       if (proc.exitCode !== 0) {
-        return log("stop-hook did not exit 0", { sessionID: s.id, exitCode: proc.exitCode, error: proc.error && String(proc.error) })
+        log("stop-hook did not exit 0", { sessionID: s.id, exitCode: proc.exitCode, error: proc.error && String(proc.error) })
+        return armIfOwed(s)
       }
       const output = proc.stdout.trim()
       if (output === RENEW_WAIT_WIRE) {
@@ -262,7 +328,7 @@ export const makePlugin = ({ run = runClank, log = consoleLog } = {}) => ({
       if (!output) {
         const diagnostic = proc.stderr.trim()
         if (diagnostic) log("diagnostic", { sessionID: s.id, diagnostic })
-        return
+        return armIfOwed(s)
       }
       if (s.activity !== seen) return log("discard stale continuation", { sessionID: s.id })
       if (s.aborted || s.failed) return log("discard after the turn was stopped", { sessionID: s.id })
@@ -408,8 +474,27 @@ export const makePlugin = ({ run = runClank, log = consoleLog } = {}) => ({
         case "session.retry.scheduled":
           void report(s, "retry", s.running?.input && turnName(s, s.running.input))
           break
+        case "session.metadata.updated":
+          if (boundMarker(data.metadata)) {
+            s.seen = true
+            return claim(s)
+          }
+          break
       }
       if ((first || event.type === "session.created") && !s.inflight) armWhenIdle(s, "first-sighting")
+    }
+
+    const listBound = async () => {
+      const here = ctx.location?.directory
+      if (!here) return
+      const res = await ctx.session.list({ limit: 50 })
+      for (const info of res?.data ?? res ?? []) {
+        if (!boundMarker(info?.metadata) || info.location?.directory !== here || !owns(info.id)) continue
+        const s = session(info.id)
+        s.seen = true
+        s.dir ??= here
+        claim(s)
+      }
     }
 
     const pump = async () => {
@@ -443,6 +528,8 @@ export const makePlugin = ({ run = runClank, log = consoleLog } = {}) => ({
       const s = session(bootstrapId)
       s.seen = true
       armWhenIdle(s, "bootstrap")
+    } else if (!bootstrapId) {
+      void listBound().catch((e) => log("bound listing failed", { error: String(e) }))
     }
 
     return () => {

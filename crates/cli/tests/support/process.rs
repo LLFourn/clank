@@ -89,6 +89,37 @@ fn setup() -> Result<()> {
     Ok(())
 }
 
+/// `opencode api session.create` as OpenCode 2.1.4 answered it: the
+/// stored record of the id and directory asked for; `session.get` answers
+/// a record with no metadata, and `session.update` answers nothing.
+fn opencode_api(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "session.update") {
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "session.get") {
+        let id = args
+            .iter()
+            .find_map(|a| a.strip_prefix("sessionID="))
+            .context("session.get without a session")?;
+        return emit(&json!({ "data": { "id": id } }));
+    }
+    let recorded: Value =
+        serde_json::from_str(include_str!("../fixtures/opencode-2.1.4-session.json"))?;
+    let at = args
+        .iter()
+        .position(|a| a == "session.create")
+        .context("only session.create is modelled")?;
+    let body = args[at..]
+        .windows(2)
+        .find(|w| w[0] == "-d")
+        .map(|w| serde_json::from_str::<Value>(&w[1]))
+        .context("session.create without a body")??;
+    let mut data = recorded["session_create"]["stdout"]["data"].clone();
+    data["id"] = body["id"].clone();
+    data["location"] = body["location"].clone();
+    emit(&json!({ "data": data }))
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version") {
@@ -149,6 +180,7 @@ fn main() -> Result<()> {
             }),
         Some("grok") => grok::run(&args[1..]),
         Some("setup") => setup(),
+        Some("api") => opencode_api(&args[1..]),
         Some("events") if args.len() == 4 => {
             // A replacement producer reuses the fixture's endpoint after the
             // monitor has retired its predecessor.

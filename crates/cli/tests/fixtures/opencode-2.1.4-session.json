@@ -1,0 +1,81 @@
+{
+  "opencode": "2.1.4",
+  "recorded": "2026-11-25",
+  "how": "Homebrew opencode 2.1.4 run with HOME and every XDG_* dir fresh and private to the run, from a git repo at /probe/repo (the run's real temporary path is shortened here). No prompt was submitted and no model was called.",
+  "tui_with_unknown_session": {
+    "argv": ["opencode", "--standalone", "--session", "ses_def053ee6ffeKCkbMBwc85ZDz0"],
+    "log": "message=\"Sent HTTP response\" http.method=GET http.url=/api/session/ses_def053ee6ffeKCkbMBwc85ZDz0 http.status=404",
+    "stored_after_25s_idle": false,
+    "source": "The TUI command looks the id up with session.get; an id it does not find becomes `newSessionID` instead of `sessionID`, and the TUI opens on its home screen with no session. Only the prompt's submit takes `newSessionID`, calling session.create({id}), so a launch nobody types into stores nothing under the id."
+  },
+  "session_get_unknown": {
+    "argv": ["opencode", "api", "--standalone", "session.get", "--param", "sessionID=ses_def05a43cffecoSf06vq7L9uBv"],
+    "exit": 1,
+    "stdout": {
+      "_tag": "SessionNotFoundError",
+      "sessionID": "ses_def05a43cffecoSf06vq7L9uBv",
+      "message": "Session not found: ses_def05a43cffecoSf06vq7L9uBv"
+    },
+    "stderr": "HTTP 404 Not Found"
+  },
+  "session_create": {
+    "argv": ["opencode", "api", "--standalone", "session.create", "--param", "sessionID=ses_def05a43cffecoSf06vq7L9uBv", "-d", "{\"id\":\"ses_def05a43cffecoSf06vq7L9uBv\",\"location\":{\"directory\":\"/probe/repo\"}}"],
+    "exit": 0,
+    "stdout": {
+      "data": {
+        "id": "ses_def05a43cffecoSf06vq7L9uBv",
+        "projectID": "global",
+        "cost": 0,
+        "tokens": { "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+        "time": { "created": 1795581179081, "updated": 1795581179081 },
+        "location": { "directory": "/probe/repo" }
+      }
+    }
+  },
+  "session_get_created": {
+    "argv": ["opencode", "api", "--standalone", "session.get", "--param", "sessionID=ses_def05a43cffecoSf06vq7L9uBv"],
+    "exit": 0,
+    "note": "A second private server read what the first created: both use the one store."
+  },
+  "store_row_after_create": {
+    "query": "select coalesce(time_idle, ''), coalesce(idle_outcome, '') from session_v2 where id = 'ses_def05a43cffecoSf06vq7L9uBv'",
+    "stdout": "|\n"
+  },
+  "store_row_for_unknown": {
+    "query": "select coalesce(time_idle, ''), coalesce(idle_outcome, '') from session_v2 where id = 'ses_def053ee6ffeKCkbMBwc85ZDz0'",
+    "stdout": ""
+  },
+  "service": {
+    "how": "The same isolation, with no --standalone: the first `opencode api` call started the background service (`opencode serve --service`), stopped afterwards. A probe plugin in the private config dir logged every session event it was given (`ctx.event.subscribe`) and, at setup after subscribing, the sessions `ctx.session.list({limit: 20})` answered.",
+    "cold_location": {
+      "steps": ["session.create ses_def0400000fcProbeColdCCCC", "session.update ses_def0400000fcProbeColdCCCC -d {\"metadata\":{\"clank\":{\"bound\":\"kimi\"}}}"],
+      "log": "the create booted no location and loaded no plugin; the update logged `location services booted` and then `loading plugin`",
+      "events_seen": [],
+      "listed_at_setup": [["ses_def0400000fcProbeColdCCCC", { "clank": { "bound": "kimi" } }]]
+    },
+    "warm_location": {
+      "steps": ["session.create ses_def0400000fdProbeServiceBB", "session.update ses_def0400000fdProbeServiceBB -d {\"metadata\":{\"clank\":{\"bound\":\"kimi\"}}}"],
+      "events_seen": [
+        { "type": "session.created", "location": { "directory": "/probe/repo" }, "data": { "sessionID": "ses_def0400000fdProbeServiceBB", "projectID": "global", "location": { "directory": "/probe/repo" }, "subpath": "", "slug": "mighty-squid", "version": "2.1.4" } },
+        { "type": "session.metadata.updated", "location": { "directory": "/probe/repo" }, "data": { "sessionID": "ses_def0400000fdProbeServiceBB", "metadata": { "clank": { "bound": "kimi" } } } }
+      ]
+    },
+    "plugin_clears_marker": {
+      "how": "The probe plugin, on a marker from its setup listing or from session.metadata.updated, called `ctx.session.update({ sessionID, metadata })` with `clank.bound` removed, then read it back with `ctx.session.get`.",
+      "listing": { "before": { "keep": 1, "clank": { "bound": "kimi" } }, "reply": null, "after": { "keep": 1 } },
+      "event": { "before": { "clank": { "bound": "qwen" } }, "reply": null, "after": {} },
+      "own_clear_heard_as": { "type": "session.metadata.updated", "data": { "metadata": {} } },
+      "later_service_listing_armed": []
+    },
+    "session_update": { "exit": 0, "stdout": "" },
+    "session_update_unknown": {
+      "exit": 1,
+      "stdout": { "_tag": "SessionNotFoundError", "sessionID": "ses_def0400000fbNoSuchDDDDDDD", "message": "Session not found: ses_def0400000fbNoSuchDDDDDDD" },
+      "stderr": "HTTP 404 Not Found"
+    }
+  },
+  "tui_with_created_session": {
+    "argv": ["opencode", "--standalone", "--session", "ses_def05a43cffecoSf06vq7L9uBv"],
+    "log": "no 404 for the session: the lookup found it, and the TUI resumed it"
+  }
+}

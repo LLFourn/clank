@@ -57,6 +57,7 @@ impl Fake {
                     "id": session,
                     "location": { "directory": dirs[session] },
                 })),
+                "session.update" => Ok(Value::Null),
                 other => panic!("unexpected {other}"),
             }
         })
@@ -87,6 +88,10 @@ impl Api for Fake {
             backend: backend.clone(),
         });
         (self.answer)(method, session, &body)
+    }
+
+    fn stored(&self, _: &Backend, session: &str) -> crate::cli::opencode_session::Stored {
+        panic!("a fork reads no store, read {session}")
     }
 }
 
@@ -120,6 +125,7 @@ fn backend(repo: &Path) -> Backend {
         program: "opencode".into(),
         env: BTreeMap::new(),
         cwd: repo.to_path_buf(),
+        server: Vec::new(),
     }
 }
 
@@ -175,6 +181,8 @@ fn a_fork_is_forked_moved_and_confirmed_before_its_child_is_bound() {
             format!("session.fork {SOURCE}"),
             format!("session.move {CHILD}"),
             format!("session.get {CHILD}"),
+            format!("session.get {CHILD}"),
+            format!("session.update {CHILD}"),
         ]
     );
     assert_eq!(
@@ -213,7 +221,9 @@ fn a_failed_move_keeps_the_child_and_the_next_start_moves_it_without_forking() {
         api.methods(),
         [
             format!("session.move {CHILD}"),
-            format!("session.get {CHILD}")
+            format!("session.get {CHILD}"),
+            format!("session.get {CHILD}"),
+            format!("session.update {CHILD}")
         ]
     );
     assert_eq!(
@@ -239,6 +249,7 @@ fn placing() -> (std::sync::Arc<Mutex<Option<String>>>, Fake) {
                 Ok(json!(true))
             }
             "session.get" => Ok(json!({ "location": { "directory": *dir } })),
+            "session.update" => Ok(Value::Null),
             other => panic!("a known child is never forked again: {other}"),
         }
     });
@@ -392,7 +403,9 @@ fn an_adopted_child_is_placed_and_confirmed_before_it_is_bound() {
         api.methods(),
         [
             format!("session.move {CHILD}"),
-            format!("session.get {CHILD}")
+            format!("session.get {CHILD}"),
+            format!("session.get {CHILD}"),
+            format!("session.update {CHILD}")
         ]
     );
     assert_eq!(bound(&repo).as_deref(), Some(CHILD));
@@ -531,6 +544,7 @@ fn answering(stdout: &str, stderr: &str, code: i32) -> (tempfile::TempDir, Backe
             ("CODE".to_string(), code.to_string()),
         ]),
         cwd: dir.path().to_path_buf(),
+        server: Vec::new(),
     };
     (dir, backend)
 }
@@ -540,8 +554,43 @@ fn call(backend: &Backend, method: &str) -> Result<Value, CallError> {
 }
 
 #[test]
-fn an_empty_successful_answer_is_a_move_and_nothing_else() {
+fn the_recorded_create_is_asked_of_the_profiles_server_and_answers_its_record() {
+    let recorded: Value =
+        serde_json::from_str(crate::cli::opencode_session::tests::RECORDED).unwrap();
+    let create = &recorded["session_create"];
+    let id = create["stdout"]["data"]["id"].as_str().unwrap();
+    let (dir, mut backend) = answering(&create["stdout"].to_string(), "", 0);
+    backend.server = vec!["--standalone".into()];
+    let body = json!({ "id": id, "location": { "directory": "/probe/repo" } });
+    let data = Cli
+        .call(&backend, "session.create", id, Some(body.clone()))
+        .ok()
+        .unwrap();
+    assert_eq!(data, create["stdout"]["data"]);
+    let argv: Vec<String> = std::fs::read_to_string(dir.path().join("opencode.args"))
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    let recorded_argv: Vec<String> = serde_json::from_value(create["argv"].clone()).unwrap();
+    assert_eq!(argv, recorded_argv[1..]);
+
+    let missing = &recorded["session_get_unknown"];
+    let (_d, backend) = answering(
+        &missing["stdout"].to_string(),
+        missing["stderr"].as_str().unwrap(),
+        1,
+    );
+    assert!(matches!(
+        Cli.call(&backend, "session.get", id, None),
+        Err(CallError::Refused(_))
+    ));
+}
+
+#[test]
+fn an_empty_successful_answer_is_a_move_or_an_update_and_nothing_else() {
     let (dir, backend) = answering("", "", 0);
+    assert_eq!(call(&backend, "session.update").ok(), Some(Value::Null));
     assert_eq!(call(&backend, "session.move").ok(), Some(Value::Null));
     assert_eq!(
         std::fs::read_to_string(dir.path().join("opencode.args")).unwrap(),

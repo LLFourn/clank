@@ -797,42 +797,32 @@ pub fn release_unconfirmed_resume(
 }
 
 /// Bind `label` to an OpenCode session before it is launched, so the
-/// model never spends a turn on it. A session already reserved (by a
-/// concurrent start, or a start whose exec failed) is returned rather
-/// than replaced. `superseded` is the other tool's binding the caller
-/// read: it may be replaced, but any other binding that appeared since
-/// is refused.
-pub fn reserve_opencode_session(
-    repo: &Path,
-    label: &AgentLabel,
-    superseded: Option<&Session>,
-    mint: impl FnOnce() -> SessionId,
-) -> anyhow::Result<Session> {
-    let guard = StateGuard::acquire(repo, label)?;
-    reserve_opencode_locked(&guard, superseded, mint)
-}
-
-/// [`reserve_opencode_session`] for a caller already holding the label's
-/// lock, which it needs held across work before the bind.
+/// model never spends a turn on it, under the label's lock the caller holds
+/// across the work before the bind. `replaces` is the binding the caller
+/// judged replaceable: another tool's, or an OpenCode session its store
+/// lacks. Only it is replaced, by the session `mint` answers; mint runs
+/// only then, and a failed one binds nothing. An OpenCode session bound
+/// since (by a concurrent start) is returned rather than replaced, and any
+/// other binding that appeared is refused.
 pub(crate) fn reserve_opencode_locked(
     guard: &StateGuard,
-    superseded: Option<&Session>,
-    mint: impl FnOnce() -> SessionId,
+    replaces: Option<&Session>,
+    mint: impl FnOnce() -> anyhow::Result<SessionId>,
 ) -> anyhow::Result<Session> {
     let label = &guard.label;
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("formatting timestamp")?;
     identity::mutate(guard, |id| match &id.binding {
-        Some(s) if s.tool == Tool::OpenCode => Ok(s.clone()),
-        Some(s) if Some(s) != superseded => Err(anyhow::anyhow!(
+        Some(s) if Some(s) != replaces && s.tool == Tool::OpenCode => Ok(s.clone()),
+        Some(s) if Some(s) != replaces => Err(anyhow::anyhow!(
             "`{label}` was bound to {} session {} while it was starting",
             s.tool.as_str(),
             s.id.as_str()
         )),
         _ => {
             let s = Session {
-                id: mint(),
+                id: mint()?,
                 tool: Tool::OpenCode,
                 updated_at: now,
                 transcript: None,
@@ -841,6 +831,17 @@ pub(crate) fn reserve_opencode_locked(
             Ok(s)
         }
     })?
+}
+
+/// Unbind `session` from the label `guard` holds, if it is still bound.
+pub(crate) fn unbind_locked(guard: &StateGuard, session: &SessionId) -> anyhow::Result<bool> {
+    identity::mutate(guard, |id| {
+        if id.binding.as_ref().is_none_or(|s| &s.id != session) {
+            return false;
+        }
+        id.binding = None;
+        true
+    })
 }
 
 /// Bind a session to an agent label, and clear the same session id from
