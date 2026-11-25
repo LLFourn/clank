@@ -52,6 +52,7 @@ pub mod nudge;
 pub(crate) mod nudge_log;
 pub mod open_zellij;
 pub(crate) mod opencode_fork;
+pub mod opencode_session;
 mod owned_callback;
 pub mod pane_input;
 pub(crate) mod pane_owners;
@@ -1256,8 +1257,9 @@ pub enum AgentCmd {
     /// with the same tool is resumed. Without one, or when the roster
     /// now names a different tool, the tool starts fresh and binds as it
     /// starts; the old binding stays until the new session reports in.
-    /// An OpenCode session is bound by clank before launch instead,
-    /// replacing the old binding then.
+    /// An OpenCode session is created through OpenCode and bound by clank
+    /// before launch instead, replacing the old binding then, as is a bound
+    /// one OpenCode's store no longer has.
     Start(AgentStartArgs),
     /// Put an agent on this repo's roster, with its review tier
     ///

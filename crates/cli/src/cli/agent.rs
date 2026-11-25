@@ -24,7 +24,7 @@ use crate::cli::teams_config::{
     AgentDescription, RepoConfigFile, ReviewKind, RosterAgent, RosterRole,
 };
 use clank_core::agent_config::{AgentConfig, LaunchConfig, Session};
-use clank_core::ids::{AgentLabel, SessionId};
+use clank_core::ids::AgentLabel;
 use clank_core::vocab::{AutoMode, Tool};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -436,6 +436,7 @@ async fn start_with(
                             superseded,
                             spec.as_ref(),
                             print,
+                            opencode,
                         )?,
                         tool,
                     )
@@ -536,6 +537,18 @@ async fn start_with(
                     }
                     let orientation = unlaunched_opencode_child(&repo, &label, session)?;
                     consume_fork = orientation.is_some();
+                    let resumed = if session.tool == Tool::OpenCode && orientation.is_none() {
+                        opencode_session_to_resume(
+                            &repo,
+                            &label,
+                            desc.launch.as_ref(),
+                            session,
+                            print,
+                            opencode,
+                        )?
+                    } else {
+                        session.clone()
+                    };
                     let prompt = match orientation {
                         Some(spec) => Some(spec.prompt),
                         None => start_prompt(&desc, cfg.as_ref(), session.tool)?,
@@ -544,7 +557,7 @@ async fn start_with(
                         compose_launch(
                             &repo,
                             &label,
-                            session,
+                            &resumed,
                             desc.launch.as_ref(),
                             prompt.as_deref(),
                         ),
@@ -885,12 +898,21 @@ fn start_prompt(
 }
 
 /// The launch of an agent with no bound session. OpenCode has no hook
-/// to bind itself, so clank chooses its session id, records the binding
-/// first, and launches it as a resume: `--session` creates a session
-/// that does not exist yet. A preview shows an id it does not record.
+/// to bind itself, so clank binds its session before the launch, which
+/// resumes it.
+///
+/// OpenCode 2.1.4 does not create a session for `--session <id>` at
+/// launch: its TUI looks the id up (a 404 in its log), opens with no
+/// session, and creates one under the id only when a prompt is submitted,
+/// so an idle agent's launch stored nothing
+/// (`tests/fixtures/opencode-2.1.4-session.json`). So OpenCode creates the
+/// session first ([`super::opencode_session::bind_created`]), and only the
+/// id it returns is bound. A preview shows an id it neither creates nor
+/// records.
 ///
 /// A fork with no source session is the exception: it launches fresh
 /// with the orientation prompt and binds later through `clank as`.
+#[allow(clippy::too_many_arguments)]
 fn compose_unbound_launch(
     repo: &Path,
     label: &AgentLabel,
@@ -899,6 +921,7 @@ fn compose_unbound_launch(
     superseded: Option<&Session>,
     fork: Option<&crate::cli::fork::ForkSpec>,
     print: bool,
+    opencode: &dyn super::opencode_fork::Api,
 ) -> anyhow::Result<ComposedLaunch> {
     if let Some(spec) = fork {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -914,20 +937,15 @@ fn compose_unbound_launch(
         return compose_bootstrap_launch(repo, label, desc);
     }
     let session = if print {
-        Session {
-            id: mint_opencode_session_id(),
-            tool: Tool::OpenCode,
-            updated_at: String::new(),
-            transcript: None,
-        }
+        preview_opencode_session()
     } else {
-        crate::agent_store::reserve_opencode_session(
+        super::opencode_session::bind_created(
             repo,
             label,
+            &opencode_backend(repo, desc.launch.as_ref()),
             superseded,
-            mint_opencode_session_id,
-        )
-        .with_context(|| format!("`{label}` was not launched: its session could not be bound"))?
+            opencode,
+        )?
     };
     Ok(compose_launch(
         repo,
@@ -938,23 +956,87 @@ fn compose_unbound_launch(
     ))
 }
 
-/// A new id in OpenCode 2.1.4's own session format (`Session.ID.create`
-/// in the shipped binary): `ses_`, 12 hex digits of the bitwise NOT of
-/// `ms * 0x1000 + counter`, so newer sessions sort first (a start mints
-/// one id, so its counter is 1), then 14 random base62 characters.
-fn mint_opencode_session_id() -> SessionId {
-    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
-    let mut random = [0u8; 14];
-    getrandom::fill(&mut random).expect("the OS can produce random bytes");
-    let tail: String = random
-        .iter()
-        .map(|b| BASE62[usize::from(*b) % BASE62.len()] as char)
-        .collect();
-    let id = format!("ses_{:012x}{tail}", !((ms << 12) + 1) & 0xffff_ffff_ffff);
-    SessionId::parse(&id).expect("an OpenCode session id is a valid session id")
+fn preview_opencode_session() -> Session {
+    Session {
+        id: super::opencode_session::mint_session_id(),
+        tool: Tool::OpenCode,
+        updated_at: String::new(),
+        transcript: None,
+    }
+}
+
+/// The OpenCode an agent's pane runs under `launch`, in `repo`.
+pub(crate) fn opencode_backend(
+    repo: &Path,
+    launch: Option<&LaunchConfig>,
+) -> super::opencode_fork::Backend {
+    let mut env = tool_env_defaults(Tool::OpenCode);
+    env.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
+    super::opencode_fork::Backend {
+        program: launch_program(Tool::OpenCode, launch),
+        env,
+        cwd: repo.to_path_buf(),
+        server: super::opencode_fork::server_args(launch),
+    }
+}
+
+/// The OpenCode session a start of `bound` resumes. Only OpenCode's store
+/// saying it has no such session replaces it, with one OpenCode creates;
+/// a store that cannot be read resumes it as it is. A preview replaces
+/// nothing.
+fn opencode_session_to_resume(
+    repo: &Path,
+    label: &AgentLabel,
+    launch: Option<&LaunchConfig>,
+    bound: &Session,
+    print: bool,
+    opencode: &dyn super::opencode_fork::Api,
+) -> anyhow::Result<Session> {
+    let backend = opencode_backend(repo, launch);
+    if opencode.stored(&backend, bound.id.as_str()) != super::opencode_session::Stored::Missing {
+        if !print {
+            reannounce(opencode, &backend, label, &bound.id);
+        }
+        return Ok(bound.clone());
+    }
+    let gone = format!(
+        "`{label}`'s OpenCode session {} is gone: OpenCode's store has no such session",
+        bound.id.as_str()
+    );
+    if print {
+        eprintln!("{gone}; a real start replaces it with a new one");
+        return Ok(preview_opencode_session());
+    }
+    let session =
+        super::opencode_session::bind_created(repo, label, &backend, Some(bound), opencode)?;
+    eprintln!("{gone}; resuming {} in its place", session.id.as_str());
+    Ok(session)
+}
+
+/// A resume is the retry route for a bound marker no plugin could arm on.
+/// Failing to rewrite it launches anyway: the session is bound and resumes,
+/// and the next start tries again.
+fn reannounce(
+    opencode: &dyn super::opencode_fork::Api,
+    backend: &super::opencode_fork::Backend,
+    label: &AgentLabel,
+    session: &clank_core::ids::SessionId,
+) {
+    match super::opencode_session::reannounce_pending(opencode, backend, label, session) {
+        Ok(true) => eprintln!(
+            "`{label}`'s OpenCode session {} was never armed on; OpenCode is told again \
+             that it is bound",
+            session.as_str()
+        ),
+        Ok(false) => {}
+        Err(
+            super::opencode_fork::CallError::Refused(e)
+            | super::opencode_fork::CallError::Unknown(e),
+        ) => eprintln!(
+            "clank: cannot tell OpenCode again that `{label}` is bound to {}: {e:#}",
+            session.as_str()
+        ),
+    }
 }
 
 /// Bootstrap launch: a registered agent has no bound session in this
@@ -1176,13 +1258,7 @@ fn compose_prepared_opencode(
 ) -> anyhow::Result<ComposedLaunch> {
     let launch = desc.launch.as_ref();
     super::opencode_fork::validate_profile(launch)?;
-    let mut env = tool_env_defaults(Tool::OpenCode);
-    env.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
-    let backend = super::opencode_fork::Backend {
-        program: launch_program(Tool::OpenCode, launch),
-        env,
-        cwd: repo.to_path_buf(),
-    };
+    let backend = opencode_backend(repo, launch);
     let session = super::opencode_fork::prepare(repo, label, &backend, superseded, api)?;
     Ok(compose_launch(
         repo,
@@ -2644,6 +2720,8 @@ mod tests {
     }
 
     use super::*;
+    use crate::cli::opencode_session::tests::OpenCode;
+    use clank_core::ids::SessionId;
 
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
@@ -4086,6 +4164,14 @@ mod tests {
         ) -> Result<serde_json::Value, crate::cli::opencode_fork::CallError> {
             panic!("this start must make no OpenCode API call, made {method}")
         }
+
+        fn stored(
+            &self,
+            _: &crate::cli::opencode_fork::Backend,
+            _: &str,
+        ) -> crate::cli::opencode_session::Stored {
+            crate::cli::opencode_session::Stored::Unknown("no store in this test".into())
+        }
     }
 
     /// A git repo whose `browser2` roster entry is `entry`, bound to a
@@ -4952,11 +5038,31 @@ mod tests {
         fork: Option<&crate::cli::fork::ForkSpec>,
         print: bool,
     ) -> anyhow::Result<ComposedLaunch> {
+        unbound_launch_with(repo, name, desc, fork, print, &OpenCode::recorded())
+    }
+
+    fn unbound_launch_with(
+        repo: &Path,
+        name: &str,
+        desc: &AgentDescription,
+        fork: Option<&crate::cli::fork::ForkSpec>,
+        print: bool,
+        opencode: &dyn crate::cli::opencode_fork::Api,
+    ) -> anyhow::Result<ComposedLaunch> {
         let cfg = AgentConfig {
             auto_mode: Some(AutoMode::Off),
             ..Default::default()
         };
-        compose_unbound_launch(repo, &label(name), desc, Some(&cfg), None, fork, print)
+        compose_unbound_launch(
+            repo,
+            &label(name),
+            desc,
+            Some(&cfg),
+            None,
+            fork,
+            print,
+            opencode,
+        )
     }
 
     fn session_arg(c: &ComposedLaunch) -> Option<&str> {
@@ -4982,13 +5088,26 @@ mod tests {
     #[test]
     fn a_fresh_opencode_agent_is_bound_before_it_launches() {
         let repo = tempfile::tempdir().unwrap();
-        let c = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false).unwrap();
+        let opencode = OpenCode::recorded();
+        let c = unbound_launch_with(
+            repo.path(),
+            "kimi",
+            &kimi_desc(None),
+            None,
+            false,
+            &opencode,
+        )
+        .unwrap();
         let id = session_arg(&c).expect("--session").to_string();
         assert!(is_opencode_session_id(&id), "{id}");
         let bound = binding(repo.path(), "kimi").expect("bound before the launch runs");
         assert_eq!(
             (bound.tool, bound.id.as_str()),
             (Tool::OpenCode, id.as_str())
+        );
+        assert!(
+            opencode.has(&id),
+            "OpenCode created the session before it was bound"
         );
         assert_eq!(c.program, "opencode");
         assert_eq!(
@@ -5056,6 +5175,7 @@ mod tests {
             None,
             None,
             false,
+            &OpenCode::recorded(),
         )
         .unwrap();
         assert!(
@@ -5091,12 +5211,20 @@ mod tests {
     #[test]
     fn concurrent_fresh_starts_share_one_opencode_session() {
         let repo = tempfile::tempdir().unwrap();
+        let opencode = OpenCode::recorded();
         let ids: Vec<String> = std::thread::scope(|s| {
             let starts: Vec<_> = (0..8)
                 .map(|_| {
                     s.spawn(|| {
-                        let c = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false)
-                            .unwrap();
+                        let c = unbound_launch_with(
+                            repo.path(),
+                            "kimi",
+                            &kimi_desc(None),
+                            None,
+                            false,
+                            &opencode,
+                        )
+                        .unwrap();
                         session_arg(&c).unwrap().to_string()
                     })
                 })
@@ -5108,6 +5236,12 @@ mod tests {
             ids.iter().all(|id| id == bound.id.as_str()),
             "{ids:?} vs {bound:?}"
         );
+        assert_eq!(opencode.created(), 1, "later starts find the binding");
+        assert_eq!(
+            opencode.markers.lock().unwrap().len(),
+            1,
+            "only the start that bound it tells OpenCode"
+        );
     }
 
     #[test]
@@ -5116,7 +5250,15 @@ mod tests {
         let config = repo.path().join(".clank/agents/kimi/state.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(&config, "{ not json").unwrap();
-        let err = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false).unwrap_err();
+        let err = unbound_launch_with(
+            repo.path(),
+            "kimi",
+            &kimi_desc(None),
+            None,
+            false,
+            &NoApiCalls,
+        )
+        .unwrap_err();
         let err = format!("{err:#}");
         assert!(
             err.contains("`kimi` was not launched") && err.contains("is malformed"),
@@ -5127,7 +5269,15 @@ mod tests {
         let claude = r#"{ "version": 1, "binding": { "id": "01a156a7-f516-7dc0-8b58-520faf122796",
                          "tool": "claude", "updated_at": "2026-10-20T00:00:00Z" } }"#;
         std::fs::write(&config, claude).unwrap();
-        let err = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false).unwrap_err();
+        let err = unbound_launch_with(
+            repo.path(),
+            "kimi",
+            &kimi_desc(None),
+            None,
+            false,
+            &NoApiCalls,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("was bound to claude session"),
             "a binding that appeared after the start read none is not replaced: {err:#}"
@@ -5241,7 +5391,7 @@ mod tests {
             Some(CHILD.into())
         );
         let calls = api.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 5);
         for call in calls.iter() {
             assert_eq!(call.backend.program, "oc-2", "{}", call.method);
             assert_eq!(call.backend.cwd, repo, "{}", call.method);
@@ -6182,6 +6332,186 @@ mod tests {
 
     fn launched() -> Vec<ComposedLaunch> {
         LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    const GONE: &str = "ses_def0ffe86ffeKnEmiwiP1mYVmL";
+
+    /// A git repo whose `browser2` is a standalone OpenCode agent bound to
+    /// `GONE`, with its home and config in the tempdir: a real start there
+    /// runs everything but the exec.
+    fn opencode_agent_bound_to_gone() -> tempfile::TempDir {
+        opencode_agent_bound_to_gone_with(&["--standalone"])
+    }
+
+    fn opencode_agent_bound_to_gone_with(args: &[&str]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_plumbing::init_repo(repo.path()).unwrap();
+        let launch = serde_json::json!({
+            "args": args,
+            "env": {
+                "HOME": repo.path().join("home"),
+                "XDG_CONFIG_HOME": repo.path().join("config"),
+            },
+        });
+        seed_repo_config(
+            repo.path(),
+            &serde_json::json!({ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "browser2": { "tool": "opencode", "role": "standby", "launch": launch },
+            } })
+            .to_string(),
+        );
+        let gone = SessionId::parse(GONE).unwrap();
+        crate::agent_store::bind_session_to_agent(repo.path(), &browser2(), Tool::OpenCode, &gone)
+            .unwrap();
+        repo
+    }
+
+    async fn start_opencode_browser2(
+        repo: &Path,
+        print: bool,
+        opencode: &dyn crate::cli::opencode_fork::Api,
+    ) -> Option<ComposedLaunch> {
+        start_with(
+            AgentStartArgs {
+                name: "browser2".into(),
+                repo: Some(repo.to_path_buf()),
+                print,
+            },
+            Purpose::Start,
+            nobody_runs_it,
+            opencode,
+            record_launch,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The kimi incident: bound to a session OpenCode never created, every
+    /// start resumed the same missing id.
+    #[tokio::test]
+    async fn a_start_whose_opencode_session_is_gone_binds_one_opencode_has() {
+        let repo = opencode_agent_bound_to_gone();
+        let opencode = OpenCode::recorded();
+        assert!(
+            start_opencode_browser2(repo.path(), false, &opencode)
+                .await
+                .is_none()
+        );
+        let bound = crate::agent_store::binding(repo.path(), &browser2())
+            .unwrap()
+            .unwrap();
+        assert_ne!(bound.id.as_str(), GONE);
+        assert_eq!(bound.tool, Tool::OpenCode);
+        assert!(opencode.has(bound.id.as_str()), "{bound:?}");
+        let [launch] = &launched()[..] else {
+            panic!("one launch")
+        };
+        assert_eq!(session_arg(launch), Some(bound.id.as_str()), "{launch:?}");
+        assert_eq!(
+            launch
+                .env_overrides
+                .get(crate::agent_env::ENV_CLANK_BOOTSTRAP_SESSION),
+            Some(&bound.id.as_str().to_string()),
+            "the plugin arms the new session's wait"
+        );
+        assert!(!launch.args.iter().any(|a| a == GONE), "{launch:?}");
+    }
+
+    /// A marker no plugin could arm on (its idle check failed, or it was
+    /// unloaded first) stays set; resuming the agent writes it again, which
+    /// is a new event for the instance loaded now.
+    #[tokio::test]
+    async fn a_resume_tells_a_shared_server_again_of_a_marker_still_standing() {
+        let repo = opencode_agent_bound_to_gone_with(&[]);
+        let standing = serde_json::json!({ "keep": 1, "clank": { "bound": "browser2" } });
+        let opencode = OpenCode::recorded().holding(GONE, repo.path(), Some(standing.clone()));
+        start_opencode_browser2(repo.path(), false, &opencode).await;
+        let [launch] = &launched()[..] else {
+            panic!("one launch")
+        };
+        assert_eq!(session_arg(launch), Some(GONE), "{launch:?}");
+        assert_eq!(
+            *opencode.markers.lock().unwrap(),
+            [(GONE.to_string(), standing)]
+        );
+
+        opencode
+            .metadata
+            .lock()
+            .unwrap()
+            .insert(GONE.into(), serde_json::json!({ "keep": 1 }));
+        start_opencode_browser2(repo.path(), false, &opencode).await;
+        launched();
+        assert_eq!(
+            opencode.markers.lock().unwrap().len(),
+            1,
+            "a consumed marker is not written again"
+        );
+        start_opencode_browser2(repo.path(), true, &opencode).await;
+        assert_eq!(
+            opencode.markers.lock().unwrap().len(),
+            1,
+            "nor by a preview"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_be_read_resumes_the_binding_as_it_is() {
+        let repo = opencode_agent_bound_to_gone();
+        let opencode = OpenCode::unreadable("sqlite3 is not available");
+        start_opencode_browser2(repo.path(), false, &opencode).await;
+        let bound = crate::agent_store::binding(repo.path(), &browser2())
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.id.as_str(), GONE);
+        let [launch] = &launched()[..] else {
+            panic!("one launch")
+        };
+        assert_eq!(session_arg(launch), Some(GONE), "{launch:?}");
+        assert_eq!(opencode.created(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_preview_of_a_gone_opencode_session_creates_and_binds_nothing() {
+        let repo = opencode_agent_bound_to_gone();
+        let before = snapshot(repo.path());
+        let opencode = OpenCode::recorded();
+        let preview = start_opencode_browser2(repo.path(), true, &opencode)
+            .await
+            .expect("print returns the launch");
+        let shown = session_arg(&preview).unwrap();
+        assert!(
+            shown != GONE && is_opencode_session_id(shown),
+            "{preview:?}"
+        );
+        assert_eq!(opencode.created(), 0);
+        assert_eq!(snapshot(repo.path()), before);
+    }
+
+    /// A start that judged the binding gone finds, under the lock, that a
+    /// concurrent start already replaced it: the newer one is kept.
+    #[test]
+    fn a_gone_binding_replaced_meanwhile_keeps_the_newer_one() {
+        let repo = opencode_agent_bound_to_gone();
+        let judged = crate::agent_store::binding(repo.path(), &browser2())
+            .unwrap()
+            .unwrap();
+        let newer = SessionId::parse("ses_def0ffe86ffdNewerAAAAAAAAA").unwrap();
+        crate::agent_store::bind_session_to_agent(repo.path(), &browser2(), Tool::OpenCode, &newer)
+            .unwrap();
+        let opencode = OpenCode::recorded();
+        let s =
+            opencode_session_to_resume(repo.path(), &browser2(), None, &judged, false, &opencode)
+                .unwrap();
+        assert_eq!(s.id, newer);
+        assert_eq!(opencode.created(), 0);
+        assert_eq!(
+            crate::agent_store::binding(repo.path(), &browser2())
+                .unwrap()
+                .map(|s| s.id),
+            Some(newer)
+        );
     }
 
     /// A git repo whose `browser2` is a Claude agent launched through a

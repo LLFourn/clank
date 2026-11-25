@@ -26,9 +26,13 @@ fn the_plugin_runs_its_lifecycle_under_the_2x_loader() {
         );
     };
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let marker = clank::cli::opencode_session::bound_marker(
+        &clank_core::ids::AgentLabel::parse("kimi").unwrap(),
+    );
     let out = std::process::Command::new(node)
         .arg(crate_dir.join("tests/opencode_plugin_lifecycle.mjs"))
         .arg(crate_dir.join("src/cli/setup_assets/opencode_plugin.js"))
+        .arg(marker.to_string())
         .env_remove("CLANK_BOOTSTRAP_SESSION_ID")
         .stdin(std::process::Stdio::null())
         .output()

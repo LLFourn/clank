@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use super::DoctorArgs;
 use crate::agent_env::{Ambient, detect_session_in, explicit_label_in, resolve_identity_in};
 use crate::agent_store::{agent_config_path, agents_root, load_agent_config};
+use crate::cli::opencode_session::Stored;
 use crate::cli::teams_config::AgentDescription;
+use clank_core::agent_config::LaunchConfig;
 use clank_core::ids::AgentLabel;
 
 /// Sentinel returned by [`run`] when one or more checks failed.
@@ -107,12 +109,15 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     results.extend(grok_checks(repo.as_deref(), home.as_deref()).await);
 
     if let Some(repo) = repo.as_deref() {
-        let data = opencode_data_dir(home.as_deref());
         let now = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
         results.extend(opencode_plugin_checks(
             repo,
             home.as_deref(),
-            &|session| opencode_last_settle(data.as_deref(), session),
+            &|launch, session| {
+                use crate::cli::opencode_fork::Api;
+                let backend = crate::cli::agent::opencode_backend(repo, launch);
+                crate::cli::opencode_fork::Cli.stored(&backend, session)
+            },
             now,
         ));
     }
@@ -1662,111 +1667,28 @@ fn render(results: &[CheckResult], json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What OpenCode's own store says about a session's latest settled
-/// execution: the one record of a finished turn that does not depend on
-/// clank's plugin having loaded.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OpenCodeSettle {
-    At { unix_secs: u64, outcome: String },
-    Never,
-    Unknown(String),
-}
-
 /// How long after OpenCode settles a turn the plugin's report of it may
 /// still be in flight: reports are chained per session, and each is a
 /// process start and a monitor round trip.
 const REPORT_GRACE_SECS: u64 = 120;
 
-fn opencode_data_dir(home: Option<&Path>) -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.map(|h| h.join(".local/share")))
-        .map(|d| d.join("opencode"))
-}
-
-/// Read-only lookup of one session's row in OpenCode 2.x's store. Why not
-/// a SQLite crate: one bounded read at the doctor command boundary does
-/// not earn a bundled C dependency, and without `sqlite3` the check says
-/// it could not tell rather than guessing.
-fn opencode_last_settle(data: Option<&Path>, session: &str) -> OpenCodeSettle {
-    let Some(db) = data
-        .map(|d| d.join("opencode.db"))
-        .filter(|db| db.is_file())
-    else {
-        return OpenCodeSettle::Unknown("OpenCode's store was not found".into());
-    };
-    if !session
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return OpenCodeSettle::Unknown(format!("`{session}` is not an OpenCode session id"));
-    }
-    // Its own `.timeout 1000` bounds the lock wait; this bounds the rest.
-    const SQLITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
-    use crate::proc_run::{Group, Out, RunError, Spec};
-    let out = crate::proc_run::run_blocking(
-        Spec::new("sqlite3")
-            .arg("-readonly")
-            .args(["-cmd", ".timeout 1000"])
-            .arg(format!("file:{}?mode=ro", db.display()))
-            .arg(format!(
-                "select coalesce(time_idle, ''), coalesce(idle_outcome, '') \
-                 from session_v2 where id = '{session}'"
-            ))
-            .stdout(Out::Capture { cap: 1 << 20 })
-            .stderr(Out::Ring { bytes: 4096 })
-            .group(Group::New),
-        SQLITE_BUDGET,
-    );
-    let out = match out {
-        Ok(out) if out.status.success() => out,
-        Ok(out) => {
-            return OpenCodeSettle::Unknown(format!(
-                "sqlite3 could not read OpenCode's store: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Err(RunError::Spawn(e)) => {
-            return OpenCodeSettle::Unknown(format!("sqlite3 is not available: {e}"));
-        }
-        Err(e) => {
-            return OpenCodeSettle::Unknown(format!(
-                "sqlite3 could not read OpenCode's store: {e}"
-            ));
-        }
-    };
-    parse_settle_row(&String::from_utf8_lossy(&out.stdout))
-}
-
-fn parse_settle_row(row: &str) -> OpenCodeSettle {
-    let row = row.trim();
-    if row.is_empty() {
-        return OpenCodeSettle::Unknown("OpenCode's store has no such session".into());
-    }
-    let (idle, outcome) = row.split_once('|').unwrap_or((row, ""));
-    match idle.parse::<u64>() {
-        Ok(ms) => OpenCodeSettle::At {
-            unix_secs: ms / 1000,
-            outcome: outcome.to_string(),
-        },
-        Err(_) if idle.is_empty() => OpenCodeSettle::Never,
-        Err(_) => OpenCodeSettle::Unknown(format!("unexpected row `{row}`")),
-    }
-}
-
 /// Whether clank's plugin is reporting each OpenCode-bound agent's turns.
 fn opencode_plugin_checks(
     repo: &Path,
     home: Option<&Path>,
-    settle: &dyn Fn(&str) -> OpenCodeSettle,
+    settle: &dyn Fn(Option<&LaunchConfig>, &str) -> Stored,
     now: u64,
 ) -> Vec<CheckResult> {
     let Ok(Some(set)) = crate::agent_store::try_resolve_via_team_with(repo, home) else {
         return Vec::new();
     };
-    std::iter::once(set.master.clone())
-        .chain(set.members.iter().map(|m| m.label.clone()))
-        .filter_map(|label| {
+    std::iter::once((set.master.clone(), set.master_desc.launch.clone()))
+        .chain(
+            set.members
+                .iter()
+                .map(|m| (m.label.clone(), m.desc.launch.clone())),
+        )
+        .filter_map(|(label, launch)| {
             let session = crate::agent_store::binding(repo, &label).ok().flatten()?;
             (session.tool == clank_core::Tool::OpenCode).then(|| {
                 let reports =
@@ -1775,7 +1697,7 @@ fn opencode_plugin_checks(
                     &label,
                     &session,
                     &reports,
-                    &settle(session.id.as_str()),
+                    &settle(launch.as_ref(), session.id.as_str()),
                     now,
                 )
             })
@@ -1805,7 +1727,7 @@ fn opencode_plugin_check(
     label: &AgentLabel,
     session: &clank_core::agent_config::Session,
     reports: &Path,
-    settle: &OpenCodeSettle,
+    settle: &Stored,
     now: u64,
 ) -> CheckResult {
     const SECTION: &str = "repo";
@@ -1829,7 +1751,7 @@ fn opencode_plugin_check(
         )
     };
     let unreported = match settle {
-        OpenCodeSettle::At { unix_secs, outcome }
+        Stored::At { unix_secs, outcome }
             if *unix_secs > bound && reported.is_none_or(|r| r < *unix_secs) =>
         {
             Some((*unix_secs, outcome.as_str()))
@@ -1837,6 +1759,15 @@ fn opencode_plugin_check(
         _ => None,
     };
     match (unreported, reported, settle) {
+        (_, _, Stored::Missing) => CheckResult::warn(
+            SECTION,
+            name,
+            format!(
+                "the binding names session {id}, which OpenCode's store does not have, so \
+                 nothing runs in it. `clank agent start {label}` replaces it with a session \
+                 OpenCode has"
+            ),
+        ),
         (Some((at, outcome)), _, _) if now < at + REPORT_GRACE_SECS => CheckResult::ok(
             SECTION,
             name,
@@ -1862,7 +1793,7 @@ fn opencode_plugin_check(
             ),
         ),
         (None, Some(last), _) => healthy(last),
-        (None, None, OpenCodeSettle::Unknown(why)) => CheckResult::warn(
+        (None, None, Stored::Unknown(why)) => CheckResult::warn(
             SECTION,
             name,
             format!(
@@ -1884,7 +1815,7 @@ fn opencode_plugin_check(
 #[cfg(test)]
 mod tests {
     mod opencode_plugin {
-        use super::super::{CheckStatus, OpenCodeSettle, opencode_plugin_check, parse_settle_row};
+        use super::super::{CheckStatus, Stored, opencode_plugin_check};
 
         const SID: &str = "ses_0bound00000000000000000";
         const BOUND: u64 = 1_793_064_908;
@@ -1898,11 +1829,7 @@ mod tests {
             }
         }
 
-        fn check(
-            reports: &[(&str, u64)],
-            settle: OpenCodeSettle,
-            now: u64,
-        ) -> (CheckStatus, String) {
+        fn check(reports: &[(&str, u64)], settle: Stored, now: u64) -> (CheckStatus, String) {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("turns.jsonl");
             let body: String = reports
@@ -1915,8 +1842,8 @@ mod tests {
             (r.status, r.message)
         }
 
-        fn at(secs: u64) -> OpenCodeSettle {
-            OpenCodeSettle::At {
+        fn at(secs: u64) -> Stored {
+            Stored::At {
                 unix_secs: secs,
                 outcome: "succeeded".into(),
             }
@@ -1933,7 +1860,7 @@ mod tests {
 
         #[test]
         fn a_session_that_has_not_finished_a_turn_since_binding_is_not_yet_reported() {
-            for settle in [OpenCodeSettle::Never, at(BOUND - 1)] {
+            for settle in [Stored::Never, at(BOUND - 1)] {
                 let (status, msg) = check(&[], settle, LATER);
                 assert_eq!(status, CheckStatus::Ok, "{msg}");
                 assert!(msg.starts_with("no report yet"), "{msg}");
@@ -1985,7 +1912,7 @@ mod tests {
 
         #[test]
         fn a_report_from_before_the_binding_is_not_evidence_for_it() {
-            let (status, msg) = check(&[(SID, BOUND - 100)], OpenCodeSettle::Never, LATER);
+            let (status, msg) = check(&[(SID, BOUND - 100)], Stored::Never, LATER);
             assert_eq!(status, CheckStatus::Ok, "{msg}");
             assert!(msg.starts_with("no report yet"), "{msg}");
             let (status, msg) = check(&[(SID, BOUND - 100)], at(BOUND + 10), LATER);
@@ -2000,7 +1927,7 @@ mod tests {
         fn an_unreadable_store_says_it_cannot_tell() {
             let (status, msg) = check(
                 &[],
-                OpenCodeSettle::Unknown("sqlite3 is not available".into()),
+                Stored::Unknown("sqlite3 is not available".into()),
                 LATER,
             );
             assert_eq!(status, CheckStatus::Warn, "{msg}");
@@ -2010,17 +1937,23 @@ mod tests {
             );
         }
 
+        /// The kimi incident: the plugin loaded, but the bound session was
+        /// never created, so no turn of it could be reported.
         #[test]
-        fn the_store_row_reads_as_its_settle() {
-            assert_eq!(
-                parse_settle_row("1793065434866|interrupted\n"),
-                OpenCodeSettle::At {
-                    unix_secs: 1_793_065_434,
-                    outcome: "interrupted".into()
-                }
-            );
-            assert_eq!(parse_settle_row("|\n"), OpenCodeSettle::Never);
-            assert!(matches!(parse_settle_row(""), OpenCodeSettle::Unknown(_)));
+        fn a_session_the_store_lacks_is_named_as_missing_not_as_a_plugin_fault() {
+            for reports in [&[][..], &[(SID, BOUND + 50)]] {
+                let (status, msg) = check(reports, Stored::Missing, LATER);
+                assert_eq!(status, CheckStatus::Warn, "{msg}");
+                assert!(
+                    msg.contains("OpenCode's store does not have")
+                        && msg.contains("`clank agent start qwen` replaces it"),
+                    "{msg}"
+                );
+                assert!(
+                    !msg.contains("plugin") && !msg.contains("clank setup"),
+                    "{msg}"
+                );
+            }
         }
     }
 

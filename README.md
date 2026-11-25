@@ -351,8 +351,21 @@ The pane's tool runs with `CLANK_AGENT=<label>` in its environment,
 and clank's SessionStart hook binds that label to the session the tool
 just created — so work can be routed to it — and rebinds it when
 `/clear` hands the process a new session id. OpenCode has no such
-hook, so clank chooses an OpenCode session's id itself, records the
-binding, and launches it with `--session <id>`. A forked OpenCode agent's
+hook, so clank has OpenCode create the agent's session first (`opencode api
+session.create`, under the profile's executable, `launch.env` and
+`--standalone`/`--server`), binds the id OpenCode returns, and launches it
+with `--session <id>`: OpenCode 2.1.4 stores nothing for a `--session` id it
+lacks until a prompt is submitted. Through a shared server (the background
+service, or `--server`), whose plugin may have seen the session created
+before it was bound, clank then marks the session bound in its metadata,
+which is what has that plugin start the agent's wait; the rest of the
+session's metadata is kept. The plugin clears the mark once a wait it
+started on it has answered, so a mark still standing means no wait served
+it: the next OpenCode loaded in the repo arms on it, and the next `clank
+agent start` writes it again. A binding the server could not be told of is
+undone. A start whose bound session OpenCode's
+store does not have binds a new one the same way and says so; a store it
+cannot read is resumed as bound. A forked OpenCode agent's
 child session is prepared before it launches: `opencode api session.fork`
 copies the source, `session.move` places the child in the fork, and
 `session.get` must confirm it is stored there before clank binds it and
@@ -1133,7 +1146,8 @@ auto-mode drives it:
   directory, and the plugin runs one loop per session, in that session's
   own directory. `clank doctor` says when a bound session has finished a
   turn but the plugin never reported it — usually an OpenCode that did not
-  load the plugin. Launch
+  load the plugin — and when OpenCode's store has no such session, which
+  `clank agent start` replaces. Launch
   repair also upgrades an existing setup-owned global copy, preserving local
   edits through the usual non-force ownership checks. OpenCode 2.x's interactive
   command takes no `--model`. A session keeps the model it was started

@@ -20,12 +20,31 @@ use clank_core::vocab::Tool;
 pub(crate) mod tests;
 
 /// The OpenCode the launched pane will use: preparing through any other
-/// store would leave `--session` to create an empty session under the id.
+/// store leaves `--session` naming a session the pane's OpenCode lacks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Backend {
     pub program: String,
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
+    /// The profile's `--standalone` or `--server <url>`, which `opencode
+    /// api` takes too.
+    pub server: Vec<String>,
+}
+
+/// The args of `launch` that select OpenCode's server.
+pub(crate) fn server_args(launch: Option<&LaunchConfig>) -> Vec<String> {
+    let args = launch.map(|l| l.args.as_slice()).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--standalone" || arg.starts_with("--server=") {
+            out.push(arg.clone());
+        } else if arg == "--server" {
+            out.push(arg.clone());
+            out.extend(it.next().cloned());
+        }
+    }
+    out
 }
 
 /// `opencode api` cannot be pointed at the server a profile's
@@ -58,6 +77,7 @@ impl CallError {
     }
 }
 
+/// OpenCode as a start reaches it: its API, and its store.
 pub(crate) trait Api {
     /// `opencode api <method> --param sessionID=<session> [-d <body>]`,
     /// answering the `data` it prints.
@@ -68,6 +88,9 @@ pub(crate) trait Api {
         session: &str,
         body: Option<Value>,
     ) -> Result<Value, CallError>;
+
+    /// What the store `backend`'s pane reads says of `session`.
+    fn stored(&self, backend: &Backend, session: &str) -> super::opencode_session::Stored;
 }
 
 pub(crate) struct Cli;
@@ -85,7 +108,9 @@ impl Api for Cli {
     ) -> Result<Value, CallError> {
         use crate::proc_run::{Group, Identity, Out, RunError, Spec};
         let mut cmd = Spec::new(&backend.program)
-            .args(["api", method, "--param", &format!("sessionID={session}")])
+            .arg("api")
+            .args(&backend.server)
+            .args([method, "--param", &format!("sessionID={session}")])
             .cwd(&backend.cwd);
         if let Some(body) = body {
             cmd = cmd.args(["-d", &body.to_string()]);
@@ -128,9 +153,11 @@ impl Api for Cli {
             if let Some(data) = printed.as_ref().and_then(|v| v.get("data")) {
                 return Ok(data.clone());
             }
-            // `session.move` answers 204 No Content; `session.get` is what
-            // proves placement.
-            if method == "session.move" && out.stdout.trim_ascii().is_empty() {
+            // `session.move` and `session.update` answer 204 No Content;
+            // `session.get` is what proves placement.
+            if ["session.move", "session.update"].contains(&method)
+                && out.stdout.trim_ascii().is_empty()
+            {
                 return Ok(Value::Null);
             }
         }
@@ -138,6 +165,17 @@ impl Api for Cli {
             return Err(CallError::Refused(failed()));
         }
         Err(CallError::Unknown(failed()))
+    }
+
+    fn stored(&self, backend: &Backend, session: &str) -> super::opencode_session::Stored {
+        super::opencode_session::Store::of(&backend.server, &|k| {
+            backend
+                .env
+                .get(k)
+                .cloned()
+                .or_else(|| std::env::var(k).ok())
+        })
+        .lookup(session)
     }
 }
 
@@ -259,12 +297,13 @@ pub(crate) fn prepare(
             stored.unwrap_or("no directory")
         )));
     }
-    let session = crate::agent_store::reserve_opencode_locked(&guard, superseded, || child_id)
+    let session = crate::agent_store::reserve_opencode_locked(&guard, superseded, || Ok(child_id))
         .with_context(|| format!("`{label}` was not launched: its session could not be bound"))?;
+    super::opencode_session::announce_bound(&guard, api, backend, label, &session.id)?;
     Ok(session)
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
             (std::fs::canonicalize(a), std::fs::canonicalize(b)),
