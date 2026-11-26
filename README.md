@@ -726,6 +726,7 @@ Blocks belong to the repository. The master asks with
 `clank block answer <name> -m "answer"`. Reviewers raise `REQUEST_CHANGES`
 when progress needs to stop; the master decides whether to ask the human.
 A block pauses the repo's review cycle, while messages and events still arrive.
+The master raises no block while the repo is idle (no active plan, nothing queued).
 
 Names are unique across the repository, and a name is reused only once its
 block is delivered: asking it again while its question is pending, or answered

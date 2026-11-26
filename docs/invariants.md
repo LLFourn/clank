@@ -120,12 +120,19 @@ whether its assertions protect the invariant. Reviewers check that.
   unique master and a caller with no harness session variable and no
   `CLANK_AGENT`. Any other agent is refused before a block file or the
   `blocked` hook is touched, and so is a caller whose identity fails to
-  resolve. Only the master's wakes offer `block ask`: a reviewer's name
-  REQUEST_CHANGES, and other agents are pointed at `clank send --master`.
+  resolve. The master raises no block while the repo is idle (no active
+  plan, nothing queued; `queue::Cycle`, the state its wait promotes from),
+  and a queue it cannot read refuses it with the error. Only the master's
+  wakes offer `block ask`: a reviewer's name REQUEST_CHANGES, and other
+  agents are pointed at `clank send --master`.
 - Tests: `crates/cli/src/cli/block/repo_tests.rs::a_reviewer_is_refused_a_block_and_told_to_request_changes`,
   `crates/cli/src/cli/block/repo_tests.rs::a_standby_agent_is_refused_a_block_and_told_to_send_the_master`,
   `crates/cli/src/cli/block/repo_tests.rs::the_master_raises_a_block`,
-  `crates/cli/src/cli/block/repo_tests.rs::a_caller_with_no_identity_raises_a_block`,
+  `crates/cli/src/cli/block/repo_tests.rs::the_master_of_an_idle_repo_is_refused_a_block`,
+  `crates/cli/src/cli/block/repo_tests.rs::the_master_raises_a_block_while_a_plan_is_queued`,
+  `crates/cli/src/cli/block/repo_tests.rs::a_withheld_promotion_leaves_the_repo_not_idle`,
+  `crates/cli/src/cli/block/repo_tests.rs::an_unreadable_queue_refuses_the_master_with_the_read_error`,
+  `crates/cli/src/cli/block/repo_tests.rs::a_caller_with_no_identity_raises_a_block_in_an_idle_repo`,
   `crates/cli/src/cli/block/repo_tests.rs::an_unresolved_identity_is_refused_and_creates_nothing`,
   `crates/cli/src/cli/wake_render.rs::only_the_master_is_offered_a_block`,
   `crates/cli/src/cli/turn_custody_tests.rs::only_the_masters_escalated_wake_offers_a_block`

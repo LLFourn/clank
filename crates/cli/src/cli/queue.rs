@@ -283,14 +283,14 @@ pub fn resolve_entry(repo: &Path, handle: &str) -> anyhow::Result<QueueEntry> {
     }
 }
 
-/// Validate that no two entries share the same `name`. Returns
-/// the entry list on success, or a loud error naming every
-/// conflicting file pair. Callers that act on a queue item
-/// (wait promote, queue remove/promote) should use this; callers
-/// that merely render (list, status count) can stay on
-/// `scan_queue`.
+/// The queue, refusing one that can't be read or where two entries
+/// share a `name`: the error names every conflicting file. Callers that
+/// act on the queue use this; callers that merely render (list, status
+/// count) can stay on `scan_queue`.
 pub fn scan_queue_no_dups(repo: &Path) -> anyhow::Result<Vec<QueueEntry>> {
-    let entries = scan_queue(repo);
+    let dir = queue_dir(repo);
+    let entries = priority_dir::try_scan(&dir)
+        .map_err(|e| anyhow::anyhow!("reading the queue `{}`: {e}", dir.display()))?;
     let mut names: std::collections::BTreeMap<&str, Vec<&QueueEntry>> =
         std::collections::BTreeMap::new();
     for e in &entries {
@@ -324,6 +324,38 @@ pub fn scan_queue_no_dups(repo: &Path) -> anyhow::Result<Vec<QueueEntry>> {
         "ambiguous queue names: {listed}. \
          Delete the duplicate(s) from .clank/queue/ and re-run."
     );
+}
+
+/// Where the plan cycle stands. The master's wait promotes from it and
+/// a block pauses it, so both read it here and cannot disagree about
+/// whether there is a cycle at all.
+#[derive(Debug)]
+pub(crate) enum Cycle {
+    /// A plan is active.
+    Active,
+    /// No plan is active and these wait to be promoted, head first.
+    /// Never empty. A pending block withholding the promotion does not
+    /// make the repo idle.
+    Queued(Vec<QueueEntry>),
+    /// No plan is active and nothing is queued.
+    Idle,
+}
+
+impl Cycle {
+    /// The cycle, given whether the fold has an active plan. The queue is
+    /// read only when none is, by [`scan_queue_no_dups`], whose errors
+    /// are returned rather than read as an empty queue.
+    pub(crate) fn read(repo: &Path, active_plan: bool) -> anyhow::Result<Self> {
+        if active_plan {
+            return Ok(Self::Active);
+        }
+        let queue = scan_queue_no_dups(repo)?;
+        Ok(if queue.is_empty() {
+            Self::Idle
+        } else {
+            Self::Queued(queue)
+        })
+    }
 }
 
 pub fn scan_queue(repo: &Path) -> Vec<QueueEntry> {
