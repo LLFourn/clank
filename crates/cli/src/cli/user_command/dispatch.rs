@@ -1,15 +1,13 @@
 //! The one dispatcher: the monitor's evaluation of every waiting request
-//! ([`pass`]) and the attempt itself ([`attempt`]), each re-verifying the
-//! stored envelope before it acts.
+//! ([`pass`]) and the attempt itself ([`attempt`]).
 //!
 //! An attempt takes the request's id lock, then the pane's write lock,
 //! and with both held finds the agent's pane again, which must still be the
 //! one recorded at the first look and still run Claude Code, and reads the
 //! input from one dump. Then comes its one commit point: the loop's
-//! readiness answer, then the agent's state lock, and under it the
-//! trusted keys and clock, the envelope verified again and the binding read
-//! under the guard; then `dispatching` is persisted and the command typed.
-//! Locks are released in reverse.
+//! readiness answer, then the agent's state lock, and under it the clock
+//! and the binding read again; then `dispatching` is persisted and the
+//! command typed. Locks are released in reverse.
 //!
 //! No cycle: the loop only tries an agent's state lock, takes id locks only with a
 //! try-lock, and never takes a pane lock (its own pane writers run off the
@@ -22,37 +20,38 @@
 //! reader that takes the id lock and finds it knows its dispatcher died
 //! and records `unconfirmed`. Nothing is ever retried.
 
-use super::envelope::{self, Id, Verified};
-use super::store::{Held, PaneSeen, Record, Stamp, State, Store};
-use super::trust::TrustSet;
+use super::request::{Command, Id};
+use super::store::{Asked, Held, PaneSeen, Record, Stamp, State, Store};
 use crate::cli::nudge_log;
 use crate::cli::open_zellij::PaneWrite;
 use crate::cli::pane_input::{Terminal, UserCommandEvidence};
 use clank_core::Tool;
 use clank_core::ids::{AgentLabel, SessionId};
 use std::collections::BTreeSet;
-use std::path::Path;
 
 /// Why a `dispatching` record found with its lock free is `unconfirmed`:
 /// its dispatcher died holding the lock, maybe after typing.
 const DIED: &str = "its dispatcher stopped before recording the outcome; it is never retried";
 
-/// Verify `record`'s envelope as it is used now: under the entry it was
-/// admitted under, as `trust` holds it, within its window, and naming the
-/// repo, label and id it was found at.
-pub(crate) fn authorise(
+/// Why a record an older clank filed is refused rather than typed.
+pub(crate) const OLDER: &str =
+    "it was filed by an older clank in a form this one does not type; it needs a new request";
+
+/// What `record` asks to type, if it may still be typed at `now` for the
+/// agent bound as `bound`: the session and command, or why it is refused.
+fn runnable(
     record: &Record,
-    trust: &TrustSet,
     now: u64,
-    repo: &Path,
-    label: &AgentLabel,
-    id: &Id,
-) -> Result<Verified, String> {
-    match trust.pinned(&record.pin(), &record.envelope, now) {
-        Ok(v) if v.names(repo, label, id) => Ok(v),
-        Ok(_) => Err("its signed repo, agent or id disagree with where it was found".into()),
-        Err(e) => Err(e.to_string()),
+    bound: Option<(Tool, SessionId)>,
+) -> Result<(SessionId, Command), String> {
+    let Asked::Run { session, command } = &record.asked else {
+        return Err(OLDER.into());
+    };
+    if record.expired(now) {
+        return Err("expired".into());
     }
+    super::bound_to(bound, session)?;
+    Ok((session.clone(), command.clone()))
 }
 
 /// What the monitor's loop says of an agent a request waits for.
@@ -87,32 +86,30 @@ pub(crate) struct Job {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Pass {
     pub(crate) jobs: Vec<Job>,
-    /// Agents whose park a verified request waits on: their next Stop, or
-    /// parked report, ends instead of parking.
+    /// Agents whose park a request waits on: their next Stop, or parked
+    /// report, ends instead of parking.
     pub(crate) release: BTreeSet<AgentLabel>,
-    /// Agents with a verified request waiting, whose records recovery must
-    /// read for their turn's end.
+    /// Agents with a request waiting, whose records recovery must read for
+    /// their turn's end.
     pub(crate) watch: BTreeSet<AgentLabel>,
     /// The earliest moment a waiting request expires.
     pub(crate) next_expiry: Option<u64>,
 }
 
-/// Where a pass or an attempt works, and the moment and keys it judges by.
+/// Where a pass or an attempt works, and the moment it judges by.
 pub(crate) struct Ctx<'a> {
     pub(crate) store: &'a Store,
     pub(crate) tag: &'a str,
-    pub(crate) repo: &'a Path,
-    pub(crate) trust: &'a TrustSet,
     pub(crate) now: u64,
     pub(crate) history: &'a (dyn Fn(&AgentLabel, nudge_log::Record) + Sync),
 }
 
 /// Evaluate every request filed for this repo whose lock is free and that
 /// `skip` does not hold back: settle a dead dispatcher's attempt as
-/// unconfirmed, refuse one whose envelope no longer verifies or whose
-/// session has gone, and otherwise record why it waits, ask for the park
-/// standing in its way to end, or hand it to an attempt. A record's state
-/// and reason are written only when they change.
+/// unconfirmed, refuse one an older clank filed, one past its lifetime or
+/// one whose session has gone, and otherwise record why it waits, ask for
+/// the park standing in its way to end, or hand it to an attempt. A
+/// record's state and reason are written only when they change.
 pub(crate) fn pass(
     ctx: &Ctx<'_>,
     agents: &mut impl Agents,
@@ -155,8 +152,8 @@ pub(crate) fn pass(
             );
             continue;
         }
-        let verified = match authorise(&record, ctx.trust, ctx.now, ctx.repo, &label, &id) {
-            Ok(v) => v,
+        let session = match runnable(&record, ctx.now, agents.binding(&label)) {
+            Ok((session, _)) => session,
             Err(why) => {
                 settle(
                     ctx,
@@ -171,23 +168,10 @@ pub(crate) fn pass(
                 continue;
             }
         };
-        if agents.binding(&label) != Some((verified.tool, verified.session.clone())) {
-            settle(
-                ctx,
-                &held,
-                &label,
-                &id,
-                &mut record,
-                State::Refused,
-                "the session it was signed for no longer holds the label".into(),
-                None,
-            );
-            continue;
-        }
-        let expiry = verified.expires_at.saturating_add(envelope::SKEW + 1);
+        let expiry = record.expires_at() + 1;
         out.next_expiry = Some(out.next_expiry.map_or(expiry, |e| e.min(expiry)));
         out.watch.insert(label.clone());
-        let reason = match agents.look(&label, &verified.session) {
+        let reason = match agents.look(&label, &session) {
             Look::Go => {
                 out.jobs.push(Job {
                     label,
@@ -262,8 +246,6 @@ fn settle(
 /// fake terminal, a fake clock and a fake crash, never a real pane.
 pub(crate) trait Seams: Sync {
     fn now(&self) -> u64;
-    /// The trusted keys as configured now.
-    fn trust(&self) -> TrustSet;
     /// The tool and session bound to `label` now.
     fn binding(&self, label: &AgentLabel) -> Option<(Tool, SessionId)>;
     /// The agent's one pane, and the tool the roster gives it.
@@ -298,13 +280,7 @@ pub(crate) enum Ended {
 
 /// One attempt for `job`: record the pane at the first look, and, when
 /// dispatching, run the final checks under the three locks and type.
-pub(crate) async fn attempt(
-    store: &Store,
-    tag: &str,
-    repo: &Path,
-    job: &Job,
-    seams: &impl Seams,
-) -> Ended {
+pub(crate) async fn attempt(store: &Store, tag: &str, job: &Job, seams: &impl Seams) -> Ended {
     let (label, id) = (&job.label, &job.id);
     let held = match crate::cli::event_interrupt::blocking(|| store.lock(tag, label, id)) {
         Ok(held) => held,
@@ -317,12 +293,9 @@ pub(crate) async fn attempt(
         return Ended::Done;
     };
     let history = |label: &AgentLabel, r: nudge_log::Record| seams.history(label, r);
-    let trust = seams.trust();
     let ctx = Ctx {
         store,
         tag,
-        repo,
-        trust: &trust,
         now: seams.now(),
         history: &history,
     };
@@ -346,17 +319,10 @@ pub(crate) async fn attempt(
         settle(&ctx, &held, label, id, record, State::Refused, why, None);
         Ended::Done
     };
-    let verified = match authorise(&record, ctx.trust, ctx.now, repo, label, id) {
-        Ok(v) => v,
+    let session = match runnable(&record, ctx.now, seams.binding(label)) {
+        Ok((session, _)) => session,
         Err(why) => return refuse(&mut record, why),
     };
-    let bound = Some((verified.tool, verified.session.clone()));
-    if seams.binding(label) != bound {
-        return refuse(
-            &mut record,
-            "the session it was signed for no longer holds the label".into(),
-        );
-    }
     if record.pane.is_none() {
         match seams.discover(label).await {
             Ok((seen, Tool::Claude)) => {
@@ -430,13 +396,13 @@ pub(crate) async fn attempt(
         drop(held);
         return Ended::OnScreen {
             stamp: store.stamp(tag, label, id),
-            expires: verified.expires_at.saturating_add(envelope::SKEW + 1),
+            expires: record.expires_at() + 1,
         };
     }
-    // The commit point: the loop's readiness, then the keys, the clock and
-    // the binding as they are now, with no await between them and the first
-    // byte but taking the agent's state lock, whose holders take no other lock.
-    if let Err(why) = seams.last_look(label, &verified.session).await {
+    // The commit point: the loop's readiness, then the clock and the binding
+    // as they are now, with no await between them and the first byte but
+    // taking the agent's state lock, whose holders take no other lock.
+    if let Err(why) = seams.last_look(label, &session).await {
         wait(&mut record, why);
         return Ended::Done;
     }
@@ -445,17 +411,10 @@ pub(crate) async fn attempt(
         Err(why) => return refuse(&mut record, format!("its binding could not be held: {why}")),
     };
     let now = seams.now();
-    let trust = seams.trust();
-    let verified = match authorise(&record, &trust, now, repo, label, id) {
-        Ok(v) => v,
+    let command = match runnable(&record, now, seams.binding(label)) {
+        Ok((_, command)) => command,
         Err(why) => return refuse(&mut record, why),
     };
-    if seams.binding(label) != Some((verified.tool, verified.session.clone())) {
-        return refuse(
-            &mut record,
-            "the session it was signed for no longer holds the label".into(),
-        );
-    }
     let Some(row) = seams.evidence() else {
         return refuse(
             &mut record,
@@ -464,7 +423,7 @@ pub(crate) async fn attempt(
                 .into(),
         );
     };
-    if verified.command.line().chars().count() > row.max_command {
+    if command.line().chars().count() > row.max_command {
         return refuse(
             &mut record,
             format!(
@@ -484,9 +443,8 @@ pub(crate) async fn attempt(
         );
         return Ended::Done;
     }
-    let typed =
-        crate::cli::pane_input::type_user_command(&term, &pane.pane, &verified.command).await;
-    let line = Some(format!("!{}", verified.command.line()));
+    let typed = crate::cli::pane_input::type_user_command(&term, &pane.pane, &command).await;
+    let line = Some(format!("!{}", command.line()));
     let (state, reason, line) = match typed {
         Ok(()) => (State::Delivered, String::new(), line),
         Err(PaneWrite::NotStarted(why)) => (

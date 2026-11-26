@@ -1,7 +1,6 @@
 use super::*;
 use crate::cli::monitor::fixtures::*;
-use crate::cli::user_command::envelope::testkey::{Signer, payload};
-use crate::cli::user_command::store::{PaneSeen, State, Store};
+use crate::cli::user_command::store::{PaneSeen, Record, State, Store};
 
 const ROSTER: &str = r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#;
 
@@ -50,7 +49,6 @@ struct World {
     repo: std::path::PathBuf,
     home: tempfile::TempDir,
     _dir: tempfile::TempDir,
-    site: Signer,
 }
 
 fn world() -> World {
@@ -61,14 +59,10 @@ fn world() -> World {
     crate::agent_store::bind_session_to_agent(&repo, &claude(), clank_core::Tool::Claude, &sid())
         .unwrap();
     crate::agent_store::set_auto_mode(&repo, &claude(), clank_core::AutoMode::On).unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let site = Signer::generate();
-    crate::cli::user_command::trust_key(home.path(), "site", &site.key().encoded(), false).unwrap();
     World {
         repo,
-        home,
+        home: tempfile::tempdir().unwrap(),
         _dir: dir,
-        site,
     }
 }
 
@@ -77,25 +71,14 @@ impl World {
         Store::at(self.home.path().join(".clank/user-commands"))
     }
 
-    /// File a request signed by `signer` now, its pane already seen, so
+    /// File `record` as `r1`, admitted now with its pane already seen, so
     /// no pass goes looking for one.
-    fn file(&self, signer: &Signer) {
+    fn file(&self, mut record: Record) {
         let now = crate::cli::recovery::unix_now();
-        let mut p = payload(&self.repo);
-        p["session"] = "session-one".into();
-        p["issued_at"] = now.into();
-        p["expires_at"] = (now + 300).into();
         let tag = repo_tag(&self.repo);
-        let id = crate::cli::user_command::envelope::Id::parse("r1").unwrap();
+        let id = crate::cli::user_command::request::Id::parse("r1").unwrap();
         let held = self.store().lock(&tag, &claude(), &id).unwrap();
-        let mut record = crate::cli::user_command::store::Record::admitted(
-            signer.sign(&p),
-            crate::cli::user_command::trust::Pin {
-                name: crate::cli::user_command::trust::KeyName::parse("site").unwrap(),
-                fingerprint: self.site.key().fingerprint(),
-            },
-            now,
-        );
+        record.admitted_at = now;
         record.pane = Some(PaneSeen {
             session: "zs".into(),
             pane: "terminal_1".into(),
@@ -106,18 +89,14 @@ impl World {
 }
 
 /// Through the loop's own round: a parked Stop stays parked with no
-/// request and with a forged one, and a verified request ends it with
+/// request and with one an older clank filed, and a request ends it with
 /// the user-command verdict; the agent is then left settling, and the
 /// round spawns no attempt while it does.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_verified_request_ends_a_park_and_a_forged_one_does_not() {
+async fn a_request_ends_a_park_and_an_older_one_does_not() {
     let w = world();
     let state = crate::repo_state::RepoState::empty(w.repo.clone());
-    let (mut uc, _wakes) = crate::cli::user_command::live::UserCommands::new(
-        &w.repo,
-        w.home.path().to_path_buf(),
-        w.store(),
-    );
+    let (mut uc, _wakes) = crate::cli::user_command::live::UserCommands::new(&w.repo, w.store());
     let (client, mut queue) = holding("session-one");
     let mut clients = vec![client];
     let mut turns = crate::cli::turn_custody::Turns::new(w.repo.clone());
@@ -158,18 +137,27 @@ async fn a_verified_request_ends_a_park_and_a_forged_one_does_not() {
     round(&mut clients, &mut uc, &mut turns, &mut owned);
     assert_eq!(clients.len(), 1, "no request, still parked");
 
-    w.file(&Signer::generate());
+    w.file(
+        serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/formats/user-command-keyed-waiting.json"
+        ))
+        .unwrap(),
+    );
     round(&mut clients, &mut uc, &mut turns, &mut owned);
-    assert_eq!(clients.len(), 1, "a forged request releases nothing");
+    assert_eq!(clients.len(), 1, "an older request releases nothing");
     let tag = repo_tag(&w.repo);
-    let id = crate::cli::user_command::envelope::Id::parse("r1").unwrap();
+    let id = crate::cli::user_command::request::Id::parse("r1").unwrap();
     assert_eq!(
         w.store().read(&tag, &claude(), &id).unwrap().unwrap().state,
         State::Refused
     );
 
     std::fs::remove_file(w.store().repo_dir(&tag).join("claude/r1.json")).unwrap();
-    w.file(&w.site);
+    w.file(Record::admitted(
+        sid(),
+        crate::cli::user_command::request::Command::for_test("git push origin feature"),
+        0,
+    ));
     round(&mut clients, &mut uc, &mut turns, &mut owned);
     assert!(clients.is_empty(), "the park was answered and retired");
     let verdict = queue.try_recv().unwrap();

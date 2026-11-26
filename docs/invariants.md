@@ -165,7 +165,7 @@ whether its assertions protect the invariant. Reviewers check that.
   to recovery and its ledger, the timer pending) until it is released: a
   thread blocked in a flock of it as the loop wanted it lets it go at once
   and wakes the loop, which retries the contended operations then. A holder may keep a lock
-  across a side effect, such as signed user-command delivery, because the
+  across a side effect, such as user-command delivery, because the
   loop never waits on it. The ingest lease's patience (250 ms) remains only
   off the loop: in commands and wait clients; a hosted GitHub source takes
   it without waiting and follows until it is handed over. `messages.writer.lock` only serializes message writers.

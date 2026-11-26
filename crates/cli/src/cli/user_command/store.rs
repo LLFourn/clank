@@ -1,21 +1,19 @@
 //! The queue, the id locks and the attempt ledger:
 //! `~/.clank/user-commands/<repo_tag>/<label>/<id>.json`, `<id>.lock` beside
-//! it. Outside every repo, so agents have no reason to edit it; that
-//! protects nothing against a same-UID writer, which can reset or delete a
-//! genuine envelope's state and so defeat replay prevention (README).
+//! it.
 //!
-//! Durable, in the home directory rather than `/tmp`, so a reboot inside an
-//! envelope's lifetime cannot reset replay state. Directories are 0700 and
-//! files 0600, vetted before every read and opened without following links.
+//! Durable, in the home directory rather than `/tmp`, so a reboot inside a
+//! request's lifetime cannot make an attempted id look new. Directories are
+//! 0700 and files 0600, vetted before every read and opened without
+//! following links.
 
-use super::envelope::{Envelope, Id};
-use super::trust::{KeyName, Pin};
+use super::request::{Command, Id};
 use anyhow::{Context, bail, ensure};
-use clank_core::ids::AgentLabel;
+use clank_core::ids::{AgentLabel, SessionId};
 use std::path::{Path, PathBuf};
 
 /// Where a request stands. The last four are terminal: nothing moves a
-/// record out of them, whatever happens to the key or the clock later.
+/// record out of them, whatever happens to the binding or the clock later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum State {
@@ -68,48 +66,58 @@ impl PartialEq for PaneSeen {
 
 impl Eq for PaneSeen {}
 
-/// One request's entry: the exact envelope as admitted, and clank's own
-/// state machine. No unsigned copy of the command, target, id or times:
-/// every use derives those from the envelope, verified again.
+/// How long after its admission a request may still be typed. A press is
+/// for now, and a request waiting on an agent releases its parked turns.
+pub(crate) const LIFETIME: u64 = 600;
+
+/// One request's entry and clank's own state machine. Its repo, agent and
+/// id are the path it is filed at.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Record {
-    pub(crate) envelope: Envelope,
+    #[serde(flatten)]
+    pub(crate) asked: Asked,
     pub(crate) state: State,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pane: Option<PaneSeen>,
-    /// The fingerprint of the key it was admitted under.
-    pub(crate) key: String,
-    /// The name that key was trusted as. A record from before keys had
-    /// names has none, and was admitted under the key now named `default`.
-    #[serde(default = "KeyName::legacy")]
-    pub(crate) key_name: KeyName,
     pub(crate) admitted_at: u64,
     pub(crate) updated_at: u64,
 }
 
+/// What a record asks to have typed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Asked {
+    Run {
+        session: SessionId,
+        command: Command,
+    },
+    /// Filed by an older clank in a shape this one never types, kept as it
+    /// was written. Read as anything but present, its id would run again.
+    Older(serde_json::Map<String, serde_json::Value>),
+}
+
 impl Record {
-    pub(crate) fn admitted(envelope: Envelope, pin: Pin, now: u64) -> Self {
+    pub(crate) fn admitted(session: SessionId, command: Command, now: u64) -> Self {
         Record {
-            envelope,
+            asked: Asked::Run { session, command },
             state: State::Admitted,
             reason: Some("the repo's monitor has not looked at it yet".into()),
             pane: None,
-            key: pin.fingerprint,
-            key_name: pin.name,
             admitted_at: now,
             updated_at: now,
         }
     }
 
-    /// The entry every use after admission verifies under.
-    pub(crate) fn pin(&self) -> Pin {
-        Pin {
-            name: self.key_name.clone(),
-            fingerprint: self.key.clone(),
-        }
+    /// Whether it is past its [`LIFETIME`] at `now`.
+    pub(crate) fn expired(&self, now: u64) -> bool {
+        now > self.expires_at()
+    }
+
+    /// The last moment it may be typed.
+    pub(crate) fn expires_at(&self) -> u64 {
+        self.admitted_at.saturating_add(LIFETIME)
     }
 
     /// Move to `state` for `reason`. False, and nothing changed, when that is
@@ -132,14 +140,11 @@ impl Record {
             reason: self.reason.clone(),
             admitted_at: self.admitted_at,
             updated_at: self.updated_at,
-            key: self.key.clone(),
-            key_name: self.key_name.to_string(),
         }
     }
 }
 
-/// What `submit` and `status` print: never the envelope, the signature or
-/// the command.
+/// What `submit` and `status` print: never the command.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Status {
     pub(crate) id: String,
@@ -147,8 +152,6 @@ pub(crate) struct Status {
     pub(crate) reason: Option<String>,
     pub(crate) admitted_at: u64,
     pub(crate) updated_at: u64,
-    pub(crate) key: String,
-    pub(crate) key_name: String,
 }
 
 /// The longest record read back.
@@ -459,14 +462,8 @@ mod tests {
 
     fn record() -> Record {
         Record::admitted(
-            Envelope {
-                request: "cmVx".into(),
-                sig: "c2ln".into(),
-            },
-            Pin {
-                name: KeyName::parse("site").unwrap(),
-                fingerprint: "fp".into(),
-            },
+            SessionId::parse("session-one").unwrap(),
+            Command::for_test("git push origin feature"),
             10,
         )
     }
@@ -560,7 +557,7 @@ mod tests {
         assert_eq!(r.updated_at, 11);
         assert!(r.moved(State::Delivered, None, 13));
         for state in [State::Refused, State::WaitingForIdle, State::Unconfirmed] {
-            assert!(!r.moved(state, Some("key changed".into()), 14));
+            assert!(!r.moved(state, Some("expired".into()), 14));
         }
         assert_eq!((r.state, r.updated_at), (State::Delivered, 13));
     }
@@ -592,12 +589,9 @@ mod tests {
     }
 
     #[test]
-    fn the_status_names_no_envelope() {
+    fn the_status_names_no_command() {
         let status = serde_json::to_string(&record().status(&id("r1"))).unwrap();
-        assert!(
-            !status.contains("cmVx") && !status.contains("c2ln"),
-            "{status}"
-        );
+        assert!(!status.contains("git push"), "{status}");
         assert!(status.contains("\"state\":\"admitted\""), "{status}");
     }
 }

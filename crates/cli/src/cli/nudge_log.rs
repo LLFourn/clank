@@ -28,7 +28,7 @@ pub(crate) enum Trigger {
     Fallback { attempt: u32 },
     /// `recovery.stall_warn`: work owed and a running turn gone silent.
     Stall,
-    /// A person's signed command (`clank user-command`), by its request id.
+    /// A person's command (`clank user-command`), by its request id.
     UserCommand { id: String },
     /// `clank block answer --nudge`, answering the block it names.
     Block { name: String },

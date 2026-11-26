@@ -378,7 +378,6 @@ dependencies = [
  "qrcode",
  "quote",
  "reqwest",
- "ring",
  "rquickjs",
  "rusqlite",
  "rustix",

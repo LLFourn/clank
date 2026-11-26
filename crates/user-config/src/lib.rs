@@ -2,9 +2,9 @@
 //! every writer of it goes through.
 //!
 //! Several programs own sections of the one document: the CLI's settings,
-//! teams and trusted keys, the web door's `remote`. Each writer reads the
+//! teams and agent library, the web door's `remote`. Each writer reads the
 //! whole document and writes it back, so a writer outside [`transact`]
-//! can put back what another just removed, such as a revoked key. An
+//! can put back what another just removed, such as an agent. An
 //! atomic rename alone does not prevent that: it orders whole-file
 //! replacements, not read-modify-write cycles.
 

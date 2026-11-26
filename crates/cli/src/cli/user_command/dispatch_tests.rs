@@ -1,13 +1,13 @@
 use super::*;
 use crate::cli::composer::fixtures::claude;
-use crate::cli::user_command::envelope::SiteKey;
-use crate::cli::user_command::envelope::testkey::{NOW, Signer, payload};
-use crate::cli::user_command::trust::{KeyName, Pin};
-use std::path::PathBuf;
+use crate::cli::user_command::store::LIFETIME;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const TAG: &str = "tag";
+const NOW: u64 = 1_800_000_000;
+const PAST: u64 = NOW + LIFETIME + 1;
 
 fn label() -> AgentLabel {
     AgentLabel::parse("claude").unwrap()
@@ -48,7 +48,6 @@ enum Write {
 
 struct Fake {
     now: AtomicU64,
-    trust: Mutex<TrustSet>,
     binding: Mutex<Option<(Tool, SessionId)>>,
     /// What each lookup finds, in turn; the last one answers every lookup
     /// after it.
@@ -59,7 +58,7 @@ struct Fake {
     written: Mutex<Vec<Vec<String>>>,
     evidence: Option<UserCommandEvidence>,
     history: Mutex<Vec<nudge_log::Record>>,
-    /// A real repo whose binding lock and config are used instead.
+    /// A real repo whose binding and binding lock are used instead.
     repo: Option<PathBuf>,
     during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     events: std::sync::Arc<Mutex<Vec<&'static str>>>,
@@ -105,22 +104,10 @@ impl Drop for Held {
     }
 }
 
-fn one(key: &SiteKey) -> TrustSet {
-    TrustSet::from_keys([("site", key.clone())])
-}
-
-fn pin(name: &str, key: &SiteKey) -> Pin {
-    Pin {
-        name: KeyName::parse(name).unwrap(),
-        fingerprint: key.fingerprint(),
-    }
-}
-
 impl Fake {
-    fn new(key: &SiteKey) -> Self {
+    fn new() -> Self {
         Fake {
             now: AtomicU64::new(NOW),
-            trust: Mutex::new(one(key)),
             binding: Mutex::new(Some((Tool::Claude, sid("session-one")))),
             discover: Mutex::new(vec![Ok((seen(), Tool::Claude))]),
             looks: Mutex::new(Ok(())),
@@ -185,9 +172,6 @@ impl Seams for Fake {
     fn now(&self) -> u64 {
         self.now.load(Ordering::SeqCst)
     }
-    fn trust(&self) -> TrustSet {
-        self.trust.lock().unwrap().clone()
-    }
     fn binding(&self, label: &AgentLabel) -> Option<(Tool, SessionId)> {
         match &self.repo {
             Some(repo) => crate::agent_store::binding(repo, label)
@@ -244,8 +228,6 @@ impl Seams for Fake {
 struct World {
     _home: tempfile::TempDir,
     store: Store,
-    repo: PathBuf,
-    site: Signer,
 }
 
 impl World {
@@ -253,31 +235,45 @@ impl World {
         let home = tempfile::tempdir().unwrap();
         World {
             store: Store::at(home.path().join("uc")),
-            repo: PathBuf::from("/w/proj"),
             _home: home,
-            site: Signer::generate(),
         }
     }
 
-    /// File `envelope` as admitted under `id`, the way `submit` does.
-    fn file(&self, id: &Id, envelope: envelope::Envelope) {
+    /// File a request for `session-one` under `id`, as `submit` does.
+    fn file(&self, id: &Id) {
         let held = self.store.lock(TAG, &label(), id).unwrap();
         held.save(&Record::admitted(
-            envelope,
-            pin("site", &self.site.key()),
+            sid("session-one"),
+            Command::for_test("git push origin feature"),
             NOW,
         ))
         .unwrap();
     }
 
-    fn file_as(&self, id: &Id, envelope: envelope::Envelope, pin: Pin) {
-        let held = self.store.lock(TAG, &label(), id).unwrap();
-        held.save(&Record::admitted(envelope, pin, NOW)).unwrap();
+    fn admit(&self) -> Id {
+        self.file(&id("r1"));
+        id("r1")
     }
 
-    fn admit(&self) -> Id {
-        self.file(&id("r1"), self.site.sign(&payload(&self.repo)));
-        id("r1")
+    /// Put `bytes` where `id`'s record goes, as another clank wrote them.
+    fn place(&self, id: &Id, bytes: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        drop(self.store.lock(TAG, &label(), id).unwrap());
+        let path = self
+            .store
+            .repo_dir(TAG)
+            .join(label().as_str())
+            .join(format!("{}.json", id.as_str()));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
     }
 
     fn record(&self, id: &Id) -> Record {
@@ -301,22 +297,15 @@ impl World {
     }
 
     async fn attempt(&self, seams: &Fake, id: &Id) -> Ended {
-        attempt(&self.store, TAG, &self.repo, &self.job(id), seams).await
+        attempt(&self.store, TAG, &self.job(id), seams).await
     }
 
-    fn pass(
-        &self,
-        trust: &TrustSet,
-        now: u64,
-        agents: &mut Agents_,
-    ) -> (Pass, Vec<nudge_log::Record>) {
+    fn pass(&self, now: u64, agents: &mut Agents_) -> (Pass, Vec<nudge_log::Record>) {
         let history = Mutex::new(Vec::new());
         let note = |_: &AgentLabel, r: nudge_log::Record| history.lock().unwrap().push(r);
         let ctx = Ctx {
             store: &self.store,
             tag: TAG,
-            repo: &self.repo,
-            trust,
             now,
             history: &note,
         };
@@ -353,7 +342,7 @@ fn agents(look: Look) -> Agents_ {
 async fn an_idle_empty_prompt_gets_the_command_once() {
     let w = World::new();
     let r1 = w.admit();
-    let seams = Fake::new(&w.site.key());
+    let seams = Fake::new();
     assert_eq!(w.attempt(&seams, &r1).await, Ended::Done);
     let written = seams.written.lock().unwrap().clone();
     assert_eq!(written.len(), 2);
@@ -387,12 +376,12 @@ async fn a_failed_write_is_recorded_as_what_it_may_have_done() {
         let r1 = w.admit();
         let seams = Fake {
             answers,
-            ..Fake::new(&w.site.key())
+            ..Fake::new()
         };
         w.attempt(&seams, &r1).await;
         assert_eq!(w.record(&r1).state, state);
         w.attempt(&seams, &r1).await;
-        let (out, _) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Go));
+        let (out, _) = w.pass(NOW, &mut agents(Look::Go));
         assert!(out.jobs.is_empty());
         assert_eq!(seams.writes(), writes, "{state:?}: never retried");
     }
@@ -414,14 +403,14 @@ async fn a_crash_after_dispatching_is_unconfirmed_and_never_replayed() {
         let r1 = w.admit();
         let seams = Fake {
             answers,
-            ..Fake::new(&w.site.key())
+            ..Fake::new()
         };
         let died = std::panic::AssertUnwindSafe(w.attempt(&seams, &r1))
             .catch_unwind()
             .await;
         assert!(died.is_err(), "the fake crash ran");
         assert_eq!(w.record(&r1).state, State::Dispatching);
-        let (out, history) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Go));
+        let (out, history) = w.pass(NOW, &mut agents(Look::Go));
         assert!(out.jobs.is_empty());
         let record = w.record(&r1);
         assert_eq!(record.state, State::Unconfirmed, "{writes}");
@@ -430,7 +419,7 @@ async fn a_crash_after_dispatching_is_unconfirmed_and_never_replayed() {
             history[0].outcome,
             nudge_log::Outcome::Indeterminate { .. }
         ));
-        w.attempt(&Fake::new(&w.site.key()), &r1).await;
+        w.attempt(&Fake::new(), &r1).await;
         assert_eq!(seams.writes(), writes, "no second write");
     }
 }
@@ -445,7 +434,7 @@ async fn a_dispatching_record_is_settled_unconfirmed_by_the_attempt() {
     let mut record = w.record(&r1);
     record.moved(State::Dispatching, None, NOW);
     w.put(&r1, &record);
-    let seams = Fake::new(&w.site.key());
+    let seams = Fake::new();
     assert_eq!(w.attempt(&seams, &r1).await, Ended::Done);
     assert_eq!(seams.writes(), 0);
     assert_eq!(w.record(&r1).state, State::Unconfirmed);
@@ -460,24 +449,17 @@ async fn a_dispatching_record_is_settled_unconfirmed_by_the_attempt() {
 }
 
 /// The decision to type is made after the input is read, against the
-/// world as it is then: a request that expires, a key revoked, or the
-/// agent no longer idle while the dump was being taken, and an ordinary
-/// clank writer that won the pane first and started a turn, each end in
-/// nothing typed.
+/// world as it is then: a request that expires, or the agent no longer
+/// idle, while the dump was being taken, and an ordinary clank writer that
+/// won the pane first and started a turn, each end in nothing typed.
 #[tokio::test]
 async fn nothing_decided_before_the_dump_or_the_pane_lock_is_trusted() {
     type Change = fn(&Fake);
     let busy: Change = |f| *f.looks.lock().unwrap() = Err("its turn is running".into());
-    let cases: [(&str, Option<Change>, Option<Change>, State); 4] = [
+    let cases: [(&str, Option<Change>, Option<Change>, State); 3] = [
         (
             "expired during the dump",
-            Some(|f| f.now.store(NOW + 301 + envelope::SKEW, Ordering::SeqCst)),
-            None,
-            State::Refused,
-        ),
-        (
-            "key revoked during the dump",
-            Some(|f| *f.trust.lock().unwrap() = TrustSet::of(None)),
+            Some(|f| f.now.store(PAST, Ordering::SeqCst)),
             None,
             State::Refused,
         ),
@@ -497,7 +479,7 @@ async fn nothing_decided_before_the_dump_or_the_pane_lock_is_trusted() {
     for (what, during_dump, before_pane, state) in cases {
         let w = World::new();
         let r1 = w.admit();
-        let seams = Fake::new(&w.site.key());
+        let seams = Fake::new();
         *seams.during_dump.lock().unwrap() = during_dump;
         *seams.before_pane.lock().unwrap() = before_pane;
         w.attempt(&seams, &r1).await;
@@ -507,27 +489,24 @@ async fn nothing_decided_before_the_dump_or_the_pane_lock_is_trusted() {
 }
 
 /// What changes after the loop's last look and before the locks are taken
-/// is caught by the checks under them: the key replaced, the window run
-/// out, the binding moved. Nothing is typed.
+/// is caught by the checks under them: the lifetime run out, the binding
+/// moved to another session or another tool. Nothing is typed.
 #[tokio::test]
 async fn the_checks_under_the_locks_see_what_changed_after_the_last_look() {
     type Change = (&'static str, fn(&Fake));
     let changes: [Change; 3] = [
-        ("key changed", |f| {
-            *f.trust.lock().unwrap() = one(&Signer::generate().key())
+        ("expired", |f| f.now.store(PAST, Ordering::SeqCst)),
+        ("the session it names does not hold the label", |f| {
+            *f.binding.lock().unwrap() = Some((Tool::Claude, sid("session-two")))
         }),
-        ("expired", |f| {
-            f.now.store(NOW + 301 + envelope::SKEW, Ordering::SeqCst)
+        (super::super::NOT_CLAUDE, |f| {
+            *f.binding.lock().unwrap() = Some((Tool::Codex, sid("session-one")))
         }),
-        (
-            "the session it was signed for no longer holds the label",
-            |f| *f.binding.lock().unwrap() = Some((Tool::Claude, sid("session-two"))),
-        ),
     ];
     for (reason, change) in changes {
         let w = World::new();
         let r1 = w.admit();
-        let seams = Fake::new(&w.site.key());
+        let seams = Fake::new();
         *seams.after_look.lock().unwrap() = Some(change);
         w.attempt(&seams, &r1).await;
         let record = w.record(&r1);
@@ -547,124 +526,69 @@ fn a_held_dispatching_record_is_left_alone() {
     record.moved(State::Dispatching, None, NOW);
     w.put(&r1, &record);
     let held = w.store.lock(TAG, &label(), &r1).unwrap();
-    let (out, history) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Go));
+    let (out, history) = w.pass(NOW, &mut agents(Look::Go));
     assert_eq!(out, Pass::default());
     assert!(history.is_empty());
     drop(held);
     assert_eq!(w.record(&r1).state, State::Dispatching);
 }
 
-/// A record fabricated outright, or whose stored request, signature,
-/// target or times were edited after admission, or filed under a path its
-/// payload does not name, is refused at its next use: no park released,
-/// no attempt, nothing typed.
+const OLDER_WAITING: &[u8] =
+    include_bytes!("../../../tests/fixtures/formats/user-command-keyed-waiting.json");
+const OLDER_DELIVERED: &[u8] =
+    include_bytes!("../../../tests/fixtures/formats/user-command-keyed-delivered.json");
+
+/// Records an older clank filed: one waiting is refused at its next use,
+/// by a pass or an attempt, with nothing released or typed; one delivered
+/// stays exactly as written; one left `dispatching` is `unconfirmed`. None
+/// reads as absent.
 #[tokio::test]
-async fn stored_authority_is_judged_at_every_use() {
-    let b64 = |b: &[u8]| {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(b)
-    };
+async fn an_older_record_is_never_typed_and_its_history_stays() {
     let w = World::new();
-    let forger = Signer::generate();
-    let good = w.site.sign(&payload(&w.repo));
-    let mut edits: Vec<(Id, envelope::Envelope)> = Vec::new();
-    edits.push((id("fabricated"), {
-        let mut p = payload(&w.repo);
-        p["id"] = "fabricated".into();
-        forger.sign(&p)
-    }));
-    for (n, (field, value)) in [
-        ("command", serde_json::Value::from("rm -rf ~")),
-        ("session", "session-two".into()),
-        ("agent", "codex".into()),
-        ("expires_at", (NOW + 900).into()),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let name = format!("edited{n}");
-        let mut p = payload(&w.repo);
-        p["id"] = name.clone().into();
-        let signed = w.site.sign(&p);
-        p[field] = value;
-        edits.push((
-            id(&name),
-            envelope::Envelope {
-                request: b64(&serde_json::to_vec(&p).unwrap()),
-                sig: signed.sig,
-            },
-        ));
-    }
-    edits.push((
-        id("resigned"),
-        envelope::Envelope {
-            request: good.request.clone(),
-            sig: b64(&[0u8; 64]),
-        },
-    ));
-    edits.push((id("misfiled"), good.clone()));
-    for (id, envelope) in &edits {
-        w.file(id, envelope.clone());
-    }
-    let (out, history) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Parked));
+    let (waiting, done, cut) = (id("waiting"), id("done"), id("cut"));
+    w.place(&waiting, OLDER_WAITING);
+    w.place(&done, OLDER_DELIVERED);
+    let mut dispatching: serde_json::Value = serde_json::from_slice(OLDER_WAITING).unwrap();
+    dispatching["state"] = "dispatching".into();
+    w.place(&cut, &serde_json::to_vec(&dispatching).unwrap());
+    let before = w.record(&done);
+    assert!(matches!(before.asked, Asked::Older(_)));
+    assert_eq!(before.state, State::Delivered);
+
+    let (out, history) = w.pass(NOW, &mut agents(Look::Parked));
     assert_eq!(out, Pass::default(), "no release, no watch, no attempt");
-    assert_eq!(history.len(), edits.len());
-    for (id, _) in &edits {
-        let record = w.record(id);
-        assert_eq!(record.state, State::Refused, "{}", id.as_str());
-    }
-    assert!(
-        w.record(&id("misfiled"))
-            .reason
-            .unwrap()
-            .contains("disagree with where it was found")
+    assert_eq!(history.len(), 2);
+    let refused = w.record(&waiting);
+    assert_eq!(
+        (refused.state, refused.reason.as_deref()),
+        (State::Refused, Some(OLDER))
     );
-    let seams = Fake::new(&w.site.key());
-    for (id, _) in &edits {
-        w.attempt(&seams, id).await;
-    }
+    assert_eq!(w.record(&cut).state, State::Unconfirmed);
+    assert_eq!(w.record(&done), before, "history is not rewritten");
+
+    let w = World::new();
+    w.place(&waiting, OLDER_WAITING);
+    let seams = Fake::new();
+    w.attempt(&seams, &waiting).await;
+    assert_eq!(w.record(&waiting).reason.as_deref(), Some(OLDER));
     assert_eq!(seams.writes(), 0);
 }
 
-/// After the trusted key is replaced, or removed, an admitted request is
-/// refused at its next use, and nothing is released or typed; a terminal
-/// outcome recorded before the change stays as it was.
+/// A record that cannot be read is left alone by a pass and an attempt:
+/// nothing is typed and nothing overwrites it.
 #[tokio::test]
-async fn a_changed_or_removed_key_refuses_at_next_use_and_keeps_history() {
+async fn an_unreadable_record_is_never_typed_or_replaced() {
     let w = World::new();
-    let delivered = id("done");
-    let mut p = payload(&w.repo);
-    p["id"] = "done".into();
-    w.file(&delivered, w.site.sign(&p));
-    let seams = Fake::new(&w.site.key());
-    w.attempt(&seams, &delivered).await;
-    assert_eq!(w.record(&delivered).state, State::Delivered);
-    let before = w.record(&delivered);
-
-    for (trust, reason) in [
-        (one(&Signer::generate().key()), "key changed"),
-        (TrustSet::of(None), "key changed"),
-    ] {
-        let r1 = w.admit();
-        let mut record = w.record(&r1);
-        record.state = State::Admitted;
-        record.reason = None;
-        w.put(&r1, &record);
-        let (out, _) = w.pass(&trust, NOW, &mut agents(Look::Parked));
-        assert!(out.release.is_empty() && out.jobs.is_empty(), "{reason}");
-        assert_eq!(w.record(&r1).state, State::Refused);
-        assert_eq!(w.record(&r1).reason.as_deref(), Some(reason));
-        assert_eq!(w.record(&delivered), before, "history is not rewritten");
-    }
-
-    let r2 = id("r2");
-    let mut p = payload(&w.repo);
-    p["id"] = "r2".into();
-    w.file(&r2, w.site.sign(&p));
-    let rotated = Fake::new(&Signer::generate().key());
-    w.attempt(&rotated, &r2).await;
-    assert_eq!(w.record(&r2).reason.as_deref(), Some("key changed"));
-    assert_eq!(rotated.writes(), 0);
+    let r1 = id("r1");
+    w.place(&r1, b"{\"state\":");
+    let (out, history) = w.pass(NOW, &mut agents(Look::Go));
+    assert_eq!(out, Pass::default());
+    assert!(history.is_empty());
+    let seams = Fake::new();
+    w.attempt(&seams, &r1).await;
+    assert_eq!(seams.writes(), 0);
+    let path = w.store.repo_dir(TAG).join("claude/r1.json");
+    assert_eq!(std::fs::read(path).unwrap(), b"{\"state\":");
 }
 
 /// The pass records why a request waits, asks for a park to end only when
@@ -674,11 +598,7 @@ async fn a_changed_or_removed_key_refuses_at_next_use_and_keeps_history() {
 fn a_pass_waits_releases_or_dispatches_and_writes_only_changes() {
     let w = World::new();
     let r1 = w.admit();
-    let (out, _) = w.pass(
-        &one(&w.site.key()),
-        NOW,
-        &mut agents(Look::Wait("its turn is running".into())),
-    );
+    let (out, _) = w.pass(NOW, &mut agents(Look::Wait("its turn is running".into())));
     assert_eq!(
         out.jobs,
         vec![Job {
@@ -689,13 +609,12 @@ fn a_pass_waits_releases_or_dispatches_and_writes_only_changes() {
         "the first look finds the pane"
     );
     assert_eq!(out.watch, [label()].into_iter().collect());
-    assert_eq!(out.next_expiry, Some(NOW + 300 + envelope::SKEW + 1));
+    assert_eq!(out.next_expiry, Some(PAST));
     let record = w.record(&r1);
     assert_eq!(record.state, State::WaitingForIdle);
     assert_eq!(record.reason.as_deref(), Some("its turn is running"));
     let stamp = w.store.stamp(TAG, &label(), &r1);
     w.pass(
-        &one(&w.site.key()),
         NOW + 5,
         &mut agents(Look::Wait("its turn is running".into())),
     );
@@ -705,13 +624,13 @@ fn a_pass_waits_releases_or_dispatches_and_writes_only_changes() {
         "unchanged, not rewritten"
     );
 
-    let (out, _) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Parked));
+    let (out, _) = w.pass(NOW, &mut agents(Look::Parked));
     assert_eq!(out.release, [label()].into_iter().collect());
     assert_eq!(
         w.record(&r1).reason.as_deref(),
         Some("releasing its parked turn")
     );
-    let (out, _) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Go));
+    let (out, _) = w.pass(NOW, &mut agents(Look::Go));
     assert!(out.release.is_empty());
     assert_eq!(
         out.jobs,
@@ -723,40 +642,41 @@ fn a_pass_waits_releases_or_dispatches_and_writes_only_changes() {
     );
 }
 
-/// Expiry at a pass or at dispatch is refused, never typed.
+/// Past its lifetime at a pass or at dispatch, a request is refused, never
+/// typed; up to its last second it is still handed on.
 #[tokio::test]
 async fn an_expired_request_is_refused() {
     let w = World::new();
     let r1 = w.admit();
-    let (_, history) = w.pass(
-        &one(&w.site.key()),
-        NOW + 301 + envelope::SKEW,
-        &mut agents(Look::Go),
-    );
+    let (out, _) = w.pass(NOW + LIFETIME, &mut agents(Look::Go));
+    assert_eq!(out.jobs.len(), 1);
+    let (_, history) = w.pass(PAST, &mut agents(Look::Go));
     assert_eq!(w.record(&r1).reason.as_deref(), Some("expired"));
     assert_eq!(history.len(), 1);
 
     let w = World::new();
     let r1 = w.admit();
-    let seams = Fake::new(&w.site.key());
-    seams
-        .now
-        .store(NOW + 301 + envelope::SKEW, Ordering::SeqCst);
+    let seams = Fake::new();
+    seams.now.store(PAST, Ordering::SeqCst);
     w.attempt(&seams, &r1).await;
     assert_eq!(w.record(&r1).reason.as_deref(), Some("expired"));
     assert_eq!(seams.writes(), 0);
 }
 
-/// Refused, with nothing typed: a binding that moved, a pane that runs
-/// another tool or cannot be located with certainty, at the first look or
-/// again under the pane's lock, a pane replaced since the first look, no
-/// committed evidence, and a command longer than its bound.
+/// Refused, with nothing typed: a binding that moved, or names another
+/// tool, a pane that runs another tool or cannot be located with
+/// certainty, at the first look or again under the pane's lock, a pane
+/// replaced since the first look, no committed evidence, and a command
+/// longer than its bound.
 #[tokio::test]
 async fn a_changed_target_is_refused() {
     type Change = fn(&mut Fake);
-    let changes: [(&str, Change); 8] = [
+    let changes: [(&str, Change); 9] = [
         ("binding", |f| {
             *f.binding.lock().unwrap() = Some((Tool::Claude, sid("session-two")))
+        }),
+        ("bound tool", |f| {
+            *f.binding.lock().unwrap() = Some((Tool::Codex, sid("session-one")))
         }),
         ("replaced", |f| {
             *f.discover.lock().unwrap() = vec![
@@ -792,7 +712,7 @@ async fn a_changed_target_is_refused() {
     for (what, change) in changes {
         let w = World::new();
         let r1 = w.admit();
-        let mut seams = Fake::new(&w.site.key());
+        let mut seams = Fake::new();
         change(&mut seams);
         w.attempt(&seams, &r1).await;
         assert_eq!(w.record(&r1).state, State::Refused, "{what}");
@@ -814,20 +734,25 @@ async fn only_an_empty_prompt_at_an_idle_agent_is_typed_into() {
     for screen in screens {
         let w = World::new();
         let r1 = w.admit();
-        let seams = Fake::new(&w.site.key());
+        let seams = Fake::new();
         *seams.screen.lock().unwrap() = screen.clone();
         let ended = w.attempt(&seams, &r1).await;
-        assert!(
-            matches!(ended, Ended::OnScreen { stamp: Some(_), expires } if expires > NOW + 300),
+        assert_eq!(
+            ended,
+            Ended::OnScreen {
+                stamp: w.store.stamp(TAG, &label(), &r1),
+                expires: PAST
+            },
             "{screen:?}"
         );
+        assert!(w.store.stamp(TAG, &label(), &r1).is_some());
         assert_eq!(w.record(&r1).state, State::WaitingForIdle, "{screen:?}");
         assert_eq!(seams.writes(), 0);
     }
     for why in ["its turn is running", "its turn is parked"] {
         let w = World::new();
         let r1 = w.admit();
-        let seams = Fake::new(&w.site.key());
+        let seams = Fake::new();
         *seams.looks.lock().unwrap() = Err(why.into());
         w.attempt(&seams, &r1).await;
         assert_eq!(w.record(&r1).reason.as_deref(), Some(why));
@@ -835,7 +760,7 @@ async fn only_an_empty_prompt_at_an_idle_agent_is_typed_into() {
     }
 }
 
-/// A repo whose master `claude` runs Claude, bound to `s1`.
+/// A repo whose master `claude` runs Claude, bound to `session-one`.
 fn bound_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     crate::cli::agent::add_repo_roster_agent(
@@ -860,20 +785,80 @@ fn bound_repo() -> tempfile::TempDir {
     dir
 }
 
+/// A plain request for `repo`, as the site sends it.
+fn submitted(repo: &Path, command: &str) -> String {
+    let mut r = crate::cli::user_command::request::fixtures::request(repo);
+    r["command"] = command.into();
+    r.to_string()
+}
+
+/// From `submit` to the pane, through the real target check against a
+/// bound repo: a plain request for an idle Claude agent is delivered once.
+/// Submitting it again answers `delivered` and types nothing; the same id
+/// with another command is refused and types nothing.
+#[tokio::test]
+async fn a_submitted_request_is_delivered_once() {
+    let dir = bound_repo();
+    let repo = dunce::canonicalize(dir.path()).unwrap();
+    let w = World::new();
+    let tag = crate::cli::monitor::repo_tag(&repo);
+    let submit = |text: &str| {
+        crate::cli::user_command::admit(&w.store, text, NOW, crate::cli::user_command::target_check)
+    };
+    let first = submitted(&repo, "echo \"a b\" $HOME");
+    assert_eq!(submit(&first).unwrap().state, State::Admitted);
+    let seams = Fake {
+        repo: Some(repo.clone()),
+        ..Fake::new()
+    };
+    let history = |_: &AgentLabel, _: nudge_log::Record| {};
+    let ctx = Ctx {
+        store: &w.store,
+        tag: &tag,
+        now: NOW,
+        history: &history,
+    };
+    let mut loop_agents = Agents_ {
+        binding: seams.binding(&label()),
+        look: Look::Go,
+    };
+    let out = pass(&ctx, &mut loop_agents, |_, _| false);
+    assert_eq!(out.jobs.len(), 1);
+    assert_eq!(
+        attempt(&w.store, &tag, &out.jobs[0], &seams).await,
+        Ended::Done
+    );
+    let written = seams.written.lock().unwrap().clone();
+    assert_eq!(
+        written
+            .iter()
+            .map(|a| a.last().unwrap().as_str())
+            .collect::<Vec<_>>(),
+        ["!echo \"a b\" $HOME", "13"]
+    );
+
+    assert_eq!(submit(&first).unwrap().state, State::Delivered);
+    assert!(
+        submit(&submitted(&repo, "git push --force"))
+            .unwrap_err()
+            .contains("already names a different request")
+    );
+    assert!(pass(&ctx, &mut loop_agents, |_, _| false).jobs.is_empty());
+    attempt(&w.store, &tag, &out.jobs[0], &seams).await;
+    assert_eq!(seams.writes(), 2, "never typed again");
+}
+
 /// Through the label's real binding lock: a rebind attempted while the
 /// command is being typed waits until the attempt is done, and an attempt
 /// that starts after a rebind is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rebind_waits_for_a_dispatch_and_one_before_it_refuses_it() {
     let repo = bound_repo();
-    let w = World {
-        repo: repo.path().to_path_buf(),
-        ..World::new()
-    };
+    let w = World::new();
     let r1 = w.admit();
     let seams = Fake {
         repo: Some(repo.path().to_path_buf()),
-        ..Fake::new(&w.site.key())
+        ..Fake::new()
     };
     let (thread_repo, events) = (repo.path().to_path_buf(), seams.events.clone());
     let rebind: std::sync::Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Default::default();
@@ -900,122 +885,13 @@ async fn a_rebind_waits_for_a_dispatch_and_one_before_it_refuses_it() {
         "the rebind waited for the dispatch to finish"
     );
 
-    let mut p = payload(&w.repo);
-    p["id"] = "r2".into();
     let r2 = id("r2");
-    w.file(&r2, w.site.sign(&p));
+    w.file(&r2);
     let after = Fake {
         repo: Some(repo.path().to_path_buf()),
-        ..Fake::new(&w.site.key())
+        ..Fake::new()
     };
     w.attempt(&after, &r2).await;
     assert_eq!(w.record(&r2).state, State::Refused);
     assert_eq!(after.writes(), 0);
-}
-
-/// With two sites trusted, removing one, replacing it, or trusting its key
-/// under another name refuses what it admitted, `key changed`, and nothing
-/// is typed; what the other site admitted is delivered.
-#[tokio::test]
-async fn untrusting_or_replacing_a_key_refuses_only_what_it_admitted() {
-    let other = Signer::generate();
-    let mut p = payload(&PathBuf::from("/w/proj"));
-    p["id"] = "r2".into();
-    type Change = fn(&SiteKey, &SiteKey) -> TrustSet;
-    let changes: [(&str, Change); 3] = [
-        ("untrusted", |_, b| {
-            TrustSet::from_keys([("site-b", b.clone())])
-        }),
-        ("replaced", |_, b| {
-            TrustSet::from_keys([("site-a", Signer::generate().key()), ("site-b", b.clone())])
-        }),
-        ("relabelled", |a, b| {
-            TrustSet::from_keys([("moved", a.clone()), ("site-b", b.clone())])
-        }),
-    ];
-    for (what, change) in changes {
-        let w = World::new();
-        let (r1, r2) = (id("r1"), id("r2"));
-        w.file_as(
-            &r1,
-            w.site.sign(&payload(&w.repo)),
-            pin("site-a", &w.site.key()),
-        );
-        w.file_as(&r2, other.sign(&p), pin("site-b", &other.key()));
-        let seams = Fake::new(&w.site.key());
-        *seams.trust.lock().unwrap() = change(&w.site.key(), &other.key());
-        w.attempt(&seams, &r1).await;
-        assert_eq!(w.record(&r1).state, State::Refused, "{what}");
-        assert_eq!(
-            w.record(&r1).reason.as_deref(),
-            Some("key changed"),
-            "{what}"
-        );
-        assert_eq!(seams.writes(), 0, "{what}");
-        w.attempt(&seams, &r2).await;
-        assert_eq!(w.record(&r2).state, State::Delivered, "{what}");
-    }
-}
-
-/// A record written before keys had names, waiting, and one already
-/// delivered: once the legacy key has migrated into a named set beside
-/// another site's, the waiting one is dispatched under `default` and the
-/// delivered one stays as it was.
-#[tokio::test]
-async fn an_old_format_record_dispatches_under_default_after_migration() {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let w = World::new();
-    let old_format = |id: &Id, state: State| {
-        let mut p = payload(&w.repo);
-        p["id"] = id.as_str().into();
-        let mut record = Record::admitted(w.site.sign(&p), pin("default", &w.site.key()), NOW);
-        record.state = state;
-        record.reason = Some("its turn is running".into());
-        let mut json = serde_json::to_value(&record).unwrap();
-        assert!(json.as_object_mut().unwrap().remove("key_name").is_some());
-        drop(w.store.lock(TAG, &label(), id).unwrap());
-        let path = w
-            ._home
-            .path()
-            .join("uc")
-            .join(TAG)
-            .join(label().as_str())
-            .join(format!("{}.json", id.as_str()));
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)
-            .unwrap()
-            .write_all(&serde_json::to_vec(&json).unwrap())
-            .unwrap();
-    };
-    let (waiting, done) = (id("waiting"), id("done"));
-    old_format(&waiting, State::WaitingForIdle);
-    old_format(&done, State::Delivered);
-    let before = w.record(&done);
-    assert_eq!(w.record(&waiting).key_name, KeyName::legacy());
-
-    let mut section = crate::cli::teams_config::UserCommandSection {
-        site_key: Some(w.site.key().encoded()),
-        ..Default::default()
-    };
-    crate::cli::user_command::trust::trust(
-        &mut section,
-        &KeyName::parse("site-b").unwrap(),
-        &Signer::generate().key(),
-        false,
-    )
-    .unwrap();
-    assert_eq!(section.site_key, None);
-    let seams = Fake::new(&w.site.key());
-    *seams.trust.lock().unwrap() = TrustSet::of(Some(&section));
-    let (_, history) = w.pass(&seams.trust(), NOW, &mut agents(Look::Go));
-    assert!(history.is_empty(), "{history:?}");
-    w.attempt(&seams, &waiting).await;
-    assert_eq!(w.record(&waiting).state, State::Delivered);
-    assert_eq!(seams.writes(), 2);
-    assert_eq!(w.record(&done), before, "history is not rewritten");
 }

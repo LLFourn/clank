@@ -74,27 +74,11 @@ pub struct UserConfigFile {
     /// before the door moved it to its own store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<crate::cli::web::door::RemoteSection>,
-    /// The sites' trusted public keys for `clank user-command`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_command: Option<UserCommandSection>,
     /// Forward-compat catchall. A leftover legacy `default_agents`
     /// key (from a pre-hard-cut config) lands here and is ignored
     /// — there is no migration that reads it.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
-}
-
-/// `clank user-command`'s trust: each site's Ed25519 public key, standard
-/// base64, by name. Written only by `clank user-command trust-key` and
-/// `untrust-key`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct UserCommandSection {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub keys: BTreeMap<String, String>,
-    /// The single key trusted before keys had names: read as `default`, and
-    /// dropped by the next trust mutation, which writes it into `keys`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub site_key: Option<String>,
 }
 
 /// User-scope zellij preferences

@@ -8,7 +8,7 @@ use super::retire::OwnedTasks;
 /// One evaluation of the repo's user `commands` against the loop's view of
 /// its agents: spawn the attempts the pass hands out, have recovery read
 /// the records of agents a request waits on, and release the parks that
-/// alone stand in a verified request's way, serving them again.
+/// alone stand in a request's way, serving them again.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn user_command_round(
     repo: &std::path::Path,
@@ -53,7 +53,6 @@ impl UserCommandLoop {
             .unwrap_or_default();
         let (commands, wakes) = crate::cli::user_command::live::UserCommands::new(
             repo,
-            user_home.clone(),
             crate::cli::user_command::store::Store::in_home(&user_home),
         );
         let crate::cli::user_command::live::Wakes {
