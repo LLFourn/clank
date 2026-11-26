@@ -1054,17 +1054,54 @@ fn grok_derived(session_id: &str, cwd: &Path, home: &Path) -> PathBuf {
         .join("chat_history.jsonl")
 }
 
-/// `~/.claude/projects/<cwd with every separator as '-'>/<id>.jsonl`.
 fn claude_derived(session_id: &str, cwd: &Path, home: &Path) -> PathBuf {
-    let slug: String = cwd
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
-        .collect();
     home.join(".claude")
         .join("projects")
-        .join(slug)
+        .join(claude_project_dir(cwd))
         .join(format!("{session_id}.jsonl"))
+}
+
+/// The directory name Claude Code keeps `cwd`'s sessions under in
+/// `~/.claude/projects`.
+///
+/// Mirrors `J0` in the Claude Code 2.1.308 bundle
+/// (`~/.local/share/claude/versions/2.1.308`): every UTF-16 code unit
+/// outside `[a-zA-Z0-9]` becomes `-` (so an astral character becomes
+/// two), and a name over 200 units keeps its first 200 and appends `-`
+/// and the base-36 `Math.abs` of Java's `String.hashCode` of the
+/// unsanitized path. The override a remote Claude session may apply
+/// (`Uwn` in `Uk`) is not followed.
+fn claude_project_dir(cwd: &Path) -> String {
+    const MAX: usize = 200;
+    let path = cwd.to_string_lossy();
+    let slug: String = path
+        .encode_utf16()
+        .map(|unit| match u8::try_from(unit) {
+            Ok(b) if b.is_ascii_alphanumeric() => char::from(b),
+            _ => '-',
+        })
+        .collect();
+    if slug.len() <= MAX {
+        return slug;
+    }
+    let hash = path.encode_utf16().fold(0i32, |h, unit| {
+        h.wrapping_shl(5)
+            .wrapping_sub(h)
+            .wrapping_add(i32::from(unit))
+    });
+    format!("{}-{}", &slug[..MAX], base36(hash.unsigned_abs()))
+}
+
+fn base36(mut n: u32) -> String {
+    let mut digits = Vec::new();
+    loop {
+        digits.push(char::from_digit(n % 36, 36).expect("below 36"));
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    digits.iter().rev().collect()
 }
 
 /// Every `rollout-*-<id>.jsonl` under the sessions dir — walked, not
@@ -1837,6 +1874,52 @@ mod tests {
             "another harness's line is not a Grok turn"
         );
         assert!(!has_adapter(Tool::OpenCode) && has_adapter(Tool::Grok));
+    }
+
+    /// The expected names are directories Claude Code 2.1.308 wrote on a
+    /// real machine, or what its own `J0` returned under node; none is
+    /// computed by the rule under test.
+    #[test]
+    fn a_claude_project_dir_is_the_name_claude_wrote() {
+        let home = Path::new("/h");
+        let claude_wrote = [
+            (
+                "/Users/llfourn/src/ios-frostsnap/.clank/worktrees/device-experiment",
+                "-Users-llfourn-src-ios-frostsnap--clank-worktrees-device-experiment",
+            ),
+            (
+                "/Users/llfourn/src/fswt/frostsnap_nostr-taipei",
+                "-Users-llfourn-src-fswt-frostsnap-nostr-taipei",
+            ),
+            (
+                "/private/tmp/claude-501/-Users-llfourn-src-clank/8e702960-295f-4755-be95-2f491e53a293/scratchpad/probe-claude",
+                "-private-tmp-claude-501--Users-llfourn-src-clank-8e702960-295f-4755-be95-2f491e53a293-scratchpad-probe-claude",
+            ),
+            ("/x/caf\u{e9}/\u{fc}\u{1F600}_w", "-x-caf------w"),
+            (
+                &format!(
+                    "/x/{}/.clank/worktrees/{}",
+                    "a".repeat(120),
+                    "b".repeat(100)
+                ),
+                &format!(
+                    "-x-{}--clank-worktrees-{}-57qxsa",
+                    "a".repeat(120),
+                    "b".repeat(59)
+                ),
+            ),
+            (
+                &format!("/x/{}/{}", "\u{e9}".repeat(90), "\u{1F600}".repeat(60)),
+                &format!("-x{}ugjjvh", "-".repeat(199)),
+            ),
+        ];
+        for (cwd, dir) in claude_wrote {
+            assert_eq!(
+                transcript_path(Tool::Claude, "abc", None, Path::new(cwd), home),
+                Some(home.join(".claude/projects").join(dir).join("abc.jsonl")),
+                "{cwd}"
+            );
+        }
     }
 
     #[test]

@@ -221,6 +221,11 @@ pub(crate) struct AgentAutoRow {
 }
 
 impl AgentAutoRow {
+    /// Its config was read and binds no session.
+    pub(crate) fn unbound(&self) -> bool {
+        self.session.is_none() && self.unreadable.is_none()
+    }
+
     /// The bound session the roster's tool has moved away from.
     pub(crate) fn superseded(&self) -> Option<&clank_core::Session> {
         let configured = clank_core::Tool::from_name(&self.tool)?;
@@ -970,13 +975,10 @@ impl StatusSnapshot {
                     None => line,
                 };
                 let _ = writeln!(out, "state: {} → {line}", row.label);
-            } else if row.session.is_some() {
-                let _ = writeln!(
-                    out,
-                    "state: {} → {}",
-                    row.label,
-                    crate::cli::agent_state::UNKNOWN
-                );
+            } else if row.unreadable.is_none() {
+                use crate::cli::agent_state::{UNBOUND, UNKNOWN};
+                let none = if row.unbound() { UNBOUND } else { UNKNOWN };
+                let _ = writeln!(out, "state: {} → {none}", row.label);
             }
             // A current state already says why it waits for a person.
             if let Some(why) = &row.waiting_for_you
@@ -5168,9 +5170,10 @@ pub(crate) mod dirty_and_wake_tests {
 
     /// Status says of an agent what its row says: unreachable, in red once
     /// it is owed work, with the reachability value in the JSON; and of a
-    /// bound agent with no published state, that nothing is known.
+    /// bound agent with no published state, that nothing is known; of one
+    /// whose config binds nothing, that it is unbound.
     #[test]
-    fn status_says_unreachable_and_unknown_as_the_row_does() {
+    fn status_says_unreachable_unknown_and_unbound_as_the_row_does() {
         use crate::cli::agent_state::{
             Activity, AgentState, Case, HandsOff, Nudge, Observer, OwedItem, Owing, Reachability,
             UNDELIVERED_SGR, View,
@@ -5241,12 +5244,15 @@ pub(crate) mod dirty_and_wake_tests {
             )
             .unwrap(),
         );
-        snap.agents = vec![bound, agent_row("codex", None)];
+        let mut unreadable = agent_row("grok", None);
+        unreadable.unreadable = Some("bad toml".into());
+        snap.agents = vec![bound, agent_row("codex", None), unreadable];
         let said = snap.human(false);
         assert!(said.contains("state: claude → unknown\n"), "{said}");
+        assert!(said.contains("state: codex → unbound\n"), "{said}");
         assert!(
-            !said.contains("state: codex"),
-            "an agent with no session has no state to be unknown: {said}"
+            !said.contains("state: grok"),
+            "an unreadable config's binding is unknown, and its config line says why: {said}"
         );
     }
 
