@@ -45,8 +45,9 @@ pub(crate) fn master(repo: &Path) -> anyhow::Result<clank_core::AgentLabel> {
 const BLOCK_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Who may raise a block (I7): a person running no agent, or the
-/// repository's unique master. Any other agent is refused with what it
-/// does instead, and so is a caller whose identity fails to resolve.
+/// repository's unique master while there is a plan cycle to pause. Any
+/// other agent is refused with what it does instead, and so is a caller
+/// whose identity fails to resolve, and the master of an idle repo.
 /// `Ok(None)` is the person.
 fn admit(
     repo: &Path,
@@ -64,6 +65,7 @@ fn admit(
     };
     let cfg = crate::agent_store::repo_config::read(repo)?.unwrap_or_default();
     if super::watch_store::Target::Master.recipient(&cfg).as_ref() == Some(&label) {
+        refuse_if_idle(repo)?;
         return Ok(Some(label));
     }
     match cfg.agents.get(&label).map(|a| a.role.resolved()) {
@@ -81,6 +83,24 @@ fn admit(
              the person must decide: `clank send --master -m \"<question>\"`."
         ),
     }
+}
+
+fn refuse_if_idle(repo: &Path) -> anyhow::Result<()> {
+    let state =
+        crate::rebuild::rebuild_repo_sync_with_policy(repo, crate::rebuild::CachePolicy::Use)
+            .map_err(|e| {
+                anyhow::anyhow!("refusing to raise a block: reading the active plan: {e}")
+            })?;
+    let cycle = super::queue::Cycle::read(repo, state.fold.active_plan.is_some())
+        .map_err(|e| anyhow::anyhow!("refusing to raise a block: {e:#}"))?;
+    if matches!(cycle, super::queue::Cycle::Idle) {
+        anyhow::bail!(
+            "refusing to raise a block: the repo is idle (no active plan, nothing queued), so \
+             there is no review cycle to pause. Ask the person in your own turn, or reply with \
+             `clank send`."
+        );
+    }
+    Ok(())
 }
 
 /// Raise `name` as `caller`, once [`admit`] allows it.

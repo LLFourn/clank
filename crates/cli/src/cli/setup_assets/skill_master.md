@@ -109,6 +109,8 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   always repo-wide: while one is pending the review cycle pauses (no
   promote, review or finish work), though messages and events still
   wake you. Raise one only when you genuinely cannot proceed.
+  While the repo is idle (no active plan, nothing queued) a block is
+  refused: ask the person in your own turn instead.
   The human answers with `clank block answer <name> -m "answer"`, without
   an agent name. Questions and answers belong to the repository and follow
   whoever becomes master. An answer is delivered once, best effort, in a

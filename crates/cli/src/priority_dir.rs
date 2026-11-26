@@ -71,8 +71,22 @@ pub fn scan(dir: &Path) -> Vec<Entry> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
+    collect(entries.flatten())
+}
+
+/// [`scan`], except that a directory or entry that can't be read is an
+/// error. A missing directory is still an empty one.
+pub fn try_scan(dir: &Path) -> std::io::Result<Vec<Entry>> {
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        read => read?,
+    };
+    Ok(collect(entries.collect::<std::io::Result<Vec<_>>>()?))
+}
+
+fn collect(entries: impl IntoIterator<Item = std::fs::DirEntry>) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
         let fname = entry.file_name();
         let Some(s) = fname.to_str() else { continue };
         let Some(stem) = s.strip_suffix(".md") else {

@@ -323,9 +323,40 @@ fn a_standby_agent_is_refused_a_block_and_told_to_send_the_master() {
     }
 }
 
+/// Introduces `plan`, which the fold then holds as the active plan.
+fn activate(repo: &Path, plan: &str) {
+    crate::test_git::init(repo);
+    let path = format!(".clank/plans/{plan}.md");
+    write(&repo.join(&path), format!("# {plan}\n"));
+    crate::test_git::commit_files(repo, &[&path], &format!("[{plan}] intro"));
+}
+
+fn enqueue(repo: &Path, plan: &str) {
+    write(
+        &repo.join(format!(".clank/queue/500-{plan}.md")),
+        format!("# {plan}\n"),
+    );
+}
+
+#[test]
+fn the_master_of_an_idle_repo_is_refused_a_block() {
+    let repo = team();
+    for kind in [Kind::Plain, permission()] {
+        let err = raise_as(repo.path(), &in_session(MASTER_SID), &kind).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("the repo is idle (no active plan, nothing queued)"),
+            "{err}"
+        );
+        assert!(err.contains("`clank send`"), "{err}");
+        assert!(nothing_raised(repo.path()), "{}", kind.name());
+    }
+}
+
 #[test]
 fn the_master_raises_a_block() {
     let repo = team();
+    activate(repo.path(), "plan");
     let (author, path) = raise_as(repo.path(), &in_session(MASTER_SID), &permission()).unwrap();
     assert_eq!(author, Some(label("boss")));
     assert_eq!(path, files(&root(repo.path()), "q").question);
@@ -334,7 +365,39 @@ fn the_master_raises_a_block() {
 }
 
 #[test]
-fn a_caller_with_no_identity_raises_a_block() {
+fn the_master_raises_a_block_while_a_plan_is_queued() {
+    let repo = team();
+    enqueue(repo.path(), "next");
+    let (author, _) = raise_as(repo.path(), &in_session(MASTER_SID), &Kind::Plain).unwrap();
+    assert_eq!(author, Some(label("boss")));
+    assert!(Pair::read(&root(repo.path()), "q").unwrap().is_some());
+}
+
+/// A pending block withholds the promotion, but the queued plan is still
+/// a cycle to pause.
+#[test]
+fn a_withheld_promotion_leaves_the_repo_not_idle() {
+    let repo = team();
+    enqueue(repo.path(), "next");
+    ask_with(repo.path(), None, "earlier", "Hold?", &Kind::Plain).unwrap();
+    let (author, _) = raise_as(repo.path(), &in_session(MASTER_SID), &Kind::Plain).unwrap();
+    assert_eq!(author, Some(label("boss")));
+    assert!(Pair::read(&root(repo.path()), "q").unwrap().is_some());
+}
+
+#[test]
+fn an_unreadable_queue_refuses_the_master_with_the_read_error() {
+    let repo = team();
+    write(&repo.path().join(".clank/queue"), "not a directory");
+    let err = raise_as(repo.path(), &in_session(MASTER_SID), &Kind::Plain).unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("reading the queue"), "{err}");
+    assert!(!err.contains("idle"), "{err}");
+    assert!(nothing_raised(repo.path()));
+}
+
+#[test]
+fn a_caller_with_no_identity_raises_a_block_in_an_idle_repo() {
     let repo = team();
     let (author, _) = raise_as(
         repo.path(),

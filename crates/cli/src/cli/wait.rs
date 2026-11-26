@@ -2783,12 +2783,13 @@ fn items_for(
     sidecars: &crate::cli::github::log::Sidecars,
 ) -> Owed {
     let mut review = status.work_for(author, inputs.role);
-    if inputs.role == Role::Master && review.is_empty() && fold.active_plan.is_none() {
-        let queue = crate::cli::queue::scan_queue_no_dups(repo).unwrap_or_else(|e| {
-            eprintln!("wait: {e}");
-            Vec::new()
-        });
-        review.extend(queue_promote_outcome(&queue));
+    if inputs.role == Role::Master && review.is_empty() {
+        use crate::cli::queue::Cycle;
+        match Cycle::read(repo, fold.active_plan.is_some()) {
+            Ok(Cycle::Queued(queue)) => review.extend(queue_promote_outcome(&queue)),
+            Ok(Cycle::Active | Cycle::Idle) => {}
+            Err(e) => eprintln!("wait: {e}"),
+        }
     }
     let events = message_items(repo, author, sidecars);
     Owed { review, events }
