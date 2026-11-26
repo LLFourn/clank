@@ -846,6 +846,9 @@ fn doing(state: &AgentState, now: u64) -> String {
 /// What a row says of an agent nothing is known about.
 pub(crate) const UNKNOWN: &str = "unknown";
 
+/// What a row says of an agent no session is bound to.
+pub(crate) const UNBOUND: &str = "unbound";
+
 /// What stands between the agent and its owed work, then what clank
 /// means to do. `shouted` when the row leads with the undelivered item
 /// rather than the activity, which then no longer says the reason itself.

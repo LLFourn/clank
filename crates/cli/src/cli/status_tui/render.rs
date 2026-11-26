@@ -798,7 +798,9 @@ pub(super) fn scrollable_header(
                         }
                     }
                 } else if !working {
-                    spans.push(dim(format!("  {}", crate::cli::agent_state::UNKNOWN)));
+                    use crate::cli::agent_state::{UNBOUND, UNKNOWN};
+                    let none = if a.unbound() { UNBOUND } else { UNKNOWN };
+                    spans.push(dim(format!("  {none}")));
                 } else if let Some((verb, since)) = verb_for(&a.label) {
                     spans.push(dim(format!("  {}", spinner_glyph(frame))));
                     spans.push(italic(format!(" {verb}…")));
@@ -3353,7 +3355,10 @@ pub(super) fn render_agent_detail(
             }
         }
         None => content.push(emit(
-            &[dim(label), colored("31", "✗ unbound".to_string())],
+            &[
+                dim(label),
+                colored("31", format!("✗ {}", crate::cli::agent_state::UNBOUND)),
+            ],
             "",
             cols,
         )),
@@ -11991,6 +11996,10 @@ mod tests {
         let row = |state: Option<crate::cli::agent_state::View>, view: &PanelView<'_>| {
             let mut s = two_agent_snap();
             s.active_plan = Some(plan_state("foo", WaitingOn::MasterToContinue));
+            s.agents[0].session = Some(crate::cli::status_tui::fixtures::bound(
+                clank_core::vocab::Tool::Claude,
+                "s1-session",
+            ));
             s.agents[0].state = state;
             visible(line_with(&render_at(&s, 40, 100, 0, 0, view).0, "claude"))
         };
@@ -12054,6 +12063,23 @@ mod tests {
             !r.contains("gone"),
             "running without a pane is not gone: {r}"
         );
+    }
+
+    /// An agent whose config binds no session has no state to show and
+    /// says so, where one whose config cannot be read says nothing is
+    /// known.
+    #[test]
+    fn an_unbound_agent_row_says_unbound() {
+        let row = |unreadable: Option<&str>| {
+            let mut s = two_agent_snap();
+            s.agents[0].state = None;
+            s.agents[0].unreadable = unreadable.map(str::to_string);
+            visible(line_with(&render(&s, 40, 100), "claude"))
+        };
+        let r = row(None);
+        assert!(r.ends_with("unbound") && !r.contains("unknown"), "{r}");
+        let r = row(Some("bad toml"));
+        assert!(r.ends_with("unknown") && !r.contains("unbound"), "{r}");
     }
 
     /// A current view of an agent whose record shows `activity` and who is

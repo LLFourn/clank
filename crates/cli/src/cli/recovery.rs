@@ -6933,6 +6933,30 @@ pub(crate) mod tests {
         assert_eq!(read(&[&go]), Some(Outcome::Running));
     }
 
+    /// A Claude agent in a `.clank/worktrees/` checkout whose binding
+    /// records no transcript is read where Claude writes one: the
+    /// directory name is the one Claude gave such a checkout.
+    #[test]
+    fn a_claude_in_a_clank_worktree_reads_the_record_claude_wrote() {
+        use crate::cli::agent_state::{Activity, load as published};
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let record = home
+            .path()
+            .join(".claude/projects/-x-repo--clank-worktrees-w/session-one.jsonl");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        append(&record, &[&user("P"), DURATION]);
+        let mut f = facts("claude", dir.path(), &record, "session-one", true, false);
+        f.session.transcript = None;
+        crate::agent_store::state::tests::bind_session(dir.path(), &f.session);
+        let mut d = Driver::new(
+            PathBuf::from("/x/repo/.clank/worktrees/w"),
+            home.path().to_path_buf(),
+        );
+        d.reconcile(vec![f], 0);
+        assert_eq!(published(dir.path()).unwrap().activity, Activity::Idle);
+    }
+
     /// Claude 2.1.308's record of an idle compaction: a finished turn, the
     /// `compact_boundary`, the summary as a `user` record under that turn's
     /// promptId, and "Compacted while idle".
