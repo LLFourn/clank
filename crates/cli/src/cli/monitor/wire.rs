@@ -29,7 +29,7 @@ use crate::cli::watch_store::Producer;
 // on delivery; a 16 monitor sends neither and still teaches `block clean`.
 // 18 parks an attending agent's turn-end instead of silencing it; a 17
 // monitor would leave it deaf to new work until its attendance ends.
-// 19 ends a parked Stop with the `user_command` silent reason when a signed
+// 19 ends a parked Stop with the `user_command` silent reason when a user
 // command waits, which an 18 hook cannot decode; an 18 monitor never
 // releases a park for one.
 // 20 reads no task listing: a `clank run` registers its process and a

@@ -219,18 +219,6 @@ fn assert_user_fixture_meaning(home: &Path) {
     assert!(effective.finish.autosquash);
 }
 
-/// The names the user trusts, by name and the key each holds.
-fn trusted(home: &Path) -> Vec<(String, String)> {
-    crate::cli::user_command::trust_set(home)
-        .keys()
-        .unwrap()
-        .iter()
-        .map(|(name, key)| (name.to_string(), key.encoded()))
-        .collect()
-}
-
-const LEGACY_SITE_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
-
 #[test]
 fn an_unversioned_user_config_keeps_its_meaning_through_every_writer() {
     let home = tempfile::tempdir().unwrap();
@@ -239,34 +227,48 @@ fn an_unversioned_user_config_keeps_its_meaning_through_every_writer() {
         fixture!("user-config.json"),
     );
     assert_user_fixture_meaning(home.path());
-    assert_eq!(
-        trusted(home.path()),
-        [("default".to_string(), LEGACY_SITE_KEY.to_string())],
-        "the legacy site_key is the key named `default`"
-    );
+    let user_command = raw(&path)["user_command"].clone();
+    assert!(user_command.is_object());
 
-    let other = crate::cli::user_command::envelope::testkey::Signer::generate()
-        .key()
-        .encoded();
-    crate::cli::user_command::trust_key(home.path(), "site-b", &other, false).unwrap();
+    crate::cli::agent::declare_global_agent(home.path(), &label("helper"), desc()).unwrap();
+    crate::cli::agent::remove_global_agent(home.path(), &label("helper")).unwrap();
     assert_eq!(
         raw(&path)["version"],
         1,
         "the next write stores the version"
     );
-    assert_eq!(raw(&path)["user_command"].get("site_key"), None);
     assert_eq!(
-        trusted(home.path()),
-        [
-            ("default".to_string(), LEGACY_SITE_KEY.to_string()),
-            ("site-b".to_string(), other.clone()),
-        ],
-        "the trust write folded the legacy key into `keys`"
+        raw(&path)["user_command"],
+        user_command,
+        "a section no clank reads now is kept as written, for a clank that still reads it"
     );
     assert_user_fixture_meaning(home.path());
 
     crate::cli::config::set_user_key(home.path(), &["diff", "wait"], "true", "bool").unwrap();
+    assert_eq!(raw(&path)["user_command"], user_command);
     assert_user_fixture_meaning(home.path());
+}
+
+/// The named keys the last clank to have them wrote: read, loaded and
+/// written past without effect.
+#[test]
+fn a_user_config_naming_keys_still_loads_and_keeps_them() {
+    let home = tempfile::tempdir().unwrap();
+    let path = place(
+        &clank_user_config::path(home.path()),
+        fixture!("user-config-named-keys.json"),
+    );
+    let before = raw(&path)["user_command"].clone();
+    assert_eq!(
+        crate::cli::team::read_user_config(home.path())
+            .unwrap()
+            .auto,
+        Some(AutoMode::On)
+    );
+    crate::cli::config::load_with_home(tempfile::tempdir().unwrap().path(), Some(home.path()))
+        .unwrap();
+    crate::cli::agent::declare_global_agent(home.path(), &label("helper"), desc()).unwrap();
+    assert_eq!(raw(&path)["user_command"], before);
 }
 
 fn assert_agent_fixture_meaning(repo: &Path, auto: AutoMode) {
@@ -1001,13 +1003,6 @@ fn a_user_config_it_cannot_read_stops_every_writer() {
             body,
             &path,
             crate::cli::agent::declare_global_agent(home.path(), &label("codex"), desc()),
-        );
-        refused(
-            "trust-key",
-            body,
-            &path,
-            crate::cli::user_command::trust_key(home.path(), "site", LEGACY_SITE_KEY, false)
-                .map(|_| ()),
         );
         refused(
             "auto mode",

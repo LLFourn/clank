@@ -660,7 +660,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply`; standing wake sources: `watch list` / `watch add` / `watch remove` / `watch transfer` (see below) |
 | `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo; `--interrupt` also tries to interrupt) |
 | `nudge` | Interrupt an agent and type a message into its terminal, for when `send` cannot be delivered |
-| `user-command` | Deliver a person's site-signed command into the asking agent's terminal as `! <command>`: `trust-key` / `untrust-key` / `keys` / `submit` / `status` (see below) |
+| `user-command` | Type a person's command into the asking agent's terminal as `!<command>`: `submit` / `status` (see below) |
 | `feedback` | `write` / `read` review feedback via a typed surface |
 | `queue` | `add` / `promote` / `remove` / `unqueue` (back to drafts) / `reprioritise` queued plans |
 | `finish` | Finalize a FINISHED plan (`-m` required; autosquash-aware) |
@@ -799,140 +799,69 @@ turn. A permission block is answered by typing your answer there for you.
 
 ### User commands
 
-**Not active yet:** until a human records the evidence described under
-*Evidence a human records* below, every request is refused at dispatch.
-
 Agents reach actions their permission checks deny but you are happy to do
 yourself: pushing a branch, opening a PR. The story site shows such a
 command with a Run button. Pressing it does not run anything in the site:
 clank types `!<command>` into the terminal of the agent that asked, Claude
 Code's bash mode runs it as your own input, and the output lands in that
-agent's conversation. Bash mode skips the agent's permission checks, so a
-`!` line reaches a prompt only because a person chose it.
+agent's conversation, which then answers it.
 
-**Interface.** Each site holds its own Ed25519 private key; clank holds
-only the public keys, each under the site's name, and verifies, never signs.
+This is a convenience, not a security boundary. Every agent and the site
+run as the same Unix user, and any of them can already type into any pane.
+What clank guards against is a press that repeats or lands in the wrong
+place.
 
-- `clank user-command trust-key --name <site> [--replace]` reads a public
-  key (standard base64 of the 32 raw bytes) from stdin, stores it as
-  `user_command.keys.<site>` in `~/.clank/config.json`, and prints its
-  blake3 fingerprint. Replacing that name's different key needs
-  `--replace`. A key already trusted under another name is refused: one key
-  has one name, so which name admitted a request never depends on search
-  order (a hand-edited config holding one key twice trusts nothing until it
-  is fixed). A name is 1 to 64 of `[A-Za-z0-9_-]`.
-- `clank user-command untrust-key --name <site>` removes it and prints its
-  fingerprint; `clank user-command keys` lists each name and fingerprint,
-  never a key.
-- A config from before keys had names (`user_command.site_key`) is read as
-  the key named `default`, and the next `trust-key` or `untrust-key` moves
-  it into `keys` and drops `site_key`, so untrusting `default` cannot bring
-  it back. If `site_key` and a different `keys.default` are both present,
-  nothing is trusted until `trust-key --name default --replace` or
-  `untrust-key --name default` decides.
-- `clank user-command submit` reads one JSON envelope from stdin, never
-  argv: `{"request": <base64 of the payload bytes>, "sig": <base64
-  signature>}`. The signature is over the bytes `clank user-command v1\n`
-  followed by exactly the payload bytes, and is verified before anything is
-  parsed from them. The payload is
-  `{v: 1, repo, agent, session, tool, id, command, issued_at, expires_at}`:
-  `repo` the repo's canonical path, `agent` a roster label, `session` and
-  `tool` the agent's current binding (`tool` must be `claude`), `id` 1 to
-  64 of `[A-Za-z0-9_-]`, `command` one non-empty line with no control
-  characters, and the times unix seconds at most 600 apart (30 s of clock
-  skew either side). Every field is signed. It is admitted under whichever
-  trusted key verifies it.
+**Interface.**
+
+- `clank user-command submit` reads one JSON request from stdin, never
+  argv: `{repo, agent, session, id, command}`. `repo` is the repo's
+  canonical path, `agent` a roster label, `session` the session bound to
+  that label now, which must be a Claude Code session, `id` 1 to 64 of
+  `[A-Za-z0-9_-]`, and `command` one non-empty line of at most 4096
+  characters with no control characters.
 - `clank user-command status --repo <r> --agent <a> --id <id>`.
 
-Both `submit` and `status` print `{id, state, reason, admitted_at,
-updated_at, key, key_name}` (the fingerprint and name it was admitted
-under), never the envelope, the signature or the command. A repeat submit
-keeps that name and fingerprint, even signed by another trusted key. A refused `submit` prints
-`{"state": "refused", "reason": …}` and exits 1, and files nothing.
+Both print `{id, state, reason, admitted_at, updated_at}`, never the
+command. A refused `submit` prints `{"state": "refused", "reason": …}`,
+exits 1, and files nothing.
 
 **States.** `admitted` → `waiting-for-idle` (with a reason) → `dispatching`
 → `delivered` | `unconfirmed` | `refused` | `failed-not-started`. The last
-four are terminal and are never rewritten, whatever later happens to the
-key or the clock. `delivered` means the terminal accepted the `!` line and
-Enter, not that the command succeeded. `unconfirmed` means something may
-have been typed; it is never retried. Every terminal outcome is added to
-the agent's nudge history.
+four are terminal and are never rewritten. `delivered` means the terminal
+accepted the `!` line and Enter, not that the command succeeded.
+`unconfirmed` means something may have been typed; it is never retried. A
+request not typed within ten minutes of its admission is refused as
+`expired`: a press is for now, and a waiting request releases its agent's
+parked turns. Every terminal outcome is added to the agent's nudge history.
 
-**At most once.** The same id with byte-identical payload returns the
-existing state (and has the monitor look again at a waiting one); the same
-id with any other payload is refused and changes nothing. `dispatching` is
-synced to disk before the first byte is written, under the request's lock;
-a reader that later finds it with the lock free records `unconfirmed`.
+**At most once.** The same id asking for the same session and command
+returns the existing state (and has the monitor look again at a waiting
+one); the same id with anything else is refused and changes nothing.
+`dispatching` is synced to disk before the first byte is written, under the
+request's lock; a reader that later finds it with the lock free records
+`unconfirmed`. The ledger is `~/.clank/user-commands/`. A record there that
+cannot be read is never treated as absent, and one an older clank filed is
+refused, never typed, so its id never runs again.
 
 **Where it is typed.** Only the repo's monitor dispatches, on its existing
 wakes (turn-ends, record reads, the store's own files changing, a waiting
-request's expiry), never by polling a pane. Before any use it verifies the
-stored envelope again, within its window, under the key trusted now under
-the name it was admitted under, and no other: if that name is gone or holds
-a different key, the request is refused with `key changed`, and so is
-every admitted, undelivered request it signed. It checks the envelope
-names the repo, agent and id it is filed under. It types only when the
-agent's latest turn completed, no question, block or presentation is
-pending, no hook is held, the session binding still matches, the pane's
-launch is the one first found, and one dump reads Claude's input as an
-empty prompt. An agent parked in its Stop hook is released first (the turn
-ends instead of parking) and looked at again a moment later. Each attempt
-holds the request lock, then the pane's write lock, reads the input, and
-only then asks the monitor whether the agent is still idle, takes the
-agent's state lock and verifies the envelope, key, clock, binding and
-launch again before it records `dispatching` and types. The monitor's own
-pane writers give way to a reserved pane rather than wait. A person typing between that dump and the write can mix with
-the command; the outcome is then `delivered` or `unconfirmed`, never
+request's expiry), never by polling a pane. It types only when the agent's
+latest turn completed, no question, block or presentation is pending, no
+hook is held, the session binding still matches, the pane's launch is the
+one first found, and one dump reads Claude's input as an empty prompt. An
+agent parked in its Stop hook is released first (the turn ends instead of
+parking) and looked at again a moment later. Each attempt holds the request
+lock, then the pane's write lock, reads the input, and only then asks the
+monitor whether the agent is still idle, takes the agent's state lock and
+checks the clock, binding and launch again before it records `dispatching`
+and types. The monitor's own pane writers give way to a reserved pane
+rather than wait. A person typing between that dump and the write can mix
+with the command; the outcome is then `delivered` or `unconfirmed`, never
 retried.
 
 **Tools.** Claude Code only. Codex has a shell mode but no verified
 rendering of it, and Grok and OpenCode have shell modes but no readable
 input line; all three are refused with that reason.
-
-**What it does not protect.** Every site and every agent run as the same
-Unix user, so this is not an OS boundary. An agent cannot forge a request,
-and a captured envelope authorises exactly one command, to one target,
-under one id, once. Names are labels, not isolation: each trusted key is a
-separate capability that can sign for any agent in any repo, and guarding
-one site's key does nothing for another's. Any of these defeats it:
-
-- reading any trusted site's private key file;
-- writing `~/.clank/config.json`, or running `trust-key` with a key of its
-  own (under a new name, or `--replace` on an existing one);
-- running `untrust-key`, which refuses that site's pending requests (a
-  denial, not a forgery);
-- modifying or deleting the ledger under `~/.clank/user-commands/`, which
-  defeats replay prevention: a genuine envelope whose entry is gone or reset
-  can be dispatched again until it expires.
-
-Add deny rules for these to every agent (Claude Code's `permissions.deny`
-in `~/.claude/settings.json`), with a `Read` and an `Edit` rule for EACH
-site's private-key path; the two below are examples, adjust them to where
-each site keeps its key:
-
-```json
-{
-  "permissions": {
-    "deny": [
-      "Read(~/.config/clankstack/site-a/site-key*)",
-      "Edit(~/.config/clankstack/site-a/site-key*)",
-      "Read(~/.config/clankstack/site-b/site-key*)",
-      "Edit(~/.config/clankstack/site-b/site-key*)",
-      "Edit(~/.clank/config.json)",
-      "Write(~/.clank/config.json)",
-      "Edit(~/.clank/user-commands/**)",
-      "Write(~/.clank/user-commands/**)",
-      "Bash(clank user-command trust-key:*)",
-      "Bash(clank user-command untrust-key:*)",
-      "Bash(rm ~/.clank/user-commands:*)"
-    ]
-  }
-}
-```
-
-Deny rules match tool calls, so they cover `Read`/`Edit`/`Write` of those
-paths and the obvious Bash spellings, not every Bash path to the same
-bytes.
 
 **Ordinary text cannot reach a shell mode.** Every other pane write
 (`send --interrupt`, recovery, the web chat) goes through one
@@ -959,14 +888,15 @@ began: a Claude user turn or queued prompt, or a Codex user message, with
 the whole text, its leading space kept or lost. Without that record it is
 indeterminate, and never replayed.
 
-**Evidence a human records.** User commands are gated on an observation
-made in a throwaway pane against the installed harness, and stay refused
-until it is committed as `USER_COMMAND_EVIDENCE` in
-`crates/cli/src/cli/pane_input.rs`: Claude Code runs a typed `!<line>`
-plus Enter as one bash command (quotes, `$`, a line at the chosen
-`max_command`), what its bash mode looks like in a `zellij action
-dump-screen --ansi` dump, and whether a bash-mode command fires a Stop
-hook. Without it every request is refused at dispatch.
+**The evidence it rests on.** Delivery is gated on an observation made in
+a throwaway pane against the installed Claude Code, committed as
+`USER_COMMAND_EVIDENCE` in `crates/cli/src/cli/pane_input.rs`: that a typed
+`!<line>` plus Enter runs as one bash command (quotes, `$`, a line at the
+chosen `max_command`), what its bash mode looks like in a `zellij action
+dump-screen --ansi` dump, and whether a bash-mode command fires a Stop hook.
+Without it every request is refused at dispatch. Claude Code 2.1.308 ran
+lines up to 3037 characters whole and dropped a chunk of longer ones, so a
+command over 2000 characters is refused at dispatch.
 
 ### Background work: run and attend
 

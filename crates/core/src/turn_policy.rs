@@ -237,8 +237,8 @@ pub struct Facts<'a> {
     /// flight or drops a receipt.
     pub owed_unknown: bool,
     pub liveness: &'a dyn Liveness,
-    /// A person's signed command, verified just now, waits for this agent
-    /// to sit idle and only a park stands in its way.
+    /// A person's command waits for this agent to sit idle and only a park
+    /// stands in its way.
     pub user_command: bool,
 }
 

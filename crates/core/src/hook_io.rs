@@ -174,7 +174,7 @@ silent_reasons! {
     OwnerGone,
     /// A native handoff's `clank wait` already carries the next wake.
     WaitArmed,
-    /// A person's signed command waits for this agent's idle prompt.
+    /// A person's command waits for this agent's idle prompt.
     UserCommand,
 }
 

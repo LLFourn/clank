@@ -257,13 +257,12 @@ pub enum Command {
     /// waiting to be acknowledged; each attempt and its outcome is
     /// added to the agent's nudge history.
     Nudge(crate::cli::NudgeArgs),
-    /// Type a person's signed command into an agent's pane
+    /// Type a person's command into an agent's pane
     ///
-    /// For the story site's Run button: the site signs one command for one
-    /// agent's session, `submit` admits it, and the repo's monitor types
-    /// `!<command>` into that agent's idle, empty Claude Code prompt at most
-    /// once. `trust-key` installs the site's public key; `status` reports a
-    /// request's state.
+    /// For the story site's Run button: `submit` files one command for one
+    /// agent's session, and the repo's monitor types `!<command>` into that
+    /// agent's idle, empty Claude Code prompt at most once. `status` reports
+    /// a request's state.
     UserCommand(crate::cli::user_command::UserCommandArgs),
     /// Watch a repo once, for every waiter
     ///

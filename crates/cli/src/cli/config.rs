@@ -1720,33 +1720,36 @@ mod tests {
         assert!(!load_isolated(tmp.path()).finish.autosquash);
     }
 
-    /// A global set with a trust mutation placed between its read and its
-    /// write, an untrust and then a trust: the mutation waits for the set,
-    /// and neither the setting nor the revocation or new key is lost. The
+    /// A global set with a library mutation placed between its read and its
+    /// write, a removal and then an addition: the mutation waits for the
+    /// set, and neither the setting nor the removal or addition is lost. The
     /// mutation is given a moment to finish first, which it can do only if
     /// it does not share the set's transaction.
     #[test]
-    fn a_global_set_racing_a_trust_mutation_loses_neither() {
-        use crate::cli::user_command::{
-            envelope::testkey::Signer, trust_key, trust_set, untrust_key,
+    fn a_global_set_racing_a_library_mutation_loses_neither() {
+        use crate::cli::agent::{declare_global_agent, remove_global_agent};
+        let label = clank_core::ids::AgentLabel::parse("site-a").unwrap();
+        let desc = || crate::cli::teams_config::AgentDescription {
+            tool: clank_core::Tool::Codex,
+            launch: None,
+            initial_prompt: None,
         };
-        for revoke in [true, false] {
+        for remove in [true, false] {
             let home = tempfile::tempdir().unwrap();
-            let key = Signer::generate().key();
-            if revoke {
-                trust_key(home.path(), "site-a", &key.encoded(), false).unwrap();
+            if remove {
+                declare_global_agent(home.path(), &label, desc()).unwrap();
             }
             let other: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
                 Default::default();
             let slot = other.clone();
-            let (h, encoded) = (home.path().to_path_buf(), key.encoded());
+            let (h, l) = (home.path().to_path_buf(), label.clone());
             clank_user_config::on_next_read(move || {
                 let (done, finished) = std::sync::mpsc::channel();
                 *slot.lock().unwrap() = Some(std::thread::spawn(move || {
-                    if revoke {
-                        untrust_key(&h, "site-a").unwrap();
+                    if remove {
+                        remove_global_agent(&h, &l).unwrap();
                     } else {
-                        trust_key(&h, "site-a", &encoded, false).unwrap();
+                        declare_global_agent(&h, &l, desc()).unwrap();
                     }
                     let _ = done.send(());
                 }));
@@ -1762,11 +1765,12 @@ mod tests {
                 .unwrap();
             assert!(
                 user_key_present(home.path(), &["finish", "autosquash"]).unwrap(),
-                "revoke={revoke}: the setting was lost"
+                "remove={remove}: the setting was lost"
             );
-            let keys = trust_set(home.path());
-            let trusted = keys.keys().unwrap();
-            assert_eq!(trusted.is_empty(), revoke, "revoke={revoke}: {keys:?}");
+            let agents = crate::cli::team::read_user_config(home.path())
+                .unwrap()
+                .agents;
+            assert_eq!(agents.is_empty(), remove, "remove={remove}: {agents:?}");
         }
     }
 

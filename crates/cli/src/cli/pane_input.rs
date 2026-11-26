@@ -16,7 +16,7 @@
 //!   ([`lock_pane`]) from its look through its last byte.
 //!
 //! The user-command writer ([`type_user_command`]) is the only pane writer
-//! that takes a raw line, and it takes only a verified one.
+//! that takes a raw line, and it takes only a [`Command`](super::user_command::request::Command).
 
 use super::composer::Composer;
 use super::open_zellij::PaneWrite;
@@ -171,9 +171,21 @@ pub(crate) struct UserCommandEvidence {
     pub(crate) how: &'static str,
 }
 
-/// The committed observation for the user-command keystrokes. None until a
-/// human records one, so every user command is refused at dispatch.
-pub(crate) const USER_COMMAND_EVIDENCE: Option<UserCommandEvidence> = None;
+/// The committed observation for the user-command keystrokes. While None,
+/// every user command is refused at dispatch.
+pub(crate) const USER_COMMAND_EVIDENCE: Option<UserCommandEvidence> = Some(UserCommandEvidence {
+    version: "2.1.308",
+    max_command: 2000,
+    how: "2026-11-26, a throwaway detached zellij 0.46.0 session, Claude Code in an empty \
+          scratch dir. `write-chars '!echo clank-probe \"a b\" $HOME'` into the empty input, \
+          then `write 13`, ran it as one bash command: `clank-probe a b /Users/<user>`, the \
+          double-quoted words one argument, `$HOME` expanded, a single-quoted `'$q'` kept. \
+          Lines of 1037 to 3037 characters ran whole (`| wc -c` counted every byte); lines of \
+          3137, 3937 and 3957 lost one 1022-byte chunk, so the bound is 2000. Typed, bash mode \
+          draws `! ` in colour 211 where the `❯` was, both rules in 211, and the footer `! for \
+          shell mode`. Each command's output then started a model turn, and a Stop hook fired \
+          once per command; UserPromptSubmit never did.",
+});
 
 /// Whether an ordinary sequence may type into the pane now: one dump, taken
 /// under the lock the caller holds, must read its input as taking ordinary
@@ -902,7 +914,7 @@ async fn say_on(
     Ok(())
 }
 
-/// Type a verified user command into the pane: `!` and the line as one
+/// Type a user command into the pane: `!` and the line as one
 /// `write-chars`, which Claude's empty input consumes as the switch to bash
 /// mode, then Enter as byte 13.
 ///
@@ -912,7 +924,7 @@ async fn say_on(
 pub(crate) async fn type_user_command(
     term: &impl Terminal,
     pane: &str,
-    command: &super::user_command::envelope::Command,
+    command: &super::user_command::request::Command,
 ) -> Result<(), PaneWrite> {
     let line = format!("!{}", command.line());
     let Some(argvs) = say_argvs(pane, &line) else {
@@ -1981,7 +1993,7 @@ mod tests {
     /// one after the text is `Unknown`.
     #[tokio::test]
     async fn the_user_command_keystrokes() {
-        let command = crate::cli::user_command::envelope::Command::for_test("echo \"$HOME\"");
+        let command = crate::cli::user_command::request::Command::for_test("echo \"$HOME\"");
         let term = fake(None);
         type_user_command(&term, "7", &command).await.unwrap();
         let written = term.written.into_inner();
@@ -2056,7 +2068,7 @@ mod tests {
                                 .await
                                 .unwrap();
                         } else {
-                            let c = crate::cli::user_command::envelope::Command::for_test("ls");
+                            let c = crate::cli::user_command::request::Command::for_test("ls");
                             type_user_command(&term, "7", &c).await.unwrap();
                         }
                     });

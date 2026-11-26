@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>clank user-command submit | The clank book</title>
-<meta name="description" content="Admit one signed request, read as a JSON envelope from stdin">
+<meta name="description" content="File one request, read as JSON from stdin">
 <script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
 <link rel="stylesheet" href="../book.css">
 </head>
@@ -18,8 +18,8 @@
   <article class="page">
 <p class="chapter-no"><a href="index.html">Command reference</a> / <a href="clank-user-command.html">clank user-command</a></p>
 <h1>clank user-command submit</h1>
-<p class="lede">Admit one signed request, read as a JSON envelope from stdin</p>
-<p>Prints the request&#39;s state as JSON. Only the repo&#39;s monitor dispatches it.</p>
+<p class="lede">File one request, read as JSON from stdin</p>
+<p><code>{repo, agent, session, id, command}</code>. Prints the request&#39;s state as JSON. Only the repo&#39;s monitor dispatches it.</p>
 <h2 id="usage">Usage</h2>
 <p class="usage"><samp>clank user-command submit</samp></p>
 <h2 id="options">Options</h2>

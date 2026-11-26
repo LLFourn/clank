@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>clank user-command | The clank book</title>
-<meta name="description" content="Type a person&#39;s signed command into an agent&#39;s pane">
+<meta name="description" content="Type a person&#39;s command into an agent&#39;s pane">
 <script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
 <link rel="stylesheet" href="../book.css">
 </head>
@@ -18,8 +18,8 @@
   <article class="page">
 <p class="chapter-no"><a href="index.html">Command reference</a></p>
 <h1>clank user-command</h1>
-<p class="lede">Type a person&#39;s signed command into an agent&#39;s pane</p>
-<p>For the story site&#39;s Run button: the site signs one command for one agent&#39;s session, <code>submit</code> admits it, and the repo&#39;s monitor types <code>!&lt;command&gt;</code> into that agent&#39;s idle, empty Claude Code prompt at most once. <code>trust-key</code> installs the site&#39;s public key; <code>status</code> reports a request&#39;s state.</p>
+<p class="lede">Type a person&#39;s command into an agent&#39;s pane</p>
+<p>For the story site&#39;s Run button: <code>submit</code> files one command for one agent&#39;s session, and the repo&#39;s monitor types <code>!&lt;command&gt;</code> into that agent&#39;s idle, empty Claude Code prompt at most once. <code>status</code> reports a request&#39;s state.</p>
 <h2 id="usage">Usage</h2>
 <p class="usage"><samp>clank user-command &lt;COMMAND&gt;</samp></p>
 <h2 id="commands">Commands</h2>
@@ -27,11 +27,8 @@
 <table>
   <thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
   <tbody>
-    <tr><td><a href="clank-user-command-keys.html"><code>keys</code></a></td><td>The trusted keys&#39; names and fingerprints</td></tr>
     <tr><td><a href="clank-user-command-status.html"><code>status</code></a></td><td>A request&#39;s state, as JSON</td></tr>
-    <tr><td><a href="clank-user-command-submit.html"><code>submit</code></a></td><td>Admit one signed request, read as a JSON envelope from stdin</td></tr>
-    <tr><td><a href="clank-user-command-trust-key.html"><code>trust-key</code></a></td><td>Trust a site&#39;s Ed25519 public key, read as base64 from stdin</td></tr>
-    <tr><td><a href="clank-user-command-untrust-key.html"><code>untrust-key</code></a></td><td>Stop trusting the key named <code>--name</code></td></tr>
+    <tr><td><a href="clank-user-command-submit.html"><code>submit</code></a></td><td>File one request, read as JSON from stdin</td></tr>
   </tbody>
 </table>
 </div>

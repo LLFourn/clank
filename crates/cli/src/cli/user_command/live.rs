@@ -2,9 +2,8 @@
 //! the attempts it owns, and the real seams an attempt runs on.
 
 use super::dispatch::{self, Ended, Job, Seams};
-use super::envelope::Id;
+use super::request::Id;
 use super::store::{PaneSeen, Stamp, Store};
-use super::trust::TrustSet;
 use crate::cli::nudge_log;
 use crate::cli::pane_input::UserCommandEvidence;
 use clank_core::Tool;
@@ -43,7 +42,6 @@ pub(crate) struct UserCommands {
     store: Store,
     tag: String,
     repo: PathBuf,
-    home: PathBuf,
     asks: tokio::sync::mpsc::UnboundedSender<Ask>,
     done: tokio::sync::mpsc::UnboundedSender<Done>,
     in_flight: BTreeSet<(AgentLabel, Id)>,
@@ -59,7 +57,7 @@ pub(crate) struct UserCommands {
 impl UserCommands {
     /// The user commands of `repo`, watched in `store`. A watch that cannot
     /// be set up is reported; the loop's other wakes still drive passes.
-    pub(crate) fn new(repo: &Path, home: PathBuf, store: Store) -> (Self, Wakes) {
+    pub(crate) fn new(repo: &Path, store: Store) -> (Self, Wakes) {
         let tag = crate::cli::monitor::repo_tag(repo);
         let (changed_tx, changed) = tokio::sync::mpsc::unbounded_channel();
         let (asks_tx, asks) = tokio::sync::mpsc::unbounded_channel();
@@ -86,7 +84,6 @@ impl UserCommands {
                 store,
                 tag,
                 repo: repo.to_path_buf(),
-                home,
                 asks: asks_tx,
                 done: done_tx,
                 in_flight: BTreeSet::new(),
@@ -143,15 +140,12 @@ impl UserCommands {
         spawn: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> dispatch::Pass {
         let now = crate::cli::recovery::unix_now();
-        let trust = super::trust_set(&self.home);
         let repo = self.repo.clone();
         let history =
             |label: &AgentLabel, record: nudge_log::Record| record_history(&repo, label, &record);
         let ctx = dispatch::Ctx {
             store: &self.store,
             tag: &self.tag,
-            repo: &self.repo,
-            trust: &trust,
             now,
             history: &history,
         };
@@ -187,7 +181,6 @@ impl UserCommands {
             }
             let live = Live {
                 repo: self.repo.clone(),
-                home: self.home.clone(),
                 asks: self.asks.clone(),
             };
             let (store, tag, job, done) = (
@@ -197,7 +190,7 @@ impl UserCommands {
                 self.done.clone(),
             );
             spawn.push(tokio::spawn(async move {
-                let ended = dispatch::attempt(&store, &tag, &live.repo, &job, &live).await;
+                let ended = dispatch::attempt(&store, &tag, &job, &live).await;
                 let _ = done.send(Done { job, ended });
             }));
         }
@@ -285,7 +278,6 @@ pub(crate) fn is_record(path: &Path) -> bool {
 /// The real world an attempt runs in.
 struct Live {
     repo: PathBuf,
-    home: PathBuf,
     asks: tokio::sync::mpsc::UnboundedSender<Ask>,
 }
 
@@ -315,10 +307,6 @@ impl crate::cli::pane_input::Terminal for Recorded<'_> {
 impl Seams for Live {
     fn now(&self) -> u64 {
         crate::cli::recovery::unix_now()
-    }
-
-    fn trust(&self) -> TrustSet {
-        super::trust_set(&self.home)
     }
 
     fn binding(&self, label: &AgentLabel) -> Option<(Tool, SessionId)> {
